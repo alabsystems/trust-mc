@@ -7,6 +7,9 @@
 //! Extracted from `codegen_decl_state_vars.rs` for 500-LOC compliance (Part of #3199, D1).
 //! - Section 1.5: Collection auxiliary variables (HashMap/Vec length, capacity, presence).
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_public::CrateDef;
 use rustc_public::mir::{AggregateKind, Operand, Rvalue, StatementKind, TerminatorKind};
@@ -202,7 +205,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             self.propagate_collection_aliases(src_local, dest_local);
                         }
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
                         self.propagate_collection_aliases(src.local, dest_local);
                     }
                     // Part of #3348: `_9 = &_7` or `_9 = &_7.stores` propagates
@@ -279,7 +282,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             current = target.local;
                             found_next = true;
                         }
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                             if p.projection.is_empty() =>
                         {
                             best = Some(p.local);
@@ -365,12 +368,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             let fields = variants[0].fields();
-            let map_field =
-                fields.iter().find(|f| Self::type_is_hashmap(&f.ty_with_args(&adt_args)));
+            let map_field = fields.iter().find(|f| {
+                mono_ty::field_ty(f, &adt_args).is_some_and(|t| Self::type_is_hashmap(&t))
+            });
             let Some(map_field) = map_field else { continue };
 
             // Extract key sort from the map field's type.
-            let key_sort = Self::extract_hashmap_sorts(map_field.ty_with_args(&adt_args))
+            let key_sort = mono_ty::field_ty(map_field, &adt_args)
+                .and_then(Self::extract_hashmap_sorts)
                 .map(|(ks, _)| ks)
                 .unwrap_or_else(ptr_sort);
             let present_sort = Sort::array(key_sort, Sort::bool());

@@ -20,7 +20,7 @@ use crate::rustc_public::CrateDef;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::{
     AggregateKind, BasicBlock, BasicBlockIdx, Body, ConstOperand, Operand, Rvalue, Statement,
-    StatementKind, SwitchTargets, Terminator, TerminatorKind, VarDebugInfoContents,
+    StatementKind, SwitchTargets, TerminatorKind, VarDebugInfoContents,
 };
 use rustc_public::ty::{GenericArgKind, MirConst, RigidTy, TyKind, UintTy};
 use rustc_public_bridge::IndexedVal;
@@ -371,7 +371,7 @@ impl LoopContractPass {
                 let Ok(cap_ty) = capture_operands[0].ty(new_body.locals()) else { return None };
                 if matches!(cap_ty.kind(), TyKind::RigidTy(RigidTy::Uint(_) | RigidTy::Int(_))) {
                     for stmt in &new_body.blocks()[site.bb].statements {
-                        if let StatementKind::Assign(p, Rvalue::Use(Operand::Copy(usrc))) =
+                        if let StatementKind::Assign(p, Rvalue::Use(Operand::Copy(usrc), ..)) =
                             &stmt.kind
                             && p.local == cap_place.local
                             && usrc.projection.is_empty()
@@ -418,7 +418,7 @@ impl LoopContractPass {
                     StatementKind::Assign(p, rv) => {
                         if p.local == 0 {
                             match rv {
-                                Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp)) => {
+                                Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp), ..) => {
                                     let deref_of_ref_temp = Some(rp.local) == ref_temp
                                         && rp.projection.len() == 1
                                         && matches!(rp.projection[0], ProjectionElem::Deref);
@@ -446,7 +446,7 @@ impl LoopContractPass {
                             && !ret_assigned_identity
                             && matches!(
                                 rv,
-                                Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp))
+                                Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp), ..)
                                     if rp.local == 1
                             )
                             && p.projection.is_empty()
@@ -547,7 +547,7 @@ impl LoopContractPass {
                 }
                 *def_count.entry(place.local).or_insert(0) += 1;
                 match rv {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
                         // `_x = ((*_1).i)` — capture slot read off the self arg.
                         if src.local == 1
                             && let Some(idx) = capture_field_index(&src.projection)
@@ -594,7 +594,7 @@ impl LoopContractPass {
             let mut returns_checked_value = false;
             for stmt in &cbody.blocks[1].statements {
                 match &stmt.kind {
-                    StatementKind::Assign(p, Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp)))
+                    StatementKind::Assign(p, Rvalue::Use(Operand::Copy(rp) | Operand::Move(rp), ..))
                         if p.local == 0 =>
                     {
                         if rp.local != checked_temp {
@@ -697,7 +697,7 @@ impl LoopContractPass {
             return;
         }
 
-        let span = new_body.blocks()[site.bb].terminator.span;
+        let span = mir_span!(new_body.blocks()[site.bb].terminator);
 
         // The measure's COMPONENT source locals: one for an identity measure,
         // two for `a - b`. Snapshotting components (not the difference) is what
@@ -717,7 +717,7 @@ impl LoopContractPass {
         for (snap, src) in snapshots.iter().zip(&components) {
             new_body.assign_to(
                 Place::from(*snap),
-                Rvalue::Use(Operand::Copy(Place::from(*src))),
+                rvalue_use!(Rvalue::Use(Operand::Copy(Place::from(*src)))),
                 &mut source,
                 InsertPosition::Before,
             );
@@ -726,11 +726,11 @@ impl LoopContractPass {
         // `_v = true; goto target` exactly like the invariant register call.
         new_body.assign_to(
             site.destination.clone(),
-            Rvalue::Use(Operand::Constant(ConstOperand {
+            rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
                 span,
                 user_ty: None,
                 const_: MirConst::from_bool(true),
-            })),
+            }))),
             &mut source,
             InsertPosition::Before,
         );
@@ -739,7 +739,7 @@ impl LoopContractPass {
         };
         new_body.replace_terminator(
             &SourceInstruction::Terminator { bb: register_tail_bb },
-            Terminator { kind: TerminatorKind::Goto { target: site.target }, span },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: site.target }, span),
         );
 
         // ── Latch: recompute old/new, check the ranking, refresh snapshots ──
@@ -817,7 +817,7 @@ impl LoopContractPass {
         for (snap, src) in snapshots.iter().zip(&components) {
             new_body.assign_to(
                 Place::from(*snap),
-                Rvalue::Use(Operand::Copy(Place::from(*src))),
+                rvalue_use!(Rvalue::Use(Operand::Copy(Place::from(*src)))),
                 &mut latch_source,
                 InsertPosition::Before,
             );
@@ -883,10 +883,7 @@ impl LoopContractPass {
         {
             new_body.replace_terminator(
                 &SourceInstruction::Terminator { bb: bb_idx },
-                Terminator {
-                    kind: TerminatorKind::Goto { target: self.new_loop_latches[terminator_target] },
-                    span: terminator.span,
-                },
+                crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: self.new_loop_latches[terminator_target] }, mir_span!(terminator)),
             );
         }
 
@@ -911,10 +908,7 @@ impl LoopContractPass {
             let new_targets = SwitchTargets::new(new_branches, new_otherwise);
             new_body.replace_terminator(
                 &SourceInstruction::Terminator { bb: bb_idx },
-                Terminator {
-                    kind: TerminatorKind::SwitchInt { discr: discr.clone(), targets: new_targets },
-                    span: terminator.span,
-                },
+                crate::rustc_compat::mir_terminator(TerminatorKind::SwitchInt { discr: discr.clone(), targets: new_targets }, mir_span!(terminator)),
             );
         }
 
@@ -1041,7 +1035,7 @@ impl LoopContractPass {
                         match rvalue {
                             Rvalue::Ref(_, _, rplace)
                             | Rvalue::CopyForDeref(rplace)
-                            | Rvalue::Use(Operand::Copy(rplace)) => {
+                            | Rvalue::Use(Operand::Copy(rplace), ..) => {
                                 if supported_vars.contains(&rplace.local) {
                                     supported_vars.push(place.local);
                                 }
@@ -1092,11 +1086,11 @@ impl LoopContractPass {
                 // ```
                 new_body.assign_to(
                     terminator_destination.clone(),
-                    Rvalue::Use(Operand::Constant(ConstOperand {
-                        span: terminator.span,
+                    rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
+                        span: mir_span!(terminator),
                         user_ty: None,
                         const_: MirConst::from_bool(true),
-                    })),
+                    }))),
                     &mut SourceInstruction::Terminator { bb: bb_idx },
                     InsertPosition::Before,
                 );
@@ -1117,7 +1111,7 @@ impl LoopContractPass {
                 let new_args = vec![
                     terminator_args[0].clone(),
                     Operand::Constant(ConstOperand {
-                        span: terminator.span,
+                        span: mir_span!(terminator),
                         user_ty: None,
                         const_: MirConst::try_from_uint(1, UintTy::Usize)
                             .expect("usize(1) should be valid"),
@@ -1125,23 +1119,17 @@ impl LoopContractPass {
                 ];
                 new_body.replace_terminator(
                     &SourceInstruction::Terminator { bb: new_body.blocks().len() - 1 },
-                    Terminator {
-                        kind: TerminatorKind::Call {
+                    crate::rustc_compat::mir_terminator(TerminatorKind::Call {
                             func: terminator_func.clone(),
                             args: new_args,
                             destination: terminator_destination.clone(),
                             target: *terminator_target,
                             unwind: *terminator_unwind,
-                        },
-                        span: terminator.span,
-                    },
+                        }, mir_span!(terminator)),
                 );
                 new_body.replace_terminator(
                     &SourceInstruction::Terminator { bb: bb_idx },
-                    Terminator {
-                        kind: TerminatorKind::Goto { target: terminator_target_bb },
-                        span: terminator.span,
-                    },
+                    crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: terminator_target_bb }, mir_span!(terminator)),
                 );
                 // Cache the new loop latch.
                 let new_latch_bb_idx = new_body.blocks().len() - 1;

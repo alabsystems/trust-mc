@@ -125,7 +125,8 @@ fn test_restore_dyn_drop_d2_candidate_baseline_clears_candidate_heap_residue() {
                 ("_dyn_drop_candidate_mem__out".into(), store.clone()),
             );
             chc_ctx.heap_state.drained_store_chain_seeds.insert("candidate_a".into(), store);
-            chc_ctx.heap_state.metadata_arrays_modified = true;
+            chc_ctx.heap_state.obj_valid_modified = true;
+            chc_ctx.heap_state.obj_size_modified = true;
             chc_ctx.heap_state.mirror_base_addrs.insert("candidate_a".into(), addr);
             chc_ctx
                 .heap_state
@@ -144,7 +145,8 @@ fn test_restore_dyn_drop_d2_candidate_baseline_clears_candidate_heap_residue() {
             assert!(chc_ctx.heap_state.modified_arrays.is_empty());
             assert!(chc_ctx.heap_state.store_chains.is_empty());
             assert!(chc_ctx.heap_state.drained_store_chain_seeds.is_empty());
-            assert!(!chc_ctx.heap_state.metadata_arrays_modified);
+            assert!(!chc_ctx.heap_state.obj_valid_modified);
+            assert!(!chc_ctx.heap_state.obj_size_modified);
             assert!(chc_ctx.heap_state.mirror_base_addrs.is_empty());
             assert!(chc_ctx.heap_state.store_forward_map.is_empty());
 
@@ -366,25 +368,35 @@ fn test_ty_trivially_no_drop_classifies_mutex_rwlock_as_dealloc_only() {
         pub fn probe_refcell_u32(x: RefCell<u32>) {
             let _ = x;
         }
+
+        pub struct Loud(u8);
+        impl Drop for Loud {
+            fn drop(&mut self) {}
+        }
+
+        pub fn probe_refcell_loud(x: RefCell<Loud>) {
+            let _ = x;
+        }
     "#;
 
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let mutex_ty = fn_input_ty_by_suffix(ctx.tcx, "probe_mutex", 0);
         let rwlock_ty = fn_input_ty_by_suffix(ctx.tcx, "probe_rwlock", 0);
         let refcell_ty = fn_input_ty_by_suffix(ctx.tcx, "probe_refcell_u32", 0);
+        let refcell_loud_ty = fn_input_ty_by_suffix(ctx.tcx, "probe_refcell_loud", 0);
 
         // Mutex/RwLock should be trivially-no-drop (dealloc-only Drop).
         assert!(ty_trivially_no_drop(mutex_ty), "Mutex<u32> should be trivially-no-drop (#4268)");
         assert!(ty_trivially_no_drop(rwlock_ty), "RwLock<u32> should be trivially-no-drop (#4268)");
-        // RefCell<u32> has a non-empty drop shim because RefCell internally
-        // uses Cell<isize> for borrow tracking and UnsafeCell for the value.
-        // The compiler generates drop glue even when T has no Drop impl.
-        // RefCell is NOT in the dealloc-only allowlist because its drop glue
-        // must recurse into T's Drop when T implements Drop.
-        assert!(
-            !ty_trivially_no_drop(refcell_ty),
-            "RefCell<u32> has a non-empty drop shim (borrow tracking internals)"
-        );
+        // RefCell is NOT in the dealloc-only allowlist: its drop glue is
+        // whatever its fields' is. RefCell<u32> has none (`needs_drop` is
+        // false: `Cell<isize>` and `UnsafeCell<u32>` drop nothing), so it is
+        // trivially no-drop once its field types are instantiated at its own
+        // arguments (Rule A, `shared::mono_ty::field_ty`). This assertion
+        // stated the opposite while the walk read `UnsafeCell<T>` with `T`
+        // free and gave up. RefCell<Loud> runs `Loud::drop`, and is not.
+        assert!(ty_trivially_no_drop(refcell_ty), "RefCell<u32> needs no drop: its glue is empty");
+        assert!(!ty_trivially_no_drop(refcell_loud_ty), "RefCell<Loud> must run Loud::drop");
     });
 }
 

@@ -10,12 +10,11 @@ use clap::Parser;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 use toml::Value;
 use toml::value::Table;
 
-use crate::session::{DEFAULT_TOOL_TIMEOUT_SECS, run_piped_with_timeout};
+use crate::session::{DEFAULT_TOOL_TIMEOUT_SECS, run_piped_with_timeout, setup_cargo_command};
 
 /// Produce the list of arguments to pass to ourself (cargo-kani).
 ///
@@ -59,9 +58,17 @@ fn cargo_locate_project(input_args: &[OsString]) -> Result<PathBuf> {
     if let Some(path) = current_args.verify_opts.cargo.manifest_path {
         Ok(path)
     } else {
-        // Use timeout protection (#995)
-        let cmd = Command::new("cargo");
-        let mut cmd = cmd;
+        // Use timeout protection (#995). Resolve cargo exactly as the build
+        // does: a bare `cargo` is absent on hosts without rustup proxies, and
+        // a failure here is read as "not a Cargo project", which would
+        // silently drop every `[package.metadata.kani]` flag.
+        let route = &current_args.verify_opts.compiler_route;
+        let mut cmd = if route.is_trustc() {
+            // The Trustc route never runs another toolchain's cargo, not even here.
+            crate::session::install::trustc_route_locate_cargo(route)?
+        } else {
+            setup_cargo_command()?
+        };
         cmd.args(["locate-project", "--message-format", "plain"]);
         let output = run_piped_with_timeout(cmd, Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS))?;
         if !output.status.success() {

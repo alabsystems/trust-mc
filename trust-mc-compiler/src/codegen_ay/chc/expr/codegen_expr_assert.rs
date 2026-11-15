@@ -12,6 +12,7 @@
 //! Migrated from include!() to proper module.
 //! Part of #2306: include!() to proper module migration.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use ay_bindings::{Expr, ExprValue, Sort, SortInner};
 use rustc_public::mir::Operand;
 use std::collections::HashSet;
@@ -24,7 +25,7 @@ use trust_mc_core::violation::PropertyKind;
 use super::codegen_ctx::diagnostics::{CellCounter, GLOBAL_COUNTERS};
 use super::codegen_expr_assert_simplify::simplify_bool_expr;
 use super::{ChcCtx, chc_debug_enabled};
-use crate::codegen_ay::chc::{chc_fresh_name, declare_pending_var};
+use crate::codegen_ay::chc::chc_fresh_name;
 
 /// Kani-parity description for a MIR `Assert` terminator message.
 ///
@@ -65,6 +66,8 @@ pub(in crate::codegen_ay::chc) fn mir_assert_kind_and_message(
         rustc_public::mir::AssertMessage::MisalignedPointerDereference { .. } => {
             PropertyKind::MemorySafety
         }
+        #[cfg(trust_toolchain)]
+        rustc_public::mir::AssertMessage::NullReferenceConstructed => PropertyKind::NullPointer,
         _ => PropertyKind::Assertion,
     };
     (kind, kani_assert_message_description(msg))
@@ -180,6 +183,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Some(rustc_public::mir::AssertMessage::MisalignedPointerDereference { .. }) => {
                 PropertyKind::MemorySafety
             }
+            #[cfg(trust_toolchain)]
+            Some(rustc_public::mir::AssertMessage::NullReferenceConstructed) => {
+                PropertyKind::NullPointer
+            }
             _ => PropertyKind::Assertion,
         };
         // `--prove-safety-only`: check UB, not user panics. Kani classifies the
@@ -229,7 +236,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return violation;
         }
 
-        let marker = declare_pending_var(chc_fresh_name("__fn_ptr_assert_obligation"), Sort::int());
+        let marker = ExactVar::defined(chc_fresh_name("__fn_ptr_assert_obligation"), Sort::int());
         marker.clone().int_add(Expr::int_const(1)).eq(marker)
     }
 

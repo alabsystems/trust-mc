@@ -6,9 +6,12 @@
 
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::chc::codegen_stmt_aggregate_adt::sign_extend_discr_val;
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::types::{
     SignExtension, coerce_bitvec_width_safe, coerce_bool_to_unit_datatype,
 };
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::{
@@ -29,14 +32,32 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Adds AY constraints encoding stmt semantics to self.ctx
     /// ENSURES: Updates SSA environment for assigned places
     pub(in crate::codegen_ay) fn codegen_statement(&mut self, stmt: &Statement) {
+        self.codegen_statement_inner(stmt);
+        // A statement that read a pointee that is not the same on every path
+        // fails closed (`ref_pointee_table`).
+        self.flush_ref_pointee_path_ambiguity();
+    }
+
+    fn codegen_statement_inner(&mut self, stmt: &Statement) {
         debug!(?stmt, kind=?stmt.kind, "AY codegen_statement");
         // Track source span for property locations (#1164).
-        self.current_span = Some(stmt.span);
+        self.current_span = Some(mir_span!(stmt));
 
         match &stmt.kind {
             StatementKind::Assign(lhs, rhs) => {
+                // Trust: an exclusive reborrow IS `Use(Copy(place))` (see
+                // `rustc_compat::exclusive_reborrow_as_copy`); rewrite it so the
+                // assignment path and every tracker it feeds see exactly that copy.
+                // The shared form is not rewritten; `codegen_rvalue` fails it closed.
+                #[cfg(trust_toolchain)]
+                let exclusive_reborrow = crate::rustc_compat::exclusive_reborrow_as_copy(rhs);
+                #[cfg(trust_toolchain)]
+                let rhs = exclusive_reborrow.as_ref().unwrap_or(rhs);
                 // Assignment semantics live in codegen_assign.rs.
                 self.codegen_assign(lhs, rhs);
+                // Points-at facts are keyed by local, not by path: a local with
+                // several producers keeps none of them.
+                self.forget_joined_ref_pointees(lhs);
                 // SwitchInt→variant bridge (#3017): a store to this place may retag its
                 // enum — drop any variant fact on that storage (over-kill on doubt).
                 self.kill_variant_facts_for_place(lhs);
@@ -45,6 +66,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // SwitchInt→variant bridge (#3017): a discriminant write retags the enum
                 // — drop any variant fact on that storage before re-encoding it.
                 self.kill_variant_facts_for_place(place);
+                // FC-06 (BMC): a discriminant write through a deref is a store.
+                self.bmc_modifies_check_deref_store(place);
                 // For unit enums, SetDiscriminant assigns the discriminant value to the enum.
                 // Get the place type to check if it's a unit enum.
                 let ty = place.ty(self.body.locals()).into_option();
@@ -65,7 +88,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     } else {
                         self.ssa_base_name(place)
                     };
-                    let location = format!("{:?}", stmt.span);
+                    let location = format!("{:?}", mir_span!(stmt));
                     let Some(root_expr) = self.env_lookup(&base_name).cloned() else {
                         self.ctx.unsupported_with_fallback("SetDiscriminant", location);
                         return;
@@ -148,6 +171,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     if let Some(sort) = Self::infer_adt_sort(def, args.clone())
                         && sort.is_datatype()
                     {
+                        // The value is built in `sort`, which may be a model
+                        // sort named apart from the ADT's path-derived name.
+                        let adt_name =
+                            crate::codegen_ay::names::constructor_datatype_name(&sort, &adt_name);
                         let place_base = self.ssa_base_name(place);
                         let num_fields = variant.fields().len();
                         let variant_fields = variant.fields();
@@ -189,8 +216,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 // datatype constructor expects BitVec(32).
                                 let coerced = if let Some(field_def) = variant_fields.get(field_idx)
                                 {
-                                    let field_ty = field_def.ty();
-                                    let expected_sort = Self::resolve_generic_ty(field_ty, &args)
+                                    let expected_sort = mono_ty::field_ty(field_def, &args)
                                         .and_then(Self::infer_sort_from_ty);
                                     if let Some(ref target_sort) = expected_sort {
                                         if expr.sort() != target_sort {
@@ -277,25 +303,58 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
 
                 // Fallback: unsupported
-                let location = format!("{:?}", stmt.span);
+                let location = format!("{:?}", mir_span!(stmt));
                 self.ctx.unsupported_with_fallback("SetDiscriminant", location);
             }
-            StatementKind::StorageLive(_var_id) => {
-                // In AY, we don't need explicit storage markers
-                // Variables are declared when first assigned
+            StatementKind::StorageLive(var_id) => {
+                // An inlined frame or lexical slot can be activated again.
+                // Its earlier StorageDead must not poison the new lifetime.
+                // Until stack IDs carry generations, a reactivated address
+                // must not let an old pointer masquerade as the new object.
+                let is_zst = self
+                    .body
+                    .locals()
+                    .get(*var_id)
+                    .is_some_and(|local| Self::layout_is_zst(local.ty));
+                if !is_zst {
+                    let uncertain_identity = self
+                        .reused_stack_locals
+                        .get_or_init(|| {
+                            crate::codegen_ay::chc::reused_address_taken_locals(self.body)
+                        })
+                        .as_ref()
+                        .is_none_or(|reused| reused.contains(var_id));
+                    if uncertain_identity {
+                        self.ctx.unsupported_with_fallback(
+                            "reused_stack_allocation_identity",
+                            format!("{:?}", mir_span!(stmt)),
+                        );
+                    }
+                }
+                self.dead_locals.remove(var_id);
+                self.maybe_dead_locals.remove(var_id);
             }
             StatementKind::StorageDead(var_id) => {
                 // Track that this local has gone out of scope.
                 // This enables dead object detection for raw pointer dereferences. (#313)
                 let local_idx: usize = *var_id;
                 self.dead_locals.insert(local_idx);
+                self.maybe_dead_locals.insert(local_idx);
                 debug!("StorageDead: marked local_{} as dead", local_idx);
             }
             StatementKind::Intrinsic(intrinsic) => {
+                // FC-06 (BMC): a byte copy through a pointer has no nameable
+                // store target; inside a modifies frame it fails closed.
+                if matches!(intrinsic, NonDivergingIntrinsic::CopyNonOverlapping(_)) {
+                    self.bmc_modifies_opaque_store("copy_nonoverlapping");
+                }
                 match intrinsic {
                     NonDivergingIntrinsic::Assume(op) => {
-                        // Assume the operand is true. Add to path constraints.
-                        // This is like `std::hint::assume` - UB if condition is false.
+                        // `intrinsics::assume(P)` is UB when P is false; Kani
+                        // asserts it ("Rust intrinsic assumption failed"). It is
+                        // recorded as a violation, not asserted into the program:
+                        // an assertion of P would make that violation unsatisfiable
+                        // (see the CHC `NonDivergingIntrinsic::Assume` arm).
                         if let Some(cond) = self.codegen_operand(op) {
                             // Convert to boolean if needed (e.g., if it's a bitvec)
                             let bool_cond = if cond.sort().is_bool() {
@@ -309,9 +368,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 // (will fail if not Bool, but that's a type error)
                                 cond
                             };
-                            // Add as SMT assertion (assume = assert in SMT-LIB)
-                            self.ctx.program.assert(bool_cond);
-                            debug!("AY codegen: added assume constraint for {:?}", op);
+                            self.record_violation_guarded_with_message(
+                                bool_cond.not(),
+                                "assume_intrinsic",
+                                Some("Rust intrinsic assumption failed".to_string()),
+                            );
+                            debug!("AY codegen: checked assume intrinsic for {:?}", op);
+                        } else {
+                            self.ctx.unsupported_with_fallback(
+                                "assume intrinsic",
+                                format!("untranslatable condition {op:?}"),
+                            );
+                            self.record_violation_guarded(
+                                Expr::bool_const(true),
+                                "unsupported_check",
+                            );
                         }
                     }
                     NonDivergingIntrinsic::CopyNonOverlapping(CopyNonOverlapping {
@@ -327,7 +398,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         // - For symbolic counts: use guarded memcpy model
                         //
                         // Soundness: Non-overlapping is assumed by the intrinsic contract.
-                        self.codegen_copy_nonoverlapping(src, dst, count, stmt.span);
+                        self.codegen_copy_nonoverlapping(src, dst, count, mir_span!(stmt));
                     }
                 }
             }
@@ -341,8 +412,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType { .. }
             | StatementKind::Nop
-            | StatementKind::ConstEvalCounter
-            | StatementKind::Retag(..) => {
+            | StatementKind::ConstEvalCounter => {
+                // These are no-ops for verification
+            }
+            #[cfg(not(trust_toolchain))]
+            StatementKind::Retag(..) => {
                 // These are no-ops for verification
             }
         }

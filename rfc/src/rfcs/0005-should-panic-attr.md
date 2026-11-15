@@ -265,6 +265,4 @@ Once the feature is available, it'd be good to gather user feedback to answer th
  - The attribute could be an argument to `kani::proof` (`#[kani::proof(should_panic)]` reads very well).
  - Add an `expected` argument to `#[kani::should_panic]`, and *replay* the harness with concrete playback to get the actual panic string.
 
-[^footnote-representation]: Double negation may not be the best representation, but it's at least accurate with respect to the original result.
 
-[^footnote-summary]: This summary is printed in both the default and terse outputs.

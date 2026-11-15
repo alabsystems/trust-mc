@@ -17,6 +17,8 @@
 
 use super::super::codegen_call_struct_map_constructor::constructor_pattern_detected;
 use super::common::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 const SINGLE_MAP_CONSTRUCTOR_SOURCE: &str = r#"
     #![allow(dead_code)]

@@ -77,10 +77,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return translated,
         };
 
-        if let Some(promoted_obj_id) =
-            self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
-        {
-            return Some(self.heap_state.promoted_const_address_for(promoted_obj_id));
+        if let Some(object) = self.ref_resolution.const_ref_objects.get(&place.local).copied() {
+            // D4: the constant pointer's object base PLUS its offset.
+            return Some(object.address());
         }
 
         if let Some(ref_target) = self.ref_resolution.ref_targets.get(&place.local).cloned() {
@@ -231,7 +230,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // NonNull<T>, Unique<T>) is flattened to a single BV64 pointer,
                 // the aggregate operand's ref_target must be carried to the wrapper
                 // local so that later deref of `wrapper.0` resolves through ref_targets.
-                if field_count == 1 {
+                // The edge is keyed by the wrapper local: one that several
+                // statements or calls produce keeps no producer's operand.
+                if field_count == 1 && !self.local_has_multiple_whole_definitions(local_idx) {
                     if let Some(Operand::Copy(place) | Operand::Move(place)) = operands.first()
                         && place.projection.is_empty()
                     {

@@ -6,7 +6,64 @@
 use std::env::var;
 use std::process::Command;
 
+#[path = "../src/build_frontend.rs"]
+mod build_frontend;
+
 fn main() {
+    // The sysroot of the compiler building this crate. `build-dev` builds
+    // trust-mc-compiler in the same cargo invocation, so its `bin/targo` is the
+    // cargo the DevCli route must run (src/session/cargo.rs) -- found here, not
+    // through rustup, whose channel a targo build never names. A compiler that
+    // cannot report a sysroot records nothing, and the driver then refuses.
+    // (No `TRUST_` prefix: authenticated Targo refuses build-script
+    // `rustc-env` names in that authority namespace.) Only the `cli` binary
+    // reads it, so the library build the trust superproject's bootstrap makes
+    // (default-features = false, through bootstrap's rustc shim) is unchanged.
+    // A release bundle (`MC_RELEASE_BUNDLE`, set by `build-trust-mc bundle`)
+    // records none: the build host's seal path means nothing where the bundle is
+    // installed, which runs its own `toolchain/bin/targo` instead.
+    if var("CARGO_FEATURE_CLI").is_ok() {
+        println!("cargo:rerun-if-env-changed=RUSTC");
+        println!("cargo:rerun-if-env-changed=MC_RELEASE_BUNDLE");
+        let release_bundle = std::env::var_os("MC_RELEASE_BUNDLE").is_some();
+        println!("cargo:rustc-env=MC_DRIVER_RELEASE_BUNDLE={}", u8::from(release_bundle));
+        // Packaged AY authority must never read this development checkout.
+        let workspace_root = if release_bundle {
+            String::new()
+        } else {
+            var("CARGO_MANIFEST_DIR").expect("Cargo supplies the package directory")
+        };
+        println!("cargo:rustc-env=MC_DRIVER_BUILD_WORKSPACE_ROOT={workspace_root}");
+        println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
+        // A missing Targo is never a reason to fall back to Cargo on Trust.
+        // Record the frontend's build identity; the only stock exception is
+        // the explicitly selected, frozen Kani comparison oracle.
+        let verbose = var("RUSTC")
+            .ok()
+            .and_then(|rustc| Command::new(rustc).arg("-vV").output().ok())
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        let host = var("HOST").unwrap_or_default();
+        let channel = var("RUSTUP_TOOLCHAIN").ok();
+        let sysroot = var("RUSTC")
+            .ok()
+            .and_then(|rustc| Command::new(rustc).args(["--print", "sysroot"]).output().ok())
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|sysroot| !sysroot.is_empty() && !sysroot.contains('\n'));
+        let frontend = build_frontend::classify(
+            &verbose,
+            channel.as_deref(),
+            &host,
+            sysroot.as_deref().map(std::path::Path::new),
+        );
+        println!("cargo:rustc-env=MC_DRIVER_BUILD_FRONTEND={frontend}");
+        if !release_bundle && let Some(sysroot) = sysroot {
+            println!("cargo:rustc-env=MC_DRIVER_BUILD_SYSROOT={sysroot}");
+        }
+    }
+
     // We want to know what target triple we were built with, but this isn't normally provided to us.
     // Note the difference between:
     // https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates
@@ -97,15 +154,39 @@ fn main() {
     // detached HEAD (the normal submodule state), and a packed ref has no
     // loose file — both cases fall through to HEAD alone, which still changes
     // on every checkout/commit in those states.
-    if let Some(ref_path) = Command::new("git")
+    let symbolic_ref = Command::new("git")
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|r| !r.is_empty())
-        && let Some(ref_file) = git_path(&ref_path)
-    {
-        println!("cargo:rerun-if-changed={ref_file}");
+        .filter(|r| !r.is_empty());
+    if let Some(ref_path) = symbolic_ref {
+        if let Some(ref_file) = git_path(&ref_path) {
+            println!("cargo:rerun-if-changed={ref_file}");
+        } else {
+            // The branch ref is packed (`git pack-refs`, or an automatic gc
+            // run by any worktree of the repository), so it has no loose
+            // file, and in a linked worktree HEAD ("ref: refs/heads/<b>")
+            // does not change on a commit. A commit made after packing then
+            // left the embedded sha stale (measured 2026-09-27: a bundle
+            // built after commit 63fd640bf reported 70aecce71, dirty). Watch
+            // `packed-refs` and the directory the next commit writes the
+            // loose ref into; only existing paths are registered.
+            if let Some(packed) = git_path("packed-refs") {
+                println!("cargo:rerun-if-changed={packed}");
+            }
+            if let Some(dir) = Command::new("git")
+                .args(["rev-parse", "--path-format=absolute", "--git-path", &ref_path])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                .and_then(|loose| loose.parent().map(std::path::Path::to_path_buf))
+                .filter(|dir| dir.is_dir())
+            {
+                println!("cargo:rerun-if-changed={}", dir.display());
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@
 //!
 //! No Datatype sorts involved.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -19,8 +20,7 @@ use tracing::debug;
 
 use super::codegen_expr_signedness::arg_signedness_or_fallback;
 use super::{
-    ChcCtx, CollectionCallResult, StubTranslateArgs, chc_fresh_name, declare_pending_var,
-    record_type_sort_fallback,
+    ChcCtx, CollectionCallResult, StubTranslateArgs, chc_fresh_name, record_type_sort_fallback,
 };
 use super::{
     stubs::StubKind,
@@ -91,7 +91,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // (symbolic value for unmapped keys — sound over-approximation).
                 self.record_aggregate_gap("hashmap_default_value_unconstrained");
                 let default_name = chc_fresh_name("hashmap_default");
-                let default_val = declare_pending_var(default_name, arr.element_sort.clone());
+                let default_val = ExactVar::unobserved(default_name, arr.element_sort.clone());
                 Some(Expr::const_array(arr.index_sort.clone(), default_val))
             })
             .unwrap_or_else(|| {
@@ -101,7 +101,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // encoding gap for the symbolic default value itself).
                 self.record_aggregate_gap("hashmap_default_type_sort_fallback");
                 let default_name = chc_fresh_name("hashmap_default");
-                let default_val = declare_pending_var(default_name, int_sort());
+                let default_val = ExactVar::unobserved(default_name, int_sort());
                 Expr::const_array(int_sort(), default_val)
             });
 
@@ -360,7 +360,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3447: cleared default element is unconstrained.
         self.record_aggregate_gap("hashmap_clear_default_unconstrained");
         let default_name = chc_fresh_name("hashmap_clear_default");
-        let default_val = declare_pending_var(default_name, arr.element_sort.clone());
+        let default_val = ExactVar::unobserved(default_name, arr.element_sort.clone());
         let cleared_data = Expr::const_array(arr.index_sort.clone(), default_val);
         // Use present array's own index sort (may differ from data's in fallback).
         let present_idx = self

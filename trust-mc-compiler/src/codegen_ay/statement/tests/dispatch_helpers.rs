@@ -440,13 +440,13 @@ fn test_mir_try_codegen_cow_tostring_precheck_routes_to_string_stub() {
                 format!("{dest_ty:?}").contains("String"),
                 "Cow precheck destination should be String-like, got {dest_ty:?}"
             );
-            if let Some(sort_name) = assigned.sort().datatype_name() {
-                assert_eq!(
-                    sort_name,
-                    crate::codegen_ay::names::RUST_STRING_SORT,
-                    "Cow precheck datatype assignment should use RustString sort"
-                );
-            }
+            // The destination is a `String`, so the value written to it has
+            // the String sort, whatever sort the Cow itself carries.
+            assert_eq!(
+                assigned.sort().datatype_name(),
+                Some(crate::codegen_ay::names::RUST_STRING_SORT),
+                "Cow precheck datatype assignment should use RustString sort"
+            );
             break;
         }
 

@@ -23,6 +23,7 @@
 //!
 //! Part of #4135: Vec extend/sort/append leaf handlers.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
@@ -84,11 +85,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         acc.constraints.push(new_len.clone().bvuge(old_len));
         self.collection_len_set(&len_var, new_len.clone(), acc);
 
-        // Capacity growth: cap = max(cap, new_len).
+        // Capacity growth: `reserve(n)`, RawVec's amortized growth.
         if let Some(cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let old_cap = self.collection_current_cap(&cap_var);
-            let grow_needed = old_cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap);
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &old_cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, new_len, acc.constraints);
         }
@@ -173,7 +179,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.collections.len_state.get_len_var(target_local).cloned().expect("checked above");
 
         // Fresh symbolic length >= 0 (unsigned BV is always >= 0).
-        let fresh_len = super::declare_pending_var(
+        let fresh_len = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
             super::chc_fresh_name("__vec_from_iter_len"),
             ay_bindings::Sort::bitvec(POINTER_WIDTH),
         );
@@ -181,7 +189,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Cap >= len.
         if let Some(cap_var) = self.collections.len_state.get_cap_var(target_local).cloned() {
-            let fresh_cap = super::declare_pending_var(
+            let fresh_cap = Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_COLLECTION_STATE,
                 super::chc_fresh_name("__vec_from_iter_cap"),
                 ay_bindings::Sort::bitvec(POINTER_WIDTH),
             );
@@ -209,7 +219,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `vec_op_extend_trusted` (always, since iterator length is unknown).
     ///
     /// Models: `len += fresh_count` where `fresh_count >= 0` (unsigned BV).
-    /// Capacity is grown to `max(cap, new_len)`.
+    /// Capacity grows as `RawVec::grow_amortized` does.
     fn vec_op_extend_with_fresh(
         &mut self,
         coll_local: usize,
@@ -219,7 +229,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let old_len = self.collection_current_len(len_var);
 
         // fresh_count >= 0 is automatic for unsigned BV.
-        let fresh_count = super::declare_pending_var(
+        let fresh_count = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
             super::chc_fresh_name("__vec_extend_count"),
             ay_bindings::Sort::bitvec(POINTER_WIDTH),
         );
@@ -229,11 +241,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         acc.constraints.push(new_len.clone().bvuge(old_len));
         self.collection_len_set(len_var, new_len.clone(), acc);
 
-        // Capacity growth: cap = max(cap, new_len).
+        // Capacity growth: `reserve(n)`, RawVec's amortized growth.
         if let Some(cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let old_cap = self.collection_current_cap(&cap_var);
-            let grow_needed = old_cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap);
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &old_cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, new_len, acc.constraints);
         }

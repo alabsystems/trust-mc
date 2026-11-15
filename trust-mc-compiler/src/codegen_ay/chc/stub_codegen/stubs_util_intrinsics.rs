@@ -7,6 +7,7 @@
 //! Converted from include!() to proper module per #2595.
 //! Extracted from stubs_util.rs per #2220 decomposition.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
@@ -15,7 +16,7 @@ use tracing::{debug, warn};
 use super::codegen_call_vtable_intrinsic::VtableIntrinsicKind;
 use super::stubs::StubKind;
 use super::types::POINTER_WIDTH;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Detect `std::intrinsics::raw_eq` calls.
@@ -380,6 +381,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // metadata — result is unconstrained symbolic size/align.
         self.record_aggregate_gap("intrinsic_dyn_trait_no_vtable_metadata");
         debug!(kind = ?kind, "dyn Trait mem intrinsic: symbolic (no vtable metadata)");
-        declare_pending_var(chc_fresh_name(prefix), Sort::bitvec(POINTER_WIDTH))
+        Havoc::mint_deferred(
+            self,
+            sound_havoc::UNTRACKED_VTABLE_METADATA,
+            chc_fresh_name(prefix),
+            Sort::bitvec(POINTER_WIDTH),
+        )
     }
 }

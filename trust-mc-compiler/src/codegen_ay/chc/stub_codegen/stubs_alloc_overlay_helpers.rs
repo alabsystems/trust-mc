@@ -295,7 +295,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// Records a concrete heap allocation size when a size expression is known.
+    /// Records a concrete heap allocation size when a size expression is known,
+    /// and otherwise that the allocation's size is symbolic (stored in
+    /// `obj_size` by the caller), for the bound of an access through a
+    /// symbolic object lane (`symbolic_lane_size`, the size choice of
+    /// `symbolic_lane_bounds`).
     pub(in crate::codegen_ay::chc) fn record_known_heap_alloc_size_expr(
         &mut self,
         obj_id: u32,
@@ -305,6 +309,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Self::try_extract_concrete_usize(size_expr).and_then(|size| u32::try_from(size).ok())
         {
             self.heap_state.record_heap_alloc_size(obj_id, size);
+        } else {
+            self.heap_state.symbolic_size_heap_ids.insert(obj_id);
         }
     }
 }

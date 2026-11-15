@@ -85,4 +85,4 @@ To keep correspondence trustworthy:
 2. Run TLC through your Rust wrapper (for example, `TlcRunner`) with the same
    config referenced in `TLA_TO_RUST_MAPPING.md`.
 3. Run property tests that encode invariants (for example,
-   `cargo test -p <crate> tla_invariant_`).
+   `targo --unverified test -p <crate> tla_invariant_`).

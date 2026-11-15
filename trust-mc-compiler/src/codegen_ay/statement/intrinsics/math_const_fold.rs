@@ -9,9 +9,8 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::{ConstOperand, Operand};
-use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 
-use super::IntoOption;
 use crate::codegen_ay::statement::StatementCodegen;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -38,6 +37,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let expr = self.env_lookup(&base_name)?.clone();
                 self.extract_f32_from_expr(&expr)
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -64,6 +65,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let expr = self.env_lookup(&base_name)?.clone();
                 self.extract_f64_from_expr(&expr)
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -78,16 +81,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<i32> {
         match operand {
             Operand::Constant(c) => {
-                let mir_const = &c.const_;
-                let alloc = match mir_const.kind() {
-                    ConstantKind::Allocated(alloc) => alloc.clone(),
-                    ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                        TyConstKind::Value(_ty, alloc) => alloc.clone(),
-                        _ => return None, // external enum: TyConstKind
-                    },
-                    _ => return None, // external enum: ConstantKind
-                };
-                alloc.read_int().into_option().map(|v| v as i32)
+                crate::codegen_ay::shared::const_pointer::const_int(&c.const_).map(|v| v as i32)
             }
             Operand::Copy(place) | Operand::Move(place) => {
                 // Only handle simple locals (no projections)
@@ -98,6 +92,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let expr = self.env_lookup(&base_name)?.clone();
                 self.extract_i32_from_expr(&expr)
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -154,26 +150,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
-        let alloc = match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => alloc.clone(),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_ty, alloc) => alloc.clone(),
-                _ => return None, // external enum: TyConstKind
-            },
-            _ => return None, // external enum: ConstantKind
-        };
-
-        // Read the bytes and interpret as f32 bits
-        // f32 is 4 bytes in little-endian
-        let bytes = alloc.bytes;
-        if bytes.len() < 4 {
-            return None;
-        }
-        let mut arr = [0u8; 4];
-        for (i, b) in bytes.iter().take(4).enumerate() {
-            arr[i] = (*b)?;
-        }
-        Some(u32::from_le_bytes(arr))
+        let bits = crate::codegen_ay::shared::const_pointer::const_uint(mir_const)?;
+        u32::try_from(bits).ok()
     }
 
     /// Extract f64 bits from a ConstOperand.
@@ -186,25 +164,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
-        let alloc = match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => alloc.clone(),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_ty, alloc) => alloc.clone(),
-                _ => return None, // external enum: TyConstKind
-            },
-            _ => return None, // external enum: ConstantKind
-        };
-
-        // Read the bytes and interpret as f64 bits
-        // f64 is 8 bytes in little-endian
-        let bytes = alloc.bytes;
-        if bytes.len() < 8 {
-            return None;
-        }
-        let mut arr = [0u8; 8];
-        for (i, b) in bytes.iter().take(8).enumerate() {
-            arr[i] = (*b)?;
-        }
-        Some(u64::from_le_bytes(arr))
+        let bits = crate::codegen_ay::shared::const_pointer::const_uint(mir_const)?;
+        u64::try_from(bits).ok()
     }
 }

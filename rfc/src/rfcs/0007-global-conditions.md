@@ -98,14 +98,11 @@ No open questions.
 
 A redesign of Kani's output is likely to change the style/architecture to report global conditions.
 
-[^status-computation]: The results for global conditions would be computed during postprocessing based on the results of other checks.
 Global conditions' checks aren't part of the SAT, therefore this computation won't impact verification time.
 
-[^failed-checks]: We do not discuss the specific interface to report the failed checks because it needs improvements (for both global conditions and standard verification).
 In particular, the description field is the only information printed for properties (such as `cover` statements) without trace locations.
 There are additional improvements we should consider: printing the actual status (for global conditions, this won't always be `FAILED`), avoid the repetition of `Failed Checks: `, etc.
 [This comment](https://github.com/model-checking/kani/pull/2516#issuecomment-1597524184) discusses problems with the current interface on some examples.
 
-[^enable-options]: In other words, global conditions won't force a specific mechanism to be enabled.
 For example, if the `#[kani::should_panic]` attribute is converted into a global condition, it will continue to be enabled through the attribute itself.
 Other global conditions may be enabled through CLI flags only (e.g., `--fail-uncoverable`), or a combination of options in general.

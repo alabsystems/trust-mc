@@ -122,7 +122,7 @@ const SOURCE_TRANSMUTE_UNCHECKED_SIZE_MISMATCH: &str = r#"
 fn find_simple_copy_assign(body: &rustc_public::mir::Body) -> (usize, usize, usize) {
     for (bb_idx, block) in body.blocks.iter().enumerate() {
         for stmt in &block.statements {
-            if let StatementKind::Assign(lhs, Rvalue::Use(op)) = &stmt.kind {
+            if let StatementKind::Assign(lhs, Rvalue::Use(op, ..)) = &stmt.kind {
                 let Some(src_local) = (match op {
                     Operand::Copy(src) | Operand::Move(src) => Some(src.local),
                     _ => None, // external enum: Operand
@@ -143,7 +143,7 @@ fn find_simple_copy_assign_stmt(
 ) -> (usize, &rustc_public::mir::Place, &Rvalue, usize, usize) {
     for (bb_idx, block) in body.blocks.iter().enumerate() {
         for stmt in &block.statements {
-            if let StatementKind::Assign(lhs, rhs @ Rvalue::Use(op)) = &stmt.kind {
+            if let StatementKind::Assign(lhs, rhs @ Rvalue::Use(op, ..)) = &stmt.kind {
                 let Some(src_local) = (match op {
                     Operand::Copy(src) | Operand::Move(src) => Some(src.local),
                     _ => None, // external enum: Operand
@@ -277,7 +277,7 @@ fn find_copy_then_projection_chain(body: &rustc_public::mir::Body) -> (usize, us
     }
     fn rvalue_source_local(rhs: &Rvalue) -> Option<usize> {
         match rhs {
-            Rvalue::Use(op) => operand_source_local(op),
+            Rvalue::Use(op, ..) => operand_source_local(op),
             Rvalue::Aggregate(_, ops) => ops.iter().find_map(operand_source_local),
             _ => None, // external enum: Rvalue
         }

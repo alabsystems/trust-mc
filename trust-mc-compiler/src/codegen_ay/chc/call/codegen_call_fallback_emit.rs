@@ -175,3 +175,86 @@ pub(in crate::codegen_ay::chc) fn try_emit_precise_call_result(
     );
     false
 }
+
+/// Sound-fallback reason recorded by every [`emit_kani_unsupported_check`].
+///
+/// Blessed `SoundHavoc` in `codegen_ctx::fallback_soundness` (a proof under it
+/// requires the call to be unreachable), and deliberately recorded WITHOUT a
+/// freed-var identity so the driver can never certify the check Genuine.
+pub(in crate::codegen_ay::chc) const KANI_UNSUPPORTED_CHECK_REASON: &str =
+    "kani_unsupported_construct_check";
+
+/// Kani's own unsupported-construct text (`kani-compiler`
+/// `codegen_cprover_gotoc/utils/utils.rs`: `"{item} is not currently supported by Kani"`).
+pub(in crate::codegen_ay::chc) fn kani_unsupported_message(item: &str) -> String {
+    format!("{item} is not currently supported by Kani")
+}
+
+/// Reproduce Kani's failing check for a construct upstream Kani does not
+/// encode — an `Intrinsic::Unimplemented`, or a foreign function reached
+/// through a fn pointer with no `--c-lib` definition.
+///
+/// Emits `from ∧ stmt_constraints → error_p{N}` carrying `message`, and NO
+/// successor edge: Kani's `assert(false); assume(false)`. Reaching the call is
+/// therefore a FAILED check, and a call on a dead path discharges.
+///
+/// The check is an unsupported construct, not a bug in the program, so it must
+/// never certify Genuine: [`KANI_UNSUPPORTED_CHECK_REASON`] is recorded without
+/// an identity, which keeps the approximation evidence incomplete.
+pub(in crate::codegen_ay::chc) fn emit_kani_unsupported_check(
+    ctx: &mut ChcCtx<'_, '_>,
+    from_app: &RelationApp,
+    stmt_constraints: &[Expr],
+    bb_idx: usize,
+    message: String,
+) {
+    debug!(
+        fn_name = %ctx.fn_name,
+        bb_idx,
+        %message,
+        "CHC: Kani-unsupported construct emitted as a failing check"
+    );
+    ctx.emit_error_rule_for_condition_with_kind(
+        from_app,
+        Expr::bool_const(false),
+        stmt_constraints,
+        bb_idx,
+        trust_mc_core::violation::PropertyKind::Other,
+        Some(message),
+    );
+    ctx.record_sound_fallback_reason(KANI_UNSUPPORTED_CHECK_REASON);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KANI_UNSUPPORTED_CHECK_REASON, kani_unsupported_message};
+    use crate::codegen_ay::chc::codegen_ctx::{FallbackSoundness, fallback_soundness};
+
+    #[test]
+    fn kani_unsupported_message_matches_kani_text() {
+        assert_eq!(
+            kani_unsupported_message("volatile_set_memory"),
+            "volatile_set_memory is not currently supported by Kani"
+        );
+        // The corpus expected file for expected/foreign-function/ffi_ptr.rs.
+        assert_eq!(
+            kani_unsupported_message("call to foreign \"C\" function `foreign`"),
+            "call to foreign \"C\" function `foreign` is not currently supported by Kani"
+        );
+    }
+
+    #[test]
+    fn kani_unsupported_message_avoids_the_unsupported_constructs_marker() {
+        // tools/kani-domination buckets a run containing "unsupported constructs"
+        // as Unsupported; Kani's per-check text must not be read as that banner.
+        assert!(!kani_unsupported_message("x").contains("unsupported constructs"));
+    }
+
+    #[test]
+    fn kani_unsupported_check_reason_keeps_proofs_clean() {
+        assert_eq!(
+            fallback_soundness(KANI_UNSUPPORTED_CHECK_REASON),
+            FallbackSoundness::SoundHavoc
+        );
+    }
+}

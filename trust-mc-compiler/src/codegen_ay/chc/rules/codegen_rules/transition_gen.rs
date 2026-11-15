@@ -78,17 +78,28 @@ pub(in crate::codegen_ay::chc) fn generate_transition_rules(ctx: &mut ChcCtx<'_,
     let entry_reachable = entry_reachable_blocks(ctx.body);
 
     for bb_idx in block_order {
+        crate::codegen_ay::translation_deadline::check_now("chc_transition_rules");
+        // A block skipped here has no rule leaving it, so nothing it writes
+        // reaches any derivation; `verify_kept_payload_value_facts` may exempt a
+        // producer in such a block (Small mode only: Large mode composes
+        // relation-less blocks into fragments and records nothing).
         let Some(from_rel) = ctx.block_relations.get(&bb_idx).cloned() else {
+            ctx.ref_resolution.untranslated_transition_blocks.insert(bb_idx);
             continue;
         };
 
         if !entry_reachable.contains(&bb_idx) {
             debug!(bb_idx, "[block] skipping statically unreachable block (dead contract island)");
+            ctx.ref_resolution.untranslated_transition_blocks.insert(bb_idx);
             continue;
         }
 
         // Debug: trace block processing (#1889)
         debug!("[block] bb{} terminator={:?}", bb_idx, ctx.body.blocks[bb_idx].terminator.kind);
+
+        // Fail-closed far pointer observations of this block (heap/stack_address.rs)
+        // apply to every rule it emits from here on.
+        let rules_start = ctx.begin_far_observation_range();
 
         // Encode block statements to get constraints, output state, and modified locals (#648, #656)
         let (stmt_constraints, output_args, modified_locals, safety_checks) =
@@ -164,6 +175,7 @@ pub(in crate::codegen_ay::chc) fn generate_transition_rules(ctx: &mut ChcCtx<'_,
         }
 
         dispatch_block_terminator(ctx, &tctx);
+        ctx.apply_far_observation_cuts(rules_start, bb_idx);
     }
 }
 
@@ -179,6 +191,8 @@ pub(in crate::codegen_ay::chc) fn dispatch_block_terminator(
     ctx: &mut ChcCtx<'_, '_>,
     tctx: &TransitionContext<'_>,
 ) {
+    // The terminator's memory writes form their own heap view groups.
+    ctx.heap_state.view_ledger.next_terminator();
     let bb_data = &ctx.body.blocks[tctx.bb_idx];
     match &bb_data.terminator.kind {
         TerminatorKind::Goto { target } => {
@@ -204,7 +218,16 @@ pub(in crate::codegen_ay::chc) fn dispatch_block_terminator(
                 .shared_constraints
                 .iter()
                 .any(|c| !matches!(c.value(), ay_bindings::ExprValue::BoolConst(true)));
-            if has_nontrivial {
+            // A block violation or far-pointer observation recorded in this
+            // block (heap/stack_address.rs `apply_far_observation_cuts`) is
+            // attached to the block's own rules; with none emitted it was
+            // dropped silently: a store past its local's end as the function's
+            // last statement (`*(&mut x as *mut u32 as *mut u64) = 1`) was a
+            // clean proof where Kani and main report it (self-review of round
+            // 10 of fix/chc-false-certificates, `q_step3.rs`
+            // `sy02_bug_wider_store_past_end`; round 8 and 9 alike).
+            let has_pending_observation = !ctx.pending_far_observations.borrow().is_empty();
+            if has_nontrivial || has_pending_observation {
                 let projected = ctx.project_full_output_to_block(tctx.bb_idx, tctx.output_args);
                 if let Some(to_rel) = ctx.block_relations.get(&tctx.bb_idx).map(|s| &**s) {
                     let to_app = RelationApp::new(to_rel, projected);
@@ -269,7 +292,9 @@ pub(in crate::codegen_ay::chc) fn dispatch_block_terminator(
                 modified_locals: tctx.modified_locals,
                 callee_path,
             };
+            let frame_net = ctx.frame_net_call_snapshot();
             let dispatched = ctx.codegen_call_terminator(&dcx);
+            ctx.frame_net_after_call(&dcx, dispatched, frame_net);
             // Part of #3470: suppress unwind edges for dispatched non-diverging calls.
             // Those handlers fully model the normal-return semantics and an extra
             // cleanup edge creates spurious error() reachability.

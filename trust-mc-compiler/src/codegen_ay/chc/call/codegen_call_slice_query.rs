@@ -264,10 +264,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             args.first().and_then(|receiver| match receiver {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
-                    if let Some(promoted_obj_id) =
-                        self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
+                    if let Some(object) =
+                        self.ref_resolution.const_ref_objects.get(&place.local).copied()
                     {
-                        return Some(self.heap_state.promoted_const_address_for(promoted_obj_id));
+                        return Some(object.address());
                     }
                     if let Some(ref_target) =
                         self.ref_resolution.ref_targets.get(&place.local).cloned()

@@ -9,12 +9,14 @@
 //! Query stubs (SliceIsEmpty, SliceFirst) are in codegen_call_slice_query.rs.
 //! Get/RangeFull stubs are in codegen_call_slice_get.rs (Part of #4130).
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use super::codegen_expr_signedness::arg_signedness_or_fallback;
+use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::shared::SignednessFallbackKind;
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
@@ -22,7 +24,7 @@ use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width
 use super::ChcCtx;
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto_prebuilt};
-use super::codegen_call_misc::CallMisc;
+use super::codegen_call_misc::{CallMisc, Referent};
 use super::codegen_rules::CodegenRules;
 
 /// Extension trait for CHC slice call handling.
@@ -232,12 +234,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        let lhs = args.first().and_then(|arg| self.resolve_raw_eq_referent(arg, modified_locals));
-        let rhs = args.get(1).and_then(|arg| self.resolve_raw_eq_referent(arg, modified_locals));
+        // Referent DATA only: a resolver tier that handed back the operand's
+        // own pointer term is refused (see `slice_eq_referent_datum`).
+        let lhs = args
+            .first()
+            .and_then(|arg| self.resolve_ref_or_const_referent_tagged(arg, modified_locals))
+            .and_then(|referent| self.slice_eq_referent_datum(referent));
+        let rhs = args
+            .get(1)
+            .and_then(|arg| self.resolve_ref_or_const_referent_tagged(arg, modified_locals))
+            .and_then(|referent| self.slice_eq_referent_datum(referent));
 
         if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
             let eq_expr = if *lhs.sort() == *rhs.sort() {
-                lhs.eq(rhs)
+                let Some(eq) = self.slice_eq_from_referent_data(args, &lhs, &rhs, modified_locals)
+                else {
+                    debug!(
+                        fn_name = %self.fn_name,
+                        sort = ?lhs.sort(),
+                        "CHC slice_eq: array datum without two constant lengths; fallback"
+                    );
+                    emit_sound_fallback_goto_prebuilt(
+                        self,
+                        from_app,
+                        target,
+                        new_output_args,
+                        stmt_constraints,
+                    );
+                    return;
+                };
+                eq
             } else if lhs.sort().is_bitvec() && rhs.sort().is_bitvec() {
                 let Some(lhs_w) = lhs.sort().bitvec_width() else {
                     warn!("CHC fallback: slice_eq lhs bitvec sort without width");
@@ -327,14 +353,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     );
                     lhs.eq(rhs)
                 }
-            } else if let Some(rhs_coerced) = Self::reinterpret_fixed_layout_expr(&rhs, lhs.sort())
+            } else if let Some((lhs, rhs)) = Self::reinterpret_fixed_layout_expr(&rhs, lhs.sort())
+                .map(|rhs| (lhs.clone(), rhs))
+                .or_else(|| {
+                    Self::reinterpret_fixed_layout_expr(&lhs, rhs.sort()).map(|lhs| (lhs, rhs.clone()))
+                })
             {
-                // Part of #3951: BV→Array coercion for slice literal vs Vec data.
-                lhs.eq(rhs_coerced)
-            } else if let Some(lhs_coerced) = Self::reinterpret_fixed_layout_expr(&lhs, rhs.sort())
-            {
-                // Part of #3951: symmetric case — Array→BV coercion.
-                lhs_coerced.eq(rhs)
+                // Part of #3951: BV↔Array coercion for a slice literal against
+                // `Vec` data; the coerced pair is one sort, compared as above.
+                let Some(eq) = self.slice_eq_from_referent_data(args, &lhs, &rhs, modified_locals)
+                else {
+                    debug!(
+                        fn_name = %self.fn_name,
+                        sort = ?lhs.sort(),
+                        "CHC slice_eq: coerced array datum without two constant lengths; fallback"
+                    );
+                    emit_sound_fallback_goto_prebuilt(
+                        self,
+                        from_app,
+                        target,
+                        new_output_args,
+                        stmt_constraints,
+                    );
+                    return;
+                };
+                eq
             } else {
                 warn!(
                     fn_name = %self.fn_name,
@@ -387,13 +430,119 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         );
     }
 
+    /// The referent DATUM a slice equality may compare, when one is
+    /// ESTABLISHED.
+    ///
+    /// `SlicePartialEq::equal` compares the ELEMENTS behind two `&[T]`. The
+    /// resolver's last tiers hand back the operand's own term, which for a
+    /// `&[T]` is the wide POINTER `[len : upper | data : lower]`, not its
+    /// elements. Compared against the other side's decoded elements, a joined
+    /// `&str` (`if c { "hi" } else { "hello" }`, no single constant behind it)
+    /// was a 128-bit pointer set equal to sixteen bytes read from the literal:
+    /// constant false, so `s != "hi"` PROVED and `s == "hi" || s == "hello"`
+    /// failed with a certified counterexample.
+    ///
+    /// The rule is the one `atomic_referent_datum` states: a tier that
+    /// dereferenced ([`Referent::Value`]) is the datum; an unreported term is
+    /// the datum only when its sort has no pointer slot at all (an element
+    /// array, a slice datatype). A thin or wide pointer-sorted unreported term
+    /// is the operand's own pointer, and the caller falls back soundly.
+    pub(in crate::codegen_ay::chc) fn slice_eq_referent_datum(
+        &self,
+        referent: Referent,
+    ) -> Option<Expr> {
+        match referent {
+            Referent::Value(val) => Some(val.into_expr()),
+            Referent::Unreported(expr) if PtrSlot::of_sort(expr.sort()).is_none() => Some(expr),
+            Referent::Unreported(expr) => {
+                debug!(
+                    fn_name = %self.fn_name,
+                    sort = ?expr.sort(),
+                    "CHC slice_eq: referent resolved to the operand's own pointer; refusing"
+                );
+                None
+            }
+        }
+    }
+
+    /// Rust's `==` on two slices from their referent DATA, both of one sort;
+    /// `None` when it cannot be stated, and the caller falls back soundly.
+    ///
+    /// A datum with no SMT array in its sort is the slice's elements and
+    /// nothing else, so its equality is the slices'. An SMT array is not: it
+    /// holds every index, and equality on it is extensional over the indices
+    /// past the slice's length that Rust never reads
+    /// (`codegen_expr_array_eq::sort_contains_array`). `[1i32, 2]` and
+    /// `[1, 2, 0]` encoded over the same constant default compared EQUAL, so
+    /// `assert!(a == b)` with `a: &[i32] = &x`, `b: &[i32] = &y` PROVED, and
+    /// `assert!(a != b)` failed with a certified counterexample
+    /// (`tools/soundness-duals/slice_eq_length_dual.rs`). An array datum is
+    /// therefore compared only below two CONSTANT lengths: lengths that differ
+    /// decide `==` alone, and an equal one up to
+    /// [`Self::SLICE_EQ_EXPAND_MAX_ELEMS`] is expanded element by element.
+    ///
+    /// The elements are read from index 0. A view that starts elsewhere
+    /// carries a `subslice_offset`, and `subslice_consumer_fail_closed`
+    /// already taints every call that passes one.
+    fn slice_eq_from_referent_data(
+        &self,
+        args: &[Operand],
+        lhs: &Expr,
+        rhs: &Expr,
+        modified_locals: &std::collections::HashSet<usize>,
+    ) -> Option<Expr> {
+        use crate::codegen_ay::chc::codegen_expr_array_eq::sort_contains_array;
+
+        if lhs.sort() != rhs.sort() {
+            return None;
+        }
+        if !sort_contains_array(lhs.sort()) {
+            return Some(lhs.clone().eq(rhs.clone()));
+        }
+        let lhs_len = self.resolve_const_slice_eq_len(args, 0, modified_locals)?;
+        let rhs_len = self.resolve_const_slice_eq_len(args, 1, modified_locals)?;
+        if lhs_len != rhs_len {
+            return Some(Expr::bool_const(false));
+        }
+        let len = usize::try_from(lhs_len)
+            .ok()
+            .filter(|len| *len <= Self::SLICE_EQ_EXPAND_MAX_ELEMS)?;
+        let lhs = Self::slice_eq_element_array(lhs)?;
+        let rhs = Self::slice_eq_element_array(rhs)?;
+        let array = lhs.sort().array_sort()?;
+        if lhs.sort() != rhs.sort() || sort_contains_array(&array.element_sort) {
+            return None;
+        }
+        let index_width = array.index_sort.bitvec_width()?;
+        let mut eq = Expr::bool_const(true);
+        for i in 0..len {
+            let idx = Expr::bitvec_const(i as u64, index_width);
+            eq = eq.and(lhs.clone().select(idx.clone()).eq(rhs.clone().select(idx)));
+        }
+        Some(eq)
+    }
+
+    /// The element array of a slice-equality datum: the datum itself when it
+    /// is an SMT array, else a slice or `Vec` datatype's `fld_data`.
+    fn slice_eq_element_array(datum: &Expr) -> Option<Expr> {
+        if datum.sort().is_array() {
+            return Some(datum.clone());
+        }
+        let data_sort = Self::get_dt_field_sort(datum, "fld_data")?;
+        if !data_sort.is_array() {
+            return None;
+        }
+        let name = datum.sort().datatype_name()?;
+        Some(datum.clone().field_select(name, "fld_data", data_sort))
+    }
+
     /// Task #69 step 5: resolve a CONST element count for a slice-eq operand.
     ///
     /// Chain: static `[T; N]` length → registered subslice_len (direct or one
     /// ref_targets hop) → shared sidecar chain (`resolve_slice_arg_length`).
     /// Only constant-foldable lengths are returned — the width-mismatch
     /// equality path must not conjoin symbolic lengths (see call site).
-    fn resolve_const_slice_eq_len(
+    pub(in crate::codegen_ay::chc) fn resolve_const_slice_eq_len(
         &self,
         args: &[Operand],
         arg_idx: usize,
@@ -451,7 +600,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let args = cx.args;
 
         // Create fresh symbolic result variable.
-        let fresh_result = super::declare_pending_var(
+        let fresh_result = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_CALL_RESULT,
             super::chc_fresh_name("__partition_point"),
             Sort::bitvec(POINTER_WIDTH),
         );

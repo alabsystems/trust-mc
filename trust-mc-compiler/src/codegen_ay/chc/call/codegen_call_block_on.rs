@@ -16,6 +16,7 @@
 //!
 //! Part of #3955.
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
@@ -31,9 +32,7 @@ use super::codegen_call_coerce::CallCoerce;
 use super::codegen_call_misc::CallMisc;
 use super::codegen_rules::CodegenRules;
 use super::inline_alias_writeback::pre_resolve_arg_target_locals;
-use super::inline_body::{
-    InlineReturn, extract_inline_assert_guard, strip_inline_assert_fallback, translate_inline_body,
-};
+use super::inline_body::{InlineReturn, translate_inline_body};
 use super::inline_result_shared::{
     InlineResultEpilogueSpec, emit_prepared_inline_result, prepare_inline_result_epilogue,
 };
@@ -140,7 +139,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             || callee_name.ends_with("::block_on")
         {
             debug!(callee = %callee_name, fn_name = %self.fn_name, "block_on: name matched");
-            let body = instance.body()?;
+            let body = instance.callee_body()?;
 
             // Try spawn path first: Scheduler::block_on with a scheduling plan
             // argument indicates the spawn runtime (inlined block_on_with_spawn).
@@ -184,11 +183,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } = inline_result;
         // Assert-guard SIDE-CHANNEL host emission (see emit_deferred_inline_check_errors).
         self.emit_deferred_inline_check_errors(dcx, deferred_checks);
-        let inline_assert_guard = extract_inline_assert_guard(&result_expr);
-        let result_expr = strip_inline_assert_fallback(&result_expr).unwrap_or(result_expr);
+        let (result_expr, mut extra_constraints) = self.take_inline_result_guards(dcx, result_expr);
         let dest_local = dcx.destination.local;
         let mut extra_dests = Vec::new();
-        let mut extra_constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
         extra_constraints.append(&mut self.invalidate_moved_block_on_args(
             dcx,
             dest_local,
@@ -302,11 +299,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             let sbo =
                 self.resolve_body_call_instance_by_suffix(callee_body, "Scheduler::block_on")?;
-            std::borrow::Cow::Owned(sbo.body()?)
+            std::borrow::Cow::Owned(sbo.callee_body()?)
         };
         let scheduler_run = self
             .resolve_body_call_instance_by_suffix(&scheduler_run_search_body, "Scheduler::run")?;
-        let scheduler_run_body = scheduler_run.body()?;
+        let scheduler_run_body = scheduler_run.callee_body()?;
         let future_trait_def_id =
             self.resolve_future_trait_def_id_from_body(&scheduler_run_body)?;
         let candidates =

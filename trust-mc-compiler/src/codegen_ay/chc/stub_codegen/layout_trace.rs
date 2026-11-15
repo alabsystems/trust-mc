@@ -67,7 +67,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.local == current_local
                     {
                         match rhs {
-                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
                                 if let Some(&pair) = self.known_layout_sizes.get(&src.local) {
                                     return Some(pair);
                                 }
@@ -93,7 +93,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             }
                             // Part of #3841: Constant assignment — extract layout from
                             // MIR constant allocation bytes.
-                            Rvalue::Use(Operand::Constant(c)) => {
+                            Rvalue::Use(Operand::Constant(c), ..) => {
                                 if let Some(pair) = Self::extract_layout_from_mir_const(&c.const_) {
                                     return Some(pair);
                                 }
@@ -153,7 +153,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             }
                         }
                         // Copy/Move chain — follow to the source
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                             if src.projection.is_empty() =>
                         {
                             if let Some(pair) = self.extract_layout_from_result_local(src.local) {
@@ -162,7 +162,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         }
                         // Part of #3841: Also follow through projected sources.
                         // Pattern: _R = Move((_S as variant#0).0)
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                             if !src.projection.is_empty() =>
                         {
                             if let Some(pair) = self.extract_layout_from_result_local(src.local) {
@@ -200,7 +200,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             && lhs.projection.is_empty()
                         {
                             match rhs {
-                                Rvalue::Use(Operand::Constant(c)) => {
+                                Rvalue::Use(Operand::Constant(c), ..) => {
                                     if let Some(pair) =
                                         Self::extract_layout_from_mir_const(&c.const_)
                                     {
@@ -223,6 +223,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 None
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -242,7 +244,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             && lhs.projection.is_empty()
                         {
                             match rhs {
-                                Rvalue::Use(Operand::Constant(c)) => {
+                                Rvalue::Use(Operand::Constant(c), ..) => {
                                     if let Some(v) = Self::extract_usize_from_mir_const(&c.const_) {
                                         return Some(v);
                                     }
@@ -256,7 +258,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     }
                                 }
                                 // Follow Move/Copy chains
-                                Rvalue::Use(inner_op @ (Operand::Copy(_) | Operand::Move(_))) => {
+                                Rvalue::Use(
+                                    inner_op @ (Operand::Copy(_) | Operand::Move(_)),
+                                    ..,
+                                ) => {
                                     if let Some(v) = self.try_extract_usize_from_operand(inner_op) {
                                         return Some(v);
                                     }
@@ -268,26 +273,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 None
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
     /// Part of #3841: Extract a `(size, align)` pair from a 16-byte MIR constant
     /// allocation representing a packed BV128 Layout value.
     fn extract_layout_from_mir_const(c: &rustc_public::ty::MirConst) -> Option<(u64, u64)> {
-        use rustc_public::ty::ConstantKind;
-        let alloc = match c.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            _ => return None,
-        };
-        let bytes = &alloc.bytes;
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+        let bytes = const_pointer::const_bytes(c)?;
         if bytes.len() == 16 {
-            // Layout is packed as (size: u64, align: u64) in little-endian
-            let size_bytes: [u8; 8] =
-                bytes[0..8].iter().map(|b| b.unwrap_or(0)).collect::<Vec<u8>>().try_into().ok()?;
-            let align_bytes: [u8; 8] =
-                bytes[8..16].iter().map(|b| b.unwrap_or(0)).collect::<Vec<u8>>().try_into().ok()?;
-            let size = u64::from_le_bytes(size_bytes);
-            let align = u64::from_le_bytes(align_bytes);
+            // Layout is packed as (size: u64, align: u64) in little-endian,
+            // uninitialized bytes read as 0 (as before); a relocation declines.
+            let size = u64::try_from(bytes.read_uint_zero_filled(0, 64)?).ok()?;
+            let align = u64::try_from(bytes.read_uint_zero_filled(8, 64)?).ok()?;
             if align > 0 && align.is_power_of_two() && size > 0 {
                 return Some((size, align));
             }
@@ -336,7 +336,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.local == current_local
                     {
                         match rhs {
-                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                             | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _) => {
                                 found_source = Some(src.local);
                                 break 'scan;

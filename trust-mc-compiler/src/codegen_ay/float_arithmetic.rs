@@ -38,10 +38,80 @@ pub(in crate::codegen_ay) fn bv_float_binop(
         BinOp::Sub | BinOp::SubUnchecked => fp_lhs.fp_sub(RoundingMode::RNE, fp_rhs),
         BinOp::Mul | BinOp::MulUnchecked => fp_lhs.fp_mul(RoundingMode::RNE, fp_rhs),
         BinOp::Div => fp_lhs.fp_div(RoundingMode::RNE, fp_rhs),
-        BinOp::Rem => fp_lhs.fp_rem(fp_rhs),
+        // Rust float `%` is C `fmod`, NOT SMT-LIB `fp.rem` (the IEEE 754
+        // remainder): `fp.rem` plus an exact one-step correction. See `fp_fmod`.
+        BinOp::Rem => fp_fmod(fp_lhs, fp_rhs),
         _ => return None,
     };
     Some(fp_result.fp_to_ieee_bv())
+}
+
+/// Rust float `%` on FP-sorted operands, EXACTLY: C `fmod` / LLVM `frem`, the
+/// TRUNCATING remainder `x - trunc(x / y) * y`, which has the dividend's sign
+/// (`5.0 % 3.0 == 2.0`, `-5.0 % 3.0 == -2.0`, `-6.0 % 3.0 == -0.0`).
+///
+/// SMT-LIB `fp.rem` (ay-bindings `fp_rem`) is a different function: the IEEE
+/// 754 remainder `x - n * y` with `n = roundTiesToEven(x / y)`, so
+/// `fp.rem(5, 3) = -1`. The BMC lane once lowered `%` to `fp.rem` alone, which
+/// let a harness refute the true `5.0 % 3.0 == 2.0` as a `Genuine`
+/// counterexample and made `x % 3.0 < 0.0` satisfiable for `x >= 0`
+/// (TRUST-MC-FREM-1; the same defect as trust-ir's TRUST-IR-AY-FREM-1). The
+/// encoding is
+///
+/// ```text
+/// r    = fp.rem(x, y)
+/// fmod = ite(!isZero(r) && !isNaN(r) && isNegative(r) != isNegative(x),
+///            fp.add(RNE, r, ite(isNegative(x), -|y|, |y|)),
+///            r)
+/// ```
+///
+/// **Why this is `fmod` (finite `x`, finite nonzero `y`).** Both functions are
+/// odd in `x` (truncation and round-to-nearest-even are symmetric about zero)
+/// and even in `y` (negating `y` negates the quotient, so `n * y` is
+/// unchanged), and a zero result takes the sign of `x` in both. With `a = |x|`,
+/// `b = |y|`, `s` the sign of `x` and `t = floor(a / b)`:
+/// `fmod(x, y) = s * (a - t * b)`, with `a - t * b` in `[0, b)`, and
+/// round-to-nearest picks `n = t` or `n = t + 1`.
+///
+/// * `n = t`: `fp.rem` already equals `fmod`. `r` is zero or has the sign of
+///   `x`, so the correction is not taken.
+/// * `n = t + 1`: `r = s * ((a - t * b) - b)` with magnitude in `(0, b/2]`. It
+///   is nonzero and has the sign opposite to `x`, and
+///   `fmod(x, y) = r + copysign(|y|, x)`.
+///
+/// So "`r` nonzero, not NaN, and of the opposite sign to `x`" is exactly the
+/// `n = t + 1` case. `isNegative(x)` is a sound reading of the sign of `x`
+/// there, because `x` is not NaN whenever `r` is not NaN.
+///
+/// **Why the add is EXACT.** Its real sum is `fmod(x, y)`, which is a float, so
+/// RNE returns it unrounded. Let `Q` be the smaller of the two operands' quanta
+/// (the weight of the last significand bit; the subnormal quantum for a
+/// subnormal). `a` and `b` are integer multiples of `Q`, hence so is
+/// `a - t * b`, and `a - t * b` is at most `a` and below `b`, so divided by `Q`
+/// it is below `2^p` (`p` the precision). A multiple of `Q` with fewer than `p`
+/// significant bits is representable. The sum lies in `s * [b/2, b)`, so it is
+/// nonzero and no signed-zero question arises.
+///
+/// **Special operands** never take the correction, and `fp.rem` already agrees
+/// with `fmod` on them (the same table as ay's `fp_rem_exact`): `x` or `y` NaN,
+/// `x` infinite, or `y` zero give NaN in both (excluded by `isNaN(r)`); `y`
+/// infinite with `x` finite gives `x` in both (same sign as `x`); `x` zero, or
+/// an exact multiple, gives a zero with the sign of `x` in both (excluded by
+/// `isZero(r)`).
+///
+/// The regression tests (`float_arithmetic_frem_tests.rs`) solve the encoding
+/// with ay and hold it bit for bit to host Rust `%`.
+pub(in crate::codegen_ay) fn fp_fmod(x: Expr, y: Expr) -> Expr {
+    let r = x.clone().fp_rem(y.clone());
+    let r_unadjusted = r.clone().fp_is_zero().or(r.clone().fp_is_nan());
+    let x_negative = x.fp_is_negative();
+    let sign_differs = r.clone().fp_is_negative().xor(x_negative.clone());
+    let overshot = r_unadjusted.not().and(sign_differs);
+    // copysign(|y|, x)
+    let y_magnitude = y.fp_abs();
+    let step = Expr::ite(x_negative, y_magnitude.clone().fp_neg(), y_magnitude);
+    let corrected = r.clone().fp_add(RoundingMode::RNE, step);
+    Expr::ite(overshot, corrected, r)
 }
 
 /// CHC-safe float BinOp: constant-fold when both operands are concrete bit
@@ -92,13 +162,14 @@ pub(in crate::codegen_ay) fn bv_float_binop_chc(
         64 => fold!(f64::from_bits(lb), f64::from_bits(rb)).to_bits(),
         _ => return None,
     };
-    // Normalize -0.0 to +0.0 so downstream BV equality compares correctly
-    // for IEEE float zero (the two patterns are IEEE-equal but BV-distinct).
-    let bits = match width {
-        32 if bits as u32 == 0x8000_0000 => 0,
-        64 if bits == 0x8000_0000_0000_0000 => 0,
-        _ => bits,
-    };
+    // The exact bits, sign of zero included. This fold used to normalise `-0.0` to
+    // `+0.0` "so downstream BV equality compares correctly"; float `==` / `!=` go
+    // through `bv_float_eq` / `bv_float_ne` (IEEE: the two zeros are equal, NaN is
+    // equal to nothing), so the normalisation bought nothing there and erased a
+    // sign the program can observe: `let y = x * -1.0` for `x = 0.0` folded to `+0`,
+    // so `y.max(x)` saw two identical zeros and the sign of the result was proved
+    // (parity-1 second review, `fold_via_mul_add_path_sign_unprovable` and
+    // `fold_computed_zero_sign_unprovable`, SUCCESSFUL clean on both routes).
     Some(Expr::bitvec_const(bits as i128, width))
 }
 
@@ -111,6 +182,17 @@ pub(in crate::codegen_ay) fn float_width_to_eb_sb(width: u32) -> Option<(u32, u3
         128 => Some((15, 113)), // f128
         _ => None,
     }
+}
+
+/// IEEE negation changes only the sign bit, including zeros, infinities and NaNs.
+/// The declared float width must match the encoded value; integer negation is
+/// never a fallback for an unsupported float representation.
+pub(in crate::codegen_ay) fn bv_float_neg(value: Expr, width: u32) -> Option<Expr> {
+    float_width_to_eb_sb(width)?;
+    if value.sort().bitvec_width() != Some(width) {
+        return None;
+    }
+    Some(value.bvxor(Expr::bitvec_const(1u128 << (width - 1), width)))
 }
 
 pub(in crate::codegen_ay) fn unsigned_max_bits(width: u32) -> u128 {
@@ -384,6 +466,66 @@ pub(in crate::codegen_ay) fn is_float_arithmetic_op(op: BinOp) -> bool {
     )
 }
 
+/// NaN-generation predicate for a float value binop on BV-encoded operands:
+/// true EXACTLY when `lhs op rhs` produces a NaN from non-NaN operands — the
+/// IEEE 754-2019 §7.2 invalid operations, and the Kani `--nan-check`
+/// "NaN on <op>" obligation.
+///
+/// Decided on the operand bits alone. It deliberately does not inspect the
+/// `fp_to_ieee_bv` result term: SMT-LIB leaves the bit pattern of a NaN
+/// unspecified there, so a result-side NaN test is only as good as the
+/// solver's choice of pattern. The cases are exhaustive for the operations
+/// Rust float binops lower to:
+/// - `+`: ∞ + ∞ with opposite signs; `-`: ∞ − ∞ with equal signs;
+/// - `*`: 0 · ∞ or ∞ · 0;
+/// - `/`: 0 / 0 or ∞ / ∞;
+/// - `%` (fmod, and IEEE remainder alike): divisor ±0 or dividend ±∞, with
+///   neither operand NaN.
+///
+/// Every other non-NaN input yields a non-NaN result (finite ⊕ finite can
+/// overflow to ±∞ but never to NaN; nonzero / 0 is ±∞). A NaN operand only
+/// propagates: the obligation belongs to the site that generated it.
+///
+/// Returns `None` for non-arithmetic ops, widths without an IEEE layout, or
+/// operands whose width differs from `width`; callers fail closed on `None`.
+pub(in crate::codegen_ay) fn bv_float_binop_generates_nan(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    width: u32,
+) -> Option<Expr> {
+    let (eb, sb) = float_width_to_eb_sb(width)?;
+    if lhs.sort().bitvec_width() != Some(width) || rhs.sort().bitvec_width() != Some(width) {
+        return None;
+    }
+    let mant_bits = sb - 1;
+    // (is_inf, is_nan, is_zero, sign) for one operand.
+    let classify = |v: &Expr| {
+        let exp_all_ones = v
+            .clone()
+            .extract(width - 2, mant_bits)
+            .eq(Expr::bitvec_const(unsigned_max_bits(eb), eb));
+        let mant_zero =
+            v.clone().extract(mant_bits - 1, 0).eq(Expr::bitvec_const(0u128, mant_bits));
+        let is_inf = exp_all_ones.clone().and(mant_zero.clone());
+        let is_nan = exp_all_ones.and(mant_zero.not());
+        let is_zero = v.clone().extract(width - 2, 0).eq(Expr::bitvec_const(0u128, width - 1));
+        let sign = v.clone().extract(width - 1, width - 1);
+        (is_inf, is_nan, is_zero, sign)
+    };
+    let (l_inf, l_nan, l_zero, l_sign) = classify(lhs);
+    let (r_inf, r_nan, r_zero, r_sign) = classify(rhs);
+    let both_inf = l_inf.clone().and(r_inf.clone());
+    Some(match op {
+        BinOp::Add | BinOp::AddUnchecked => both_inf.and(l_sign.eq(r_sign).not()),
+        BinOp::Sub | BinOp::SubUnchecked => both_inf.and(l_sign.eq(r_sign)),
+        BinOp::Mul | BinOp::MulUnchecked => l_zero.and(r_inf).or(l_inf.and(r_zero)),
+        BinOp::Div => l_zero.and(r_zero).or(both_inf),
+        BinOp::Rem => r_zero.and(l_nan.not()).or(l_inf.and(r_nan.not())),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,7 +588,126 @@ mod tests {
         let result = float_to_float_bv(bv, 64, 32).expect("f64→f32");
         assert_eq!(result.sort().bitvec_width(), Some(32));
     }
+
+    const NAN_GEN_OPS: [BinOp; 8] = [
+        BinOp::Add,
+        BinOp::AddUnchecked,
+        BinOp::Sub,
+        BinOp::SubUnchecked,
+        BinOp::Mul,
+        BinOp::MulUnchecked,
+        BinOp::Div,
+        BinOp::Rem,
+    ];
+
+    /// Host IEEE oracle for `bv_float_binop_generates_nan`: NaN out, no NaN in.
+    fn host_generates_nan(op: BinOp, a: f32, b: f32) -> bool {
+        let r = match op {
+            BinOp::Add | BinOp::AddUnchecked => a + b,
+            BinOp::Sub | BinOp::SubUnchecked => a - b,
+            BinOp::Mul | BinOp::MulUnchecked => a * b,
+            BinOp::Div => a / b,
+            BinOp::Rem => a % b,
+            _ => unreachable!("arithmetic ops only"),
+        };
+        r.is_nan() && !a.is_nan() && !b.is_nan()
+    }
+
+    #[test]
+    fn test_generates_nan_is_bool_for_every_ieee_width() {
+        for width in [16u32, 32, 64, 128] {
+            let l = Expr::var("l", ay_bindings::Sort::bitvec(width));
+            let r = Expr::var("r", ay_bindings::Sort::bitvec(width));
+            for op in NAN_GEN_OPS {
+                let p = bv_float_binop_generates_nan(op, &l, &r, width)
+                    .expect("arithmetic op on an IEEE width has a predicate");
+                assert!(p.sort().is_bool(), "{op:?} on f{width}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_generates_nan_refuses_what_it_cannot_describe() {
+        let l = Expr::var("l", ay_bindings::Sort::bitvec(32));
+        let r = Expr::var("r", ay_bindings::Sort::bitvec(32));
+        assert!(bv_float_binop_generates_nan(BinOp::Eq, &l, &r, 32).is_none());
+        // Operand width disagrees with the claimed float width.
+        assert!(bv_float_binop_generates_nan(BinOp::Add, &l, &r, 64).is_none());
+        // x87 extended has no IEEE layout here.
+        let x = Expr::var("x", ay_bindings::Sort::bitvec(80));
+        assert!(bv_float_binop_generates_nan(BinOp::Add, &x, &x, 80).is_none());
+    }
+
+    /// The CHC constant fold keeps the sign of a zero result: `0.0 * -1.0` is `-0.0`,
+    /// bit for bit, and the sums of zeros follow IEEE 754's sign rule. A fold that
+    /// returned `+0.0` for every zero let `max(y, x)` with `y = x * -1.0` see two
+    /// identical zeros and prove the sign of its result.
+    #[test]
+    fn test_chc_constant_fold_keeps_the_sign_of_zero() {
+        let pz = Expr::bitvec_const(0u64, 32);
+        let nz = Expr::bitvec_const(0x8000_0000u64, 32);
+        let neg_one = Expr::bitvec_const((-1.0f32).to_bits() as u64, 32);
+        let bits = |e: Option<Expr>| match e.expect("fold").value() {
+            ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).unwrap(),
+            other => panic!("not a constant: {other:?}"),
+        };
+        assert_eq!(
+            bits(bv_float_binop_chc(BinOp::Mul, pz.clone(), neg_one.clone(), 32)),
+            0x8000_0000
+        );
+        assert_eq!(bits(bv_float_binop_chc(BinOp::Mul, nz.clone(), neg_one, 32)), 0);
+        assert_eq!(bits(bv_float_binop_chc(BinOp::Add, nz.clone(), nz.clone(), 32)), 0x8000_0000);
+        assert_eq!(bits(bv_float_binop_chc(BinOp::Add, nz.clone(), pz.clone(), 32)), 0);
+        assert_eq!(bits(bv_float_binop_chc(BinOp::Sub, nz.clone(), pz.clone(), 32)), 0x8000_0000);
+        assert_eq!(bits(bv_float_binop_chc(BinOp::Sub, pz.clone(), pz, 32)), 0);
+        let pz64 = Expr::bitvec_const(0u64, 64);
+        let neg_one64 = Expr::bitvec_const((-1.0f64).to_bits(), 64);
+        assert_eq!(
+            bits(bv_float_binop_chc(BinOp::Mul, pz64, neg_one64, 64)),
+            0x8000_0000_0000_0000
+        );
+    }
+
+    /// The expression constructors may or may not fold constant operands; any
+    /// verdict that does fold must agree with host IEEE 754 arithmetic.
+    #[test]
+    fn test_generates_nan_folded_verdicts_agree_with_host_ieee() {
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -2.5,
+            f32::MAX,
+            f32::from_bits(1),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for op in NAN_GEN_OPS {
+            for a in specials {
+                for b in specials {
+                    let pa = Expr::bitvec_const(a.to_bits() as u64, 32);
+                    let pb = Expr::bitvec_const(b.to_bits() as u64, 32);
+                    let p = bv_float_binop_generates_nan(op, &pa, &pb, 32).expect("f32");
+                    let expected = host_generates_nan(op, a, b);
+                    let folded_true = matches!(p.value(), ay_bindings::ExprValue::BoolConst(true));
+                    let folded_false =
+                        matches!(p.value(), ay_bindings::ExprValue::BoolConst(false));
+                    assert!(
+                        !(folded_true && !expected) && !(folded_false && expected),
+                        "{op:?}: {a} vs {b} folded against IEEE (expected {expected})"
+                    );
+                }
+            }
+        }
+    }
 }
+#[cfg(test)]
+#[path = "float_arithmetic_frem_tests.rs"]
+mod float_arithmetic_frem_tests;
 #[cfg(test)]
 #[path = "float_arithmetic_saturating_tests.rs"]
 mod float_arithmetic_saturating_tests;
+
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+pub(in crate::codegen_ay) use float_arithmetic_saturating_tests::eval_bv_expr;

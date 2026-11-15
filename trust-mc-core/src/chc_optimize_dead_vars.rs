@@ -348,7 +348,22 @@ fn dedupe_rules(vc: &mut ChcVc) -> usize {
 
 fn prune_trivially_false_rules(vc: &mut ChcVc) -> usize {
     let mut stripped = 0;
+    let keep_error_obligations = vc.keep_error_obligations;
+    if keep_error_obligations {
+        for rule in vc.rules.iter_mut() {
+            if crate::chc::rule_is_error_obligation(rule)
+                && !rule_body_is_literal_false(rule)
+                && rule.body.constraints.iter().any(constraint_contains_false_conjunct)
+            {
+                crate::chc::pin_false_error_obligation(rule);
+            }
+        }
+    }
     vc.rules.retain(|rule| {
+        // Lost-checks recovery: see `ChcVc::keep_error_obligations`.
+        if keep_error_obligations && crate::chc::rule_is_error_obligation(rule) {
+            return true;
+        }
         // Error-headed false-bodied rules are exempt (task #76): they are
         // deliberate discharge obligations (`(rule (=> false error))` from
         // the straightline `replace_with_unsat_error_obligation`) or checks

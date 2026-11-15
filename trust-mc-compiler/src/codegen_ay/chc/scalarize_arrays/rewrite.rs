@@ -409,11 +409,33 @@ fn build_scalar_store_constraints(
 enum PlanSlot {
     /// No application has named a slot here yet.
     Unknown,
-    /// Every naming application named the array with this `infos` index.
+    /// Every naming application named an array with the lane layout of this
+    /// `infos` index (the same array, or one with identical lanes).
     Array(usize),
-    /// Applications disagree, or one names something that is not a
-    /// scalarizable array — leave the column alone.
+    /// Applications disagree on the lane layout, or one names something that
+    /// is not a scalarizable array — leave the column alone.
     Conflict,
+    /// The relation's applications already disagree on ARITY, so positions
+    /// are not comparable and no column has a plan.
+    Diverged,
+}
+
+/// How [`expand_relation_app`] treats one relation column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ColumnPlan {
+    /// Every naming application agrees on this array's lane layout: expand the
+    /// column in EVERY application at this position, named or not.
+    Expand(usize),
+    /// Applications disagree about the column's lanes: expand NOTHING here,
+    /// not even an argument that names a scalarized array. The name then
+    /// survives as a whole-array mention, and `residual_scalarized_array_mentions`
+    /// bans that array (fail closed) instead of committing a rewrite whose
+    /// applications carry different column counts — or, worse, the SAME count
+    /// with lanes of different arrays at different indices.
+    Keep,
+    /// No usable plan: nothing named the column, or the relation's arities
+    /// already diverged. Named arguments expand by name, as they always did.
+    Unplanned,
 }
 
 /// Per-relation, per-position scalarization plan.
@@ -432,7 +454,33 @@ enum PlanSlot {
 /// The plan records, per column, the array every naming application agrees the
 /// column holds, so the expansion can be applied by POSITION to every
 /// application — including the ones that do not name it.
-fn scalarize_position_plan(vc: &ChcVc, maps: &RewriteMaps) -> HashMap<String, Vec<Option<usize>>> {
+///
+/// A column the applications DISAGREE about is the mirror image of that bug
+/// and gets [`ColumnPlan::Keep`]. `collapse_mid_aliases` substitutes a frame
+/// chain onto its root, so when the root is a stored-to `__mid_bbN` var the
+/// head names THAT var (itself a constant-index candidate) in a column whose
+/// other applications name the loop's symbolically indexed state array.
+/// Expanding the recognised name alone widened the head to the mid var's lanes
+/// while every other application kept the whole array: the declaration took
+/// the head's sorts and AY rejected the program before solving
+/// (`prusti/Selection_sort.rs`, row 72: "Predicate 'main__bb8' expected
+/// argument sort (_ BitVec 32), got (Array (_ BitVec 64) (_ BitVec 32))").
+///
+/// Two DIFFERENT scalarized arrays may still share a column — the loop head
+/// names `a`, the back edge its `a__mid_bbN` — when their lane layouts
+/// (constant indices and element sort) are identical: each application then
+/// contributes the same lanes in the same order, and a column nobody reads
+/// (zero lanes) leaves every application together.
+fn scalarize_position_plan(
+    vc: &ChcVc,
+    infos: &[ScalarInfo],
+    maps: &RewriteMaps,
+) -> HashMap<String, Vec<ColumnPlan>> {
+    let same_lanes = |a: usize, b: usize| {
+        a == b
+            || (infos[a].elem_sort == infos[b].elem_sort
+                && infos[a].index_to_scalar.keys().eq(infos[b].index_to_scalar.keys()))
+    };
     let decl_arity: HashMap<&str, usize> =
         vc.relations.iter().map(|r| (r.name.as_str(), r.arg_sorts.len())).collect();
     let mut acc: HashMap<String, Vec<PlanSlot>> = HashMap::new();
@@ -443,16 +491,17 @@ fn scalarize_position_plan(vc: &ChcVc, maps: &RewriteMaps) -> HashMap<String, Ve
         if app.args.len() != arity {
             // Arities already diverge here: positions are not comparable, so
             // this relation gets no positional expansion.
-            columns.iter_mut().for_each(|slot| *slot = PlanSlot::Conflict);
+            columns.iter_mut().for_each(|slot| *slot = PlanSlot::Diverged);
             return;
         }
         for (k, arg) in app.args.iter().enumerate() {
             let ExprValue::Var { name } = arg.value() else { continue };
             let named = maps.by_input.get(name).or_else(|| maps.by_output.get(name)).copied();
             columns[k] = match (columns[k], named) {
+                (PlanSlot::Diverged, _) => PlanSlot::Diverged,
                 (PlanSlot::Conflict, _) | (_, None) => PlanSlot::Conflict,
                 (PlanSlot::Unknown, Some(info_idx)) => PlanSlot::Array(info_idx),
-                (PlanSlot::Array(seen), Some(info_idx)) if seen == info_idx => {
+                (PlanSlot::Array(seen), Some(info_idx)) if same_lanes(seen, info_idx) => {
                     PlanSlot::Array(seen)
                 }
                 (PlanSlot::Array(_), Some(_)) => PlanSlot::Conflict,
@@ -470,8 +519,9 @@ fn scalarize_position_plan(vc: &ChcVc, maps: &RewriteMaps) -> HashMap<String, Ve
             let plan = columns
                 .into_iter()
                 .map(|slot| match slot {
-                    PlanSlot::Array(info_idx) => Some(info_idx),
-                    _ => None,
+                    PlanSlot::Array(info_idx) => ColumnPlan::Expand(info_idx),
+                    PlanSlot::Conflict => ColumnPlan::Keep,
+                    PlanSlot::Unknown | PlanSlot::Diverged => ColumnPlan::Unplanned,
                 })
                 .collect();
             (name, plan)
@@ -487,16 +537,22 @@ fn scalarize_position_plan(vc: &ChcVc, maps: &RewriteMaps) -> HashMap<String, Ve
 /// to `select(arg, idx)` per tracked lane — exact by definition of `select`, and
 /// it keeps the column count identical across every application of the relation.
 /// An array scalarized to ZERO lanes (nothing ever reads it) drops the column in
-/// both cases.
+/// both cases. A column the plan marks [`ColumnPlan::Keep`] is left whole in
+/// every application, named or not (see [`scalarize_position_plan`]).
 pub(super) fn expand_relation_app(
     app: &RelationApp,
     infos: &[ScalarInfo],
     maps: &RewriteMaps,
-    plan: &HashMap<String, Vec<Option<usize>>>,
+    plan: &HashMap<String, Vec<ColumnPlan>>,
 ) -> RelationApp {
     let columns = plan.get(app.name.as_str());
     let mut new_args = Vec::new();
     for (k, arg) in app.args.iter().enumerate() {
+        let column = columns.and_then(|cols| cols.get(k)).copied().unwrap_or(ColumnPlan::Unplanned);
+        if column == ColumnPlan::Keep {
+            new_args.push(arg.clone());
+            continue;
+        }
         if let ExprValue::Var { name } = arg.value() {
             if let Some(&info_idx) = maps.by_input.get(name) {
                 let info = &infos[info_idx];
@@ -513,7 +569,7 @@ pub(super) fn expand_relation_app(
                 continue;
             }
         }
-        if let Some(&Some(info_idx)) = columns.and_then(|cols| cols.get(k)) {
+        if let ColumnPlan::Expand(info_idx) = column {
             let info = &infos[info_idx];
             for idx in info.index_to_scalar.keys() {
                 let index = Expr::bitvec_const(idx.value.clone(), idx.width);
@@ -541,7 +597,7 @@ fn stage_rule_rewrites(
     maps: &RewriteMaps,
     rewrite_ctx: &mut RewriteContext,
 ) -> Vec<StagedRule> {
-    let plan = &scalarize_position_plan(vc, maps);
+    let plan = &scalarize_position_plan(vc, infos, maps);
     vc.rules
         .iter()
         .map(|rule| {

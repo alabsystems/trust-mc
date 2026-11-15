@@ -34,16 +34,18 @@ impl Backend {
     pub(crate) fn resolve(self, ay_solver: AYSolver) -> Result<Self, String> {
         match self {
             Backend::Auto | Backend::AY => {
-                if which::which("ay").is_ok() || !ay_solver.requires_ay_binary() {
-                    Ok(Backend::AY)
-                } else {
-                    #[cfg(feature = "ay-direct")]
-                    let hint = "(direct available for testing via --ay-solver=direct)";
-                    #[cfg(not(feature = "ay-direct"))]
-                    let hint = "";
-                    Err(format!(
-                        "AY solver not found in PATH. Install ay for the AY backend.\n{hint}"
-                    ))
+                // Presence only; whether the binary is the pinned AY revision is
+                // checked when the session resolves it (`crate::ay_binary`).
+                match crate::ay_binary::locate() {
+                    Ok(_) => Ok(Backend::AY),
+                    Err(_) if !ay_solver.requires_ay_binary() => Ok(Backend::AY),
+                    Err(reason) => {
+                        #[cfg(feature = "ay-direct")]
+                        let hint = "(direct available for testing via --ay-solver=direct)";
+                        #[cfg(not(feature = "ay-direct"))]
+                        let hint = "";
+                        Err(format!("{reason}\n{hint}"))
+                    }
                 }
             }
         }
@@ -272,9 +274,18 @@ pub(crate) struct CheckArgs {
     #[arg(long)]
     pub no_unwinding_checks: bool,
 
-    /// Check that floating-point operations do not GENERATE NaN (Kani's
-    /// `--nan-check`). Opt-in, matching Kani: NaN generation is legal Rust, so
-    /// it is only a defect when the program intends otherwise.
+    /// Check that floating-point operations do not GENERATE NaN (CBMC's
+    /// `--nan-check`, "NaN on addition" and its siblings). Opt-in here. Kani
+    /// does NOT match that: kani-driver passes `--nan-check` to CBMC whenever
+    /// overflow checks are on, which is its default (`cbmc_check_flags` in
+    /// `kani-driver/src/call_cbmc.rs`), so a Kani harness whose float add can
+    /// see `+inf` and `-inf` fails where trust-mc's default proves it
+    /// (`tools/soundness-duals/iter_sum_float_unread_dual.rs::
+    /// f32_sym_sum_nan_only_bug`, known red). The default stays off because
+    /// the CHC lane cannot decide the obligation for symbolic operands: it
+    /// ranges over an uninterpreted float table, and the obligation used to
+    /// be emitted unconditionally, failing every harness with symbolic float
+    /// arithmetic (`codegen_stmt_fallback.rs`). NaN generation is legal Rust.
     ///
     /// The compiler has always had this flag (`nan_checks`), but nothing
     /// forwarded it, so it was unreachable from the driver — which silently

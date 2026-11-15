@@ -6,6 +6,7 @@
 //! Split from codegen_stmt.rs (#2036); ADT handling lives in `codegen_stmt_aggregate_adt.rs`.
 //! Closure and coroutine aggregates live in `codegen_stmt_aggregate_closure.rs`.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -21,7 +22,6 @@ use trust_mc_core::chc::VarDecl;
 use crate::codegen_ay::shared::ty_signedness_shallow;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
-use super::codegen_ctx::globals::declare_pending_var;
 use super::codegen_types::CodegenTypes;
 use super::{ChcCtx, chc_fresh_name};
 
@@ -56,9 +56,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     ?kind,
                     "CHC: coroutine closure aggregate unsupported — sound over-approximation"
                 );
-                self.record_sound_fallback_reason("coroutine_closure_unsupported");
+                let booked = self.record_sound_fallback_reason("coroutine_closure_unsupported");
                 let name = chc_fresh_name("__coroutine_closure_nondet");
-                Some(declare_pending_var(name, ptr_sort()))
+                Some(Havoc::booked(booked, name, ptr_sort()))
             }
             AggregateKind::RawPtr(_, _) => {
                 // RawPtr aggregates lower to (data_ptr, metadata).
@@ -152,9 +152,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         warn!(
                             "CHC: RawPtr aggregate operand translation failed — sound over-approximation"
                         );
-                        self.record_sound_fallback_reason("rawptr_operand_translation_failed");
+                        let booked =
+                            self.record_sound_fallback_reason("rawptr_operand_translation_failed");
                         let name = chc_fresh_name("__rawptr_agg_nondet");
-                        Some(declare_pending_var(name, ptr_sort()))
+                        Some(Havoc::booked(booked, name, ptr_sort()))
                     }
                 } else {
                     debug!("CHC: RawPtr aggregate with no operands → null pointer");

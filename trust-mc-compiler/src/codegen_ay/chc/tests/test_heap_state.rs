@@ -421,14 +421,19 @@ fn test_alloc_id_overflow_returns_none() {
     assert_eq!(heap.next_alloc_id(), None, "u32::MAX should return None (cannot advance counter)");
 }
 
-/// The last allocatable ID is u32::MAX - 1 (counter advances to u32::MAX).
+/// The last allocatable ID is one below `OBJECT_ID_LIMIT`: an id at or past it
+/// would share the high offset bits of an identity term's lane, where a
+/// wrapping step's carry lands (heap/stack_address.rs).
 #[test]
-fn test_alloc_id_last_valid_is_max_minus_one() {
+fn test_alloc_id_last_valid_is_below_the_object_id_limit() {
+    use crate::codegen_ay::chc::heap::stack_address::OBJECT_ID_LIMIT;
     let mut heap = ChcHeapState::new();
-    heap.set_next_alloc_id(u32::MAX - 1);
-    assert_eq!(heap.next_alloc_id(), Some(u32::MAX - 1));
-    // Counter is now at u32::MAX; next call fails
+    heap.set_next_alloc_id(OBJECT_ID_LIMIT - 1);
+    assert_eq!(heap.next_alloc_id(), Some(OBJECT_ID_LIMIT - 1));
+    // Counter is now at the limit; next call fails
     assert_eq!(heap.next_alloc_id(), None);
+    heap.set_next_alloc_id(u32::MAX - 1);
+    assert_eq!(heap.next_alloc_id(), None, "far past the limit fails too");
 }
 
 /// reserve_heap_alloc_id propagates None on overflow (#2735).

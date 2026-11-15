@@ -811,7 +811,19 @@ fn test_hashmap_insert_get_generates_vc() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_hashmap_insert_get");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashmap_insert_get", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: constant-key map arrays are
+        // scalarized (7faa74cf9) and write-only ones eliminated (85da41dad), removing the insert
+        // Store.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashmap_insert_get",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_hashmap_insert_get", body.blocks.len());
         // HashMap insert+get pipeline should produce multiple rules
@@ -1560,7 +1572,18 @@ fn test_hashmap_multi_ops_generates_vc() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_hashmap_multi_ops");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashmap_multi_ops", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the map arrays are never read, so
+        // write-only array elimination (85da41dad) removes the insert Store.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashmap_multi_ops",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_hashmap_multi_ops", body.blocks.len());
 
@@ -1868,9 +1891,9 @@ fn test_hashmap_call_translation_none_emits_error_rule() {
         };
         chc_ctx.codegen_call_hashmap(&cx);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one fallback rule");
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one fallback rule plus its error_p bridge");
         let rule = chc_ctx.vc.rules.last().expect("hashmap call should emit one rule");
-        assert_eq!(rule.head.name, "error", "fallback should emit fail-closed error rule");
+        assert!(is_error_check_rule(rule), "fallback should emit fail-closed error rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),
@@ -1930,9 +1953,9 @@ fn test_btreeset_call_translation_none_emits_error_rule() {
         };
         chc_ctx.codegen_call_btreeset(&cx);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one fallback rule");
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one fallback rule plus its error_p bridge");
         let rule = chc_ctx.vc.rules.last().expect("btreeset call should emit one rule");
-        assert_eq!(rule.head.name, "error", "fallback should emit fail-closed error rule");
+        assert!(is_error_check_rule(rule), "fallback should emit fail-closed error rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),
@@ -1992,9 +2015,9 @@ fn test_hashset_call_translation_none_emits_error_rule() {
         };
         chc_ctx.codegen_call_hashset(&cx);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one fallback rule");
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one fallback rule plus its error_p bridge");
         let rule = chc_ctx.vc.rules.last().expect("hashset call should emit one rule");
-        assert_eq!(rule.head.name, "error", "fallback should emit fail-closed error rule");
+        assert!(is_error_check_rule(rule), "fallback should emit fail-closed error rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),
@@ -2058,9 +2081,9 @@ fn test_iterator_intrinsic_translation_none_emits_error_rule() {
         };
         chc_ctx.codegen_call_iterator_intrinsic(&cx);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one fallback rule");
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one fallback rule plus its error_p bridge");
         let rule = chc_ctx.vc.rules.last().expect("iterator intrinsic call should emit one rule");
-        assert_eq!(rule.head.name, "error", "fallback should emit fail-closed error rule");
+        assert!(is_error_check_rule(rule), "fallback should emit fail-closed error rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),

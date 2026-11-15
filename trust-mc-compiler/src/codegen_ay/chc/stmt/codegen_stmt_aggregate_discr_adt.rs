@@ -9,6 +9,9 @@
 //! discriminant dispatch: unit enums, Option-like enums, 2-variant enums with
 //! both payloads, general N-variant enums, BV-flattened enums, and fallbacks.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort, SortInner};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::Place;
@@ -21,7 +24,7 @@ use super::codegen_stmt_aggregate_discr_literal_opt::literal_option_ctor_discr;
 use crate::codegen_ay::names;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
-use super::{ChcCtx, declare_pending_var};
+use super::ChcCtx;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Translate a discriminant for an ADT type given the resolved enum expression.
@@ -87,21 +90,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return Some(result);
             }
 
-            // Fallback: non-Datatype sort -- constrained symbolic discriminant
+            // Fallback: non-Datatype sort -- a booked symbolic discriminant
+            // (Rule E) ranging over the variants' discriminant VALUES, the
+            // encoder's convention (`discriminant_for_variant`). It used to be
+            // `[0, n)`, which excludes every real value of an enum with explicit
+            // discriminants (`#[repr(u8)] enum E { A = 3, B = 7 }`).
             warn!(?place, num_variants, sort = ?enum_expr.sort(), "translate_discriminant: general enum non-Datatype sort");
             self.record_aggregate_gap("discr_non_datatype_sort");
             let discr_name =
                 crate::codegen_ay::names::discr_sym_name(place.local, place.projection.len());
-            let discr = declare_pending_var(discr_name, ptr_sort());
-            let upper = Expr::bitvec_const(num_variants as u64, POINTER_WIDTH);
-            self.heap_state.pending_updates.push(discr.clone().bvult(upper));
+            let discr =
+                Havoc::mint(self, sound_havoc::UNTRACKED_DISCRIMINANT, discr_name, ptr_sort());
+            let range = self.enum_discriminant_value_set(def, &discr);
+            self.heap_state.pending_updates.push(range);
             Some(discr)
         } else if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Coroutine(..))) {
             let discr_name =
                 crate::codegen_ay::names::discr_sym_name(place.local, place.projection.len());
             warn!(?place, "translate_discriminant: coroutine fallback -> symbolic discriminant");
             self.record_aggregate_gap("discr_coroutine_fallback");
-            let discr = declare_pending_var(discr_name, ptr_sort());
+            let discr =
+                Havoc::mint(self, sound_havoc::UNTRACKED_DISCRIMINANT, discr_name, ptr_sort());
             let upper = Expr::bitvec_const(256u64, POINTER_WIDTH);
             self.heap_state.pending_updates.push(discr.clone().bvult(upper));
             Some(discr)
@@ -139,7 +148,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         })
     }
 
-    /// Option-like enum discriminant: extract "has payload" predicate.
+    /// The discriminant VALUE of variant `idx` of `def`
+    /// (`discriminant_for_variant`, sign-extended to `POINTER_WIDTH`): what a
+    /// MIR `SwitchInt` on `Discriminant(_)` compares against. It equals the
+    /// variant index only when the enum declares no explicit discriminants.
+    fn variant_discriminant_value(&self, def: &AdtDef, idx: usize) -> u128 {
+        let internal_def = rustc_internal::internal(self.tcx, *def);
+        let discr =
+            internal_def.discriminant_for_variant(self.tcx, InternalVariantIdx::from_usize(idx));
+        sign_extend_discr_val(discr.val, discr.ty, self.tcx, POINTER_WIDTH)
+    }
+
+    /// Option-like enum discriminant: extract "has payload" predicate, mapped
+    /// to the payload and empty variants' discriminant VALUES. Returning the
+    /// variant indices instead made an explicit-discriminant enum
+    /// (`#[repr(u8)] enum PF { Val(u8) = 7, Nothing = 2 }`) match neither
+    /// `SwitchInt` arm, so its `otherwise -> unreachable` edge was reachable
+    /// and certified (`explicit_discriminant_dual.rs::safe_pf_tuple`).
     fn translate_option_like_discriminant(
         &mut self,
         place: &Place,
@@ -158,6 +183,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let payload_idx = if v0_fields > 0 { 0 } else { 1 };
         let empty_idx = 1 - payload_idx;
+        let payload_discr = self.variant_discriminant_value(def, payload_idx);
+        let empty_discr = self.variant_discriminant_value(def, empty_idx);
         let sort = enum_expr.sort().clone();
 
         // Part of #4290: Fast-path for literal datatype constructors and
@@ -176,8 +203,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     enum_expr.value(),
                     dt_name,
                     &payload_ctor_name,
-                    payload_idx,
-                    empty_idx,
+                    payload_discr,
+                    empty_discr,
                 ) {
                     debug!(
                         ?place,
@@ -226,23 +253,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         place.local,
                         place.projection.len(),
                     );
-                    let discr = declare_pending_var(discr_name, ptr_sort());
-                    let upper = Expr::bitvec_const(2u64, POINTER_WIDTH);
-                    self.heap_state.pending_updates.push(discr.clone().bvult(upper));
+                    // A booked symbolic discriminant (Rule E) over the two
+                    // variants' discriminant VALUES (was `[0, 2)`).
+                    let discr = Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_DISCRIMINANT,
+                        discr_name,
+                        ptr_sort(),
+                    );
+                    let range = self.enum_discriminant_value_set(*def, &discr);
+                    self.heap_state.pending_updates.push(range);
                     return Some(discr);
                 }
             }
         };
 
-        // Convert Bool to isize: ite(has_payload, payload_idx, empty_idx)
+        // Convert Bool to isize: ite(has_payload, payload value, empty value)
         Some(Expr::ite(
             has_payload,
-            Expr::bitvec_const(payload_idx as u64, POINTER_WIDTH),
-            Expr::bitvec_const(empty_idx as u64, POINTER_WIDTH),
+            Expr::bitvec_const(payload_discr, POINTER_WIDTH),
+            Expr::bitvec_const(empty_discr, POINTER_WIDTH),
         ))
     }
 
-    /// 2-variant enum with both payloads (e.g., Result<T, E>).
+    /// 2-variant enum with both payloads (e.g., Result<T, E>), mapped to the
+    /// variants' discriminant VALUES (`enum TwoP { A(u8) = 5, B(u16) = 9 }`
+    /// switches on 5 and 9, not on 0 and 1).
     fn translate_two_variant_discriminant(
         &mut self,
         place: &Place,
@@ -274,8 +310,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         );
         Some(Expr::ite(
             is_variant_0,
-            Expr::bitvec_const(0u64, POINTER_WIDTH),
-            Expr::bitvec_const(1u64, POINTER_WIDTH),
+            Expr::bitvec_const(self.variant_discriminant_value(def, 0), POINTER_WIDTH),
+            Expr::bitvec_const(self.variant_discriminant_value(def, 1), POINTER_WIDTH),
         ))
     }
 

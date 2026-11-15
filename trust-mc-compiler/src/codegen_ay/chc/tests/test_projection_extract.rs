@@ -38,7 +38,7 @@ fn test_extract_field_projections_from_struct_access() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(_, rvalue) = &stmt.kind {
                     let place = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p),
                         _ => None,
                     };
                     if let Some(place) = place
@@ -95,7 +95,7 @@ fn test_extract_field_projections_from_enum_downcast() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(_, rvalue) = &stmt.kind {
                     let place = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p),
                         _ => None,
                     };
                     if let Some(place) = place
@@ -138,7 +138,7 @@ fn find_downcast_field_place(body: &rustc_public::mir::Body) -> Option<Place> {
                 return None;
             };
             let place = match rvalue {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => place,
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) => place,
                 _ => return None,
             };
             let has_downcast =
@@ -205,7 +205,7 @@ fn test_extract_field_projections_deref_returns_empty() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(_, rvalue) = &stmt.kind {
                     let place = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p),
                         _ => None,
                     };
                     if let Some(place) = place
@@ -256,7 +256,7 @@ fn test_extract_field_projections_nested_struct() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(_, rvalue) = &stmt.kind {
                     let place = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p),
                         _ => None,
                     };
                     if let Some(place) = place {

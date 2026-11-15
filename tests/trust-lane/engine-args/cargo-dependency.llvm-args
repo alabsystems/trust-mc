@@ -1,0 +1,4 @@
+# The `-Cllvm-args` group trust-mc-driver's Trustc route passes to every crate
+# of a cargo build (CARGO_ENCODED_RUSTFLAGS). See standalone.llvm-args.
+--trust-mc-engine-args=pct1:1
+--check-version=@CARGO_PKG_VERSION@

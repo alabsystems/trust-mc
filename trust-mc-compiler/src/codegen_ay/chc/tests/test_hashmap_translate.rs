@@ -55,7 +55,19 @@ fn test_hashmap_insert_pipeline_produces_vc() {
             detected
         );
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashmap_insert", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the map arrays are never read, so
+        // write-only array elimination (85da41dad) removes the insert Store and its transition
+        // rules.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashmap_insert",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         let bb_count = body.blocks.len();
         assert!(
@@ -182,7 +194,19 @@ fn test_hashmap_remove_pipeline() {
             detected
         );
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashmap_remove", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the map arrays are never read, so
+        // write-only array elimination (85da41dad) removes the insert/remove Stores and their
+        // rules.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashmap_remove",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         let bb_count = body.blocks.len();
         assert!(

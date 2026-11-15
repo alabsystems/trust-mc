@@ -1,7 +1,7 @@
 {
   "denominator": 818,
-  "provenance": "fresh public corpus over the included Kani verification suites, 2026-06-15",
-  "row_sha256": "393e71e1f522142a880a86a03f8dfdd1362dd09855c09582f0a1e507fa365a30",
+  "provenance": "frozen public corpus, 2026-06-15; source-oracle corrections, 2026-11-14",
+  "row_sha256": "91e3425e3e1cb4339ced9bc99f5bb24caad671f147697d02c1b95293f5dfdd98",
   "rows": [
     {
       "expected": "PROOF",
@@ -88,7 +88,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
       "harness": "check_invalid_ptr",
       "lane": "tests/expected"
@@ -376,7 +376,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
       "harness": "check_reverse_is_its_own_inverse",
       "lane": "tests/expected"
@@ -430,13 +430,13 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/coroutines/main.rs",
       "harness": "main",
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/coroutines/pin/main.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -466,7 +466,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/cover/cover-unreachable/main.rs",
       "harness": "cover_unreachable",
       "lane": "tests/expected"
@@ -1090,7 +1090,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
       "harness": "modify_harness",
       "lane": "tests/expected"
@@ -1120,7 +1120,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
       "harness": "modify_harness",
       "lane": "tests/expected"
@@ -1156,7 +1156,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
       "harness": "modify_harness",
       "lane": "tests/expected"
@@ -1222,7 +1222,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
       "harness": "check_modify",
       "lane": "tests/expected"
@@ -1336,7 +1336,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/function-contract/mutable-references/mut_ref_ensures_and_modifies.rs",
       "harness": "divide_by_harness",
       "lane": "tests/expected"
@@ -2254,13 +2254,13 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/niche/main.rs",
       "harness": "main",
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/niche2/main.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -2938,7 +2938,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/report/unsupported/reachable/test.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -3034,7 +3034,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/slice-pattern-array/main.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -3046,7 +3046,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/slice_c_str/c_str_unsupported.rs",
       "harness": "check_c_str",
       "lane": "tests/expected"
@@ -3238,7 +3238,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-diverging-variants.rs",
       "harness": "access_padding_unsupported",
       "lane": "tests/expected"
@@ -3328,7 +3328,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/atomic/atomic.rs",
       "harness": "local_atomic_uninit",
       "lane": "tests/expected"
@@ -3496,7 +3496,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_typed_swap_nonoverlapping_safe",
       "lane": "tests/expected"
@@ -3640,7 +3640,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "pointer_union_should_fail",
       "lane": "tests/expected"
@@ -3652,7 +3652,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "transmute_into_union_should_fail",
       "lane": "tests/expected"
@@ -3664,7 +3664,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "transmute_union_should_fail",
       "lane": "tests/expected"
@@ -3676,7 +3676,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "uber_union_should_fail",
       "lane": "tests/expected"
@@ -3688,7 +3688,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "union_as_subfields_should_fail",
       "lane": "tests/expected"
@@ -3802,7 +3802,7 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/char_validity.rs",
       "harness": "check_char_ok",
       "lane": "tests/expected"
@@ -3874,13 +3874,13 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_copy_nonoverlap",
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_copy_nonoverlap_ub",
       "lane": "tests/expected"
@@ -3994,13 +3994,13 @@
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/write_invalid.rs",
       "harness": "write_invalid_bytes_no_ub_with_spurious_cex",
       "lane": "tests/expected"
     },
     {
-      "expected": "CTREX",
+      "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/write_invalid.rs",
       "harness": "write_valid_before_read",
       "lane": "tests/expected"
@@ -4048,7 +4048,7 @@
       "lane": "tests/prusti"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/prusti/Binary_search.rs",
       "harness": "main",
       "lane": "tests/prusti"
@@ -4540,7 +4540,7 @@
       "lane": "tests/slow"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/add.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4564,31 +4564,31 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/arith_assume3.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/div.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/mod.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/mul.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/basic/sub.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4600,7 +4600,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/functions/closure_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4612,7 +4612,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/functions/double_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4624,31 +4624,31 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/generics/generic_function1.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/generics/generic_function2.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/generics/generic_function3.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/generics/generic_function4.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/generics/generic_function5.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4660,7 +4660,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/loops/gauss_sum_nondet_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4672,25 +4672,25 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/loops/iterator_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/overflow/add_overflow.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/overflow/mul_overflow.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/overflow/sub_overflow.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4702,7 +4702,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/recursion/fac_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4714,7 +4714,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/recursion/fib_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4726,7 +4726,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/structures/option_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4738,7 +4738,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/structures/point_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4750,19 +4750,19 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/vector/vec11.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/vector/vec12.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/vector/vec13.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -4774,7 +4774,7 @@
       "lane": "tests/smack"
     },
     {
-      "expected": "PROOF",
+      "expected": "CTREX",
       "file": "tests/smack/vector/vec_resize_fail.rs",
       "harness": "main",
       "lane": "tests/smack"

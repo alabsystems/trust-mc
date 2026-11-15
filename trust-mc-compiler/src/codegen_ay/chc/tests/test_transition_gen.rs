@@ -684,7 +684,8 @@ fn test_drop_box_dyn_d2_restores_heap_state_between_candidates() {
                 ("_dyn_drop_candidate_mem__out".into(), store.clone()),
             );
             chc_ctx.heap_state.drained_store_chain_seeds.insert("candidate_a".into(), store);
-            chc_ctx.heap_state.metadata_arrays_modified = true;
+            chc_ctx.heap_state.obj_valid_modified = true;
+            chc_ctx.heap_state.obj_size_modified = true;
             chc_ctx.heap_state.mirror_base_addrs.insert("candidate_a".into(), addr);
             chc_ctx
                 .heap_state
@@ -700,7 +701,8 @@ fn test_drop_box_dyn_d2_restores_heap_state_between_candidates() {
             assert!(chc_ctx.heap_state.modified_arrays.is_empty());
             assert!(chc_ctx.heap_state.store_chains.is_empty());
             assert!(chc_ctx.heap_state.drained_store_chain_seeds.is_empty());
-            assert!(!chc_ctx.heap_state.metadata_arrays_modified);
+            assert!(!chc_ctx.heap_state.obj_valid_modified);
+            assert!(!chc_ctx.heap_state.obj_size_modified);
             assert!(chc_ctx.heap_state.mirror_base_addrs.is_empty());
             assert!(chc_ctx.heap_state.store_forward_map.is_empty());
 
@@ -901,12 +903,27 @@ fn test_cleanup_drop_inline_assert_emits_error_rule() {
 
             let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
             let cleanup_rel = format!("{fn_name}__bb{}", cleanup_bb.1);
+            // The inlined Drop assert's check need not sit on the cleanup block itself: the
+            // Drop continues into the next block (bb5 -> bb6) and the error_p check rule is
+            // emitted there. Require a check rule reachable from the cleanup block.
+            let mut reachable = std::collections::HashSet::from([cleanup_rel.clone()]);
+            loop {
+                let before = reachable.len();
+                for rule in &vc.rules {
+                    if let Some(rel) = rule.body.relation.as_ref()
+                        && reachable.contains(rel.name.as_str())
+                        && !is_error_head(rule.head.name.as_str())
+                    {
+                        reachable.insert(rule.head.name.to_string());
+                    }
+                }
+                if reachable.len() == before {
+                    break;
+                }
+            }
             let has_cleanup_error = vc.rules.iter().any(|rule| {
-                rule.head.name == "error"
-                    && matches!(
-                        rule.body.relation.as_ref(),
-                        Some(rel) if rel.name == cleanup_rel
-                    )
+                is_error_check_rule(rule)
+                    && rule.body.relation.as_ref().is_some_and(|rel| reachable.contains(rel.name.as_str()))
             });
             assert!(
                 has_cleanup_error,
@@ -1087,7 +1104,7 @@ fn test_dummyresource_cleanup_drop_emits_error_rule() {
             let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
             let cleanup_rel = format!("{fn_name}__bb{cleanup_bb}");
             let has_cleanup_error = vc.rules.iter().any(|rule| {
-                rule.head.name == "error"
+                is_error_check_rule(rule)
                     && matches!(rule.body.relation.as_ref(), Some(rel) if rel.name == cleanup_rel)
             });
             assert!(

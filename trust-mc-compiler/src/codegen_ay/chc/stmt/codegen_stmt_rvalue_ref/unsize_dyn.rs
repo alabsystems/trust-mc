@@ -9,9 +9,12 @@
 //! - `is_custom_dst_unsize`
 //! - `try_translate_dyn_trait_coercion`
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
-use ay_bindings::Expr;
+use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
@@ -39,8 +42,10 @@ fn peel_array_like_inner(
         {
             let variants = adt_def.variants();
             if variants.len() == 1 && variants[0].fields().len() == 1 {
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
-                peel_array_like_inner(tcx, field_ty)
+                match mono_ty::field_ty(&variants[0].fields()[0], &args) {
+                    Some(field_ty) => peel_array_like_inner(tcx, field_ty),
+                    None => ty,
+                }
             } else {
                 ty
             }
@@ -160,18 +165,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             dyn_coercion::extract_concrete_tail_for_dyn(src_inner, target_inner);
         let vtable_src =
             rustc_internal::stable(rustc_internal::internal(self.tcx, concrete_for_vtable));
-        let vtable_id = dyn_coercion::resolve_dyn_target_vtable_id(self, target_inner, vtable_src)?;
-
-        // Part of #3159: Record concrete type's size/align for vtable intrinsic constraining.
-        // When vtable_size/vtable_align is called later, we build an ITE chain
-        // mapping vtable discriminant values to their concrete type metadata.
+        // A `dyn` -> `dyn` unsize has no concrete type: its id is derived from
+        // the source's (`dyn_to_dyn.rs`), from the source local's vtable state
+        // variable or the source datum's own vtable field.
+        let vtable_expr = if let Some(cast) =
+            crate::codegen_ay::chc::dyn_to_dyn::dyn_to_dyn_unsize(self, src_ty, *target_ty)
         {
-            use crate::kani_middle::abi::LayoutOf;
-            let layout = LayoutOf::new(vtable_src);
-            if let (Some(size), Some(align)) = (layout.size_of(), layout.align_of()) {
-                self.vtable_type_metadata.entry(vtable_id).or_insert((size as u64, align as u64));
+            let source = self.host_operand_vtable(operand).or_else(|| {
+                let src_expr = self.translate_operand_with_modified(operand, modified_locals)?;
+                self.extract_embedded_vtable_expr(&src_expr)
+                    .map(crate::codegen_ay::provenance::Val::into_expr)
+            });
+            crate::codegen_ay::chc::dyn_to_dyn::dyn_to_dyn_vtable(self, &cast, source)?
+        } else {
+            let vtable_id =
+                dyn_coercion::resolve_dyn_target_vtable_id(self, target_inner, vtable_src)?;
+
+            // Part of #3159: Record concrete type's size/align for vtable intrinsic constraining.
+            // When vtable_size/vtable_align is called later, we build an ITE chain
+            // mapping vtable discriminant values to their concrete type metadata.
+            {
+                use crate::kani_middle::abi::LayoutOf;
+                let layout = LayoutOf::new(vtable_src);
+                if let (Some(size), Some(align)) = (layout.size_of(), layout.align_of()) {
+                    self.vtable_type_metadata
+                        .entry(vtable_id)
+                        .or_insert((size as u64, align as u64));
+                }
             }
-        }
+            Expr::bitvec_const(vtable_id as u128, POINTER_WIDTH)
+        };
 
         // Part of #4225: Alias heap memory from concrete type key to unsized type key.
         {
@@ -196,12 +219,57 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         POINTER_WIDTH,
                         SignExtension::ZeroExtend,
                     );
-                    if let Some(loaded_val) = self.load_from_type_array(
-                        alias_ptr.clone(),
-                        &src_pointee_key,
-                        src_elem_sort.clone(),
-                        None,
-                    ) {
+                    // The alias store below republishes the object's value as
+                    // its CONCRETE type array holds it. A store of a field
+                    // (another sort) reaches only the field's type array, the
+                    // cells the dyn view reads, so after one the concrete
+                    // value is stale and republishing it overwrote the newer
+                    // field: `d.a = 255; let o: Box<dyn Tv> = d;` read the
+                    // constructor's `a` back through `o` and `assert!(o.get()
+                    // < 255)` was proved (walker_dyn_heap_write_dual.rs,
+                    // bug_write_then_coerce_*). `heap/heap_unsize_alias.rs`
+                    // decides which view is republished and when the
+                    // coercion fails closed.
+                    let alias_obj =
+                        Self::try_extract_obj_id(&alias_ptr).or_else(|| match operand {
+                            Operand::Copy(place) | Operand::Move(place)
+                                if place.projection.is_empty() =>
+                            {
+                                self.known_alloc_ids.get(&place.local).copied()
+                            }
+                            _ => None,
+                        });
+                    let republish_concrete =
+                        alias_obj.is_none_or(|obj_id| self.unsize_alias_may_republish(obj_id));
+                    let source_val = if republish_concrete {
+                        self.load_from_type_array(
+                            alias_ptr.clone(),
+                            &src_pointee_key,
+                            src_elem_sort.clone(),
+                            None,
+                        )
+                    } else {
+                        // The field view is current: republish ITS value,
+                        // which leaves the cells the dyn view reads as they
+                        // are.
+                        debug!(
+                            ?alias_obj,
+                            src_key = %src_pointee_key,
+                            "CHC: Unsize dyn coercion — concrete view stale after a field store; \
+                             republishing the field view"
+                        );
+                        // A field the walked impl loads whole, from an array
+                        // no leaf store writes, cannot see the republished
+                        // leaves (`payload_field_read_as_a_whole`).
+                        self.fail_closed_on_field_read_as_a_whole(src_inner);
+                        self.load_struct_from_field_view(&alias_ptr, src_inner)
+                    };
+                    // The alias store copies the object's value from one of its
+                    // memory views into another: the image of a static it
+                    // reaches, never its state (`decl::static_path`,
+                    // `StaticImageWrites`).
+                    self.begin_static_image_writer();
+                    if let Some(loaded_val) = source_val {
                         // UnsizedCoercion FP fix: never let the alias store
                         // silently narrow a whole-struct value into a narrower
                         // target element sort. Previously a BV16 flattened
@@ -244,12 +312,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             let mut extra = Vec::new();
                             let prev_suppress = self.suppress_heap_store_checks;
                             self.suppress_heap_store_checks = true;
-                            let decomposed = self.try_decompose_struct_store(
-                                &alias_ptr,
-                                &loaded_val,
-                                src_inner,
-                                &mut extra,
-                            );
+                            let decomposed = self.with_coherent_object_stores(|ctx| {
+                                ctx.try_decompose_struct_store(
+                                    &alias_ptr,
+                                    &loaded_val,
+                                    src_inner,
+                                    &mut extra,
+                                )
+                            });
                             self.suppress_heap_store_checks = prev_suppress;
                             if decomposed {
                                 self.heap_state.pending_updates.extend(extra);
@@ -279,20 +349,50 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                         "CHC: Unsize dyn coercion — zero-sized source, nothing to scatter"
                                     );
                                 } else {
-                                // Decompose declined (unknown offsets/params/
-                                // width mismatch): skip the alias store
-                                // entirely. Unconstrained target-key cells are
-                                // a sound over-approximation — they can
-                                // fabricate a spurious CTREX but can never
-                                // discharge an assert into a false Safe.
-                                self.record_sound_fallback_reason("unsize_alias_width_mismatch");
-                                debug!(
-                                    src_key = %src_pointee_key,
-                                    tgt_key = %tgt_pointee_key,
-                                    "CHC: Unsize dyn coercion — struct decompose declined, skipping alias store (sound over-approximation)"
-                                );
+                                    // Decompose declined (unknown offsets/params/
+                                    // width mismatch): skip the alias store
+                                    // entirely. Unconstrained target-key cells are
+                                    // a sound over-approximation — they can
+                                    // fabricate a spurious CTREX but can never
+                                    // discharge an assert into a false Safe.
+                                    self.record_sound_fallback_reason(
+                                        "unsize_alias_width_mismatch",
+                                    );
+                                    debug!(
+                                        src_key = %src_pointee_key,
+                                        tgt_key = %tgt_pointee_key,
+                                        "CHC: Unsize dyn coercion — struct decompose declined, skipping alias store (sound over-approximation)"
+                                    );
                                 }
                             }
+                        } else if matches!(
+                            src_inner.kind(),
+                            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))
+                        ) && matches!(
+                            target_inner.kind(),
+                            TyKind::RigidTy(RigidTy::Dynamic(..))
+                        ) && tgt_elem_sort == Sort::bitvec(8)
+                            && alias_obj.is_some_and(|obj| {
+                                self.defer_reference_byte_view(obj, &src_pointee_key)
+                            })
+                        {
+                            // A reference datum is a logical split address, not
+                            // its native pointer bytes. Keep the concrete typed
+                            // cell; do not fabricate a byte mirror by truncation
+                            // or bit extraction. For this known heap allocation,
+                            // the view ledger judges every USED byte-view read
+                            // against the actual typed writes, including reads
+                            // through escaped/symbolic addresses and reads in
+                            // blocks encoded before their preceding store. An
+                            // unread dyn byte alias needs no cells; a used one
+                            // remains explicitly unbacked and cannot certify a
+                            // counterexample. Globals/unknown objects retain the
+                            // immediate refusal below, outside that ledger.
+                            debug!(
+                                ?alias_obj,
+                                src_key = %src_pointee_key,
+                                "CHC: Unsize dyn reference payload — defer unavailable physical byte view to heap read ledger"
+                            );
                         } else {
                             // Any other sort mismatch: skip the alias store
                             // (sound over-approximation) rather than emit a
@@ -307,6 +407,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             );
                         }
                     }
+                    self.end_static_image_writer();
                 }
             }
         }
@@ -335,8 +436,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             s.push_str("_mk");
             s
         };
-        let vtable_expr = Expr::bitvec_const(vtable_id as u128, POINTER_WIDTH);
-
         // Part of #3159: Ensure the Dyn_Trait datatype is declared in the SMT2
         // output. Without this, the solver sees Dyn_Trait_mk as an unknown
         // constant and fails. All other datatype constructor codegen paths
@@ -346,7 +445,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         debug!(
             ?src_ty,
             ?target_ty,
-            vtable_id,
+            %vtable_expr,
             "CHC: Unsize coercion to dyn Trait with vtable ID (#3159)"
         );
 

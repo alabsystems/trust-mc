@@ -59,7 +59,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.projection.is_empty()
                     {
                         match rvalue {
-                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                                 if place.projection.is_empty()
                                     || (place.projection.len() == 1
                                         && matches!(
@@ -282,7 +282,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
                             return Some(place.local);
                         }
-                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                             if place.projection.is_empty() =>
                         {
                             return Some(place.local);

@@ -682,12 +682,15 @@ fn test_kani_hook_is_allocated_ptr_level_queries_obj_valid() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_is_allocated");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(
+        // Pre-pass VC: obj_valid is seeded const_array(true) at entry and never stored in this
+        // probe, so const folding (f49f19459, uniform-default select fold) rewrites the
+        // hook's select(obj_valid, id) to true in the translated VC (equisatisfiable).
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_is_allocated",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Ptr, ..ChcConfig::default() },
-        );
+        ));
         assert_vc_structure(&vc, "probe_is_allocated", body.blocks.len());
 
         // At Ptr level, the constraint should reference obj_valid (via select),
@@ -1083,10 +1086,19 @@ fn test_kani_hook_unsupported_check_emits_error_rule() {
         });
         assert!(has_hook, "MIR should contain UnsupportedCheckHook call");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_unsupported", ChcConfig::default());
+        let (mut vc, _, diagnostics) =
+            ChcCtx::new(ctx.tcx, &body, "probe_unsupported", ChcConfig::default())
+                .translate_with_diagnostics();
         assert!(
             vc.rules.iter().any(|r| r.head.name == "error"),
             "UnsupportedCheck hook should emit at least one error rule"
+        );
+        assert_eq!(diagnostics.sound_havoc_drop.get(), 1);
+        assert_eq!(vc.accounted_approximations, 0);
+        vc.finalize_approximation_identity(diagnostics.sound_havoc_drop.get());
+        assert!(
+            !vc.approximation_identity_complete,
+            "a forced unsupported check has no identity that can certify Genuine"
         );
     });
 }
@@ -1122,11 +1134,15 @@ fn test_kani_hook_unsupported_check_prove_safety_only_still_emits_error_rule() {
         });
         assert!(has_hook, "MIR should contain UnsupportedCheckHook call");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_unsupported_prove_safety_only", cfg);
+        let (vc, _, diagnostics) =
+            ChcCtx::new(ctx.tcx, &body, "probe_unsupported_prove_safety_only", cfg)
+                .translate_with_diagnostics();
         assert!(
             vc.rules.iter().any(|r| r.head.name == "error"),
             "UnsupportedCheck must remain fail-closed in prove_safety_only mode"
         );
+        assert_eq!(diagnostics.sound_havoc_drop.get(), 1);
+        assert_eq!(vc.accounted_approximations, 0);
     });
 }
 

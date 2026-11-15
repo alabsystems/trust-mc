@@ -6,6 +6,7 @@
 //!
 //! Extracted from `stubs_util_intrinsics.rs` — Part of #4206.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort, SortInner};
@@ -13,10 +14,9 @@ use rustc_public::mir::{Operand, Place};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
-use super::codegen_expr_heap::obj_valid_out;
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Translate pointer/NonZero helper calls to direct expressions.
@@ -39,8 +39,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Some(ptr) => Self::coerce_to_pointer(ptr),
                 None => {
                     warn!(?stub, "CHC: ptr::is_null missing operand; using symbolic pointer");
-                    self.record_sound_fallback_reason("ptr_is_null_missing_operand");
-                    declare_pending_var(
+                    let booked = self.record_sound_fallback_reason("ptr_is_null_missing_operand");
+                    Havoc::booked(
+                        booked,
                         chc_fresh_name("__ptr_is_null"),
                         Sort::bitvec(POINTER_WIDTH),
                     )
@@ -54,10 +55,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // obj_valid so dereference checks catch null pointer use.
             if !self.int_lift {
                 if let Some((obj_id, _offset)) = self.split_pointer(&result) {
-                    let current_valid = self.current_obj_valid_array();
-                    let invalidated = current_valid.store(obj_id, Expr::bool_const(false));
-                    self.heap_state.pending_updates.push(obj_valid_out().eq(invalidated));
-                    self.mark_heap_metadata_modified();
+                    self.invalidate_int_to_ptr_object(obj_id, None);
                     debug!("#3361: invalidated obj_valid for PtrNull");
                 }
             }
@@ -70,16 +68,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Handled before the `first_arg` closure to avoid borrow conflicts with
         // self.split_pointer. PtrAddr (which extracts an address from an existing
         // pointer that has provenance) is handled below without invalidation.
+        //
+        // The pointer is the identity whose address the integer is
+        // (`int_to_ptr_value_of_operand`), as the transmute this stub stands for
+        // gives on the host path (cast_dispatch.rs): in Kani's address layout
+        // (heap/stack_address.rs) an integer is `region << 48 | offset`, not an
+        // identity term, so the integer taken as the identity named the wrong
+        // object (`without_provenance(5 << 32)` named stack slot 5, not object
+        // 0 at offset `5 << 32`; found merging main dbfe268fc into
+        // fix/chc-lost-writes).
         if matches!(stub, StubKind::WithoutProvenance | StubKind::WithoutProvenanceMut) {
             let arg_expr =
                 args.first().and_then(|a| self.translate_operand_with_modified(a, modified_locals));
-            let result = Self::coerce_to_pointer(arg_expr?);
+            let result = self.int_to_ptr_value_of_operand(Self::coerce_to_pointer(arg_expr?));
             if !self.int_lift {
                 if let Some((obj_id, _offset)) = self.split_pointer(&result) {
-                    let current_valid = self.current_obj_valid_array();
-                    let invalidated = current_valid.store(obj_id, Expr::bool_const(false));
-                    self.heap_state.pending_updates.push(obj_valid_out().eq(invalidated));
-                    self.mark_heap_metadata_modified();
+                    self.invalidate_int_to_ptr_object(obj_id, args.first());
                     debug!("#3361: invalidated obj_valid for WithoutProvenance stub");
                 }
             }
@@ -111,20 +115,49 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => value,
             });
         }
-        // PtrAddr: extract address from existing pointer (has provenance, no invalidation)
+        // PtrAddr: the pointer's ADDRESS (it keeps its provenance, so no
+        // invalidation). A pointer term is its (object, offset) IDENTITY, and
+        // `p as usize` reads the address from it (heap/stack_address.rs); `addr`
+        // returned the identity instead, so `p.addr() == p as usize` FAILED
+        // certified Genuine (review probe t_ptr.rs `ptr_addr_method_safe`).
         if stub == StubKind::PtrAddr {
-            return Some(Self::coerce_to_pointer(first_arg()?));
+            let ptr = Self::coerce_to_pointer(first_arg()?);
+            return Some(self.ptr_to_int_value(ptr));
         }
         // PtrWithAddr: with_addr(self, addr) -> pointer with new address (Part of #3492)
-        // with_addr computes self.wrapping_byte_offset((addr as isize).wrapping_sub(self.addr() as isize))
-        // which simplifies to just `addr` (self + (addr - self) = addr).
-        // Returning the second arg directly avoids the Mem-level operand resolution
-        // failure that occurs when with_addr is inlined and intermediate isize values
-        // land in typed memory arrays.
+        // with_addr is self.wrapping_byte_offset((addr as isize).wrapping_sub(self.addr()
+        // as isize)): it keeps SELF's provenance and moves only its address. The result
+        // is self's identity stepped by `addr - self.addr()` (a wrapping byte offset,
+        // `step_wrapping_pointer`), so a deref is checked against self's object.
+        // Reading the pointer at `addr` instead — whichever tracked allocation holds
+        // it (`int_to_ptr_value`), or the address itself — named another object for
+        // `p.with_addr(b.addr())` and let `p.with_addr(p.addr() + 4)` on a `[u8; 4]`
+        // land in bounds of a neighbour: both derefs, out of `p`'s object in Kani, were
+        // clean proofs (third review of fix/chc-false-certificates, 2026-09-27:
+        // `ad_with_addr_other_obj_bug`, `ad_with_addr_past_end_bug`).
         if stub == StubKind::PtrWithAddr {
+            let ptr = Self::coerce_to_pointer(first_arg()?);
+            // `p.with_addr(p.addr() + k)` (and the inlined `p.map_addr(|a| a + k)`)
+            // is `p` moved by `k` bytes, whatever the base address: stepping by
+            // the constant keeps the solver off the base arithmetic.
+            if let (Some(pointer), Some(address)) = (args.first(), args.get(1))
+                && let Some(k) = self.address_is_pointer_addr_plus(address, pointer)
+            {
+                let k = Expr::bitvec_const(k as u128 & u128::from(u64::MAX), POINTER_WIDTH);
+                let base_t64 = self.wrapping_operand_t64(pointer, &ptr, modified_locals);
+                return Some(self.step_wrapping_address_from(ptr, k, false, base_t64));
+            }
+            let keeps_region = matches!((args.first(), args.get(1)), (Some(pointer), Some(address))
+                if self.address_keeps_pointer_region(address, pointer));
             let addr_arg =
                 args.get(1).and_then(|a| self.translate_operand_with_modified(a, modified_locals));
-            return Some(Self::coerce_to_pointer(addr_arg?));
+            let addr = Self::coerce_to_pointer(addr_arg?);
+            // `self.wrapping_byte_offset(addr - self.addr())`: self's object at
+            // `addr`, far when `addr` is outside self's region; a dereference is
+            // then outside self's object and the pointer equals none of another
+            // object's (heap/stack_address.rs `with_addr_value`).
+            let base_not_far = args.first().is_some_and(|pointer| self.operand_cannot_be_far(pointer));
+            return Some(self.with_addr_value(ptr, addr, keeps_region, base_not_far));
         }
 
         None
@@ -151,6 +184,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;

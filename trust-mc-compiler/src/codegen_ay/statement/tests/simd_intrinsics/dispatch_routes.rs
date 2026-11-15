@@ -19,6 +19,8 @@ fn test_dispatch_simd_routes_bitwise_intrinsic() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.dispatch_simd(
             "core::intrinsics::simd_and",
             &[local_operand(1), local_operand(2)],
@@ -29,9 +31,9 @@ fn test_dispatch_simd_routes_bitwise_intrinsic() {
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_and dispatch should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
 
-        let emitted = latest_constraint_text(&codegen);
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvand"), "simd_and dispatch should emit bvand, got {emitted}");
     });
 }
@@ -140,6 +142,8 @@ fn test_dispatch_simd_routes_shuffle_intrinsic() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.dispatch_simd(
             "core::intrinsics::simd_shuffle8",
             &[local_operand(1), local_operand(2), local_operand(3)],
@@ -150,9 +154,9 @@ fn test_dispatch_simd_routes_shuffle_intrinsic() {
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_shuffle dispatch should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
 
-        let emitted = latest_constraint_text(&codegen);
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("ite"),
             "simd_shuffle dispatch should emit indexed ITE selection, got {emitted}"
@@ -202,6 +206,8 @@ fn test_dispatch_simd_routes_cast_intrinsic() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.dispatch_simd(
             "core::intrinsics::simd_cast",
             &[local_operand(1)],
@@ -212,9 +218,9 @@ fn test_dispatch_simd_routes_cast_intrinsic() {
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_cast dispatch should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U16x4"));
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U16x4"));
 
-        let emitted = latest_constraint_text(&codegen);
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("zero_extend"),
             "simd_cast widen should emit zero_extend operations, got {emitted}"

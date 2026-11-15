@@ -192,19 +192,21 @@ fn test_packed_row_same_arg_call_identity_solver_produces_unsat() {
     assert_probe_unsat("probe_packed_row_same_arg_call_identity");
 }
 
-/// Known false proof: same-arg call inlining creates independent symbolic copies
-/// instead of constrained-equal copies. The deliberate false assertion gets unsat
-/// because the inline body sees `lhs` and `rhs` as unrelated values.
-/// Demoted to structural-only check per W3:4311 precedent (#4028 Group E).
+/// Was a known false proof, pinned here as `unsat` (W3:4311, #4028 Group E):
+/// the walked `assert_rows_distinct(row, row)` compares a term with itself, the
+/// assertion's discriminant folds onto its panic arm, and the walker bailed
+/// ("all branches dead"), dropping the certain failure with the bail. Since
+/// fix/chc-walker-fail-closed (Mechanism D commit) a fold onto a diverging arm
+/// records the failure, so the false assertion is reachable, as it must be.
 #[test]
 fn test_packed_row_same_arg_call_false_assert_is_not_vacuously_unsat() {
-    assert_probe_unsat("probe_packed_row_same_arg_call_false_assert");
+    assert_probe_not_unsat("probe_packed_row_same_arg_call_false_assert");
 }
 
-/// Known false proof: same pattern as above for bits-only comparison.
+/// The same for the bits-only comparison.
 #[test]
 fn test_packed_row_same_arg_call_bits_false_assert_is_not_vacuously_unsat() {
-    assert_probe_unsat("probe_packed_row_same_arg_call_bits_false_assert");
+    assert_probe_not_unsat("probe_packed_row_same_arg_call_bits_false_assert");
 }
 
 #[test]

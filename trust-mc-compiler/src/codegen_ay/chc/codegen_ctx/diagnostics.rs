@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(in crate::codegen_ay) use super::diagnostics_global::{
     GLOBAL_COUNTERS, GlobalDiagnosticCounters,
 };
+#[cfg(test)]
+pub(in crate::codegen_ay) use super::diagnostics_global::{
+    compilation_counters, enter_compilation_counters,
+};
 
 /// Per-function diagnostic counters for CHC encoding quality.
 ///
@@ -201,6 +205,50 @@ pub(in crate::codegen_ay) struct ChcDiagnostics {
     /// Maps category tag → count for the top-3 fallback clusters.
     /// Uncategorized sites still go through `place_translation_drop` alone.
     pub(in crate::codegen_ay::chc) sound_fallback_detail: BTreeMap<&'static str, usize>,
+}
+
+/// Rule E bookings through counters a verdict reads (`fresh_vars::Booked`).
+/// Only the counters `generate_metadata` plumbs into a verdict, or whose SMT
+/// marker the driver acts on, can stand as a booking; `aggregate_encoding_gap`
+/// (read by no verdict) has no booking method on purpose.
+impl ChcDiagnostics {
+    /// Unresolved pointer metadata, havocked (Step-C fail-closes a Success).
+    pub(in crate::codegen_ay::chc) fn book_ptr_metadata_unconstrained(&self) -> super::Booked {
+        self.ptr_metadata_unconstrained.inc();
+        super::Booked::recorded()
+    }
+
+    /// A stub approximation (Step-C fail-closes a Success).
+    pub(in crate::codegen_ay::chc) fn book_stub_approximation(&self) -> super::Booked {
+        self.stub_approximation.inc();
+        super::Booked::recorded()
+    }
+
+    /// A dropped store transition (a demoting category).
+    pub(in crate::codegen_ay::chc) fn book_store_dropped(&self) -> super::Booked {
+        self.store_dropped_transition.inc();
+        super::Booked::recorded()
+    }
+
+    /// Recursive inlining past the unwind budget (the
+    /// `RECURSIVE_UNWIND_ASSERTION` marker the driver turns into a failure).
+    pub(in crate::codegen_ay::chc) fn book_recursive_unwind_exhausted(&self) -> super::Booked {
+        self.recursive_unwind_exhausted.inc();
+        super::Booked::recorded()
+    }
+
+    /// An audited sound havoc booked at a site that holds no context, only
+    /// these counters: unattributed (no identity), so the harness's
+    /// approximations are incomplete and none of its counterexamples is
+    /// certified Genuine.
+    pub(in crate::codegen_ay::chc) fn book_sound_havoc_unattributed(
+        &self,
+        reason: super::SoundHavocReason,
+    ) -> super::Booked {
+        let _ = reason;
+        self.sound_havoc_drop.inc();
+        super::Booked::recorded()
+    }
 }
 
 impl Default for ChcDiagnostics {

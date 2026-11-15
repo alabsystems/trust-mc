@@ -54,6 +54,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             AggregateKind::Tuple => self.codegen_tuple_aggregate(operands),
             AggregateKind::Array(elem_ty) => self.codegen_array_aggregate(*elem_ty, operands),
             AggregateKind::Adt(def, variant_idx, args, _user_ty_annot, _active_field) => {
+                let ty = rustc_public::ty::Ty::from_rigid_kind(rustc_public::ty::RigidTy::Adt(
+                    *def,
+                    args.clone(),
+                ));
+                if self.is_native_box_target(ty) {
+                    self.ctx.unsupported_with_fallback("BoxConstructionAggregate",
+                        "native Box construction outside the checked constructor paths has no tracked ownership/allocator validity");
+                }
                 self.codegen_adt_aggregate(*def, *variant_idx, args.clone(), operands)
             }
             AggregateKind::Closure(def, args) => {

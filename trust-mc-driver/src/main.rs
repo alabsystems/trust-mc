@@ -38,6 +38,7 @@ use trust_mc_driver as _;
 mod args;
 mod args_toml;
 mod autoharness;
+mod ay_binary;
 #[cfg(feature = "ay-direct")]
 mod ay_direct;
 mod ay_parse;
@@ -49,9 +50,11 @@ mod call_cargo;
 mod call_single_file;
 #[cfg(feature = "ay-chc-native")]
 mod chc_auto_hints;
+mod chc_claim_policy;
 mod concrete_playback;
 mod coverage;
 mod ctrex_classify;
+mod ctrex_havoc;
 #[cfg(test)]
 mod ctrex_classify_tests;
 mod deadline;
@@ -59,6 +62,7 @@ mod demotion;
 mod harness_runner;
 mod list;
 mod loop_two_lane;
+mod memory_limit;
 mod metadata;
 mod project;
 mod proof_summary;
@@ -83,6 +87,7 @@ mod unsoundness_extract_tests;
 mod util;
 mod verification_provenance;
 mod verification_result;
+mod stage_timing;
 mod version;
 mod wall_clock_watchdog;
 
@@ -90,6 +95,8 @@ mod wall_clock_watchdog;
 /// The driver can be invoked via `cargo trust-mc` and `trust-mc` commands, which determines what kind of
 /// project should be verified. Legacy `cargo kani`/`kani` invocations are also supported.
 fn main() -> ExitCode {
+    // First, so `[AY:STAGE_MS:compile:…]` measures the whole pre-solve phase.
+    crate::stage_timing::mark_process_start();
     // Reset SIGPIPE to default behavior to avoid panic when piping to head/tail (#663)
     // This allows graceful exit when the consumer closes stdout early.
     #[cfg(unix)]
@@ -108,12 +115,17 @@ fn main() -> ExitCode {
 
     // Activate ay's process-wide RSS memory guard. Without this, the in-process
     // CHC solver (AdaptivePortfolio with 12 parallel engines) has no memory bound
-    // and concurrent trust-mc-driver processes can OOM the system.
+    // and concurrent trust-mc-driver processes can OOM the system. ay's default
+    // (phys / 2) is sized for ONE driver; `TRUST_MC_JOBS` and
+    // `TRUST_MC_AY_MEMORY_LIMIT_MB` share or lower it — see `memory_limit`.
     #[cfg(all(feature = "ay-chc-native", feature = "ay-memory-limit"))]
     {
-        let limit = ay_sys::default_memory_limit();
-        if limit > 0 {
-            ay_sys::set_process_memory_limit(limit);
+        let resolved = memory_limit::resolve_from_env();
+        if resolved.bytes > 0 {
+            ay_sys::set_process_memory_limit(resolved.bytes);
+        }
+        if let Some(note) = resolved.stderr_note() {
+            eprintln!("{note}");
         }
     }
 
@@ -152,6 +164,9 @@ fn main() -> ExitCode {
         // We should consider creating a standard for error reporting.
         debug!(?error, "main_failure");
         util::error(&format_args!("{error:#}"));
+        // A compile the wall-clock budget cut short is a no-verdict outcome,
+        // and every no-verdict outcome carries exactly one typed reason.
+        wall_clock_watchdog::report_compile_timeout(&error);
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -746,16 +761,19 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
     if !session.args.common_args.quiet {
         println!("[AY:CODEGEN_COMPLETE:harnesses={}]", harnesses.len());
     }
+    stage_timing::record_elapsed("compile", stage_timing::since_process_start(), "codegen-complete");
 
-    // The driver budgets --harness-timeout per harness, so the process
-    // budget carries one extra harness-timeout per extra harness (mirrors
-    // the outer runners' per-extra-harness scaling — see
-    // wall_clock_watchdog::extend_for_extra_harnesses). P5.2: standalone
-    // projects already armed this PRE-codegen from a source scan
-    // (project.rs — codegen cost is per-harness too); the call here is an
-    // idempotent top-up from the authoritative metadata count, covering
-    // scan undercounts and cargo/std projects.
-    wall_clock_watchdog::extend_for_extra_harnesses(
+    // Codegen is done: restart the watchdog clock so the solve phase gets
+    // the budget `--harness-timeout` describes (5x + grace, plus one raw
+    // timeout per extra harness — the outer runners' shape) instead of what
+    // compilation left of it. Capped at the compile allowance so the process
+    // still ends before the outer SIGKILL; see
+    // wall_clock_watchdog::rearm_after_codegen. The count is the
+    // authoritative post-codegen one and replaces the pre-codegen scan
+    // credit (project.rs armed that so a slow multi-harness codegen was not
+    // hard-killed inside a single-harness budget). From here on a watchdog
+    // fire is labelled DriverTimeout rather than CompileTimeout.
+    wall_clock_watchdog::rearm_after_codegen(
         session.args.harness_timeout.map(std::time::Duration::from),
         harnesses.len(),
     );

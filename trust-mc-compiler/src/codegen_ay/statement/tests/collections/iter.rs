@@ -59,6 +59,7 @@ fn test_codegen_iter_stub_fold_empty_args() {
             &dest,
             Some(1),
             "core::iter::Iterator::fold",
+            None,
         );
         assert_eq!(result, Some(1));
     });
@@ -83,6 +84,7 @@ fn test_codegen_iter_stub_sum_empty_args() {
             &dest,
             Some(2),
             "core::iter::Iterator::sum",
+            None,
         );
         assert_eq!(result, Some(2));
     });
@@ -139,7 +141,7 @@ fn test_codegen_iter_stub_fold_exhausted_iter_uses_init_branch() {
                 .iter()
                 .flat_map(|bb| bb.statements.iter())
                 .find_map(|stmt| {
-                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_))) =
+                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_), ..)) =
                         &stmt.kind
                     {
                         let expr = codegen.codegen_operand(op)?;
@@ -158,6 +160,7 @@ fn test_codegen_iter_stub_fold_exhausted_iter_uses_init_branch() {
                 &dest,
                 Some(9),
                 "core::iter::Iterator::fold",
+                None,
             );
 
             assert_eq!(result, Some(9));
@@ -193,13 +196,20 @@ fn test_codegen_iter_stub_fold_exhausted_iter_uses_init_branch() {
     );
 }
 
-/// Test IterSum preserves numeric zero on exhausted iterator.
-/// iter.rs: IterSum branch — ITE(non_empty, symbolic, zero).
+/// An IterSum the stub cannot classify gets no empty-sum identity.
+///
+/// The identity of `Sum::sum` over no items is the impl's: `0` for std's
+/// integers, `-0.0` for its floats, anything at all for a user impl. This
+/// probe's body has no `Iterator::sum` call writing the destination, so
+/// `classify_iter_sum` cannot read the impl (`SumSummand::Unknown`), and the
+/// exhausted iterator's sum must be the havoc rather than a guessed `0`
+/// (AY alignment review round 2: a guessed identity is how a user `Sum` and a
+/// float sum were mis-encoded). The identity itself is pinned by
+/// `iter_sum_summand`'s tests and the `iter_sum` end-to-end tests.
 #[test]
-fn test_codegen_iter_stub_sum_exhausted_iter_uses_zero_branch() {
+fn test_codegen_iter_stub_sum_unclassified_call_has_no_identity() {
     use crate::codegen_ay::stubs::StubKind;
     use ay_bindings::ExprValue;
-    use num_bigint::BigInt;
 
     with_test_ay_ctx_for_source(COLLECTIONS_PROBE_SOURCE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "probe_u32");
@@ -239,6 +249,7 @@ fn test_codegen_iter_stub_sum_exhausted_iter_uses_zero_branch() {
             &dest,
             Some(10),
             "core::iter::Iterator::sum",
+            None,
         );
 
         assert_eq!(result, Some(10));
@@ -253,24 +264,11 @@ fn test_codegen_iter_stub_sum_exhausted_iter_uses_zero_branch() {
             other => panic!("expected Eq assignment constraint, got {other:?}"),
         };
 
-        match rhs.value() {
-            ExprValue::Ite { else_expr, .. } => {
-                assert!(
-                    matches!(
-                        else_expr.value(),
-                        ExprValue::BitVecConst { value, width }
-                            if *value == BigInt::from(0u32) && *width == 32
-                    ),
-                    "IterSum exhausted branch should use zero, got {:?}",
-                    else_expr.value()
-                );
-            }
-            ExprValue::BitVecConst { value, width } => {
-                assert_eq!(value, &BigInt::from(0u32), "expected sum empty identity result");
-                assert_eq!(*width, 32, "expected sum identity width");
-            }
-            other => panic!("expected ITE/zero constant for IterSum, got {other:?}"),
-        }
+        assert!(
+            !matches!(rhs.value(), ExprValue::Ite { .. } | ExprValue::BitVecConst { .. }),
+            "an unclassified IterSum must be a plain havoc, got {:?}",
+            rhs.value()
+        );
     });
 }
 
@@ -293,6 +291,7 @@ fn test_codegen_iter_stub_map_next_empty_args() {
             &dest,
             Some(3),
             "core::iter::adapters::map::Map::next",
+            None,
         );
         // MapNext with empty args hits warn path, returns target directly
         assert_eq!(result, Some(3));
@@ -318,6 +317,7 @@ fn test_codegen_iter_stub_filter_next_empty_args() {
             &dest,
             Some(4),
             "core::iter::adapters::filter::Filter::next",
+            None,
         );
         // FilterNext with empty args hits warn path, returns target directly
         assert_eq!(result, Some(4));
@@ -363,6 +363,7 @@ fn test_codegen_iter_stub_map_next_with_seeded_iter() {
             &dest,
             Some(5),
             "core::iter::adapters::map::Map::next",
+            None,
         );
 
         assert_eq!(result, Some(5));
@@ -437,6 +438,7 @@ fn test_codegen_iter_stub_filter_next_with_seeded_iter() {
             &dest,
             Some(6),
             "core::iter::adapters::filter::Filter::next",
+            None,
         );
 
         assert_eq!(result, Some(6));
@@ -492,6 +494,7 @@ fn test_codegen_iter_stub_map_creates_wrapper() {
             &dest,
             Some(7),
             "core::iter::Iterator::map",
+            None,
         );
         assert_eq!(result, Some(7));
     });
@@ -515,6 +518,7 @@ fn test_codegen_iter_stub_map_empty_args() {
             &dest,
             Some(8),
             "core::iter::Iterator::map",
+            None,
         );
         // IterMap with empty args hits warn path, returns target
         assert_eq!(result, Some(8));
@@ -539,6 +543,7 @@ fn test_codegen_iter_stub_filter_empty_args() {
             &dest,
             Some(9),
             "core::iter::Iterator::filter",
+            None,
         );
         // IterFilter with empty args hits warn path, returns target
         assert_eq!(result, Some(9));
@@ -588,6 +593,7 @@ fn test_bmc_into_iter_next_skip_path_non_datatype() {
             &dest,
             Some(1),
             "alloc::vec::IntoIter::next",
+            None,
         );
 
         let skip_after = get_bmc_iterator_unsound_skip_count();
@@ -633,6 +639,7 @@ fn test_bmc_hashmap_iter_next_skip_path_non_datatype() {
             &dest,
             Some(2),
             "std::collections::hash_map::IntoIter::next",
+            None,
         );
 
         let skip_after = get_bmc_iterator_unsound_skip_count();
@@ -676,6 +683,7 @@ fn test_bmc_set_iter_next_skip_path_non_datatype() {
             &dest,
             Some(3),
             "alloc::collections::btree::set::IntoIter::next",
+            None,
         );
 
         let skip_after = get_bmc_iterator_unsound_skip_count();
@@ -1358,7 +1366,7 @@ fn test_hashmap_iter_field_select_extracts_field() {
             &ctor,
             vec![
                 Expr::var("data", Sort::array(Sort::bitvec(64), Sort::bitvec(32))),
-                Expr::const_array(Sort::bool(), Expr::bool_const(true)),
+                Expr::const_array(Sort::bitvec(64), Expr::bool_const(true)), // index = key sort
                 Expr::var("keys", Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(64))),
                 Expr::bitvec_const(0u64, POINTER_WIDTH),
                 Expr::bitvec_const(3u64, POINTER_WIDTH),

@@ -72,6 +72,10 @@ fn resolve_iter_local(chc_ctx: &ChcCtx<'_, '_>, args: &[Operand]) -> usize {
         Operand::Constant(_) => {
             unreachable!("HashMapIterNext first arg should be Copy/Move place, not constant")
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => {
+            unreachable!("HashMapIterNext first arg should be Copy/Move place, not runtime checks")
+        }
     }
 }
 
@@ -117,7 +121,8 @@ fn test_codegen_call_hashmap_iter_next_updates_iter_and_destination_outputs() {
         let rule = chc_ctx.vc.rules.last().expect("HashMapIterNext should emit one rule");
 
         let iter_head_arg =
-            rule.head.args.get(iter_vec_idx).expect("iter local slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, iter_vec_idx)
+                .expect("iter local slot should exist in rule head");
         assert!(
             is_var_named(iter_head_arg, &iter_out_name),
             "iterator slot should route through output var {iter_out_name}, got {:?}",
@@ -125,7 +130,8 @@ fn test_codegen_call_hashmap_iter_next_updates_iter_and_destination_outputs() {
         );
 
         let dest_head_arg =
-            rule.head.args.get(dest_vec_idx).expect("destination slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, dest_vec_idx)
+                .expect("destination slot should exist in rule head");
         assert!(
             is_var_named(dest_head_arg, &dest_out_name),
             "destination slot should route through output var {dest_out_name}, got {:?}",
@@ -191,14 +197,14 @@ fn test_codegen_call_hashmap_iter_next_empty_args_keeps_original_constraints() {
         );
 
         let dest_head_arg =
-            rule.head.args.get(dest_vec_idx).expect("destination slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, dest_vec_idx).expect("destination slot should exist in rule head");
         assert!(
             is_var_named(dest_head_arg, &dest_out_name),
             "fallback should still route destination through output var {dest_out_name}"
         );
 
         let iter_head_arg =
-            rule.head.args.get(iter_vec_idx).expect("iter slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, iter_vec_idx).expect("iter slot should exist in rule head");
         assert!(
             is_var_named(iter_head_arg, &iter_in_name),
             "fallback should preserve iterator input var {iter_in_name}"
@@ -251,14 +257,16 @@ fn test_codegen_call_hashmap_iter_untracked_iter_still_emits_destination_rule() 
         let rule =
             chc_ctx.vc.rules.last().expect("HashMapIterNext fallback path should emit one rule");
         let dest_head_arg =
-            rule.head.args.get(dest_vec_idx).expect("destination slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, dest_vec_idx)
+                .expect("destination slot should exist in rule head");
         assert!(
             is_var_named(dest_head_arg, &dest_out_name),
             "destination slot should still route through output var {dest_out_name}"
         );
 
         let iter_head_arg =
-            rule.head.args.get(iter_vec_idx).expect("iterator slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, iter_vec_idx)
+                .expect("iterator slot should exist in rule head");
         assert!(
             is_var_named(iter_head_arg, &iter_in_name),
             "untracked iterator local should preserve the input var {iter_in_name}"
@@ -300,12 +308,13 @@ fn test_codegen_call_hashmap_iter_non_datatype_iter_emits_error_rule() {
 
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before_rules + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before_rules + 2,
             "forced-failure hashmap_iter path should emit one fail-closed rule"
         );
         let rule =
             chc_ctx.vc.rules.last().expect("hashmap_iter fail-closed call should emit a rule");
-        assert_eq!(rule.head.name, "error", "forced-failure path should emit error()");
+        assert!(is_error_check_rule(rule), "forced-failure path should emit an error-family check rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),

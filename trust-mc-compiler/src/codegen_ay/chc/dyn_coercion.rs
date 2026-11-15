@@ -10,12 +10,16 @@
 //!
 //! Part of #3589: blanket-impl unsized dyn coercion recovery.
 
+use crate::callee_body::CalleeBody;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use crate::codegen_ay::field_roles::{self, FieldRole};
 use crate::codegen_ay::provenance::{Loc, is_value_widened_into_address};
 use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::shared::is_pointer_wrapper_adt;
+use crate::codegen_ay::shared::mono_ty;
 use crate::kani_middle::abi::LayoutOf;
 use ay_bindings::Expr;
 use rustc_middle::ty::TypeVisitableExt;
@@ -49,15 +53,6 @@ fn is_std_pointer_wrapper_adt(def: rustc_public::ty::AdtDef) -> bool {
         )
 }
 
-fn single_field_storage_ty(
-    def: rustc_public::ty::AdtDef,
-    args: &rustc_public::ty::GenericArgs,
-) -> Option<rustc_public::ty::Ty> {
-    let variants = def.variants();
-    (variants.len() == 1 && variants[0].fields().len() == 1)
-        .then(|| variants[0].fields()[0].ty_with_args(args))
-}
-
 /// Peel exactly one pointer-like wrapper layer.
 ///
 /// References, raw pointers, and known smart pointers peel directly.
@@ -72,7 +67,7 @@ pub(super) fn peel_pointer_like_wrapper_ty(ty: rustc_public::ty::Ty) -> rustc_pu
             first_type_arg_ty(&args).unwrap_or(ty)
         }
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-            let Some(storage_ty) = single_field_storage_ty(def, &args) else {
+            let Some(storage_ty) = mono_ty::single_field_storage_ty(def, &args) else {
                 return ty;
             };
             match storage_ty.kind() {
@@ -203,7 +198,8 @@ pub(super) fn extract_pointer_expr(expr: &Expr) -> Option<Loc> {
     // reads the FIRST variant's fields, which is a positional assumption of its
     // own. It is harmless for the shapes this function is called on (the
     // pointer-representation sorts are single-constructor, and an Option-like
-    // sort's first constructor is the empty `None_*`, so it declines), and
+    // sort's first constructor is the empty `None_*`, or for a payload-first
+    // enum the payload one, whose field has no recorded role, so it declines), and
     // fixing it would be a variant-selection change rather than a provenance
     // one — a separate question from which FIELD holds the address.
     let cons = dt.constructors.first()?;
@@ -324,11 +320,53 @@ pub(super) fn collect_dyn_trait_candidates(
 
                 // For struct-with-dyn-tail unsizing, extract the concrete tail.
                 let concrete_ty = extract_concrete_tail_for_dyn(src_inner, target_inner);
+                // A `dyn` -> `dyn` unsize has no concrete type: its runtime
+                // type is one of the source trait object's, and its site maps
+                // the source's id (`dyn_to_dyn.rs`). Listing the source trait
+                // object here gave the site an id whose candidate has no body,
+                // which the dispatch dropped silently.
+                if matches!(concrete_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+                    continue;
+                }
 
                 if seen_types.insert(concrete_ty) {
                     candidates.push(DynCandidate { concrete_ty, vtable_id: next_id });
                     next_id += 1;
                 }
+            }
+        }
+    }
+
+    // Phase 3 (design 3, D2: `kani_middle/dyn_universe.rs`): every concrete
+    // type the harness's reachable code unsizes to this trait object. A
+    // closure boxed in a helper, or a generic instantiation coerced in a
+    // callee, is in neither phase above, so its coercion site found no id and
+    // the dispatch had no arm for it. Appended after the other phases, in a
+    // fixed order, so every other id is unchanged and the coercion sites and
+    // the dispatch sites of one harness agree.
+    if let Some(universe) = &ctx.dyn_universe {
+        let extra = ctx
+            .dyn_universe_types_by_trait
+            .borrow_mut()
+            .entry(trait_def_id)
+            .or_insert_with(|| {
+                let mut types: Vec<rustc_public::ty::Ty> = universe
+                    .principals()
+                    .into_iter()
+                    .filter(|principal| {
+                        rustc_internal::internal(ctx.tcx, principal.def_id()) == trait_def_id
+                    })
+                    .flat_map(|principal| universe.concrete_types(principal, None))
+                    .collect();
+                types.sort_by_cached_key(|ty| format!("{ty:?}"));
+                types.dedup();
+                types
+            })
+            .clone();
+        for concrete_ty in extra {
+            if seen_types.insert(concrete_ty) {
+                candidates.push(DynCandidate { concrete_ty, vtable_id: next_id });
+                next_id += 1;
             }
         }
     }
@@ -419,10 +457,16 @@ fn body_has_unsize_coercion_to_trait(
 }
 
 /// Resolve the vtable ID for a concrete type from the merged candidate sequence.
+///
+/// A trait object is never a concrete type: a `dyn` -> `dyn` unsize takes its
+/// id from the source's (`dyn_to_dyn.rs`), so a `dyn` tail resolves to none.
 pub(super) fn resolve_vtable_id(
     candidates: &[DynCandidate],
     concrete_ty: rustc_public::ty::Ty,
 ) -> Option<u64> {
+    if matches!(concrete_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+        return None;
+    }
     candidates.iter().find(|c| c.concrete_ty == concrete_ty).map(|c| c.vtable_id)
 }
 
@@ -519,17 +563,47 @@ pub(super) fn resolve_dispatch_bodies(
 ) -> (Vec<ResolvedDispatchBody>, bool) {
     let mut results = Vec::new();
     let mut dropped_resolved_candidate = false;
+    // `Fn*::call(self, args)`: the argument tuple a candidate must accept.
+    let fn_family_args_tuple = {
+        let method = rustc_internal::internal(ctx.tcx, fn_def.def_id());
+        let trait_def_id = ctx.tcx.parent(method);
+        ctx.tcx.fn_trait_kind_from_def_id(trait_def_id).and_then(|_| {
+            fn_args
+                .0
+                .iter()
+                .filter_map(|arg| match arg {
+                    GenericArgKind::Type(ty) => Some(*ty),
+                    _ => None,
+                })
+                .nth(1)
+        })
+    };
 
     for candidate in candidates {
+        // A closure or fn item of another signature is never the runtime
+        // type of this call, and resolving it raises an internal compiler
+        // error that aborts the compilation (design 3: the dyn-coercion
+        // universe puts closures of every signature in the `Fn` list).
+        if let Some(args_tuple) = fn_family_args_tuple
+            && super::call::codegen_call_closure::fn_family_candidate_fits(
+                candidate.concrete_ty,
+                args_tuple,
+            ) == Some(false)
+        {
+            continue;
+        }
         if let Some(drop_self_ty) =
             wrapped_dyn_drop_self_ty(ctx, fn_def, fn_args, candidate.concrete_ty)
         {
-            let drop_instance = Instance::resolve_drop_in_place(drop_self_ty);
+            let Some(drop_instance) = mono_ty::drop_in_place(drop_self_ty) else {
+                ctx.record_sound_fallback_reason(mono_ty::DROP_GLUE_UNRESOLVED);
+                continue;
+            };
             // Drop-glue shims stay on the RAW fetch: they are gate-false by
             // construction (no contract attrs on synthesized glue), so the
             // transformed route would be an identical no-op.
             if !drop_instance.is_empty_shim()
-                && let Some(body) = drop_instance.body()
+                && let Some(body) = drop_instance.callee_body()
             {
                 results.push(ResolvedDispatchBody { vtable_id: candidate.vtable_id, body });
             }
@@ -666,8 +740,10 @@ pub(super) fn extract_concrete_tail_for_dyn(
     if let TyKind::RigidTy(RigidTy::Adt(adt_def, ref args)) = src_inner.kind() {
         let variants = adt_def.variants();
         if variants.len() == 1 {
-            if let Some(last_field) = variants[0].fields().last() {
-                return last_field.ty_with_args(args);
+            if let Some(last_field) = variants[0].fields().last()
+                && let Some(tail) = mono_ty::field_ty(last_field, args)
+            {
+                return tail;
             }
         }
     }

@@ -41,7 +41,18 @@ fn test_vec_push_emits_store_on_fld_data() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_vec_push");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_vec_push", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the pushed Vec is never read
+        // afterwards, so write-only array elimination (85da41dad) removes the fld_data Store.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_vec_push",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_vec_push", body.blocks.len());
         assert_has_nontrivial_transition_constraints(&vc, "probe_vec_push");
@@ -303,7 +314,19 @@ fn test_multiple_pushes_produce_multiple_stores() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_multi_push");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_multi_push", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the pushed Vec is never read
+        // afterwards, so write-only array elimination (85da41dad) removes the three fld_data
+        // Stores.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_multi_push",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_multi_push", body.blocks.len());
 

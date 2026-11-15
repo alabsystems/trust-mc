@@ -1,0 +1,8 @@
+Status: SUCCESS\
+Description: "assertion failed: x < 3"
+
+Status: FAILURE\
+Description: "panic reached"
+
+VERIFICATION:- SUCCESSFUL
+VERIFICATION:- FAILED

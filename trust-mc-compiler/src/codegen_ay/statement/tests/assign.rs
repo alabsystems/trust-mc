@@ -37,7 +37,10 @@ fn test_codegen_statement_assign_updates_env_mapping() {
                 .find(|stmt| {
                     matches!(
                         &stmt.kind,
-                        StatementKind::Assign(_, Rvalue::Use(Operand::Copy(_) | Operand::Move(_)))
+                        StatementKind::Assign(
+                            _,
+                            Rvalue::Use(Operand::Copy(_) | Operand::Move(_), ..)
+                        )
                     )
                 })
                 .expect("expected copy assignment");
@@ -257,7 +260,10 @@ fn test_codegen_statement_const_assignment() {
 
             // Find a constant assignment
             let const_stmt = body.blocks.iter().flat_map(|bb| bb.statements.iter()).find(|stmt| {
-                matches!(&stmt.kind, StatementKind::Assign(_, Rvalue::Use(Operand::Constant(_))))
+                matches!(
+                    &stmt.kind,
+                    StatementKind::Assign(_, Rvalue::Use(Operand::Constant(_), ..))
+                )
             });
 
             let stmt =

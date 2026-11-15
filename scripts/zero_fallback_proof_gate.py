@@ -388,6 +388,23 @@ def _check_forbidden_harness_metadata(row: dict[str, Any], *, label: str) -> lis
     return failures
 
 
+def _check_cover_evidence(row: dict[str, Any], *, label: str) -> list[str]:
+    # This gate can consume an already-formed proof report directly. Require
+    # its cover evidence here as well as in extraction; report provenance and
+    # a PASS/PROOF classification do not establish property outcomes.
+    file_name = row.get("file")
+    if not isinstance(file_name, str) or not file_name.startswith("tests/expected/cover/"):
+        return []
+    _ensure_scripts_path()
+    from replacement_harness_dispositions import cover_mismatch
+
+    try:
+        mismatch = cover_mismatch(row, row.get("cover_properties"), row.get("cover_error"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        return [f"{label}: invalid cover authority: {error}"]
+    return [] if mismatch is None else [f"{label}: {mismatch}"]
+
+
 def _check_harness_row(row: Any, seen_harness_keys: set[tuple[str, str]]) -> list[str]:
     if not isinstance(row, dict):
         return [f"non-object harness row: {row!r}"]
@@ -399,6 +416,7 @@ def _check_harness_row(row: Any, seen_harness_keys: set[tuple[str, str]]) -> lis
     failures.extend(_check_harness_classification(row, label=label))
     failures.extend(_check_required_harness_fields(row, label=label))
     failures.extend(_check_forbidden_harness_metadata(row, label=label))
+    failures.extend(_check_cover_evidence(row, label=label))
     return failures
 
 

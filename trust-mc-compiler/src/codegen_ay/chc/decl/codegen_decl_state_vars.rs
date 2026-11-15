@@ -14,6 +14,7 @@ use ay_bindings::Sort;
 use tracing::debug;
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::names;
 use crate::codegen_ay::types::{bv8_sort, ptr_sort};
 
 use super::ChcCtx;
@@ -29,6 +30,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // 1. Scalar locals (existing behavior)
         self.collect_state_vars_scalar_locals();
 
+        // 1.1. A narrow `Option<&scalar>` payload that may reach a reader taking
+        // it for an address fails closed (stmt/codegen_stmt_value_ref_payload.rs).
+        self.book_escaping_ref_payloads();
+
         // 1.25. Auxiliary pointee state variables for &T/&mut T function arguments (#2496).
         self.collect_state_vars_ref_pointees();
 
@@ -43,6 +48,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
             let os_sort = obj_size_sort();
             self.push_state_var_pair("obj_size", "obj_size__out", os_sort);
+
+            // Base addresses of address-taken stack locals, when the body
+            // observes addresses (heap/stack_address.rs).
+            if self.track_level >= ChcTrackLevel::Ptr {
+                self.collect_stack_base_state_vars();
+            }
+
+            // Strong counts of the Rc/Arc allocations the body clones, when
+            // the pre-scan accounts for every handle (rc_strong_count.rs).
+            self.collect_rc_strong_count_state_vars();
 
             debug!(
                 track_level = ?self.track_level,
@@ -91,15 +106,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.collect_float_binop_table_state_vars();
         }
 
-        // 6. Frozen congruent call-summary table for ESTABLISHED-pure scalar
+        // 6. First-class congruent call-summary UFs for ESTABLISHED-pure scalar
         // callees the precise inline lane refused by size (see
-        // call_uf_table.rs). Read-only and unconstrained, and declared only
-        // when the pre-scan finds such a call, so ordinary harnesses keep
-        // their relation arity. Skipped under int-lift for the same reason as
-        // the float tables above: Array sorts block PDR there, and the call
-        // lane then keeps its pre-existing sound havoc.
+        // call_uf_table.rs). Adds NO state var and no relation width: each
+        // callee's `(declare-fun ...)` is a global symbol minted lazily at its
+        // first application, and the lane is enabled only when the pre-scan
+        // finds a call PAIR congruence can pay for.
+        //
+        // Still skipped under int-lift. The historical reason (Array sorts
+        // block PDR) died with the frozen table, but the surviving one is the
+        // declared signature: int-lift rewrites scalar state vars to Int, this
+        // lane deliberately emits only {Bool, BitVec} signatures
+        // (`sort_is_uf_declarable`), and a signature/application sort
+        // disagreement is an ay-chc parse error that aborts the WHOLE problem.
+        // The call lane keeps its pre-existing sound havoc there. Enabling
+        // int-lift UFs is a separate, separately measured change.
         if !self.int_lift {
-            self.collect_call_uf_table_state_vars();
+            self.collect_call_uf_congruence_lane();
         }
     }
 
@@ -121,19 +144,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<CollectionProjectionKind> {
         // Phase 1: AY sort-name prefix matching for known collection sorts.
         // These are constructed by codegen with unambiguous prefixes.
-        if dt_name.starts_with("VecIntoIter") {
+        if names::is_vec_into_iter_sort_name(dt_name) {
             return Some(CollectionProjectionKind::VecIntoIter);
         }
-        if dt_name.starts_with("HashMapIntoIter") {
+        if names::is_hashmap_into_iter_sort_name(dt_name) {
             return Some(CollectionProjectionKind::HashMapIntoIter);
         }
-        if dt_name.starts_with("HashSetIntoIter") {
+        if names::is_hashset_into_iter_sort_name(dt_name) {
             return Some(CollectionProjectionKind::HashSetIntoIter);
         }
-        if dt_name.starts_with("Vec_") {
+        if names::is_vec_sort_name(dt_name) {
             return Some(CollectionProjectionKind::Vec);
         }
-        if dt_name.starts_with("SliceIter_") {
+        if names::is_slice_iter_sort_name(dt_name) {
             return Some(CollectionProjectionKind::VecIntoIter);
         }
 
@@ -146,18 +169,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "IntoIter" => {
                     // IntoIter is shared by Vec, HashMap, HashSet, array — disambiguate
                     // via the AY sort name which encodes the source collection.
-                    if dt_name.contains("HashMap") {
-                        Some(CollectionProjectionKind::HashMapIntoIter)
-                    } else if dt_name.contains("HashSet") {
-                        Some(CollectionProjectionKind::HashSetIntoIter)
-                    } else if dt_name == "IntoIter" || dt_name.contains("PolymorphicIter") {
-                        // Part of #3711: array IntoIter wraps PolymorphicIter,
-                        // not a Vec carrier. Bare "IntoIter" without collection
-                        // prefix is the array variant.
-                        Some(CollectionProjectionKind::ArrayIntoIter)
-                    } else {
-                        Some(CollectionProjectionKind::VecIntoIter)
-                    }
+                    // Part of #3711: array IntoIter wraps PolymorphicIter, not a
+                    // Vec carrier; a bare "IntoIter" is the array variant.
+                    Some(match names::into_iter_sort_source(dt_name) {
+                        names::IntoIterSource::HashMap => CollectionProjectionKind::HashMapIntoIter,
+                        names::IntoIterSource::HashSet => CollectionProjectionKind::HashSetIntoIter,
+                        names::IntoIterSource::Array => CollectionProjectionKind::ArrayIntoIter,
+                        names::IntoIterSource::Vec => CollectionProjectionKind::VecIntoIter,
+                    })
                 }
                 "Iter" | "IterMut" => Some(CollectionProjectionKind::VecIntoIter),
                 "Vec" => Some(CollectionProjectionKind::Vec),
@@ -168,7 +187,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Phase 3: Fallback for synthetic sorts without MIR type info.
         // Uses substring heuristic — only reachable for sorts not backed
         // by a MIR ADT (e.g., stubs that construct sorts programmatically).
-        if dt_name.contains("IntoIter") || dt_name.contains("Iter_") || dt_name.ends_with("Iter") {
+        if names::is_iterator_model_sort_name(dt_name) {
             return Some(CollectionProjectionKind::VecIntoIter);
         }
         None

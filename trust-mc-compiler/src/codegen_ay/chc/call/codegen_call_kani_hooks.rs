@@ -130,10 +130,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Extract the human-readable message a `kani::safety_check(cond, msg)`
     /// carries in `args[1]`, when it is a const `&str` (the shape every
     /// in-tree emitter uses). Mirrors `emit_kani_assert_error_rule`.
-    fn safety_check_message(
-        &mut self,
-        args: &[rustc_public::mir::Operand],
-    ) -> Option<String> {
+    fn safety_check_message(&mut self, args: &[rustc_public::mir::Operand]) -> Option<String> {
         let (bytes, _) = self.try_extract_const_str_bytes(args.get(1)?)?;
         String::from_utf8(bytes).ok()
     }
@@ -161,8 +158,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // safety" with no Description — indistinguishable from a real
             // memory-safety failure, and from each other. Surface it.
             let message = self.safety_check_message(dcx.args);
-            let error_app =
-                self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
+            let error_app = self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
             let body = RuleBody::from_base_and_extra(
                 Some(from_app.clone()),
                 stmt_constraints,
@@ -230,8 +226,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // safety" with no Description — indistinguishable from a real
             // memory-safety failure, and from each other. Surface it.
             let message = self.safety_check_message(dcx.args);
-            let error_app =
-                self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
+            let error_app = self.register_error_head(PropertyKind::MemorySafety, bb_idx, message);
             let body = RuleBody::from_base_and_extra(
                 Some(from_app.clone()),
                 stmt_constraints,
@@ -311,6 +306,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             PropertyKind::UndefinedBehavior,
             dcx.bb_idx,
             message,
+        );
+        // This is an encoder refusal, not a witnessed program error. It has
+        // no freed value whose independence could certify a Genuine result.
+        self.record_sound_fallback_reason(
+            super::codegen_call_fallback_emit::KANI_UNSUPPORTED_CHECK_REASON,
         );
 
         if let Some(target) = dcx.target {
@@ -417,15 +417,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 }
 
-/// Extract a `&str` constant operand's contents (P3-uninit).
-///
-/// Follows the fat-pointer allocation's provenance to the string bytes,
-/// mirroring the BMC-side `try_extract_str_constant` (operand_ref.rs). Used
-/// to plumb `kani::unsupported(message)` into the property description.
+/// Extract a `&str` constant operand's contents (P3-uninit): the pointee
+/// WINDOW its pointer names (`const_pointer::fixed_pointee`), at the pointer's
+/// offset, for the length its metadata word carries. Used to plumb
+/// `kani::unsupported(message)` into the property description (message text
+/// only; never a verdict input).
 fn const_str_from_operand(operand: &rustc_public::mir::Operand) -> Option<String> {
-    use rustc_public::mir::alloc::GlobalAlloc;
+    use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
     use rustc_public::mir::{ConstOperand, Operand};
-    use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+    use rustc_public::ty::{RigidTy, TyKind};
 
     let ConstOperand { const_: mir_const, .. } = match operand {
         Operand::Constant(c) => c,
@@ -438,33 +438,9 @@ fn const_str_from_operand(operand: &rustc_public::mir::Operand) -> Option<String
     if !matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Str)) {
         return None;
     }
-
-    let alloc = match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => alloc.clone(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_, alloc) => alloc.clone(),
-            _ => return None, // external enum: TyConstKind
-        },
-        _ => return None, // external enum: ConstantKind
-    };
-
-    // Fat pointer layout: [data_ptr (with provenance), len].
-    let (_, prov) = alloc.provenance.ptrs.first()?;
-    let target_alloc = match GlobalAlloc::from(prov.0) {
-        GlobalAlloc::Memory(target) => target,
-        _ => return None, // external enum: GlobalAlloc
-    };
-
-    let ptr_bytes = crate::codegen_ay::types::POINTER_WIDTH as usize / 8;
-    let len_bytes = alloc.bytes.get(ptr_bytes..ptr_bytes * 2)?;
-    let mut len_value: usize = 0;
-    for (i, byte) in len_bytes.iter().take(ptr_bytes).enumerate() {
-        len_value |= (*(byte.as_ref()?) as usize) << (i * 8);
-    }
-
-    let str_bytes: Vec<u8> = target_alloc.bytes.iter().take(len_value).filter_map(|b| *b).collect();
-    if str_bytes.len() != len_value {
-        return None;
-    }
-    String::from_utf8(str_bytes).ok()
+    let bytes = const_pointer::const_bytes(mir_const)?;
+    let (_, window) = rustc_middle::ty::tls::with(|tcx| {
+        const_pointer::fixed_pointee(tcx, &bytes, 0, pointee_ty)
+    })?;
+    String::from_utf8(window.read_data_bytes(0, window.len())?).ok()
 }

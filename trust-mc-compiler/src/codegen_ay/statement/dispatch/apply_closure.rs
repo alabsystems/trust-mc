@@ -28,6 +28,7 @@
 //! could produce a FALSE COUNTEREXAMPLE. The path match is exact
 //! (`::apply_closure` + `internal`) so a different call is never mis-routed.
 
+use crate::callee_body::CalleeBody;
 use std::sync::Arc;
 
 use rustc_public::mir::mono::Instance;
@@ -139,6 +140,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     Some(Arc::from(self.ssa_base_name(place).as_str()))
                 }
                 Operand::Constant(_) => None,
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => None,
             };
             return Some(InlineArgValue {
                 expr,
@@ -171,7 +174,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
             if let Ok(instance) = Instance::resolve_closure(def, &generic_args, kind)
-                && instance.body().is_some()
+                && instance.callee_body().is_some()
             {
                 return Some(instance);
             }

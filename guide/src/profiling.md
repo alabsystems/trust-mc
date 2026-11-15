@@ -7,7 +7,7 @@ First, install `samply` using [the instructions](https://github.com/mstange/samp
 
 
 ## Running trust-mc for profiling output
-1. First, build trust-mc from source with `cargo build-dev --profile profiling` to ensure you are getting all release mode optimizations without stripping useful debug info.
+1. First, build trust-mc from source with `targo --unverified build-dev --profile profiling` to ensure you are getting all release mode optimizations without stripping useful debug info.
 2. Then, you can profile the trust-mc compiler on a crate of your choice by [exporting trust-mc to your local PATH](build-from-source.md#adding-trust-mc-to-your-path) and  running `FLAMEGRAPH=[OPTION] targo trust-mc` within the crate.
 
 The `FLAMEGRAPH` environment variable is read in exactly one place (`FLAMEGRAPH_ENV_VAR` in [`session/cargo.rs`](../../trust-mc-driver/src/session/cargo.rs)), and the only value acted on is `compiler`, which profiles each time the compiler is called. Nothing instruments the driver itself today, so `FLAMEGRAPH=driver` does nothing.
@@ -16,7 +16,7 @@ We have to instrument the driver and compiler separately because samply's instru
 
 Our default sampling rate is *8000 Hz*, set by `FLAMEGRAPH_SAMPLING_RATE` in [`session/cargo.rs`](../../trust-mc-driver/src/session/cargo.rs); change it there.
 
-> Note: Specifically when profiling the compiler, ensure you are running `cargo clean` immediately before `targo trust-mc`, or parts of the workspace may not be recompiled by the trust-mc compiler.
+> Note: Specifically when profiling the compiler, ensure you are running `targo clean` immediately before `targo trust-mc`, or parts of the workspace may not be recompiled by the trust-mc compiler.
 
 
 ## Displaying profiling output

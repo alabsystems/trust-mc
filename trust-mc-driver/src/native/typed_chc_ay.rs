@@ -69,6 +69,19 @@ pub(crate) fn lower_obligation(
     lower_obligation_with_accounting(obligation).map(|(problem, _)| problem)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: lowerings run on this thread, for the tests that pin which
+    /// rows pay for a (re-)lowering.
+    static LOWERINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many lowerings have run on this thread.
+#[cfg(test)]
+pub(crate) fn lowerings_on_this_thread() -> u64 {
+    LOWERINGS.with(std::cell::Cell::get)
+}
+
 /// Lower a typed obligation and return the lowering-exactness accounting.
 ///
 /// The accounting is derived from the lowering run itself (see
@@ -77,6 +90,8 @@ pub(crate) fn lower_obligation(
 pub(crate) fn lower_obligation_with_accounting(
     obligation: &trust_mc_core::MirChcPdrObligation,
 ) -> NativeSolveResult<(ay_chc::ChcProblem, TypedChcLoweringAccounting)> {
+    #[cfg(test)]
+    LOWERINGS.with(|count| count.set(count.get() + 1));
     // Exact-or-reject: no lowering path below performs a drop or a havoc —
     // each unsupported construct is a hard `Err` — so the accounting stays at
     // its zero default. Any future lossy fallback must increment these fields
@@ -194,9 +209,13 @@ fn lower_sort(sort: &Sort) -> NativeSolveResult<ay_chc::ChcSort> {
                     Ok(ay_chc::ChcDtConstructor { name: constructor.name.clone(), selectors })
                 })
                 .collect::<NativeSolveResult<Vec<_>>>()?;
+            // `.into()`: ay's `ChcSort::Datatype` carries its constructors as
+            // `Arc<Vec<_>>` up to ay 880b991e and as the interned
+            // `ChcDtConstructors` from ay 98d0c32245 (datatype sorts are
+            // identified by reference); both are `From<Vec<_>>`.
             Ok(ay_chc::ChcSort::Datatype {
                 name: datatype.name.clone(),
-                constructors: Arc::new(constructors),
+                constructors: constructors.into(),
             })
         }
         SortInner::Uninterpreted(name) => Ok(ay_chc::ChcSort::Uninterpreted(name.clone())),
@@ -276,9 +295,7 @@ fn lower_expr(expr: &Expr) -> NativeSolveResult<ay_chc::ChcExpr> {
 fn lower_expr_node(expr: &Expr) -> NativeSolveResult<ay_chc::ChcExpr> {
     match expr.value() {
         ExprValue::BoolConst(value) => Ok(ay_chc::ChcExpr::Bool(*value)),
-        ExprValue::BitVecConst { value, width } => {
-            Ok(ay_chc::ChcExpr::BitVec(parse_u128(value, "bitvector constant")?, *width))
-        }
+        constant @ ExprValue::BitVecConst { .. } => lower_bitvec_constant(constant),
         ExprValue::IntConst(value) => lower_int_constant(value),
         ExprValue::RealConst(value) => {
             Ok(ay_chc::ChcExpr::Real(parse_i64(value, "real constant")?, 1))
@@ -463,6 +480,10 @@ fn op1(op: ay_chc::ChcOp, inner: ay_chc::ChcExpr) -> ay_chc::ChcExpr {
 //       (b) decode-defined: an asserted conjunct is the signed bv2nat-decode
 //           defining v — either the Bool-level R5 Ite or an equality against
 //           the R5t decode TERM,
+//         or
+//       (c) copy-defined: an asserted conjunct is the Int equality `v = u`
+//           (either operand order, both plain Int variables) with u already
+//           admissible by (a), (b) or (c) — closed to a fixpoint,
 //     ("asserted conjunct" = a leaf of the constraint's top-level `And` TREE;
 //      see `top_level_conjuncts`, which flattens nested `And` and descends
 //      through nothing else, so a conjunct under `Or`/`Not`/`Ite` — which is
@@ -477,7 +498,13 @@ fn op1(op: ay_chc::ChcOp, inner: ay_chc::ChcExpr) -> ay_chc::ChcExpr {
 //     window integer has a unique w-bit two's-complement pattern). Case (a)
 //     facts guarantee v's value lies in the window in EVERY model of the
 //     constraint; case (b) forces v = sbv(W) for the decoded BV term W
-//     (see R5), which lies in the window by construction. Hence every Int
+//     (see R5), which lies in the window by construction; case (c) forces
+//     v = u in every model, and u lies in the window in every model by
+//     induction on the fixpoint (its base is (a)/(b)), so v does too. (c) is
+//     the SSA copy chain the producer writes between a decoded temporary and
+//     the return slot — `_4 = sbv(W)`, `_0 = _4`, `_2#s2_1 = _4` — whose
+//     copies carry no range fact of their own; without it the whole clause
+//     failed G2 and reached ay in the mixed Int+bridge theory. Hence every Int
 //     model restricts to window values on rewritten vars and maps to exactly
 //     one BV model, and every BV model decodes to exactly one Int model — the
 //     two constraint versions are equisatisfiable (in fact their model sets
@@ -627,6 +654,8 @@ fn rewrite_bridged_constraint(
             }
         }
     }
+    // R1(c): close admissibility over asserted Int copy equalities.
+    close_admissible_over_copies(&conjuncts, &mut admissible);
 
     // G3: an admissible name occurring with a non-Int sort anywhere in the
     // constraint, or occurring at all in head/body predicate arguments, would
@@ -752,6 +781,52 @@ fn collect_var_sorts(
     }
     for child in chc_expr_children(expr) {
         collect_var_sorts(child, out);
+    }
+}
+
+/// R1(c): grow `admissible` to its fixpoint under the asserted Int copy
+/// equalities `Eq(Var u, Var v)` among `conjuncts` (both operands plain
+/// Int-sorted variables; either may be the admissible one).
+///
+/// SOUND: every element of `conjuncts` is asserted (see
+/// [`top_level_conjuncts`]), so `u = v` holds in every model of the
+/// constraint; if `u` lies in the signed window in every model, so does `v`.
+/// Only plain variable-to-variable equalities are followed — an equality
+/// against any other term grants nothing here (a literal is R1(a)'s bound
+/// scan, a decode is R1(b)). The callers' remaining gates are unchanged: a
+/// name captured by a non-Int occurrence or by a predicate argument still
+/// fails G3, and every reached node must still rewrite (G2/G4).
+fn close_admissible_over_copies(conjuncts: &[&ay_chc::ChcExpr], admissible: &mut BTreeSet<String>) {
+    let copies: Vec<(&str, &str)> = conjuncts
+        .iter()
+        .filter_map(|conjunct| match conjunct {
+            ay_chc::ChcExpr::Op(ay_chc::ChcOp::Eq, args) if args.len() == 2 => {
+                match (args[0].as_ref(), args[1].as_ref()) {
+                    (ay_chc::ChcExpr::Var(lhs), ay_chc::ChcExpr::Var(rhs))
+                        if lhs.sort == ay_chc::ChcSort::Int && rhs.sort == ay_chc::ChcSort::Int =>
+                    {
+                        Some((lhs.name.as_str(), rhs.name.as_str()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    // Each pass either admits a new name or stops; at most `copies.len()`
+    // passes admit anything.
+    loop {
+        let mut grew = false;
+        for &(lhs, rhs) in &copies {
+            let (lhs_in, rhs_in) = (admissible.contains(lhs), admissible.contains(rhs));
+            if lhs_in != rhs_in {
+                admissible.insert(String::from(if lhs_in { rhs } else { lhs }));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
     }
 }
 
@@ -1317,11 +1392,63 @@ fn lower_no_overflow_addsub_signed(
 /// bits to be zero.
 fn lower_no_overflow_mul_unsigned(lhs: &Expr, rhs: &Expr) -> NativeSolveResult<ay_chc::ChcExpr> {
     let width = require_bv_width(lhs)?;
+    // Constant-factor fast path. When one factor is a compile-time constant `K`,
+    // unsigned `a * K` overflows a `w`-bit value IFF `a > floor((2^w - 1) / K)`.
+    // That is an EXACT, bit-precise native-width comparison against a constant —
+    // no `2w` zero-extension and no bit-blasted double-width product — so the
+    // solver never pays for a 128-bit multiply it does not need. This is the
+    // exact shape the compiler emits for constant-scaled byte assembly
+    // (`trust-endian`/`trust-radix64`): every `(b as u64) * 2^(8k)` no-overflow
+    // check collapses to `b <= 255`. The generic `2w` product encoding below is
+    // the fallback for a genuine variable-by-variable multiply. Restricted to
+    // `w <= 64` so `2^w - 1` and the derived bound fit `u128` exactly.
+    if width <= 64 {
+        if let Some(pred) = const_factor_mul_unsigned_nooverflow(lhs, rhs, width)? {
+            return Ok(pred);
+        }
+        if let Some(pred) = const_factor_mul_unsigned_nooverflow(rhs, lhs, width)? {
+            return Ok(pred);
+        }
+    }
     let a = op1(ay_chc::ChcOp::BvZeroExtend(width), lower_expr(lhs)?);
     let b = op1(ay_chc::ChcOp::BvZeroExtend(width), lower_expr(rhs)?);
     let product = op2(ay_chc::ChcOp::BvMul, a, b);
     let high = op1(ay_chc::ChcOp::BvExtract(2 * width - 1, width), product);
     Ok(op2(ay_chc::ChcOp::Eq, high, ay_chc::ChcExpr::BitVec(0, width)))
+}
+
+/// If `konst` is a bit-vector literal `K`, return the EXACT native-width
+/// no-unsigned-overflow predicate for `var * K` (multiplication is commutative,
+/// so factor order does not matter). `Ok(None)` when `konst` is not a usable
+/// unsigned literal, leaving the caller on the generic `2w` product encoding —
+/// including a negative literal, which the generic path routes to the
+/// ay-rejected-encoding classifier rather than silently accepting. `width <= 64`
+/// so `2^w - 1` fits `u128`; `K` is parsed through its decimal spelling (the
+/// same `Display`-boundary the surrounding constant lowering uses) so no
+/// bignum-arithmetic dependency is introduced.
+fn const_factor_mul_unsigned_nooverflow(
+    var: &Expr,
+    konst: &Expr,
+    width: u32,
+) -> NativeSolveResult<Option<ay_chc::ChcExpr>> {
+    let ExprValue::BitVecConst { value, .. } = konst.value() else {
+        return Ok(None);
+    };
+    let Ok(k) = value.to_string().parse::<u128>() else {
+        return Ok(None);
+    };
+    // `a * 0 == 0` never overflows.
+    if k == 0 {
+        return Ok(Some(ay_chc::ChcExpr::Bool(true)));
+    }
+    let max: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+    // floor((2^w - 1) / K); `bound <= max < 2^w`, so it fits `w` bits.
+    let bound = max / k;
+    Ok(Some(op2(
+        ay_chc::ChcOp::BvULe,
+        lower_expr(var)?,
+        ay_chc::ChcExpr::BitVec(bound, width),
+    )))
 }
 
 /// `BvMulNoOverflowSigned`: sign-extend to `2w`, multiply, require the `2w`
@@ -1359,11 +1486,43 @@ fn parse_i64(value: &impl Display, role: &str) -> NativeSolveResult<i64> {
         .map_err(|_| invalid_vc(format!("{role} `{value}` does not fit native ay-chc i64")))
 }
 
-fn parse_u128(value: &impl Display, role: &str) -> NativeSolveResult<u128> {
-    value
-        .to_string()
-        .parse::<u128>()
-        .map_err(|_| invalid_vc(format!("{role} `{value}` does not fit native ay-chc u128")))
+/// Lower a bit-vector constant exactly, at any declared width.
+///
+/// `ay_chc::ChcExpr` keeps a `BitVec(u128, u32)` leaf, so ay's checked
+/// constructor represents a literal wider than 128 bits as a
+/// most-significant-first `BvConcat` tree of at-most-128-bit leaves. No step on
+/// this path narrows the value through `u128`: a 256-bit SIMD or pointer-model
+/// constant reaches the solver with every bit intact instead of failing the
+/// whole obligation the way the old `u128` parse did.
+///
+/// Exact-or-reject in both directions:
+/// * a negative or over-wide payload is a producer defect (`Expr::bitvec_const`
+///   normalizes every literal into `0..2^width`), so it is REJECTED here rather
+///   than reduced modulo `2^width` into a silently different constant;
+/// * ay's own width rejection (width 0, or above `ay_chc::MAX_BITVECTOR_WIDTH`)
+///   propagates as this same typed error.
+///
+/// Both land on `NativeSolveError::InvalidInput` — the ay-rejected-encoding
+/// classification (an encoder defect), never an undecided solve.
+fn lower_bitvec_constant(constant: &ExprValue) -> NativeSolveResult<ay_chc::ChcExpr> {
+    let ExprValue::BitVecConst { value, width } = constant else {
+        return Err(unsupported_expr(constant));
+    };
+    let Some(unsigned) = value.to_biguint() else {
+        return Err(invalid_vc(format!(
+            "bitvector constant `{value}` is negative; a bit-vector literal is unsigned"
+        )));
+    };
+    if unsigned.bits() > u64::from(*width) {
+        return Err(invalid_vc(format!(
+            "bitvector constant `{value}` does not fit its declared width {width}"
+        )));
+    }
+    ay_chc::ChcExpr::bitvec_from_biguint(&unsigned, *width).map_err(|err| {
+        invalid_vc(format!(
+            "bitvector constant `{value}` at width {width} rejected by ay-chc: {err}"
+        ))
+    })
 }
 
 fn unsupported_sort(sort: &Sort) -> NativeSolveError {
@@ -1499,6 +1658,148 @@ mod large_int_lowering_tests {
         // 2^127 does not fit i128 (max is 2^127 - 1) — must be a lowering error,
         // never a silent wrap.
         assert!(lower_int_constant(&"170141183460469231731687303715884105728").is_err());
+    }
+}
+
+#[cfg(test)]
+mod wide_bitvec_lowering_tests {
+    //! Bit-vector constants past 128 bits lower EXACTLY. The old `u128` parse
+    //! had no representation for their high bits at all and failed the whole
+    //! obligation (a completeness restriction, not a truncation); ay's checked
+    //! constructor keeps every bit as a most-significant-first `BvConcat` tree
+    //! of at-most-128-bit leaves.
+    use ay_bindings::{Expr, Sort};
+
+    use super::*;
+
+    /// 2^200 - 2^127: 73 set bits over 127 zero ones. Every bit above 128 is
+    /// invisible to a `u128` path, and its low 128 bits are not the value.
+    const WIDE_200: &str = "1606938044258990275541791951157702133290471306479076951195648";
+
+    /// The literal's leaves in high-to-low order, as `(value, width)`.
+    fn leaves(expr: &ay_chc::ChcExpr) -> Vec<(u128, u32)> {
+        match expr {
+            ay_chc::ChcExpr::BitVec(value, width) => vec![(*value, *width)],
+            ay_chc::ChcExpr::Op(ay_chc::ChcOp::BvConcat, args) => {
+                args.iter().flat_map(|arg| leaves(arg)).collect()
+            }
+            other => panic!("unexpected node in bit-vector literal tree: {other:?}"),
+        }
+    }
+
+    /// `Expr::bitvec_const` normalizes into `0..2^width`, so a negative seed is
+    /// the only way to write a beyond-`u128` literal without a `BigInt` in
+    /// scope: `-1` at width 200 is `2^200 - 1`.
+    #[test]
+    fn all_ones_past_128_bits_lowers_without_truncation() {
+        let lowered =
+            lower_expr(&Expr::bitvec_const(-1i8, 200)).expect("a 200-bit literal must lower");
+        assert_eq!(leaves(&lowered), vec![((1u128 << 72) - 1, 72), (u128::MAX, 128)]);
+        assert_eq!(leaves(&lowered).iter().map(|(_, width)| width).sum::<u32>(), 200);
+    }
+
+    #[test]
+    fn a_beyond_u128_constant_keeps_its_high_bits() {
+        let expr = Expr::bitvec_const(i128::MIN, 200);
+        assert!(
+            matches!(expr.value(), ExprValue::BitVecConst { value, width: 200 }
+                if value.to_string() == WIDE_200),
+            "fixture must carry the exact 2^200 - 2^127 payload"
+        );
+
+        let lowered = lower_expr(&expr).expect("a beyond-u128 literal must lower");
+        // High 72 bits all set, low 128 bits exactly 2^127 — a `u128` narrowing
+        // would keep only the second leaf and drop the first.
+        assert_eq!(leaves(&lowered), vec![((1u128 << 72) - 1, 72), (1u128 << 127, 128)]);
+    }
+
+    #[test]
+    fn constants_through_128_bits_stay_compact_leaves() {
+        let narrow = lower_expr(&Expr::bitvec_const(u64::MAX, 64)).expect("u64::MAX at 64 lowers");
+        assert_eq!(leaves(&narrow), vec![(u128::from(u64::MAX), 64)]);
+        let full = lower_expr(&Expr::bitvec_const(-1i8, 128)).expect("all-ones at 128 lowers");
+        assert_eq!(leaves(&full), vec![(u128::MAX, 128)]);
+    }
+
+    /// Exact-or-reject: ay's constructor would reduce an over-wide payload
+    /// modulo `2^width` (256 at width 8 is 0), which is a DIFFERENT constant.
+    /// Only a directly-built `ExprValue` can carry one — the public
+    /// `Expr::bitvec_const` normalizes first — so pin the guard here.
+    #[test]
+    fn an_over_wide_payload_is_rejected_not_reduced() {
+        let malformed = ExprValue::BitVecConst { value: 256u16.into(), width: 8 };
+        let error = lower_bitvec_constant(&malformed)
+            .expect_err("a payload wider than its declared sort must be rejected");
+        assert!(
+            matches!(&error, NativeSolveError::InvalidInput { detail, .. }
+                if detail.contains("does not fit its declared width")),
+            "expected an over-wide rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_negative_payload_is_rejected_not_wrapped() {
+        let malformed = ExprValue::BitVecConst { value: (-1i8).into(), width: 8 };
+        let error = lower_bitvec_constant(&malformed)
+            .expect_err("a negative bit-vector payload must be rejected");
+        assert!(
+            matches!(&error, NativeSolveError::InvalidInput { detail, .. }
+                if detail.contains("negative")),
+            "expected a signedness rejection, got: {error}"
+        );
+    }
+
+    /// Response item 9: a literal ay REFUSES is an encoder defect — the same
+    /// classification an ay-rejected query already carries — not an undecided
+    /// solve. `InvalidInput` is the structural, whole-bundle error;
+    /// `native_solve_error_is_per_request_not_proved` is the seam that must
+    /// keep saying so for the typed errors adopted from wide literals.
+    #[test]
+    fn a_width_past_ays_cap_is_an_encoder_defect_not_an_undecided_solve() {
+        let over_cap = ay_chc::MAX_BITVECTOR_WIDTH + 1;
+        let error = lower_expr(&Expr::bitvec_const(1u8, over_cap))
+            .expect_err("a width past ay's public cap must be rejected");
+        assert!(
+            matches!(&error, NativeSolveError::InvalidInput { field, .. }
+                if field == "request.obligation.vc"),
+            "ay's typed width rejection must surface as a VC-level encoder defect, got: {error}"
+        );
+        #[cfg(feature = "native-trust-ir-bundle")]
+        assert!(
+            !super::super::native_solve_error_is_per_request_not_proved(&error),
+            "an ay-rejected literal must stay a structural encoder defect, not a not-proved row"
+        );
+    }
+
+    /// The rejection must also survive the whole-obligation lowering, where a
+    /// sort/width defect could otherwise be mistaken for solver inconclusiveness.
+    #[test]
+    fn an_obligation_carrying_a_rejected_literal_fails_the_lowering() {
+        let mut vc = trust_mc_core::ChcVc::new();
+        vc.add_relation(trust_mc_core::RelationDecl::nullary("error"));
+        vc.query = trust_mc_core::ChcQuery::new().with_target("error");
+        vc.add_rule(trust_mc_core::Rule::new(
+            trust_mc_core::RuleBody::new(
+                None,
+                vec![Expr::var("v", Sort::bitvec(ay_chc::MAX_BITVECTOR_WIDTH + 1))
+                    .eq(Expr::bitvec_const(1u8, ay_chc::MAX_BITVECTOR_WIDTH + 1))],
+            ),
+            trust_mc_core::RelationApp::nullary("error"),
+        ));
+        let obligation = trust_mc_core::MirChcPdrObligation::new(
+            "wide-bitvec-test",
+            "crate::wide_bitvec",
+            trust_mc_core::MirObligationKind::Assertion,
+            vc,
+        );
+
+        let error = lower_obligation_with_accounting(&obligation)
+            .expect_err("an ay-rejected literal must fail the obligation lowering");
+        assert!(
+            matches!(&error, NativeSolveError::InvalidInput { field, .. }
+                if field == "request.obligation.vc"),
+            "expected a VC-level encoder defect, got: {error}"
+        );
     }
 }
 
@@ -2021,5 +2322,228 @@ mod producer_shape_bridge_tests {
         }
         let (lo, hi) = bounds.get("x").copied().expect("x must gain window bounds");
         assert!(lo.is_some() && hi.is_some(), "x must be window-bounded, got {lo:?}..{hi:?}");
+    }
+}
+
+#[cfg(test)]
+mod copy_chain_bridge_tests {
+    //! R1(c) pins: the decoded value reaches the return slot through SSA copies
+    //! that carry no range fact of their own. These are the exact dumped
+    //! (`TRUST_MC_DUMP_CHC`) typed CHC constraints of the `x & 1023` and
+    //! `x | 1` body rows of `tests/ui/trust/plain_binaryop_return_value_proves.rs`
+    //! (`masked_is_nonnegative`, `ored_is_nonnegative`), whose return slot `_0`
+    //! is only ever equated to the decoded temporary `_4`. Before R1(c) the
+    //! copies failed G2, the clause reached ay in the mixed Int+bridge theory,
+    //! and the strict PDR entry answered Unknown (Inconclusive), so the
+    //! compiler refused both functions.
+    use std::time::Duration;
+
+    use ay_bindings::{Expr, Sort};
+
+    use super::*;
+
+    const I32_MIN: i128 = -2_147_483_648;
+    const I32_MAX: i128 = 2_147_483_647;
+
+    #[derive(Clone, Copy)]
+    enum Op {
+        And1023,
+        Or1,
+    }
+
+    /// The dumped constraint's conjuncts, in dump order. `post` is the last
+    /// asserted fact about the return slot (the negated postcondition in the
+    /// real VC).
+    fn row(op: Op, post: Expr) -> Vec<Expr> {
+        let x = || Expr::var("x", Sort::int());
+        let r = || Expr::var("_0", Sort::int());
+        let t = || Expr::var("_4", Sort::int());
+        let s21 = || Expr::var("_2#s2_1", Sort::int());
+        let s1021 = || Expr::var("_2#s1_0_s2_1", Sort::int());
+        let b3 = || Expr::var("_3", Sort::bool());
+        let zero = || Expr::int(0);
+        let w = move || match op {
+            Op::And1023 => Expr::int(1023).int2bv(32).bvand(x().int2bv(32)),
+            Op::Or1 => Expr::int(1).int2bv(32).bvor(x().int2bv(32)),
+        };
+        vec![
+            x().int_lt(zero()).eq(b3()),
+            x().int_lt(zero()).eq(b3()),
+            r().eq(s1021()),
+            r().eq(s21()),
+            r().eq(t()),
+            s21().eq(t()),
+            s21().eq(t()),
+            x().int_ge(Expr::int(I32_MIN)),
+            Expr::ite(
+                Expr::bitvec_const(1, 1).eq(w().extract(31, 31)),
+                w().bv2int().int_sub(Expr::int(1i128 << 32)).eq(t()),
+                w().bv2int().eq(t()),
+            ),
+            x().int_le(Expr::int(I32_MAX)),
+            post,
+            x().int_lt(zero()).not(),
+        ]
+    }
+
+    fn negated_post() -> Expr {
+        Expr::var("_0", Sort::int()).int_ge(Expr::int(0)).not()
+    }
+
+    fn lowered(conjuncts: Vec<Expr>) -> ay_chc::ChcProblem {
+        let mut vc = trust_mc_core::ChcVc::new();
+        vc.add_relation(trust_mc_core::RelationDecl::nullary("error"));
+        vc.query = trust_mc_core::ChcQuery::new().with_target("error");
+        vc.add_rule(trust_mc_core::Rule::new(
+            trust_mc_core::RuleBody::new(None, conjuncts),
+            trust_mc_core::RelationApp::nullary("error"),
+        ));
+        lower_obligation(&trust_mc_core::MirChcPdrObligation::new(
+            "trust_ir-native-trust_mc-request-2-proof-2",
+            "plain_binaryop_return_value_proves::masked_is_nonnegative",
+            trust_mc_core::MirObligationKind::Assertion,
+            vc,
+        ))
+        .expect("copy-chain row lowers")
+    }
+
+    fn constraint_of(problem: &ay_chc::ChcProblem) -> ay_chc::ChcExpr {
+        problem.clauses()[0].body.constraint.clone().expect("clause constraint")
+    }
+
+    fn has_int_or_bridge(expr: &ay_chc::ChcExpr) -> bool {
+        match expr {
+            ay_chc::ChcExpr::Int(_) => true,
+            ay_chc::ChcExpr::Var(var) => var.sort == ay_chc::ChcSort::Int,
+            ay_chc::ChcExpr::Op(
+                ay_chc::ChcOp::Int2Bv(_)
+                | ay_chc::ChcOp::Bv2Nat
+                | ay_chc::ChcOp::Sub
+                | ay_chc::ChcOp::Lt
+                | ay_chc::ChcOp::Le
+                | ay_chc::ChcOp::Gt
+                | ay_chc::ChcOp::Ge,
+                _,
+            ) => true,
+            _ => chc_expr_children(expr).iter().any(|c| has_int_or_bridge(c)),
+        }
+    }
+
+    fn raw_constraint(conjuncts: &[Expr]) -> ay_chc::ChcExpr {
+        ay_chc::ChcExpr::and_vec(
+            conjuncts.iter().map(|c| lower_expr(c).expect("conjunct lowers")).collect(),
+        )
+    }
+
+    fn assert_rewrites_and_proves(op: Op) {
+        let problem = lowered(row(op, negated_post()));
+        let constraint = constraint_of(&problem);
+        assert!(
+            !has_int_or_bridge(&constraint),
+            "the copy-chain row must rewrite to pure QF_BV, got: {constraint:?}"
+        );
+
+        let mut smt = ay_chc::SmtContext::new();
+        smt.reset();
+        let result = smt.check_sat_with_timeout(&constraint, Duration::from_secs(5));
+        assert!(result.is_unsat(), "rewritten copy-chain row must be UNSAT, got {result:?}");
+
+        // The entry the native runner uses (`solve_typed_chc_with_pdr`).
+        let config = ay_encode::invoke::EncodeConfig::new()
+            .with_engine(ay_encode::invoke::Engine::Pdr)
+            .with_proof_mode(ay_encode::invoke::ProofMode::Strict)
+            .with_timeout(Duration::from_secs(30));
+        let verdict = ay_encode::invoke::solve(problem, &config).expect("PDR solve runs");
+        assert!(
+            matches!(verdict, ay_encode::verdict::AyVerdict::Proved { .. }),
+            "expected Proved for the rewritten copy-chain row, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn masked_copy_chain_row_rewrites_and_proves() {
+        assert_rewrites_and_proves(Op::And1023);
+    }
+
+    #[test]
+    fn ored_copy_chain_row_rewrites_and_proves() {
+        assert_rewrites_and_proves(Op::Or1);
+    }
+
+    /// FALSIFICATION PIN: `result >= 1` is FALSE for `x = 1024` (`x & 1023 =
+    /// 0`). Its negation keeps the error derivable; the rewrite must keep it
+    /// SAT and the acyclic decision must still refute it.
+    #[test]
+    fn masked_copy_chain_false_clause_still_refutes() {
+        let post = Expr::var("_0", Sort::int()).int_ge(Expr::int(1)).not();
+        let problem = lowered(row(Op::And1023, post));
+        let constraint = constraint_of(&problem);
+        assert!(!has_int_or_bridge(&constraint), "same fragment, must also rewrite");
+
+        let mut smt = ay_chc::SmtContext::new();
+        smt.reset();
+        let result = smt.check_sat_with_timeout(&constraint, Duration::from_secs(5));
+        assert!(result.is_sat(), "false-clause variant must stay SAT, got {result:?}");
+
+        let decision = crate::direct_smt_cex::acyclic_direct_smt_decision(&problem);
+        assert!(
+            matches!(decision, crate::direct_smt_cex::AcyclicDecision::Unsafe(_)),
+            "acyclic direct-SMT must refute the derivable-error variant"
+        );
+    }
+
+    /// A copy equality that is NOT asserted (under `Or`) grants nothing: `_0`
+    /// stays inadmissible and the whole clause refuses the rewrite.
+    #[test]
+    fn unasserted_copy_grants_no_window() {
+        let mut conjuncts = row(Op::And1023, negated_post());
+        let r = || Expr::var("_0", Sort::int());
+        // Drop every asserted equation naming `_0`, then re-add `_0 = _4` only
+        // under a disjunction.
+        conjuncts.remove(4);
+        conjuncts.remove(3);
+        conjuncts.remove(2);
+        conjuncts.push(r().eq(Expr::var("_4", Sort::int())).or(Expr::var("_3", Sort::bool())));
+        assert!(
+            rewrite_bridged_constraint(&raw_constraint(&conjuncts), &[], &[]).is_none(),
+            "an equality under `Or` must not license re-sorting `_0`"
+        );
+    }
+
+    /// A copy chain with no admissible root (`_0 = y`, `y` unconstrained)
+    /// grants nothing: the clause refuses the rewrite.
+    #[test]
+    fn copy_chain_without_admissible_root_fails_closed() {
+        let mut conjuncts = row(Op::And1023, negated_post());
+        conjuncts.remove(4);
+        conjuncts.remove(3);
+        conjuncts.remove(2);
+        conjuncts.push(Expr::var("_0", Sort::int()).eq(Expr::var("y", Sort::int())));
+        assert!(
+            rewrite_bridged_constraint(&raw_constraint(&conjuncts), &[], &[]).is_none(),
+            "a copy of an unconstrained Int must not be re-sorted"
+        );
+    }
+
+    /// The closure itself: a chain is followed in either operand order, to a
+    /// fixpoint, and a name equated only to non-variables is not admitted.
+    #[test]
+    fn closure_follows_chains_in_both_orders() {
+        let v =
+            |n: &str| Arc::new(ay_chc::ChcExpr::Var(ay_chc::ChcVar::new(n, ay_chc::ChcSort::Int)));
+        let eq = |a: Arc<ay_chc::ChcExpr>, b: Arc<ay_chc::ChcExpr>| {
+            ay_chc::ChcExpr::Op(ay_chc::ChcOp::Eq, vec![a, b])
+        };
+        let facts = [
+            eq(v("c"), v("b")),
+            eq(v("a"), v("b")),
+            eq(v("d"), Arc::new(ay_chc::ChcExpr::Int(3))),
+            eq(v("e"), v("f")),
+        ];
+        let refs: Vec<&ay_chc::ChcExpr> = facts.iter().collect();
+        let mut admissible: BTreeSet<String> = ["a".to_string()].into_iter().collect();
+        close_admissible_over_copies(&refs, &mut admissible);
+        let got: Vec<&str> = admissible.iter().map(String::as_str).collect();
+        assert_eq!(got, vec!["a", "b", "c"]);
     }
 }

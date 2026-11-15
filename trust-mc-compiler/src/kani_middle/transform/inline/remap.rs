@@ -8,7 +8,8 @@
 //! statements, terminators) to caller context during inlining. They are
 //! pure functions with no dependency on the inlining pass struct.
 
-use rustc_middle::ty::{EarlyBinder, TyCtxt, TypingEnv};
+use crate::rustc_compat::early_binder_bind;
+use rustc_middle::ty::{TyCtxt, TypingEnv};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AggregateKind, AssertMessage, BasicBlock, BasicBlockIdx, ConstOperand, Operand, Place,
@@ -33,7 +34,7 @@ pub(super) fn monomorphize_ty(tcx: TyCtxt<'_>, instance: Instance, ty: Ty) -> Ty
     rustc_internal::stable(internal_instance.instantiate_mir_and_normalize_erasing_regions(
         tcx,
         TypingEnv::fully_monomorphized(),
-        EarlyBinder::bind(internal_ty),
+        early_binder_bind(tcx, internal_ty),
     ))
 }
 
@@ -88,6 +89,7 @@ fn remap_statement(
         StatementKind::FakeRead(kind, place) => {
             StatementKind::FakeRead(kind.clone(), remap_place(place, local_map, remap_ty))
         }
+        #[cfg(not(trust_toolchain))]
         StatementKind::Retag(kind, place) => {
             StatementKind::Retag(*kind, remap_place(place, local_map, remap_ty))
         }
@@ -109,7 +111,7 @@ fn remap_statement(
         }
     };
 
-    Statement { kind, span: stmt.span }
+    crate::rustc_compat::mir_statement(kind, mir_span!(stmt))
 }
 
 /// Remap a place from callee to caller context.
@@ -151,7 +153,9 @@ fn remap_rvalue(
     remap_ty: &impl Fn(Ty) -> Ty,
 ) -> Rvalue {
     match rvalue {
-        Rvalue::Use(operand) => Rvalue::Use(remap_operand(operand, local_map, remap_ty)),
+        Rvalue::Use(operand, ..) => {
+            rvalue_use!(Rvalue::Use(remap_operand(operand, local_map, remap_ty)))
+        }
         Rvalue::Repeat(operand, count) => {
             Rvalue::Repeat(remap_operand(operand, local_map, remap_ty), count.clone())
         }
@@ -187,12 +191,18 @@ fn remap_rvalue(
                 operands.iter().map(|op| remap_operand(op, local_map, remap_ty)).collect();
             Rvalue::Aggregate(remap_aggregate_kind(kind, remap_ty), new_operands)
         }
+        #[cfg(not(trust_toolchain))]
         Rvalue::ShallowInitBox(operand, ty) => {
             Rvalue::ShallowInitBox(remap_operand(operand, local_map, remap_ty), remap_ty(*ty))
         }
         Rvalue::CopyForDeref(place) => {
             Rvalue::CopyForDeref(remap_place(place, local_map, remap_ty))
         }
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(ty, mutability, place) => {
+            Rvalue::Reborrow(remap_ty(*ty), *mutability, remap_place(place, local_map, remap_ty))
+        }
+        #[cfg(not(trust_toolchain))]
         Rvalue::NullaryOp(op) => Rvalue::NullaryOp(op.clone()),
     }
 }
@@ -207,6 +217,8 @@ fn remap_operand(
         Operand::Copy(place) => Operand::Copy(remap_place(place, local_map, remap_ty)),
         Operand::Move(place) => Operand::Move(remap_place(place, local_map, remap_ty)),
         Operand::Constant(c) => Operand::Constant(remap_const_operand(c, remap_ty)),
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(checks) => Operand::RuntimeChecks(checks.clone()),
     }
 }
 
@@ -349,7 +361,7 @@ fn remap_terminator(
         TerminatorKind::InlineAsm { .. } => term.kind.clone(),
     };
 
-    Terminator { kind, span: term.span }
+    crate::rustc_compat::mir_terminator(kind, mir_span!(term))
 }
 
 /// Remap an unwind action from callee to caller context.
@@ -401,5 +413,7 @@ fn remap_assert_message(
         | AssertMessage::ResumedAfterDrop(_)
         | AssertMessage::MisalignedPointerDereference { .. }
         | AssertMessage::NullPointerDereference => msg.clone(),
+        #[cfg(trust_toolchain)]
+        AssertMessage::NullReferenceConstructed => msg.clone(),
     }
 }

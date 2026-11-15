@@ -328,6 +328,8 @@ fn receiver_local_from_operand(arg: &Operand) -> Option<usize> {
     match arg {
         Operand::Copy(place) | Operand::Move(place) => Some(place.local),
         Operand::Constant(_) => None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 

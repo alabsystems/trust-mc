@@ -4,6 +4,7 @@
 
 //! Vec resize operation and the resize-array quantifier helper.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -16,7 +17,7 @@ use super::super::codegen_call_misc::CallMisc;
 
 use super::super::ChcCtx;
 use super::super::codegen_call_vec::ChcVecFields;
-use super::super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::super::codegen_ctx::globals::chc_fresh_name;
 use super::super::codegen_ctx::types::CollectionProjectionKind;
 use super::shared::{ProjectedVecState, coerce_array_element};
 
@@ -66,8 +67,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         if let Some(cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let current_cap = self.collection_current_cap(&cap_var);
-            let grow_needed = current_cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), current_cap);
+            // Growth reserves through `extend_with`: RawVec's amortized growth.
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &current_cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, new_len.clone(), acc.constraints);
         }
@@ -84,11 +91,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let Some((ptr, old_len, cap, data)) =
                 self.extract_projected_vec_fields(coll_local, modified_locals)
             {
-                let grow_needed = cap.clone().bvult(new_len.clone());
-                let new_cap = Expr::ite(grow_needed, new_len.clone(), cap);
+                let new_cap = self.vec_reserved_cap(
+                    Some(self.body.locals()[coll_local].ty),
+                    &cap,
+                    &new_len,
+                    crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                    acc.constraints,
+                );
                 Self::emit_cap_ge_len(new_cap.clone(), new_len.clone(), acc.constraints);
-                let (out_data, resize_relation, modeled_fill) =
-                    quantified_resize_growth_array(data, old_len, new_len.clone(), fill_value);
+                let (out_data, resize_relation, modeled_fill) = quantified_resize_growth_array(
+                    self,
+                    data,
+                    old_len,
+                    new_len.clone(),
+                    fill_value,
+                );
                 acc.constraints.push(resize_relation);
                 if !modeled_fill {
                     // Part of #3447: resize growth without a translated fill value
@@ -130,11 +147,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let vec_in = Expr::var(&*name, sort);
                 if let Some(fields) = ChcVecFields::extract(vec_in) {
                     let ChcVecFields { vec_sort, ptr, len: old_len, cap, data } = fields;
-                    let grow_needed = cap.clone().bvult(new_len.clone());
-                    let new_cap = Expr::ite(grow_needed, new_len.clone(), cap);
+                    let new_cap = self.vec_reserved_cap(
+                        Some(self.body.locals()[coll_local].ty),
+                        &cap,
+                        &new_len,
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                        acc.constraints,
+                    );
                     Self::emit_cap_ge_len(new_cap.clone(), new_len.clone(), acc.constraints);
-                    let (out_data, resize_relation, modeled_fill) =
-                        quantified_resize_growth_array(data, old_len, new_len.clone(), fill_value);
+                    let (out_data, resize_relation, modeled_fill) = quantified_resize_growth_array(
+                        self,
+                        data,
+                        old_len,
+                        new_len.clone(),
+                        fill_value,
+                    );
                     acc.constraints.push(resize_relation);
                     if !modeled_fill {
                         // Part of #3447: resize growth without a translated fill value
@@ -222,6 +249,7 @@ fn bitvec_const_u64(e: &Expr) -> Option<u64> {
 }
 
 pub(in crate::codegen_ay::chc) fn quantified_resize_growth_array(
+    ctx: &mut ChcCtx<'_, '_>,
     data: Expr,
     old_len: Expr,
     new_len: Expr,
@@ -232,7 +260,7 @@ pub(in crate::codegen_ay::chc) fn quantified_resize_growth_array(
     };
 
     let fill_value = fill_value
-        .map(|fill| coerce_array_element(fill, &data.sort()))
+        .map(|fill| coerce_array_element(ctx, fill, &data.sort()))
         .filter(|fill| fill.sort() == &data_arr.element_sort);
     let modeled_fill = fill_value.is_some();
 
@@ -266,7 +294,7 @@ pub(in crate::codegen_ay::chc) fn quantified_resize_growth_array(
         return (out, Expr::bool_const(true), true);
     }
 
-    let fresh = declare_pending_var(chc_fresh_name("__resize_data"), data.sort().clone());
+    let fresh = ExactVar::defined(chc_fresh_name("__resize_data"), data.sort().clone());
     let idx_name = chc_fresh_name("__resize_idx");
     let idx_sort = ptr_sort();
 

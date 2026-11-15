@@ -60,22 +60,25 @@
 //! register-resolvable with havocable types, guard block pure, all instances
 //! resolvable) and the body is neither contract-instrumented nor carries an
 //! explicit `kani_loop_modifies` assigns clause. Any failure leaves the loop
-//! on the LEGACY encoding verbatim (cyclic + invariant-as-hint) — status quo
-//! ante; the legacy silent-exit fail-open is pre-existing and tracked
-//! (memory: contract-inline-check-loss). A loop is never PARTIALLY
-//! instrumented (the plan phase is read-only).
+//! on the LEGACY encoding (cyclic). A loop is never PARTIALLY instrumented
+//! (the plan phase is read-only). On the CHC lane a declined loop's latch then
+//! carries a reachable-state invariant check, and CHC codegen books every
+//! legacy latch fail-closed, because that check is not the inductive step
+//! (design 5; `LoopContractPass::instrument_declined_loops`).
 
 use super::LoopContractPass;
 use crate::kani_middle::KaniAttributes;
 use crate::kani_middle::transform::body::{
     CheckType, InsertPosition, MutableBody, SourceInstruction,
 };
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use crate::rustc_public::CrateDef;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     BasicBlock, ConstOperand, Mutability, NonDivergingIntrinsic, Operand, Place, ProjectionElem,
-    Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnwindAction,
+    Rvalue, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnwindAction,
 };
 use rustc_public::ty::{
     AdtKind, GenericArgKind, GenericArgs, MirConst, RigidTy, Ty, TyKind, UintTy,
@@ -125,6 +128,22 @@ const TRANSFORMED_BASE: u128 = 2;
 /// never classify as Genuine/clean.
 pub(crate) const TRANSFORMED_NESTED_LEGACY: u128 = 4;
 
+/// `_transformed` code on the latch register call of a loop the rule DECLINED
+/// whose latch carries the reachable-state check (design 5; see
+/// `LoopContractPass::instrument_declined_loops`). CHC codegen counts it as a
+/// legacy latch and books it fail-closed: the check is not the inductive
+/// step, so it can refute but never prove.
+pub(crate) const TRANSFORMED_LEGACY_LATCH: u128 = 5;
+
+/// Message stem of the reachable-state latch check on a legacy loop, followed
+/// by the `(loop N)` suffix. Deliberately NOT one of the rule's obligation
+/// stems (`ay_parse::vc_artifact::LOOP_CONTRACT_OBLIGATION_PREFIXES`): it is
+/// not the inductive step, so the driver must neither render it as Kani's
+/// "Check invariant after step" nor treat the harness as carrying the rule's
+/// obligations (the two-lane retry's eligibility test).
+pub(crate) const LOOP_INVARIANT_LEGACY_MSG: &str = "loop invariant checked after each executed \
+     iteration (legacy loop encoding: reachable states only, the inductive step is not proved)";
+
 /// Everything needed to instrument one loop, gathered read-only up front so a
 /// late failure can never leave a loop partially instrumented.
 struct LoopRulePlan {
@@ -164,6 +183,29 @@ struct LoopRulePlan {
     /// Decreases interplay: re-snapshot `old = src` after the havoc so the
     /// ranking check compares within the symbolic iteration.
     resnapshot: Option<Vec<(usize, usize)>>,
+    /// The loop guard as seen from the entry edge, when it is a pure chain
+    /// (see [`entry_guard_chain`]): the blocks from `switch_bb` through the
+    /// first switch with a loop-exit edge, and that switch's in-loop target.
+    /// `apply_loop_rule` evaluates a copy of it on the entry state so the BASE
+    /// obligation binds only when the loop is actually entered. `None` keeps
+    /// the base on every entry (stricter than Kani, never less sound); it is
+    /// also chosen when the guard is provably true on entry
+    /// ([`guard_true_on_entry`]), where the two encodings admit the same runs.
+    entry_guard: Option<(Vec<usize>, usize)>,
+}
+
+/// What [`LoopContractPass::apply_legacy_latch`] needs for one declined loop.
+struct LegacyLatchPlan {
+    /// Block whose terminator is the role-1 latch register call.
+    reg_bb: usize,
+    /// The guard `SwitchInt(_v)` the latch returns to.
+    switch_bb: usize,
+    /// Destination of the latch register call (`_v`, a plain bool local).
+    reg_dest: Place,
+    /// The closure-ref operand of the register call.
+    closure_arg: Operand,
+    /// Resolved `Fn::call` shim of the invariant closure.
+    closure_shim: Instance,
 }
 
 impl LoopContractPass {
@@ -174,9 +216,53 @@ impl LoopContractPass {
         if self.new_loop_latches.is_empty() {
             return;
         }
-        // Triage lever: fall back to the legacy (fail-open, cyclic) encoding.
+        let Some(check_type) = self.safety_check_no_assume_type.clone() else {
+            // No harness in this unit: nothing is verified, keep MIR untouched.
+            return;
+        };
+
+        let mut loops: Vec<(usize, usize)> =
+            self.new_loop_latches.iter().map(|(head, latch)| (*head, *latch)).collect();
+        loops.sort_unstable();
+
+        // Loops the rule declines keep the LEGACY encoding; `instrument_declined_loops`
+        // then gives each one its reachable-state latch check or its
+        // nested-legacy sentinel (see there). `rule_regions` are the regions of
+        // the loops the rule DID instrument, read before each rewrite.
+        let mut declined: Vec<(usize, usize, usize)> = Vec::new();
+        let mut rule_regions: Vec<BTreeSet<usize>> = Vec::new();
+        self.instrument_rule_loops(
+            tcx,
+            body,
+            &loops,
+            &check_type,
+            &mut declined,
+            &mut rule_regions,
+        );
+        self.instrument_declined_loops(tcx, body, &declined, &rule_regions, &check_type);
+    }
+
+    /// The #47 rule proper: instrument every loop whose plan succeeds, and
+    /// collect `(loop_idx, head_bb, latch_hint)` for every loop it declines.
+    fn instrument_rule_loops(
+        &mut self,
+        tcx: TyCtxt,
+        body: &mut MutableBody,
+        loops: &[(usize, usize)],
+        check_type: &CheckType,
+        declined: &mut Vec<(usize, usize, usize)>,
+        rule_regions: &mut Vec<BTreeSet<usize>>,
+    ) {
+        let decline_all = |declined: &mut Vec<(usize, usize, usize)>| {
+            declined.extend(
+                loops.iter().enumerate().map(|(loop_idx, (head, latch))| (loop_idx, *head, *latch)),
+            );
+        };
+        // Triage lever: fall back to the legacy (cyclic) encoding. The two-lane
+        // retry's properties lane sets it too (`loop_two_lane::lane_p_command`).
         if std::env::var("TRUST_MC_NO_LOOP_RULE").map(|v| v == "1").unwrap_or(false) {
             tracing::warn!("loop-contract proof rule disabled by TRUST_MC_NO_LOOP_RULE");
+            decline_all(declined);
             return;
         }
         // #47 scope gate 1 REMOVED (measured, 2026-08-28). It skipped every
@@ -209,16 +295,9 @@ impl LoopContractPass {
             .any(|info| info.name.to_string().contains("kani_loop_modifies"));
         if has_loop_modifies {
             tracing::debug!("loop-contract rule: skipped (explicit loop assigns clause)");
+            decline_all(declined);
             return;
         }
-        let Some(check_type) = self.safety_check_no_assume_type.clone() else {
-            // No harness in this unit: nothing is verified, keep MIR untouched.
-            return;
-        };
-
-        let mut loops: Vec<(usize, usize)> =
-            self.new_loop_latches.iter().map(|(head, latch)| (*head, *latch)).collect();
-        loops.sort_unstable();
         let single_loop = loops.len() == 1;
 
         // Wall-2 honesty gate: a NESTED rule-instrumented loop whose invariant
@@ -237,9 +316,9 @@ impl LoopContractPass {
         // applies. Inner loops whose invariant locals are re-initialized on
         // the iteration path before their entry (nested_loop_local_var_
         // func_call's `j = sum_pair(..)`) keep the full rule.
-        let skip_inner = self.nested_dependent_inner_skips(tcx, body, &loops);
+        let skip_inner = self.nested_dependent_inner_skips(tcx, body, loops);
 
-        for (loop_idx, (head_bb, latch_hint)) in loops.into_iter().enumerate() {
+        for (loop_idx, &(head_bb, latch_hint)) in loops.iter().enumerate() {
             if skip_inner.contains(&head_bb) {
                 tracing::debug!(
                     head_bb,
@@ -258,19 +337,7 @@ impl LoopContractPass {
                 // (`run_loop_contract_fn(_, _transformed)` ignores it; the
                 // FC-29 breadcrumb recovery only matches codes 2/1).
                 if let Ok(reg_bb) = self.walk_to_register_call(tcx, body, latch_hint) {
-                    let span = body.blocks()[reg_bb].terminator.span;
-                    let sentinel =
-                        body.new_uint_operand(TRANSFORMED_NESTED_LEGACY, UintTy::Usize, span);
-                    let mut term = body.blocks()[reg_bb].terminator.clone();
-                    if let TerminatorKind::Call { args, .. } = &mut term.kind
-                        && args.len() >= 2
-                    {
-                        args[1] = sentinel;
-                        body.replace_terminator(
-                            &SourceInstruction::Terminator { bb: reg_bb },
-                            term,
-                        );
-                    }
+                    mark_nested_legacy(body, reg_bb);
                 }
                 continue;
             }
@@ -283,23 +350,265 @@ impl LoopContractPass {
                         havoc = ?plan.havoc.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
                         "loop-contract rule: instrumenting base/step/post"
                     );
-                    Self::apply_loop_rule(body, &plan, &check_type, loop_idx);
+                    rule_regions.push(loop_region(body, plan.switch_bb, plan.reg_bb));
+                    Self::apply_loop_rule(body, &plan, check_type, loop_idx);
                 }
                 Err(reason) => {
-                    // Unsupported shape: keep the LEGACY encoding verbatim
-                    // (cyclic loop + invariant-as-hint). Status quo ante — the
-                    // legacy path proves several of these (for_loop_for_array
-                    // was parity pre-rule); fail-closing them here regressed
-                    // parity tests. The legacy silent-exit fail-open is
-                    // pre-existing and tracked (contract-inline-check-loss).
+                    // Unsupported shape: the LEGACY encoding (cyclic loop)
+                    // carries the loop. `instrument_declined_loops` gives it
+                    // its reachable-state latch check; CHC codegen books every
+                    // legacy latch fail-closed, because that check is not the
+                    // inductive step (`prescan_loop_contract_legacy_latches`).
                     tracing::debug!(
                         head_bb,
                         reason,
                         "loop-contract rule: skipped (unsupported shape, legacy encoding kept)"
                     );
+                    declined.push((loop_idx, head_bb, latch_hint));
                 }
             }
         }
+    }
+
+    /// Design 5 (docs/chc-hole-fix-designs-2026-09-24.md, "Legacy loop-contract
+    /// latch"): the loops the rule DECLINED.
+    ///
+    /// On the legacy encoding the latch `_v = kani_register_loop_contract(&inv, 1)`
+    /// feeds the loop guard `SwitchInt(_v)`, and the CHC lane reads the register
+    /// fn's raw `{ true }` body there: the invariant is never evaluated, so
+    /// "invariant after step" has no derivation at all, and a broken invariant
+    /// proved (tools/soundness-duals/loop_contract_discharged_obligation_dual.rs).
+    ///
+    /// Each declined loop gets one of two things:
+    ///
+    /// * NESTED inside a loop the rule instrumented: the nested-legacy sentinel
+    ///   (`TRANSFORMED_NESTED_LEGACY`). The outer rule's havoc flows into this
+    ///   cyclic loop, so its states are not reachable states and a check on
+    ///   them could refute a correct program; CHC codegen books the sentinel
+    ///   fail-closed (`prescan_loop_rule_nested_legacy_demotion`).
+    /// * Otherwise, on the CHC lane: a REACHABLE-STATE latch check
+    ///   ([`Self::apply_legacy_latch`]). The invariant is evaluated through the
+    ///   closure's `Fn::call` shim, the same vehicle the rule uses for its three
+    ///   evaluations, and asserted without an assume; `_v` is then reset to
+    ///   `true`, so the invariant value can never exit the loop. The register
+    ///   call becomes a breadcrumb with `_transformed = TRANSFORMED_LEGACY_LATCH`.
+    ///
+    /// The check is exact for the concrete loop: it fails iff some reachable
+    /// iteration breaks the invariant, and every such run also fails Kani's
+    /// base or step check. It is NOT the inductive step (a true but
+    /// non-inductive invariant passes it), so it can never support a proof:
+    /// CHC codegen counts every legacy latch, and a harness that has one never
+    /// reports SUCCESSFUL (`prescan_loop_contract_legacy_latches`).
+    ///
+    /// The walker's view of the register fn is untouched: 290ac7cb8 made the
+    /// inline walker evaluate the invariant INSIDE the register body, where it
+    /// read by-reference captures as addresses and fed the loop exit; that was
+    /// reverted (loop_contract_register_walk_dual.rs guards it).
+    ///
+    /// Not applied in the two-lane retry's PROPERTIES lane, which is legacy on
+    /// purpose and whose success the parent only accepts beside a proof of the
+    /// obligations (`loop_two_lane::merge`), nor on the BMC lane.
+    fn instrument_declined_loops(
+        &self,
+        tcx: TyCtxt,
+        body: &mut MutableBody,
+        declined: &[(usize, usize, usize)],
+        rule_regions: &[BTreeSet<usize>],
+        check_type: &CheckType,
+    ) {
+        for &(loop_idx, head_bb, latch_hint) in declined {
+            let reg_bb = match self.walk_to_register_call(tcx, body, latch_hint) {
+                Ok(reg_bb) => reg_bb,
+                Err(reason) => {
+                    // The role-1 call (wherever it is) stays unpaired, which CHC
+                    // codegen counts as a legacy latch.
+                    tracing::debug!(head_bb, reason, "legacy latch: register call not located");
+                    continue;
+                }
+            };
+            if rule_regions.iter().any(|region| region.contains(&reg_bb)) {
+                tracing::debug!(
+                    head_bb,
+                    reg_bb,
+                    "legacy latch: declined loop nested in a rule-instrumented loop -> \
+                     nested-legacy sentinel"
+                );
+                mark_nested_legacy(body, reg_bb);
+                continue;
+            }
+            if !self.chc_legacy_latch || super::is_two_lane_properties_lane() {
+                continue;
+            }
+            match self.plan_legacy_latch(body, reg_bb) {
+                Ok(plan) => {
+                    tracing::debug!(head_bb, reg_bb, "legacy latch: reachable-state check");
+                    Self::apply_legacy_latch(body, &plan, check_type, loop_idx);
+                }
+                Err(reason) => {
+                    // Left as an unpaired role-1 latch: counted, fail-closed.
+                    tracing::debug!(head_bb, reg_bb, reason, "legacy latch: not instrumented");
+                }
+            }
+        }
+    }
+
+    /// Everything [`Self::apply_legacy_latch`] needs, gathered read-only.
+    fn plan_legacy_latch(
+        &self,
+        body: &MutableBody,
+        reg_bb: usize,
+    ) -> Result<LegacyLatchPlan, &'static str> {
+        let TerminatorKind::Call { func, args, destination, target, .. } =
+            &body.blocks()[reg_bb].terminator.kind
+        else {
+            return Err("latch register terminator is not a call");
+        };
+        let Some(switch_bb) = *target else { return Err("latch register call has no target") };
+        if args.len() < 2 {
+            return Err("latch register call lacks its arguments");
+        }
+        let role = match &args[1] {
+            Operand::Constant(c) => c.const_.eval_target_usize().ok(),
+            _ => None,
+        };
+        if role != Some(1) {
+            return Err("latch register call is not the role-1 latch");
+        }
+        if !destination.projection.is_empty()
+            || body.locals()[destination.local].ty != Ty::bool_ty()
+        {
+            return Err("latch register destination is not a plain bool local");
+        }
+        if !matches!(body.blocks()[switch_bb].terminator.kind, TerminatorKind::SwitchInt { .. }) {
+            return Err("latch register call does not return to the guard switch");
+        }
+        let Some(RigidTy::FnDef(_, genargs)) =
+            func.ty(body.locals()).ok().and_then(|t| t.kind().rigid().cloned())
+        else {
+            return Err("latch register callee is not a FnDef");
+        };
+        let closure_shim =
+            invariant_closure_shim(&genargs).ok_or("invariant closure shim unresolvable")?;
+        Ok(LegacyLatchPlan {
+            reg_bb,
+            switch_bb,
+            reg_dest: destination.clone(),
+            closure_arg: args[0].clone(),
+            closure_shim,
+        })
+    }
+
+    /// Rewrite one legacy latch (see [`Self::instrument_declined_loops`]):
+    ///
+    /// ```text
+    /// reg_bb:   _v = kani_register_loop_contract(&inv, 5) -> eval   // breadcrumb
+    /// eval:     _v = <inv closure Fn shim>(&inv, ())      -> check
+    /// check:    safety_check_no_assume(_v, "<legacy msg> (loop N)") -> reset
+    /// reset:    _v = true; goto -> guard switch
+    /// ```
+    ///
+    /// Same encoding discipline as [`Self::apply_loop_rule`]: the evaluation
+    /// writes the ORIGINAL destination `_v`, which the next block reads.
+    fn apply_legacy_latch(
+        body: &mut MutableBody,
+        plan: &LegacyLatchPlan,
+        check_type: &CheckType,
+        loop_idx: usize,
+    ) {
+        let span = mir_span!(body.blocks()[plan.reg_bb].terminator);
+        let (CheckType::SafetyCheck(check_instance)
+        | CheckType::SafetyCheckNoAssume(check_instance)
+        | CheckType::UnsupportedCheck(check_instance)) = check_type;
+        let unit_ty = Ty::new_tuple(&[]);
+        let fn_op = |body: &mut MutableBody, instance: &Instance| {
+            Operand::Copy(Place::from(body.new_local(instance.ty(), span, Mutability::Not)))
+        };
+
+        // reset: `_v = true; goto -> switch`.
+        let reset_bb = body.push_block(BasicBlock {
+            statements: vec![crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
+                    plan.reg_dest.clone(),
+                    rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
+                        span,
+                        user_ty: None,
+                        const_: MirConst::from_bool(true),
+                    }))),
+                ),
+                span,
+            )],
+            terminator: crate::rustc_compat::mir_terminator(
+                TerminatorKind::Goto { target: plan.switch_bb },
+                span,
+            ),
+        });
+
+        // check: assert-only; its `false` continuation is NOT cut, so a later
+        // real failure in the loop stays reachable.
+        let check_bb = {
+            let func = fn_op(body, check_instance);
+            let msg_op = Operand::Constant(ConstOperand {
+                span,
+                user_ty: None,
+                const_: MirConst::from_str(&format!(
+                    "{LOOP_INVARIANT_LEGACY_MSG} {LOOP_ID_MARKER}{loop_idx})"
+                )),
+            });
+            let dest = Place::from(body.new_local(unit_ty, span, Mutability::Mut));
+            body.push_block(BasicBlock {
+                statements: vec![],
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
+                        func,
+                        args: vec![Operand::Copy(plan.reg_dest.clone()), msg_op],
+                        destination: dest,
+                        target: Some(reset_bb),
+                        unwind: UnwindAction::Terminate,
+                    },
+                    span,
+                ),
+            })
+        };
+
+        // eval: `_v = <closure shim>(&closure, ())`, the closure-ref by COPY.
+        let eval_bb = {
+            let shim_self_op = match &plan.closure_arg {
+                Operand::Copy(p) | Operand::Move(p) => Operand::Copy(p.clone()),
+                c @ Operand::Constant(_) => c.clone(),
+                #[cfg(trust_toolchain)]
+                checks @ Operand::RuntimeChecks(_) => checks.clone(),
+            };
+            let unit_local = body.new_local(unit_ty, span, Mutability::Mut);
+            let func = fn_op(body, &plan.closure_shim);
+            body.push_block(BasicBlock {
+                statements: vec![crate::rustc_compat::mir_statement(
+                    StatementKind::Assign(
+                        Place::from(unit_local),
+                        Rvalue::Aggregate(rustc_public::mir::AggregateKind::Tuple, vec![]),
+                    ),
+                    span,
+                )],
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
+                        func,
+                        args: vec![shim_self_op, Operand::Move(Place::from(unit_local))],
+                        destination: plan.reg_dest.clone(),
+                        target: Some(check_bb),
+                        unwind: UnwindAction::Terminate,
+                    },
+                    span,
+                ),
+            })
+        };
+
+        // reg_bb: the register call becomes a role-5 breadcrumb into `eval`.
+        let mut term = body.blocks()[plan.reg_bb].terminator.clone();
+        let TerminatorKind::Call { args, target, .. } = &mut term.kind else {
+            unreachable!("plan_legacy_latch validated the latch register call terminator")
+        };
+        args[1] = transformed_const(TRANSFORMED_LEGACY_LATCH, span);
+        *target = Some(eval_bb);
+        body.replace_terminator(&SourceInstruction::Terminator { bb: plan.reg_bb }, term);
     }
 
     /// Wall-2 honesty gate (see call site): heads of NESTED instrumented loops
@@ -443,7 +752,7 @@ impl LoopContractPass {
                 Some(Rvalue::Ref(_, _, src) | Rvalue::AddressOf(_, src)) => {
                     captures.insert(src.local);
                 }
-                Some(Rvalue::Use(Operand::Copy(src) | Operand::Move(src)))
+                Some(Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..))
                     if src.projection.is_empty() =>
                 {
                     captures.insert(src.local);
@@ -489,23 +798,7 @@ impl LoopContractPass {
         let Ok(reg_instance) = Instance::resolve(fn_def, &genargs) else {
             return Err("latch register instance unresolvable");
         };
-        // The invariant closure is the LAST closure among the register fn's
-        // generic args (an enclosing generic fn contributes earlier generics).
-        let mut closure_shim = None;
-        for arg in genargs.0.iter().rev() {
-            if let GenericArgKind::Type(arg_ty) = arg
-                && let TyKind::RigidTy(RigidTy::Closure(closure_def, closure_args)) = arg_ty.kind()
-            {
-                closure_shim = rustc_public::mir::mono::Instance::resolve_closure(
-                    closure_def,
-                    &closure_args,
-                    rustc_public::ty::ClosureKind::Fn,
-                )
-                .ok();
-                break;
-            }
-        }
-        let Some(closure_shim) = closure_shim else {
+        let Some(closure_shim) = invariant_closure_shim(&genargs) else {
             return Err("invariant closure shim unresolvable");
         };
 
@@ -539,6 +832,10 @@ impl LoopContractPass {
 
         // ── Loop region: {switch} + reverse-reach(reg_bb) stopping at switch ─
         let region = loop_region(body, switch_bb, reg_bb);
+        let entry_guard =
+            entry_guard_chain(body, switch_bb, reg_bb, &region).filter(|(chain, body_entry)| {
+                !guard_true_on_entry(body, anchor_bb, chain, *body_entry)
+            });
 
         // ── Havoc set (register-level store scan; fail-closed) ──────────────
         let havoc_locals = self.scan_havoc_set(tcx, body, &region, switch_bb, destination.local)?;
@@ -600,6 +897,7 @@ impl LoopContractPass {
             havoc,
             assume_instance,
             resnapshot,
+            entry_guard,
         })
     }
 
@@ -708,13 +1006,14 @@ impl LoopContractPass {
                     StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(..))
                     | StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
-                    | StatementKind::Retag(..)
                     | StatementKind::FakeRead(..)
                     | StatementKind::PlaceMention(..)
                     | StatementKind::AscribeUserType { .. }
                     | StatementKind::Coverage(..)
                     | StatementKind::ConstEvalCounter
                     | StatementKind::Nop => {}
+                    #[cfg(not(trust_toolchain))]
+                    StatementKind::Retag(..) => {}
                 }
             }
             match &block.terminator.kind {
@@ -855,7 +1154,7 @@ impl LoopContractPass {
         check_type: &CheckType,
         loop_idx: usize,
     ) {
-        let span = body.blocks()[plan.anchor_bb].terminator.span;
+        let span = mir_span!(body.blocks()[plan.anchor_bb].terminator);
         let (CheckType::SafetyCheck(check_instance)
         | CheckType::SafetyCheckNoAssume(check_instance)
         | CheckType::UnsupportedCheck(check_instance)) = check_type;
@@ -902,8 +1201,8 @@ impl LoopContractPass {
             let dest = Place::from(body.new_local(unit_ty, span, Mutability::Mut));
             body.push_block(BasicBlock {
                 statements: vec![],
-                terminator: Terminator {
-                    kind: TerminatorKind::Call {
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func,
                         args: vec![Operand::Copy(plan.reg_dest.clone()), msg_op],
                         destination: dest,
@@ -911,7 +1210,7 @@ impl LoopContractPass {
                         unwind: UnwindAction::Terminate,
                     },
                     span,
-                },
+                ),
             })
         };
 
@@ -921,8 +1220,8 @@ impl LoopContractPass {
             let dest = Place::from(body.new_local(unit_ty, span, Mutability::Mut));
             body.push_block(BasicBlock {
                 statements: vec![],
-                terminator: Terminator {
-                    kind: TerminatorKind::Call {
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func,
                         args: vec![bool_op(false)],
                         destination: dest,
@@ -930,24 +1229,26 @@ impl LoopContractPass {
                         unwind: UnwindAction::Terminate,
                     },
                     span,
-                },
+                ),
             })
         };
 
-        let bool_switch = |discr: Place, false_bb: usize, true_bb: usize| Terminator {
-            kind: TerminatorKind::SwitchInt {
-                discr: Operand::Copy(discr),
-                targets: SwitchTargets::new(vec![(0, false_bb)], true_bb),
-            },
-            span,
+        let bool_switch = |discr: Place, false_bb: usize, true_bb: usize| {
+            crate::rustc_compat::mir_terminator(
+                TerminatorKind::SwitchInt {
+                    discr: Operand::Copy(discr),
+                    targets: SwitchTargets::new(vec![(0, false_bb)], true_bb),
+                },
+                span,
+            )
         };
 
         // Build the head chain back-to-front so every block knows its target.
         // tail: [_v = true, (old = src)] goto -> original guard switch.
-        let mut tail_stmts = vec![Statement {
-            kind: StatementKind::Assign(plan.reg_dest.clone(), Rvalue::Use(bool_op(true))),
+        let mut tail_stmts = vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(plan.reg_dest.clone(), rvalue_use!(Rvalue::Use(bool_op(true)))),
             span,
-        }];
+        )];
         // Decreases interplay: the ranking snapshot must be taken on the
         // havocked (symbolic-iteration) state, not the concrete entry state.
         // Refresh EVERY measure component after the havoc. A compound measure
@@ -955,17 +1256,20 @@ impl LoopContractPass {
         // difference from these, so missing one would leave `old` free and the
         // ranking obligation would refute on a terminating loop.
         for &(old_local, measure_src) in plan.resnapshot.iter().flatten() {
-            tail_stmts.push(Statement {
-                kind: StatementKind::Assign(
+            tail_stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
                     Place::from(old_local),
-                    Rvalue::Use(Operand::Copy(Place::from(measure_src))),
+                    rvalue_use!(Rvalue::Use(Operand::Copy(Place::from(measure_src)))),
                 ),
                 span,
-            });
+            ));
         }
         let tail_bb = body.push_block(BasicBlock {
             statements: tail_stmts,
-            terminator: Terminator { kind: TerminatorKind::Goto { target: plan.switch_bb }, span },
+            terminator: crate::rustc_compat::mir_terminator(
+                TerminatorKind::Goto { target: plan.switch_bb },
+                span,
+            ),
         });
 
         // The invariant closure's `Fn::call` shim self operand. Reuse the
@@ -974,6 +1278,8 @@ impl LoopContractPass {
         let shim_self_op = match &plan.closure_arg {
             Operand::Copy(p) | Operand::Move(p) => Operand::Copy(p.clone()),
             c @ Operand::Constant(_) => c.clone(),
+            #[cfg(trust_toolchain)]
+            checks @ Operand::RuntimeChecks(_) => checks.clone(),
         };
         // An invariant-evaluation block: `_v = <closure shim>(&closure, ())`.
         // The REAL evaluation vehicle — the register fn's body is `{ true }`.
@@ -981,15 +1287,15 @@ impl LoopContractPass {
             let unit_local = body.new_local(unit_ty, span, Mutability::Mut);
             let func = fn_op(body, &plan.closure_shim);
             body.push_block(BasicBlock {
-                statements: vec![Statement {
-                    kind: StatementKind::Assign(
+                statements: vec![crate::rustc_compat::mir_statement(
+                    StatementKind::Assign(
                         Place::from(unit_local),
                         Rvalue::Aggregate(rustc_public::mir::AggregateKind::Tuple, vec![]),
                     ),
                     span,
-                }],
-                terminator: Terminator {
-                    kind: TerminatorKind::Call {
+                )],
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func,
                         args: vec![shim_self_op.clone(), Operand::Move(Place::from(unit_local))],
                         destination: plan.reg_dest.clone(),
@@ -997,7 +1303,7 @@ impl LoopContractPass {
                         unwind: UnwindAction::Terminate,
                     },
                     span,
-                },
+                ),
             })
         };
 
@@ -1016,8 +1322,8 @@ impl LoopContractPass {
             let func = fn_op(body, any_instance);
             next = body.push_block(BasicBlock {
                 statements: vec![],
-                terminator: Terminator {
-                    kind: TerminatorKind::Call {
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func,
                         args: vec![],
                         destination: Place::from(*local),
@@ -1025,7 +1331,7 @@ impl LoopContractPass {
                         unwind: UnwindAction::Terminate,
                     },
                     span,
-                },
+                ),
             });
         }
         let havoc_head_bb = next;
@@ -1068,8 +1374,8 @@ impl LoopContractPass {
         let reg2_func = fn_op(body, &plan.reg_instance);
         let bc_bb = body.push_block(BasicBlock {
             statements: vec![],
-            terminator: Terminator {
-                kind: TerminatorKind::Call {
+            terminator: crate::rustc_compat::mir_terminator(
+                TerminatorKind::Call {
                     func: reg2_func,
                     args: vec![plan.closure_arg.clone(), transformed_const(TRANSFORMED_BASE, span)],
                     destination: breadcrumb_dest,
@@ -1077,10 +1383,84 @@ impl LoopContractPass {
                     unwind: UnwindAction::Terminate,
                 },
                 span,
-            },
+            ),
         });
+        // ── ENTRY GATE: the base obligation binds only when the loop is
+        // entered. Kani (0.67.0, measured on
+        // tests/expected/loop-contract/function_with_loop_no_assertion.rs and
+        // three variants) reports `loop_invariant_base` SUCCESS for
+        // `#[kani::loop_invariant(i >= 2)] while i > 2` at `i = 0`, FAILURE at
+        // `i = 3` with a false invariant, and still FAILS an `assert!(i >= 2)`
+        // after the loop at `i = 0`: a loop whose guard is false on entry is
+        // simply not entered, its invariant is neither checked nor assumed.
+        // Asserting the base on every entry edge refuted that program with a
+        // counterexample certified Genuine. So evaluate a copy of the pure guard
+        // chain on the entry state first: its exit edge keeps the original exit
+        // target and the concrete state (zero iterations, no invariant
+        // assumed), its in-loop edge enters the base/havoc/assume chain, where
+        // the original guard is evaluated again on the havocked state. Every
+        // path that enters the loop still passes the base obligation, so this
+        // removes no check a real execution could violate.
+        let entry_bb = match &plan.entry_guard {
+            Some((chain, body_entry)) => {
+                // The copies write the guard's temporaries on a path that no
+                // longer crosses the body-entry edge's `StorageDead`s, so CHC
+                // liveness would carry them through the whole base/havoc/assume
+                // chain (measured on function_with_loop_no_assertion: two extra
+                // columns on nearly every relation, and rows the ungated
+                // encoding proved in ~45 ms ran out of their 5 s budget). End
+                // the storage of every temporary whose `StorageLive` is inside
+                // the chain on the in-loop edge; the original guard revives it
+                // after the havoc, so no read can see the ended storage.
+                let live_in_chain: BTreeSet<usize> = chain
+                    .iter()
+                    .flat_map(|&bb| body.blocks()[bb].statements.iter())
+                    .filter_map(|stmt| match &stmt.kind {
+                        StatementKind::StorageLive(local) => Some(*local),
+                        _ => None,
+                    })
+                    .collect();
+                let temps: BTreeSet<usize> = chain
+                    .iter()
+                    .flat_map(|&bb| body.blocks()[bb].statements.iter())
+                    .filter_map(|stmt| match &stmt.kind {
+                        StatementKind::Assign(place, _) => Some(place.local),
+                        _ => None,
+                    })
+                    .filter(|local| live_in_chain.contains(local))
+                    .collect();
+                let mut next = if temps.is_empty() {
+                    bc_bb
+                } else {
+                    body.push_block(BasicBlock {
+                        statements: temps
+                            .iter()
+                            .map(|&local| {
+                                crate::rustc_compat::mir_statement(
+                                    StatementKind::StorageDead(local),
+                                    span,
+                                )
+                            })
+                            .collect(),
+                        terminator: crate::rustc_compat::mir_terminator(
+                            TerminatorKind::Goto { target: bc_bb },
+                            span,
+                        ),
+                    })
+                };
+                for (pos, &bb) in chain.iter().enumerate().rev() {
+                    let old_target = chain.get(pos + 1).copied().unwrap_or(*body_entry);
+                    let statements = body.blocks()[bb].statements.clone();
+                    let mut terminator = body.blocks()[bb].terminator.clone();
+                    retarget_terminator(&mut terminator, old_target, next);
+                    next = body.push_block(BasicBlock { statements, terminator });
+                }
+                next
+            }
+            None => bc_bb,
+        };
         let mut anchor_term = body.blocks()[plan.anchor_bb].terminator.clone();
-        retarget_terminator(&mut anchor_term, plan.switch_bb, bc_bb);
+        retarget_terminator(&mut anchor_term, plan.switch_bb, entry_bb);
         body.replace_terminator(&SourceInstruction::Terminator { bb: plan.anchor_bb }, anchor_term);
 
         let mut latch_term = body.blocks()[plan.reg_bb].terminator.clone();
@@ -1102,16 +1482,16 @@ impl LoopContractPass {
         check_type: &CheckType,
         reason: &str,
     ) {
-        let span = body.blocks()[head_bb].terminator.span;
+        let span = mir_span!(body.blocks()[head_bb].terminator);
         let mut src = SourceInstruction::Terminator { bb: head_bb };
         let ff = body.new_local(Ty::bool_ty(), span, Mutability::Mut);
         body.assign_to(
             Place::from(ff),
-            Rvalue::Use(Operand::Constant(ConstOperand {
+            rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
                 span,
                 user_ty: None,
                 const_: MirConst::from_bool(false),
-            })),
+            }))),
             &mut src,
             InsertPosition::Before,
         );
@@ -1127,6 +1507,42 @@ fn transformed_const(value: u128, span: rustc_public::ty::Span) -> Operand {
         user_ty: None,
         const_: MirConst::try_from_uint(value, UintTy::Usize).expect("usize const"),
     })
+}
+
+/// The `Fn::call` shim of the invariant closure named by a register fn's
+/// generic args. The invariant closure is the LAST closure among them (an
+/// enclosing generic fn contributes earlier generics).
+fn invariant_closure_shim(genargs: &GenericArgs) -> Option<Instance> {
+    genargs.0.iter().rev().find_map(|arg| match arg {
+        GenericArgKind::Type(arg_ty) => match arg_ty.kind() {
+            TyKind::RigidTy(RigidTy::Closure(closure_def, closure_args)) => Some(
+                rustc_public::mir::mono::Instance::resolve_closure(
+                    closure_def,
+                    &closure_args,
+                    rustc_public::ty::ClosureKind::Fn,
+                )
+                .ok(),
+            ),
+            _ => None,
+        },
+        _ => None,
+    })?
+}
+
+/// Rewrite the latch register call in `reg_bb` to carry the nested-legacy
+/// sentinel (`TRANSFORMED_NESTED_LEGACY`), which CHC codegen books
+/// fail-closed. The argument is otherwise unused
+/// (`run_loop_contract_fn(_, _transformed)` ignores it).
+fn mark_nested_legacy(body: &mut MutableBody, reg_bb: usize) {
+    let span = mir_span!(body.blocks()[reg_bb].terminator);
+    let sentinel = body.new_uint_operand(TRANSFORMED_NESTED_LEGACY, UintTy::Usize, span);
+    let mut term = body.blocks()[reg_bb].terminator.clone();
+    if let TerminatorKind::Call { args, .. } = &mut term.kind
+        && args.len() >= 2
+    {
+        args[1] = sentinel;
+        body.replace_terminator(&SourceInstruction::Terminator { bb: reg_bb }, term);
+    }
 }
 
 /// Whether a stored-but-not-havocable local is ITERATION-SCOPED, making the
@@ -1260,11 +1676,12 @@ fn rvalue_reads_local(rv: &Rvalue, local: usize) -> bool {
         matches!(op, Operand::Copy(p) | Operand::Move(p) if place_reads(p, local))
     }
     match rv {
-        Rvalue::Use(op)
+        Rvalue::Use(op, ..)
         | Rvalue::Repeat(op, _)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::UnaryOp(_, op)
-        | Rvalue::ShallowInitBox(op, _) => op_reads(op, local),
+        | Rvalue::UnaryOp(_, op) => op_reads(op, local),
+        #[cfg(not(trust_toolchain))]
+        Rvalue::ShallowInitBox(op, _) => op_reads(op, local),
         Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
             op_reads(a, local) || op_reads(b, local)
         }
@@ -1273,8 +1690,13 @@ fn rvalue_reads_local(rv: &Rvalue, local: usize) -> bool {
         | Rvalue::Len(p)
         | Rvalue::CopyForDeref(p)
         | Rvalue::Discriminant(p) => place_reads(p, local),
+        // A reborrow copies the value stored at `p`.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(_, _, p) => place_reads(p, local),
         Rvalue::Aggregate(_, ops) => ops.iter().any(|op| op_reads(op, local)),
-        Rvalue::NullaryOp(..) | Rvalue::ThreadLocalRef(..) => false,
+        Rvalue::ThreadLocalRef(..) => false,
+        #[cfg(not(trust_toolchain))]
+        Rvalue::NullaryOp(..) => false,
     }
 }
 
@@ -1299,11 +1721,12 @@ fn collect_stmt_kind_locals(kind: &StatementKind, out: &mut BTreeSet<usize>) {
         StatementKind::Assign(place, rv) => {
             place_locals(place, out);
             match rv {
-                Rvalue::Use(op)
+                Rvalue::Use(op, ..)
                 | Rvalue::Repeat(op, _)
                 | Rvalue::Cast(_, op, _)
-                | Rvalue::UnaryOp(_, op)
-                | Rvalue::ShallowInitBox(op, _) => op_locals(op, out),
+                | Rvalue::UnaryOp(_, op) => op_locals(op, out),
+                #[cfg(not(trust_toolchain))]
+                Rvalue::ShallowInitBox(op, _) => op_locals(op, out),
                 Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                     op_locals(a, out);
                     op_locals(b, out);
@@ -1313,18 +1736,23 @@ fn collect_stmt_kind_locals(kind: &StatementKind, out: &mut BTreeSet<usize>) {
                 | Rvalue::Len(p)
                 | Rvalue::CopyForDeref(p)
                 | Rvalue::Discriminant(p) => place_locals(p, out),
+                #[cfg(trust_toolchain)]
+                Rvalue::Reborrow(_, _, p) => place_locals(p, out),
                 Rvalue::Aggregate(_, ops) => {
                     for op in ops {
                         op_locals(op, out);
                     }
                 }
-                Rvalue::NullaryOp(..) | Rvalue::ThreadLocalRef(..) => {}
+                Rvalue::ThreadLocalRef(..) => {}
+                #[cfg(not(trust_toolchain))]
+                Rvalue::NullaryOp(..) => {}
             }
         }
         StatementKind::SetDiscriminant { place, .. }
         | StatementKind::PlaceMention(place)
-        | StatementKind::FakeRead(_, place)
-        | StatementKind::Retag(_, place) => place_locals(place, out),
+        | StatementKind::FakeRead(_, place) => place_locals(place, out),
+        #[cfg(not(trust_toolchain))]
+        StatementKind::Retag(_, place) => place_locals(place, out),
         StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op)) => op_locals(op, out),
         StatementKind::Intrinsic(NonDivergingIntrinsic::CopyNonOverlapping(c)) => {
             op_locals(&c.src, out);
@@ -1441,6 +1869,295 @@ fn retarget_terminator(term: &mut Terminator, old: usize, new: usize) {
         }
         _ => {}
     }
+}
+
+/// The loop guard seen from the entry edge, as a chain that is safe to evaluate
+/// twice: `switch_bb` (the `SwitchInt(_v)` head) followed by single-successor
+/// blocks up to the first `SwitchInt` with an edge leaving the loop region.
+/// Returns the chain and that switch's single in-region target (the body).
+///
+/// `None` (the base stays on every entry) unless every block is
+/// * a `Goto` to the next chain block, or a `SwitchInt` whose targets are one
+///   in-region block plus loop exits: no calls, no `Assert` (a guard overflow
+///   check evaluated twice would be reported twice), and
+/// * made only of storage markers, `Nop`s and assignments to locals assigned
+///   nowhere outside the chain: guard-private temporaries, which the
+///   invariant closure (built before the loop from user locals) cannot
+///   observe, so evaluating them before the base leaves the entry state the
+///   invariant reads unchanged.
+fn entry_guard_chain(
+    body: &MutableBody,
+    switch_bb: usize,
+    reg_bb: usize,
+    region: &BTreeSet<usize>,
+) -> Option<(Vec<usize>, usize)> {
+    const MAX_GUARD_BLOCKS: usize = 16;
+    let in_region_targets = |bb: usize| -> (Vec<usize>, bool) {
+        let mut inside: Vec<usize> = Vec::new();
+        let mut exits = false;
+        for succ in body.blocks()[bb].terminator.successors() {
+            if region.contains(&succ) {
+                if !inside.contains(&succ) {
+                    inside.push(succ);
+                }
+            } else {
+                exits = true;
+            }
+        }
+        (inside, exits)
+    };
+    // The head switch on `_v`: one in-loop target, the rest exits.
+    if !matches!(body.blocks()[switch_bb].terminator.kind, TerminatorKind::SwitchInt { .. }) {
+        return None;
+    }
+    let (inside, _) = in_region_targets(switch_bb);
+    let [mut cur] = inside[..] else { return None };
+    let mut chain = vec![switch_bb];
+    loop {
+        if chain.len() > MAX_GUARD_BLOCKS
+            || cur == switch_bb
+            || cur == reg_bb
+            || chain.contains(&cur)
+        {
+            return None;
+        }
+        match &body.blocks()[cur].terminator.kind {
+            TerminatorKind::Goto { target } if region.contains(target) => {
+                chain.push(cur);
+                cur = *target;
+            }
+            TerminatorKind::SwitchInt { .. } => {
+                let (inside, exits) = in_region_targets(cur);
+                let [body_entry] = inside[..] else { return None };
+                if !exits {
+                    return None;
+                }
+                chain.push(cur);
+                break Some(body_entry);
+            }
+            _ => return None,
+        }
+    }
+    .filter(|_| chain.len() >= 2)
+    .filter(|_| chain.iter().all(|&bb| guard_block_statements_are_private(body, bb, &chain)))
+    .map(|body_entry| (chain, body_entry))
+}
+
+/// A scalar the entry-state evaluation in [`guard_true_on_entry`] can track.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryValue {
+    Bool(bool),
+    Uint(u128),
+    Int(i128),
+}
+
+/// Whether the guard chain provably takes its in-loop edge on the ENTRY state,
+/// so the entry gate would only add a zero-iteration path no execution takes.
+///
+/// The gate is not free when it is redundant: `lc_dual_nested.rs`
+/// (`let mut i = 0; while i < 3` around `let mut j = 0; while j < 2`) emitted a
+/// BMC VC of 517,959 bytes gated against 357,847 ungated, and the standalone ay
+/// solve went from 3.6 s to 27.7 s, because the zero-iteration edge joins the
+/// entry state into every loop exit. When the guard is true on entry both
+/// encodings admit exactly the same executions, so the gate is dropped.
+///
+/// Values come only from projection-free assignments of constants, copies and
+/// comparisons on the unique-predecessor path that ends at `anchor_bb`, and
+/// only for locals never mutably borrowed or taken as a raw address anywhere in
+/// the body. The invariant closure's shared borrows of the guard's locals are
+/// the common case (`_6 = &_1` for `i` in `lc_dual_nested.rs`), and a shared
+/// borrow of a plain integer or bool cannot write it. Every
+/// other read is unknown and keeps the gate. A wrong `true` could only restore
+/// the stricter ungated base obligation, which adds failures and hides none.
+fn guard_true_on_entry(
+    body: &MutableBody,
+    anchor_bb: usize,
+    chain: &[usize],
+    body_entry: usize,
+) -> bool {
+    const MAX_PATH_BLOCKS: usize = 64;
+    let mut address_taken: BTreeSet<usize> = BTreeSet::new();
+    let mut preds: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    for (bb, block) in body.blocks().iter().enumerate() {
+        for stmt in &block.statements {
+            if let StatementKind::Assign(
+                _,
+                Rvalue::Ref(_, rustc_public::mir::BorrowKind::Mut { .. }, place)
+                | Rvalue::AddressOf(_, place),
+            ) = &stmt.kind
+            {
+                address_taken.insert(place.local);
+            }
+        }
+        for succ in block.terminator.successors() {
+            preds.entry(succ).or_default().insert(bb);
+        }
+    }
+
+    // The straight path into the anchor, oldest block first.
+    let mut path = vec![anchor_bb];
+    let mut cur = anchor_bb;
+    while path.len() < MAX_PATH_BLOCKS {
+        let Some(ps) = preds.get(&cur) else { break };
+        let [pred] = ps.iter().copied().collect::<Vec<_>>()[..] else { break };
+        if path.contains(&pred) || chain.contains(&pred) {
+            break;
+        }
+        path.push(pred);
+        cur = pred;
+    }
+    path.reverse();
+
+    let constant = |c: &MirConst| -> Option<EntryValue> {
+        use rustc_public::ty::{Allocation, ConstantKind, TyConstKind};
+        let read = |alloc: &Allocation, ty: Ty| match ty.kind() {
+            TyKind::RigidTy(RigidTy::Bool) => {
+                alloc.read_uint().ok().map(|v| EntryValue::Bool(v != 0))
+            }
+            TyKind::RigidTy(RigidTy::Uint(_)) => alloc.read_uint().ok().map(EntryValue::Uint),
+            TyKind::RigidTy(RigidTy::Int(_)) => alloc.read_int().ok().map(EntryValue::Int),
+            _ => None, // external enum: TyKind
+        };
+        match c.kind() {
+            ConstantKind::Allocated(alloc) => read(alloc, c.ty()),
+            ConstantKind::Ty(ty_const) => match ty_const.kind() {
+                TyConstKind::Value(value_ty, alloc) => read(alloc, *value_ty),
+                _ => None, // external enum: TyConstKind
+            },
+            _ => None, // external enum: ConstantKind
+        }
+    };
+    let operand = |op: &Operand, env: &HashMap<usize, EntryValue>| -> Option<EntryValue> {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                env.get(&place.local).copied()
+            }
+            Operand::Constant(c) => constant(&c.const_),
+            _ => None,
+        }
+    };
+    let rvalue = |rv: &Rvalue, env: &HashMap<usize, EntryValue>| -> Option<EntryValue> {
+        use rustc_public::mir::{BinOp, UnOp};
+        use std::cmp::Ordering;
+        match rv {
+            Rvalue::Use(op, ..) => operand(op, env),
+            Rvalue::UnaryOp(UnOp::Not, op) => match operand(op, env)? {
+                EntryValue::Bool(b) => Some(EntryValue::Bool(!b)),
+                _ => None,
+            },
+            Rvalue::BinaryOp(bin, lhs, rhs) => {
+                let ord = match (operand(lhs, env)?, operand(rhs, env)?) {
+                    (EntryValue::Uint(a), EntryValue::Uint(b)) => a.cmp(&b),
+                    (EntryValue::Int(a), EntryValue::Int(b)) => a.cmp(&b),
+                    (EntryValue::Bool(a), EntryValue::Bool(b))
+                        if matches!(bin, BinOp::Eq | BinOp::Ne) =>
+                    {
+                        a.cmp(&b)
+                    }
+                    _ => return None,
+                };
+                let holds = match bin {
+                    BinOp::Lt => ord == Ordering::Less,
+                    BinOp::Le => ord != Ordering::Greater,
+                    BinOp::Gt => ord == Ordering::Greater,
+                    BinOp::Ge => ord != Ordering::Less,
+                    BinOp::Eq => ord == Ordering::Equal,
+                    BinOp::Ne => ord != Ordering::Equal,
+                    _ => return None,
+                };
+                Some(EntryValue::Bool(holds))
+            }
+            _ => None,
+        }
+    };
+    let step = |stmt: &StatementKind, env: &mut HashMap<usize, EntryValue>| match stmt {
+        StatementKind::Assign(place, rv) => {
+            let value = if place.projection.is_empty() && !address_taken.contains(&place.local) {
+                rvalue(rv, env)
+            } else {
+                None
+            };
+            match value {
+                Some(v) => env.insert(place.local, v),
+                None => env.remove(&place.local),
+            };
+        }
+        StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+            env.remove(local);
+        }
+        StatementKind::SetDiscriminant { place, .. } => {
+            env.remove(&place.local);
+        }
+        _ => {}
+    };
+
+    let mut env: HashMap<usize, EntryValue> = HashMap::new();
+    for &bb in &path {
+        let block = &body.blocks()[bb];
+        for stmt in &block.statements {
+            step(&stmt.kind, &mut env);
+        }
+        match &block.terminator.kind {
+            TerminatorKind::Call { destination, .. } => {
+                env.remove(&destination.local);
+            }
+            TerminatorKind::Drop { place, .. } => {
+                env.remove(&place.local);
+            }
+            TerminatorKind::InlineAsm { .. } => env.clear(),
+            _ => {}
+        }
+    }
+    for (pos, &bb) in chain.iter().enumerate() {
+        let block = &body.blocks()[bb];
+        for stmt in &block.statements {
+            step(&stmt.kind, &mut env);
+        }
+        let expected = chain.get(pos + 1).copied().unwrap_or(body_entry);
+        match &block.terminator.kind {
+            TerminatorKind::Goto { target } if *target == expected => {}
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let value = match operand(discr, &env) {
+                    Some(EntryValue::Bool(b)) => u128::from(b),
+                    Some(EntryValue::Uint(v)) => v,
+                    _ => return false,
+                };
+                let taken = targets
+                    .branches()
+                    .find(|(v, _)| *v == value)
+                    .map(|(_, t)| t)
+                    .unwrap_or_else(|| targets.otherwise());
+                if taken != expected {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether every statement of `bb` is a storage marker, a `Nop`, or an
+/// assignment to a local no block outside `chain` assigns (statement or call
+/// destination). See [`entry_guard_chain`].
+fn guard_block_statements_are_private(body: &MutableBody, bb: usize, chain: &[usize]) -> bool {
+    let assigned_outside = |local: usize| {
+        body.blocks().iter().enumerate().filter(|(other, _)| !chain.contains(other)).any(
+            |(_, block)| {
+                block.statements.iter().any(|stmt| {
+                    matches!(&stmt.kind, StatementKind::Assign(place, _) if place.local == local)
+                }) || matches!(
+                    &block.terminator.kind,
+                    TerminatorKind::Call { destination, .. } if destination.local == local
+                )
+            },
+        )
+    };
+    body.blocks()[bb].statements.iter().all(|stmt| match &stmt.kind {
+        StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => true,
+        StatementKind::Assign(place, _) => !assigned_outside(place.local),
+        _ => false,
+    })
 }
 
 /// Natural-loop-style region of the (already transformed) contracted loop:
@@ -1622,7 +2339,7 @@ fn resolve_mut_pointer_base(
                 _ => Some(target.local),
             }
         }
-        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.projection.is_empty() => {
+        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) if p.projection.is_empty() => {
             resolve_mut_pointer_base(body, defs, p.local, fuel - 1)
         }
         Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) if p.projection.is_empty() => {
@@ -1905,5 +2622,268 @@ mod nested_reinitialization_tests {
             &nodes(&[0]),
             &BTreeSet::new(),
         ));
+    }
+}
+
+/// Design 5: the declined-loop latch rewrite (`instrument_declined_loops`), on
+/// a compiled body with a role-1 latch that returns to its guard switch.
+#[cfg(test)]
+mod legacy_latch_rewrite_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{TRANSFORMED_LEGACY_LATCH, TRANSFORMED_NESTED_LEGACY};
+    use crate::kani_middle::transform::body::{CheckType, MutableBody};
+    use crate::kani_middle::transform::loop_contracts::LoopContractPass;
+    use rustc_middle::ty::TyCtxt;
+    use rustc_public::mir::mono::Instance;
+    use rustc_public::mir::{Operand, Place, Rvalue, StatementKind, TerminatorKind};
+    use rustc_public::rustc_internal;
+    use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+    use rustc_public::{CompilerError, CrateDef, run_with_tcx};
+    use std::collections::BTreeSet;
+
+    const DECLINED_LOOP_SOURCE: &str = r#"
+#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+#[inline(never)]
+#[kanitool::fn_marker = "kani_register_loop_contract"]
+fn kani_register_loop_contract<F: Fn() -> bool>(f: &F, transformed: usize) -> bool {
+    transformed != 0 && f()
+}
+
+fn safety_check(cond: bool, msg: &'static str) {
+    let _ = (cond, msg);
+}
+
+pub fn declined_loop(n: u32) -> u32 {
+    let mut i = 0u32;
+    let bound = n;
+    loop {
+        let inv = || bound < 100;
+        let v: bool = kani_register_loop_contract(&inv, 1);
+        if !v || i >= bound {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+"#;
+
+    fn with_tcx<F>(source: &str, callback: F)
+    where
+        F: for<'tcx> FnOnce(TyCtxt<'tcx>) + Send,
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CRATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let src_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&src_path, source).expect("write test source");
+        let out_dir = temp_dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("create output dir");
+        let unique_id = CRATE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let args = vec![
+            "rustc".to_string(),
+            src_path.to_string_lossy().into_owned(),
+            "--crate-type=lib".to_string(),
+            format!("--crate-name=legacy_latch_rewrite_{unique_id}"),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+            "--edition=2024".to_string(),
+            "-C".to_string(),
+            "opt-level=0".to_string(),
+        ];
+        let result = run_with_tcx!(&args, |tcx| {
+            callback(tcx);
+            std::ops::ControlFlow::<(), ()>::Continue(())
+        });
+        assert!(
+            result.is_ok() || matches!(result, Err(CompilerError::Skipped)),
+            "rustc_public run failed: {result:?}"
+        );
+    }
+
+    fn find(tcx: TyCtxt<'_>, suffix: &str) -> Instance {
+        rustc_public::all_local_items()
+            .into_iter()
+            .find_map(|item| {
+                let def_id = rustc_internal::internal(tcx, item.def_id());
+                tcx.def_path_str(def_id)
+                    .ends_with(suffix)
+                    .then(|| Instance::try_from(item).ok())
+                    .flatten()
+            })
+            .expect("missing item with requested suffix")
+    }
+
+    fn role(operand: &Operand) -> Option<u64> {
+        match operand {
+            Operand::Constant(c) => c.const_.eval_target_usize().ok(),
+            _ => None,
+        }
+    }
+
+    /// `(block, role)` of every register call in `body`.
+    fn register_calls(body: &MutableBody) -> Vec<(usize, Option<u64>)> {
+        body.blocks()
+            .iter()
+            .enumerate()
+            .filter_map(|(bb, block)| {
+                let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
+                    return None;
+                };
+                let callee = func.ty(body.locals()).ok()?;
+                let TyKind::RigidTy(RigidTy::FnDef(def, _)) = callee.kind() else { return None };
+                def.name().contains("kani_register_loop_contract").then(|| (bb, role(&args[1])))
+            })
+            .collect()
+    }
+
+    fn call_parts(body: &MutableBody, bb: usize) -> (Operand, Vec<Operand>, Place, usize) {
+        let TerminatorKind::Call { func, args, destination, target: Some(target), .. } =
+            body.blocks()[bb].terminator.kind.clone()
+        else {
+            panic!("bb{bb} does not end in a call with a return target");
+        };
+        (func, args, destination, target)
+    }
+
+    fn operand_fn_ty(body: &MutableBody, operand: &Operand) -> rustc_public::ty::Ty {
+        operand.ty(body.locals()).expect("callee type")
+    }
+
+    /// A declined loop off every rule region, on the CHC lane: the role-1
+    /// latch becomes a role-5 breadcrumb into `eval` (the invariant closure's
+    /// `Fn::call` shim writing the latch destination `_v`), then `check` (the
+    /// assert-only safety check of `_v`), then `reset` (`_v = true`, back to
+    /// the guard switch), so the invariant value can never exit the loop.
+    #[test]
+    fn declined_loop_latch_gets_the_reachable_state_check() {
+        with_tcx(DECLINED_LOOP_SOURCE, |tcx| {
+            let func = find(tcx, "declined_loop");
+            let check = find(tcx, "safety_check");
+            let mut body = MutableBody::from(func.body().unwrap());
+            let calls = register_calls(&body);
+            assert_eq!(calls.len(), 1, "one register call: {calls:?}");
+            let (reg_bb, before) = calls[0];
+            assert_eq!(before, Some(1), "the source latch is role 1");
+            let (register_fn, _, v, switch_bb) = call_parts(&body, reg_bb);
+            let blocks_before = body.blocks().len();
+
+            let pass = LoopContractPass { chc_legacy_latch: true, ..LoopContractPass::default() };
+            pass.instrument_declined_loops(
+                tcx,
+                &mut body,
+                &[(0, reg_bb, reg_bb)],
+                &[],
+                &CheckType::SafetyCheckNoAssume(check),
+            );
+
+            assert_eq!(body.blocks().len(), blocks_before + 3, "eval, check and reset are new");
+            let (breadcrumb_fn, breadcrumb_args, breadcrumb_dest, eval_bb) =
+                call_parts(&body, reg_bb);
+            assert_eq!(breadcrumb_fn, register_fn, "the register call stays as a breadcrumb");
+            assert_eq!(role(&breadcrumb_args[1]), Some(TRANSFORMED_LEGACY_LATCH as u64));
+            assert_eq!(breadcrumb_dest, v);
+            assert_ne!(eval_bb, switch_bb, "the breadcrumb no longer feeds the guard");
+
+            let (shim_fn, shim_args, eval_dest, check_bb) = call_parts(&body, eval_bb);
+            assert_eq!(eval_dest, v, "the evaluation writes the latch destination");
+            let TyKind::RigidTy(RigidTy::FnDef(_, register_args)) =
+                operand_fn_ty(&body, &register_fn).kind()
+            else {
+                panic!("the register callee is not a fn item");
+            };
+            let shim = super::invariant_closure_shim(&register_args).expect("closure shim");
+            assert_eq!(
+                operand_fn_ty(&body, &shim_fn),
+                shim.ty(),
+                "the invariant is evaluated by the closure's shim beside the register call, \
+                 never inside it"
+            );
+            assert_ne!(operand_fn_ty(&body, &shim_fn), operand_fn_ty(&body, &register_fn));
+            assert_eq!(shim_args.len(), 2, "shim(&closure, ())");
+
+            let (check_fn, check_args, _, reset_bb) = call_parts(&body, check_bb);
+            assert_eq!(operand_fn_ty(&body, &check_fn), check.ty(), "the assert-only check");
+            assert!(
+                matches!(&check_args[0], Operand::Copy(place) if *place == v),
+                "the check reads `_v`: {check_args:?}"
+            );
+
+            let reset = &body.blocks()[reset_bb];
+            assert!(
+                matches!(reset.terminator.kind, TerminatorKind::Goto { target } if target == switch_bb),
+                "reset returns to the guard switch"
+            );
+            let resets_to_true = reset.statements.iter().any(|statement| match &statement.kind {
+                StatementKind::Assign(place, Rvalue::Use(Operand::Constant(c), ..)) => {
+                    *place == v
+                        && matches!(c.const_.kind(), ConstantKind::Allocated(alloc)
+                            if alloc.read_bool().is_ok_and(|value| value))
+                }
+                _ => false,
+            });
+            assert!(resets_to_true, "reset assigns `_v = true`: {:?}", reset.statements);
+        });
+    }
+
+    /// A declined loop inside a loop the rule instrumented keeps its latch in
+    /// place and takes the nested-legacy sentinel, which CHC codegen books.
+    #[test]
+    fn declined_loop_inside_a_rule_region_gets_the_nested_legacy_sentinel() {
+        with_tcx(DECLINED_LOOP_SOURCE, |tcx| {
+            let func = find(tcx, "declined_loop");
+            let check = find(tcx, "safety_check");
+            let mut body = MutableBody::from(func.body().unwrap());
+            let (reg_bb, _) = register_calls(&body)[0];
+            let (_, _, _, switch_bb) = call_parts(&body, reg_bb);
+            let blocks_before = body.blocks().len();
+
+            let pass = LoopContractPass { chc_legacy_latch: true, ..LoopContractPass::default() };
+            let region: BTreeSet<usize> = [reg_bb].into_iter().collect();
+            pass.instrument_declined_loops(
+                tcx,
+                &mut body,
+                &[(0, reg_bb, reg_bb)],
+                &[region],
+                &CheckType::SafetyCheckNoAssume(check),
+            );
+
+            assert_eq!(body.blocks().len(), blocks_before, "no check is added");
+            let (_, args, _, target) = call_parts(&body, reg_bb);
+            assert_eq!(role(&args[1]), Some(TRANSFORMED_NESTED_LEGACY as u64));
+            assert_eq!(target, switch_bb, "the latch still feeds the guard switch");
+        });
+    }
+
+    /// Off the CHC lane (BMC), a declined loop's latch is left as it was: an
+    /// unpaired role-1 latch, which CHC codegen would count as legacy.
+    #[test]
+    fn declined_loop_off_the_chc_lane_keeps_its_role_one_latch() {
+        with_tcx(DECLINED_LOOP_SOURCE, |tcx| {
+            let func = find(tcx, "declined_loop");
+            let check = find(tcx, "safety_check");
+            let mut body = MutableBody::from(func.body().unwrap());
+            let (reg_bb, _) = register_calls(&body)[0];
+            let (_, _, _, switch_bb) = call_parts(&body, reg_bb);
+            let blocks_before = body.blocks().len();
+
+            let pass = LoopContractPass { chc_legacy_latch: false, ..LoopContractPass::default() };
+            pass.instrument_declined_loops(
+                tcx,
+                &mut body,
+                &[(0, reg_bb, reg_bb)],
+                &[],
+                &CheckType::SafetyCheckNoAssume(check),
+            );
+
+            assert_eq!(body.blocks().len(), blocks_before);
+            let (_, args, _, target) = call_parts(&body, reg_bb);
+            assert_eq!(role(&args[1]), Some(1));
+            assert_eq!(target, switch_bb);
+        });
     }
 }

@@ -209,7 +209,10 @@ impl<'tcx, 'body> CodegenRulesEntryStatic<'tcx, 'body> for ChcCtx<'tcx, 'body> {
             }
             let arr_sort = Sort::array(ptr_sort(), eff_sort.clone());
             let arr = Expr::var(&*arr_name, arr_sort);
-            let promoted_addr = self.heap_state.promoted_const_address_for(*promoted_obj_id);
+            // The seed's object base (`concat(obj_id, 0)`, `global_objects`) plus
+            // its OBJECT-relative offset: a window at offset k seeded k + j.
+            let promoted_addr =
+                crate::codegen_ay::chc::decl::global_objects::object_base_for(*promoted_obj_id);
             let addr = if *byte_offset == 0 {
                 promoted_addr.clone()
             } else {
@@ -226,7 +229,12 @@ impl<'tcx, 'body> CodegenRulesEntryStatic<'tcx, 'body> for ChcCtx<'tcx, 'body> {
 
 /// Private helpers for promoted constant validity constraints.
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    /// Set generous size for each promoted constant region.
+    /// The size of each CONSTANT-MEMORY object whose cells the entry rule
+    /// seeds: its allocation's length (D3, `global_objects`). It was a generous
+    /// 4096 for every object in `const_ref_memory_inits`, which let an
+    /// out-of-bounds read of a 12-byte constant pass its bounds check, and gave
+    /// a static seeded there a second, contradicting size. A static's size is
+    /// its own layout record (`static_alloc_sizes`).
     /// obj_valid is NOT set per-entry — subsumed by `obj_valid = const_array(true)`.
     /// Part of #112: Skip when int_lift is active (arrays not declared).
     fn collect_promoted_validity_constraints(&self, constraints: &mut Vec<Expr>) {
@@ -241,8 +249,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .map(|(_, _, _, promoted_obj_id, _)| *promoted_obj_id)
             .collect();
         for promoted_obj_id in promoted_obj_ids {
+            let Some(size) = self.const_memory_object_size(promoted_obj_id) else { continue };
+            // The size sort is 32 bits: a larger object gets no exact size
+            // (its `obj_size` stays free), never a truncated one.
+            let Ok(size) = u32::try_from(size) else { continue };
             let id_expr = Expr::bitvec_const(promoted_obj_id as i128, 32);
-            constraints.push(obj_size.clone().select(id_expr).eq(Expr::bitvec_const(4096i128, 32)));
+            constraints.push(
+                obj_size.clone().select(id_expr).eq(Expr::bitvec_const(u128::from(size), 32)),
+            );
         }
     }
 }

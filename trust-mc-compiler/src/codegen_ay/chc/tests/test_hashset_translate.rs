@@ -88,7 +88,19 @@ fn test_hashset_contains_generates_vc() {
     with_test_ay_ctx_for_source(HASHSET_CONTAINS_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_hashset_contains");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashset_contains", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the Bool result is never read
+        // after return, so dead-scalar pruning (6b811318f) drops its column from the translated
+        // relations.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashset_contains",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_hashset_contains", body.blocks.len());
 

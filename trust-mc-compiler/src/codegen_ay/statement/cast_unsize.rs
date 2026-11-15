@@ -47,7 +47,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // BV → DT unsize (thin pointer → fat pointer wrapper).
             if let SortInner::BitVec(_) = src_sort.inner() {
                 if let SortInner::Datatype(tgt_dt) = target_sort.inner() {
-                    if tgt_dt.name.starts_with("Dyn_") {
+                    if crate::codegen_ay::names::is_dyn_sort_name(&tgt_dt.name) {
                         // Direct BV → Dyn_Trait: construct fat pointer.
                         let vtable_dummy = self.resolve_vtable_value_for_unsize(src_ty);
                         return construct_dyn_fat_pointer(
@@ -101,7 +101,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Field count mismatch: source is thin wrapper, target is fat wrapper.
         // Try to extract a thin pointer from source and build fat pointer target.
-        if tgt_dt.name.starts_with("Dyn_") {
+        if crate::codegen_ay::names::is_dyn_sort_name(&tgt_dt.name) {
             let thin_ptr = self.extract_thin_pointer(&expr, src_dt)?;
             let vtable_val = self.resolve_vtable_value_for_unsize(src_ty);
             return construct_dyn_fat_pointer(thin_ptr, tgt_dt, tgt_sort.clone(), vtable_val);
@@ -174,7 +174,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             } else if let SortInner::BitVec(_) = sf.sort.inner() {
                 // Source is BV, target is DT (thin ptr → fat ptr at leaf).
                 if let SortInner::Datatype(inner_tgt) = tf.sort.inner() {
-                    if inner_tgt.name.starts_with("Dyn_") {
+                    if crate::codegen_ay::names::is_dyn_sort_name(&inner_tgt.name) {
                         let vtable_val = self.resolve_vtable_value_for_unsize(src_ty);
                         if let Some(fat) = construct_dyn_fat_pointer(
                             extracted,
@@ -278,7 +278,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut field_exprs = Vec::with_capacity(ctor.fields.len());
         for field in &ctor.fields {
             match field.sort.inner() {
-                SortInner::Datatype(inner_dt) if inner_dt.name.starts_with("Dyn_") => {
+                SortInner::Datatype(inner_dt)
+                    if crate::codegen_ay::names::is_dyn_sort_name(&inner_dt.name) =>
+                {
                     // Leaf: construct fat pointer.
                     let fat = construct_dyn_fat_pointer(
                         thin_ptr.clone(),

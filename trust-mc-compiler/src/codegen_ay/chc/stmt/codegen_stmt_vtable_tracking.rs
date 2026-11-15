@@ -104,6 +104,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         super::super::dyn_coercion::find_dyn_trait_tail_ty(self, target_inner)?;
 
         let src_ty = operand.ty(self.body.locals()).ok()?;
+        // A `dyn` -> `dyn` unsize takes its id from the source's
+        // (`dyn_to_dyn.rs`). An upcast always binds the destination here, so
+        // the generic propagation below never copies the source's id, which
+        // indexes the source principal's list, into a `dyn Super` local.
+        if let Some(cast) = super::super::dyn_to_dyn::dyn_to_dyn_unsize(self, src_ty, *target_ty) {
+            let source = self.host_operand_vtable(operand);
+            let vtable = super::super::dyn_to_dyn::dyn_to_dyn_vtable(self, &cast, source)?;
+            if let rustc_public::mir::Operand::Copy(place) | rustc_public::mir::Operand::Move(place) =
+                operand
+                && place.projection.is_empty()
+            {
+                self.vtable_propagation_edges.insert(dst_local, place.local);
+            }
+            return self.capture_known_vtable_discriminant(dst_local, vtable);
+        }
         let src_inner = super::super::dyn_coercion::peel_pointer_like_wrapper_ty(src_ty);
         let concrete_ty =
             super::super::dyn_coercion::extract_concrete_tail_for_dyn(src_inner, target_inner);
@@ -116,6 +131,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             dst_local,
             Expr::bitvec_const(vtable_id as u128, crate::codegen_ay::types::POINTER_WIDTH),
         )
+    }
+
+    /// The vtable id a host operand carries: the current value of its local's
+    /// vtable state variable (the `__out` name when this block already bound
+    /// it, as [`Self::propagate_vtable_discriminant`] reads it). `None` for a
+    /// projected operand or a local with no vtable state variable.
+    pub(in crate::codegen_ay::chc) fn host_operand_vtable(
+        &self,
+        operand: &rustc_public::mir::Operand,
+    ) -> Option<Expr> {
+        let (rustc_public::mir::Operand::Copy(place) | rustc_public::mir::Operand::Move(place)) =
+            operand
+        else {
+            return None;
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let (src_in, src_out) = self.vtable_state_vars.get(&place.local)?.clone();
+        let modified = self
+            .state_var_index_by_name(&src_in)
+            .is_some_and(|idx| self.encode.modified_state_indices.contains(&idx));
+        let name: &str = if modified { &src_out } else { &src_in };
+        Some(Expr::var(name, Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH)))
     }
 
     /// Clear any stored vtable tracking for a local and make the CHC output
@@ -196,9 +235,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // instead of cloning the String (O(n)) then converting to Arc.
         let in_arc: Arc<str> = Arc::from(in_name);
         let out_arc: Arc<str> = Arc::from(out_name);
-        super::push_pending_var_decl(Arc::clone(&in_arc), sort.clone());
-        super::push_pending_var_decl(Arc::clone(&out_arc), sort.clone());
-        self.state_var_mgr.push_state_var_pair_arc(Arc::clone(&in_arc), &out_arc, sort);
+        self.declare_state_column_pair(&in_arc, &out_arc, sort);
         debug!(
             local_idx,
             in_name = %in_arc,

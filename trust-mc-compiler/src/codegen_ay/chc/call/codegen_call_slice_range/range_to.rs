@@ -5,6 +5,7 @@
 //! CHC RangeTo/RangeToInclusive slice indexing.
 //! Part of #3495, #3981.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use tracing::{debug, warn};
@@ -14,7 +15,7 @@ use trust_mc_core::chc::{Rule, RuleBody};
 
 use super::super::chc_call_context::ChcCallContext;
 use super::super::codegen_call_coerce::emit_sound_fallback_goto;
-use super::super::{ChcCtx, RelationApp, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn codegen_call_slice_range_to_index(
@@ -89,7 +90,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let effective_start =
             slice_backing.as_ref().map(|backing| backing.offset.as_expr().clone());
 
-        let error_app = RelationApp::new("error", Vec::new());
+        let error_app = self.register_error_head(
+            // A slice range out of bounds (or reversed) panics: an `assertion`-class
+            // property, so `should_panic` can stand on it. `bb` is metadata only.
+            trust_mc_core::violation::PropertyKind::Assertion,
+            target,
+            Some("range end index out of range for slice".to_string()),
+        );
         if let Some(ref backing) = slice_backing {
             let oob = if inclusive {
                 end_bv.clone().bvuge(backing.len.as_expr().clone())
@@ -98,6 +105,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             let body =
                 RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
+            self.vc.add_rule(Rule::new(body, error_app));
+        } else {
+            // FAIL CLOSED. `resolve_slice_backing` did not resolve, so the bound
+            // cannot be encoded — but the property above is already REGISTERED.
+            // Leaving it ruleless drops the check while the property table still
+            // claims it: in a harness carrying any other `error` rule the
+            // driver's lost-error-rules gate does not fire (it is harness-global),
+            // `chc_success_properties` marks every registered property `Success`,
+            // and a real out-of-bounds slice range would be reported proved.
+            // That is the missed-bug shape `tools/soundness-duals/lost_error_rules_dual.rs`
+            // was written for. Emit the conservative rule instead — the same body
+            // shape `emit_untranslatable_assert_rule` uses, error derivable
+            // whenever control reaches here — so the check can only ever be
+            // reported FAILED, never proved.
+            let body = RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, []);
             self.vc.add_rule(Rule::new(body, error_app));
         }
 
@@ -142,7 +164,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         self.record_aggregate_gap("slice_range_to_subslice_rebase");
         let shifted_base_name = chc_fresh_name("__subslice_to_base");
-        let mut shifted = declare_pending_var(shifted_base_name, inner_arr_sort.clone());
+        let mut shifted = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
+            shifted_base_name,
+            inner_arr_sort.clone(),
+        );
 
         for i in 0..MAX_SUBSLICE_ELEMS {
             let idx = Expr::bitvec_const(i as i128, POINTER_WIDTH);

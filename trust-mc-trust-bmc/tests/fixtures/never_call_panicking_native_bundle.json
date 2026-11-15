@@ -1,0 +1,2162 @@
+{
+  "schema_version": 8,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          51,
+          51,
+          20,
+          89,
+          214,
+          250,
+          200,
+          99,
+          188,
+          196,
+          255,
+          188,
+          30,
+          66,
+          159,
+          69,
+          177,
+          76,
+          79,
+          195,
+          181,
+          67,
+          221,
+          49,
+          144,
+          148,
+          72,
+          227,
+          22,
+          149,
+          175,
+          208
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.10.0",
+    "source_language": "Rust",
+    "source_languages": [
+      "Rust",
+      "TrustIr"
+    ],
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        51,
+        51,
+        20,
+        89,
+        214,
+        250,
+        200,
+        99,
+        188,
+        196,
+        255,
+        188,
+        30,
+        66,
+        159,
+        69,
+        177,
+        76,
+        79,
+        195,
+        181,
+        67,
+        221,
+        49,
+        144,
+        148,
+        72,
+        227,
+        22,
+        149,
+        175,
+        208
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.10.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 8,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      157,
+      81,
+      92,
+      219,
+      60,
+      56,
+      149,
+      126,
+      151,
+      25,
+      128,
+      107,
+      24,
+      109,
+      120,
+      204,
+      88,
+      236,
+      236,
+      244,
+      28,
+      116,
+      167,
+      153,
+      153,
+      75,
+      87,
+      106,
+      138,
+      246,
+      244,
+      25
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "g",
+        "symbol": "g",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            238,
+            207,
+            46,
+            55,
+            159,
+            67,
+            37,
+            80,
+            18,
+            251,
+            116,
+            0,
+            47,
+            50,
+            205,
+            238,
+            144,
+            80,
+            233,
+            97,
+            156,
+            250,
+            19,
+            86,
+            40,
+            71,
+            163,
+            234,
+            239,
+            73,
+            144,
+            243
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:n_panicking_never__g:arithmetic_safety:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 19,
+          "col": 4
+        },
+        "assertion_id": 1796951081,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 1,
+        "public_obligation_id": "vc:n_panicking_never__g:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 15,
+          "col": 0
+        },
+        "assertion_id": 834141072,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 2,
+        "public_obligation_id": "vc:n_panicking_never__g:assertion:panic-freedom:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 15,
+          "col": 0
+        },
+        "assertion_id": 4260323898,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "n_panicking_never::g",
+    "functions": [
+      {
+        "id": 0,
+        "name": "g",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "Bool"
+              ],
+              [
+                1,
+                "U32"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Uge",
+                    "ty": "U32",
+                    "lhs": 1,
+                    "rhs": 6
+                  }
+                },
+                "results": [
+                  7
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 4294967295
+                    }
+                  }
+                },
+                "results": [
+                  8
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U32",
+                    "lhs": 1,
+                    "rhs": 8
+                  }
+                },
+                "results": [
+                  9
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  10
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "ty": "Bool",
+                    "cond": 7,
+                    "then_val": 9,
+                    "else_val": 10
+                  }
+                },
+                "results": [
+                  11
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 11
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 4294967295
+                    }
+                  }
+                },
+                "results": [
+                  13
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U32",
+                    "lhs": 1,
+                    "rhs": 13
+                  }
+                },
+                "results": [
+                  12
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  14
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 12,
+                    "rhs": 14
+                  }
+                },
+                "results": [
+                  15
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 15,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Call": {
+                    "callee": 1,
+                    "args": [
+                      0
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  16
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 16
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Overflow": {
+                    "op": "AddOverflow",
+                    "ty": "U32",
+                    "lhs": 1,
+                    "rhs": 17
+                  }
+                },
+                "results": [
+                  18,
+                  19
+                ],
+                "proofs": [
+                  "NoOverflow"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    }
+                  }
+                },
+                "results": [
+                  20
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    },
+                    "aggregate": 20,
+                    "field": 0,
+                    "value": 18
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    },
+                    "aggregate": 21,
+                    "field": 1,
+                    "value": 19
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ExtractField": {
+                    "ty": "Bool",
+                    "aggregate": 22,
+                    "field": 1
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 23,
+                    "rhs": 24
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 25
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoOverflow"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 3,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "ExtractField": {
+                    "ty": "U32",
+                    "aggregate": 22,
+                    "field": 0
+                  }
+                },
+                "results": [
+                  26
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "U32",
+                    "operand": 26
+                  }
+                },
+                "results": [
+                  27
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      27
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      },
+      {
+        "id": 1,
+        "name": "stop_if",
+        "ty": 1,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "Bool"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 0,
+                    "rhs": 3
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 4,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 5
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoPanic"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 6
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      },
+      {
+        "id": 2,
+        "name": "core::panicking::panic",
+        "ty": 2,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                {
+                  "FatPtr": {
+                    "Slice": 0
+                  }
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 0
+                  }
+                },
+                "results": [
+                  12
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrData": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "ptr": 12
+                  }
+                },
+                "results": [
+                  13
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  15
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 0
+                    },
+                    "aggregate": 15,
+                    "field": 0,
+                    "value": 13
+                  }
+                },
+                "results": [
+                  14
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Cast": {
+                    "op": "Bitcast",
+                    "src_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "dst_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 0
+                  }
+                },
+                "results": [
+                  16
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 16
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  19
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Shl",
+                    "ty": "U64",
+                    "lhs": 17,
+                    "rhs": 19
+                  }
+                },
+                "results": [
+                  18
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Or",
+                    "ty": "U64",
+                    "lhs": 18,
+                    "rhs": 21
+                  }
+                },
+                "results": [
+                  20
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 1
+                    }
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 1
+                    },
+                    "aggregate": 23,
+                    "field": 0,
+                    "value": 14
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 1
+                    },
+                    "aggregate": 24,
+                    "field": 1,
+                    "value": 22
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  26
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 26
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoPanic"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      }
+    ],
+    "structs": [
+      {
+        "id": 0,
+        "name": "core::ptr::non_null::NonNull",
+        "fields": [
+          {
+            "name": "pointer",
+            "ty": "Ptr",
+            "offset": 0
+          }
+        ],
+        "size": 8,
+        "align": 8,
+        "repr": "Transparent"
+      },
+      {
+        "id": 1,
+        "name": "core::fmt::Arguments",
+        "fields": [
+          {
+            "name": "template",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          },
+          {
+            "name": "args",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      }
+    ],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          "Bool",
+          "U32"
+        ],
+        "returns": [
+          "U32"
+        ],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          "Bool"
+        ],
+        "returns": [],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          {
+            "FatPtr": {
+              "Slice": 0
+            }
+          }
+        ],
+        "returns": [],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "arithmetic overflow (Add) (public verifier obligation vc:n_panicking_never__g:arithmetic_safety:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"lt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}}}}}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"x\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+          "smtlib": "(and (and (>= x 0) (<= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (= _3 (= x 4294967295)) (and (not (= x 4294967295)) (and (>= x 0) (<= x 4294967295)) (and (or (> (+ x 1) 4294967295) (= _0 (+ x 1))) (and (= _3 (= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (or (< (+ x 1) 0) (> (+ x 1) 4294967295))))))))))",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "contract:trust-mc-typed-chc-public:87577253671adbbb3fb511282c42f1d94f49a7332baa09cfd12add70d039a316",
+          "assertion_id": "trust-assertion:contract:trust-mc-typed-chc-public:87577253671adbbb3fb511282c42f1d94f49a7332baa09cfd12add70d039a316",
+          "range": {
+            "file": 0,
+            "start_line": 19,
+            "start_col": 4,
+            "end_line": 19,
+            "end_col": 9
+          },
+          "public": {
+            "obligation_id": "vc:n_panicking_never__g:arithmetic_safety:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                16,
+                4,
+                14,
+                32,
+                29,
+                234,
+                175,
+                1,
+                76,
+                142,
+                142,
+                235,
+                139,
+                141,
+                37,
+                134,
+                17,
+                198,
+                105,
+                132,
+                231,
+                139,
+                177,
+                193,
+                56,
+                176,
+                198,
+                246,
+                223,
+                8,
+                118,
+                203
+              ]
+            }
+          }
+        },
+        "site": {
+          "function": 0,
+          "block": 2,
+          "inst_index": 8
+        }
+      },
+      {
+        "id": 1,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:n_panicking_never__g:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:n_panicking_never__g:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:n_panicking_never__g:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 15,
+            "start_col": 0,
+            "end_line": 20,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:n_panicking_never__g:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                61,
+                25,
+                129,
+                194,
+                81,
+                216,
+                214,
+                47,
+                192,
+                56,
+                36,
+                52,
+                172,
+                190,
+                169,
+                219,
+                98,
+                186,
+                250,
+                117,
+                29,
+                71,
+                204,
+                224,
+                98,
+                47,
+                245,
+                162,
+                126,
+                68,
+                94,
+                212
+              ]
+            }
+          }
+        },
+        "site": null
+      },
+      {
+        "id": 2,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "panic freedom: no assertion, `unreachable!`, or panic is reachable (public verifier obligation vc:n_panicking_never__g:assertion:panic-freedom:0)",
+        "formula": {
+          "schema": "trust.trust_ir.obligation-source.v1",
+          "payload": "{\"source_id\":\"vc:n_panicking_never__g:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:n_panicking_never__g:assertion:panic-freedom:0\",\"native_assertion_id\":4260323898,\"span\":{\"file\":\"probes2/n_panicking_never.rs\",\"line_start\":15,\"col_start\":0,\"line_end\":20,\"col_end\":1},\"public_obligation_id\":\"vc:n_panicking_never__g:assertion:panic-freedom:0\"}",
+          "smtlib": null,
+          "sort": null
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:n_panicking_never__g:assertion:panic-freedom:0",
+          "assertion_id": "trust-assertion:vc:n_panicking_never__g:assertion:panic-freedom:0",
+          "range": {
+            "file": 0,
+            "start_line": 15,
+            "start_col": 0,
+            "end_line": 20,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:n_panicking_never__g:assertion:panic-freedom:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                133,
+                158,
+                64,
+                179,
+                229,
+                31,
+                153,
+                170,
+                171,
+                89,
+                116,
+                28,
+                59,
+                222,
+                74,
+                1,
+                165,
+                59,
+                95,
+                22,
+                120,
+                117,
+                210,
+                130,
+                170,
+                131,
+                99,
+                60,
+                60,
+                42,
+                200,
+                121
+              ]
+            }
+          }
+        },
+        "site": null
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "NativeC"
+    },
+    "files": [
+      "probes2/n_panicking_never.rs",
+      "core/src/panic.rs",
+      "core/src/panicking.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": [],
+    "predicates": [],
+    "global_asm": [],
+    "imports": [],
+    "tuple_layouts": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            51,
+            51,
+            20,
+            89,
+            214,
+            250,
+            200,
+            99,
+            188,
+            196,
+            255,
+            188,
+            30,
+            66,
+            159,
+            69,
+            177,
+            76,
+            79,
+            195,
+            181,
+            67,
+            221,
+            49,
+            144,
+            148,
+            72,
+            227,
+            22,
+            149,
+            175,
+            208
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            157,
+            81,
+            92,
+            219,
+            60,
+            56,
+            149,
+            126,
+            151,
+            25,
+            128,
+            107,
+            24,
+            109,
+            120,
+            204,
+            88,
+            236,
+            236,
+            244,
+            28,
+            116,
+            167,
+            153,
+            153,
+            75,
+            87,
+            106,
+            138,
+            246,
+            244,
+            25
+          ]
+        },
+        "obligations": [
+          0,
+          1,
+          2
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              32,
+              168,
+              228,
+              182,
+              53,
+              46,
+              164,
+              167,
+              118,
+              112,
+              117,
+              53,
+              0,
+              137,
+              108,
+              223,
+              217,
+              151,
+              178,
+              102,
+              27,
+              149,
+              203,
+              65,
+              139,
+              240,
+              155,
+              206,
+              175,
+              140,
+              231,
+              117
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                226,
+                17,
+                38,
+                83,
+                152,
+                61,
+                164,
+                144,
+                200,
+                112,
+                48,
+                33,
+                207,
+                201,
+                239,
+                184,
+                51,
+                40,
+                160,
+                52,
+                118,
+                142,
+                222,
+                196,
+                51,
+                148,
+                103,
+                255,
+                171,
+                177,
+                90,
+                191
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"lt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"add\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"x\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}}}}}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"x\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+                  "smtlib": "(and (and (>= x 0) (<= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (= _3 (= x 4294967295)) (and (not (= x 4294967295)) (and (>= x 0) (<= x 4294967295)) (and (or (> (+ x 1) 4294967295) (= _0 (+ x 1))) (and (= _3 (= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (and (<= 0 x) (<= x 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (or (< (+ x 1) 0) (> (+ x 1) 4294967295))))))))))",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    167,
+                    180,
+                    232,
+                    226,
+                    18,
+                    209,
+                    80,
+                    71,
+                    189,
+                    8,
+                    78,
+                    84,
+                    108,
+                    98,
+                    196,
+                    73,
+                    3,
+                    7,
+                    170,
+                    205,
+                    246,
+                    91,
+                    50,
+                    252,
+                    146,
+                    148,
+                    123,
+                    217,
+                    228,
+                    2,
+                    33,
+                    124
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 1796951081,
+                "span": {
+                  "file": 0,
+                  "line": 19,
+                  "col": 4
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 1,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          1
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                224,
+                53,
+                210,
+                98,
+                227,
+                27,
+                111,
+                41,
+                175,
+                203,
+                34,
+                137,
+                15,
+                230,
+                246,
+                98,
+                205,
+                47,
+                207,
+                3,
+                158,
+                218,
+                90,
+                57,
+                2,
+                0,
+                173,
+                177,
+                14,
+                192,
+                51,
+                115
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 1,
+                "assertion_id": 834141072,
+                "span": {
+                  "file": 0,
+                  "line": 15,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 2,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          2
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                134,
+                112,
+                247,
+                92,
+                159,
+                209,
+                41,
+                202,
+                21,
+                88,
+                12,
+                11,
+                82,
+                167,
+                230,
+                136,
+                186,
+                12,
+                61,
+                25,
+                111,
+                56,
+                219,
+                28,
+                125,
+                9,
+                142,
+                120,
+                207,
+                182,
+                138,
+                198
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.trust_ir.obligation-source.v1",
+                  "payload": "{\"source_id\":\"vc:n_panicking_never__g:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:n_panicking_never__g:assertion:panic-freedom:0\",\"native_assertion_id\":4260323898,\"span\":{\"file\":\"probes2/n_panicking_never.rs\",\"line_start\":15,\"col_start\":0,\"line_end\":20,\"col_end\":1},\"public_obligation_id\":\"vc:n_panicking_never__g:assertion:panic-freedom:0\"}",
+                  "smtlib": null,
+                  "sort": null
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    205,
+                    106,
+                    50,
+                    240,
+                    166,
+                    193,
+                    38,
+                    200,
+                    52,
+                    239,
+                    203,
+                    18,
+                    151,
+                    87,
+                    233,
+                    91,
+                    205,
+                    33,
+                    167,
+                    126,
+                    164,
+                    198,
+                    179,
+                    127,
+                    95,
+                    213,
+                    43,
+                    76,
+                    47,
+                    32,
+                    87,
+                    158
+                  ]
+                },
+                "obligation": 2,
+                "assertion_id": 4260323898,
+                "span": {
+                  "file": 0,
+                  "line": 15,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

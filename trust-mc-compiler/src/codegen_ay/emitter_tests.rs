@@ -438,6 +438,65 @@ fn test_emit_bmc_default_logic() {
     );
 }
 
+/// A BMC VC whose terms use floating point is emitted under a logic that has
+/// it. The float lives in a bit-vector (`fp.to_ieee_bv` of an FP operation),
+/// so no declaration names an FP sort. Under the default `QF_AUFBV` ay routes
+/// the VC to a procedure that does not interpret `fp.rem` and answers
+/// `unknown` for this true claim; under the widened logic it proves it.
+#[test]
+fn test_emit_bmc_widens_logic_for_floating_point() {
+    let mut vc = BmcVc::new();
+    vc.query.logic = Some("QF_AUFBV".to_string());
+    vc.add_decl(Decl::constant("x", Sort::bv64()));
+    let x = Expr::var("x", Sort::bv64());
+    let five = Expr::bitvec_const(0x4014_0000_0000_0000u64, 64);
+    let three = Expr::bitvec_const(0x4008_0000_0000_0000u64, 64);
+    let minus_one = Expr::bitvec_const(0xbff0_0000_0000_0000u64, 64);
+    vc.add_constraint(x.clone().eq(five));
+    // fp.rem(5, 3) = -1 (the IEEE remainder): the violation is unreachable.
+    let rem = super::float_arithmetic::bv_to_ieee_fp(x, 11, 53)
+        .fp_rem(super::float_arithmetic::bv_to_ieee_fp(three, 11, 53))
+        .fp_to_ieee_bv();
+    vc.add_violation(Violation::new(
+        PropertyId::new(0),
+        PropertyKind::Assertion,
+        rem.eq(minus_one).not(),
+    ));
+
+    let named = super::emitter::emit_bmc_with_logic_override(vc.clone(), true).to_string();
+    assert!(named.contains("(set-logic QF_AUFBV)"), "a named logic is kept:\n{named}");
+    let smt = emit_bmc(vc).to_string();
+    assert!(smt.contains("(set-logic ALL)"), "FP terms need an FP logic:\n{smt}");
+    let verdict = super::codegen_function::integration_ay_runner::run_ay_smt2(&smt)
+        .unwrap_or_else(|err| panic!("AY failed: {err}. SMT:\n{smt}"));
+    assert_eq!(verdict, "unsat", "SMT:\n{smt}");
+}
+
+/// The widening touches only a logic without floating point: `HORN`, `ALL`
+/// and a logic that names FP stay as they are, and a VC without FP terms
+/// keeps `QF_AUFBV` (`test_emit_bmc_default_logic`).
+#[test]
+fn test_upgrade_logic_for_floating_point_keeps_fp_capable_logics() {
+    use super::emitter::upgrade_logic_for_floating_point;
+    for logic in ["HORN", "ALL", "ALL_SUPPORTED", "QF_ABVFP", "QF_BVFP", "QF_FP"] {
+        let mut program = ay_bindings::AYProgram::new();
+        program.set_logic(logic);
+        upgrade_logic_for_floating_point(&mut program, true);
+        assert_eq!(program.get_logic(), Some(logic));
+    }
+    for logic in ["QF_AUFBV", "QF_BV", "QF_ABV", "QF_UFBV"] {
+        let mut program = ay_bindings::AYProgram::new();
+        program.set_logic(logic);
+        upgrade_logic_for_floating_point(&mut program, false);
+        assert_eq!(program.get_logic(), Some(logic), "no FP terms: unchanged");
+        upgrade_logic_for_floating_point(&mut program, true);
+        assert_eq!(program.get_logic(), Some("ALL"), "{logic} has no floating point");
+    }
+    let mut unset = ay_bindings::AYProgram::new();
+    upgrade_logic_for_floating_point(&mut unset, true);
+    assert_eq!(unset.get_logic(), None);
+}
+
 #[test]
 fn test_emit_chc_horn_logic() {
     // CHC mode should always emit HORN logic

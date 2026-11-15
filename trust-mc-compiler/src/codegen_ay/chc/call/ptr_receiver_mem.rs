@@ -13,6 +13,8 @@
 //!
 //! Part of #3697, #3094.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{BasicBlockIdx, Operand};
 use rustc_public::ty::{RigidTy, Ty, TyKind};
@@ -168,16 +170,36 @@ pub(in crate::codegen_ay::chc) fn load_from_memory(
             .map(Val::of_value);
     }
 
+    // F1 (inline_walk_guard.rs): the selects below read memory directly.
+    ctx.note_inline_walk_memory_read();
     // Phase 2: search for aliased repr(transparent) array with matching elem_sort.
+    //
+    // The candidate is chosen deterministically: the array of the type the
+    // wrapper holds (`AtomicU32` -> `UnsafeCell<u32>` -> `u32`) when it was
+    // written, else the least key. The first match of a `HashMap` walk picked
+    // ANY written array of the same element sort, so `AtomicU32::load` over a
+    // `Box<u32>` read `mem_Ordering` (also `BitVec(32)`) in some runs and
+    // `mem_u32` in others (`safe_atomic_from_box_ptr` SUCCESSFUL or FAILED
+    // from run to run on main too).
     let target_sort = ctx.elem_sort_for_memory_array(load_ty);
-    let alt = ctx
+    let inner_key = single_field_inner_ty(load_ty).map(|ty| ctx.type_key_for_body_ty(ty));
+    let mut candidates: Vec<(std::sync::Arc<str>, std::sync::Arc<str>, Sort)> = ctx
         .heap_state
         .type_arrays
         .iter()
-        .find(|(_, (arr_name, sort))| {
+        .filter(|(_, (arr_name, sort))| {
             *sort == target_sort && ctx.heap_state.write_used_type_arrays.contains_key(arr_name)
         })
-        .map(|(key, (arr_name, sort))| (key.clone(), arr_name.clone(), sort.clone()));
+        .map(|(key, (arr_name, sort))| (key.clone(), arr_name.clone(), sort.clone()))
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let preferred = inner_key
+        .as_deref()
+        .and_then(|inner| candidates.iter().position(|(key, _, _)| key.as_ref() == inner));
+    let alt = match preferred {
+        Some(i) => Some(candidates.swap_remove(i)),
+        None => candidates.into_iter().next(),
+    };
 
     if let Some((alt_key, alt_arr_name, alt_elem_sort)) = alt {
         let arr_sort = Sort::array(crate::codegen_ay::types::ptr_sort(), alt_elem_sort);
@@ -191,6 +213,18 @@ pub(in crate::codegen_ay::chc) fn load_from_memory(
             alt_key = %alt_key,
             "ptr_receiver: repr(transparent) alias fallback (#3452)"
         );
+        // The alias lane reads memory like any dereference, so it carries the
+        // dereference's validity and bounds checks (`heap_access_checks`), as
+        // the other two lanes do inside `load_from_memory_untyped`. Without
+        // them, `AtomicU32::from_ptr(p).load(..)` through an integer-to-pointer
+        // result read a model slot unchecked and verified SUCCESSFUL where Kani
+        // reports an invalid integer address (review of fix/chc-lost-writes,
+        // lostwrite track round 3, finding 3: `bug_atomic_k1..k3`).
+        let checks = ctx.heap_access_checks(addr.as_addr_expr().clone(), load_ty);
+        if !checks.is_empty() {
+            ctx.mark_heap_metadata_read();
+        }
+        ctx.heap_state.pending_checks.extend(checks);
         return Some(Val::of_value(arr_expr.select(addr.as_addr_expr().clone())));
     }
 
@@ -248,14 +282,24 @@ pub(in crate::codegen_ay::chc) fn drain_pending_updates(
 ) {
     extra.append(&mut ctx.heap_state.pending_updates);
     extra.append(&mut ctx.heap_state.drain_store_chains(&ctx.diagnostics));
+    extra.extend(ctx.take_address_assumptions());
 }
 
-/// Emit a memory-backed store transition for heap-addressable receivers.
+/// Emit a memory-backed store transition for heap-addressable receivers
+/// (the volatile store's Mem bridge).
 ///
-/// Shared by both atomic and volatile store paths.
 /// Part of #3710: `build_memory_store` accumulates store constraints into
 /// heap store chains (returns None on success). Constraints are flushed by
 /// `drain_pending_updates` which calls `drain_store_chains`.
+///
+/// D7(b): a store whose address names a static the harness keeps a state
+/// variable for (`write_volatile(A.as_ptr(), 9)`), or whose pointer operand
+/// the MIR derives from one, writes that state variable too, along the
+/// static place path, and the static's image is synced from it — the
+/// atomic call model's route (`plan_static_store_route`). Before, the store
+/// wrote one typed view of the image and nothing else: `A.load() == 5` after
+/// it PROVED, and once a later atomic store synced the image from the stale
+/// state, so did `*A.as_ptr() == 6` after `A.fetch_add(1)`.
 pub(in crate::codegen_ay::chc) fn emit_mem_store_transition(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
@@ -264,16 +308,75 @@ pub(in crate::codegen_ay::chc) fn emit_mem_store_transition(
     addr: Expr,
     pointee_ty: Ty,
 ) -> bool {
+    use super::codegen_call_cell_register::substitute_vars;
+
     let dest_local: usize = dcx.destination.local;
-    // build_memory_store accumulates the store into heap store chains
-    // and returns None (success). The accumulated constraint is flushed
-    // by drain_pending_updates → drain_store_chains below.
-    ctx.build_memory_store_untyped(addr, value, pointee_ty);
+    let routes =
+        ctx.plan_static_store_route(&addr, &dcx.args[0], dcx.modified_locals, dcx.stmt_constraints);
+    let mut substitution = std::collections::HashMap::new();
+    let mut superseded = Vec::new();
+    for route in &routes {
+        substitution.extend(route.substitution.clone());
+        superseded.extend(route.superseded.iter().copied());
+    }
+    let kept: Vec<Expr> = dcx
+        .stmt_constraints
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !superseded.contains(idx))
+        .map(|(_, c)| substitute_vars(c, &substitution))
+        .collect();
+    let value = substitute_vars(&value, &substitution);
+    if !substitution.is_empty() {
+        ctx.heap_state.rewrite_pending_terms(|e| substitute_vars(e, &substitution));
+    }
 
     let mut extra = Vec::new();
+    ctx.with_static_store_routing(|ctx| {
+        // build_memory_store accumulates the store into heap store chains
+        // and returns None (success). The accumulated constraint is flushed
+        // by drain_pending_updates → drain_store_chains below.
+        ctx.build_memory_store_untyped(addr.clone(), value.clone(), pointee_ty);
+        ctx.constrain_static_store_routes(&routes, pointee_ty, &value, &addr, &mut extra);
+    });
     drain_pending_updates(ctx, &mut extra);
     let out = ctx.build_output_args(dcx.modified_locals, &[dest_local]);
-    drain_pending_checks(ctx, dcx, target);
-    ctx.emit_goto_rule_extra(dcx.from_app, target, &out, dcx.stmt_constraints, extra);
+    let rewritten = DispatchCallContext {
+        bb_idx: dcx.bb_idx,
+        func: dcx.func,
+        args: dcx.args,
+        destination: dcx.destination,
+        target: dcx.target,
+        from_app: dcx.from_app,
+        stmt_constraints: &kept,
+        modified_locals: dcx.modified_locals,
+        callee_path: dcx.callee_path.clone(),
+    };
+    drain_pending_checks(ctx, &rewritten, target);
+    ctx.emit_goto_rule_extra(dcx.from_app, target, &out, &kept, extra);
     true
+}
+
+/// The type a single-field wrapper ultimately holds: `AtomicU32` (one field
+/// `v: UnsafeCell<u32>`) -> `UnsafeCell<u32>` -> `u32`. `None` when `ty` is not
+/// a struct with exactly one field (so it holds itself).
+fn single_field_inner_ty(ty: Ty) -> Option<Ty> {
+    let mut current = ty;
+    let mut unwrapped = false;
+    for _ in 0..8 {
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = current.kind() else { break };
+        if def.kind() != rustc_public::ty::AdtKind::Struct {
+            break;
+        }
+        let variants = def.variants();
+        let [variant] = variants.as_slice() else { break };
+        let fields = variant.fields();
+        let [field] = fields.as_slice() else { break };
+        let Some(field_ty) = crate::codegen_ay::shared::mono_ty::field_ty(field, &args) else {
+            break;
+        };
+        current = field_ty;
+        unwrapped = true;
+    }
+    unwrapped.then_some(current)
 }

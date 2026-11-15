@@ -162,6 +162,9 @@ pub(in crate::codegen_ay::chc) fn generate_fragment_rules(ctx: &mut ChcCtx<'_, '
         .collect();
 
     for (entry_bb, blocks, exits) in &fragments {
+        // Fail-closed far pointer observations of this fragment
+        // (heap/stack_address.rs) apply to every rule it emits.
+        let rules_start = ctx.begin_far_observation_range();
         if blocks.len() == 1 {
             generate_single_block_rules(ctx, blocks[0]);
         } else if is_composable_linear_chain(ctx, blocks) {
@@ -179,6 +182,7 @@ pub(in crate::codegen_ay::chc) fn generate_fragment_rules(ctx: &mut ChcCtx<'_, '
         } else {
             generate_fallback_fragment_rules(ctx, blocks);
         }
+        ctx.apply_far_observation_cuts(rules_start, *entry_bb);
         let _ = exits; // Exit edges are handled by the last block's terminator dispatch.
     }
 }

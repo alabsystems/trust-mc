@@ -476,7 +476,7 @@ fn test_const_ref_deref_mem_level_uses_const_value() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     _,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() == 1
                     && matches!(place.projection[0], ProjectionElem::Deref)
@@ -800,7 +800,7 @@ fn find_coroutine_deref_payload_read(body: &rustc_public::mir::Body) -> Option<P
                 return None;
             };
             let place = match rhs {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::Ref(_, _, place)
                 | Rvalue::AddressOf(_, place)
                 | Rvalue::CopyForDeref(place)

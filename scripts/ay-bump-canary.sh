@@ -13,9 +13,9 @@ usage() {
 Usage: ./scripts/ay-bump-canary.sh [--compile-only]
 
 Runs the pre-bump AY checklist:
-  1. cargo check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"
-  2. cargo check --all-targets
-  3. cargo build-dev
+  1. targo --unverified check -p trust-mc-driver --all-targets --features "ay,ay-chc-native"
+  2. targo --unverified check --all-targets
+  3. targo --unverified build-dev
   4. Tier 2 DT+BV / TIC compiletest canaries
   5. Tier 3 Spacer loop compiletest canaries
   6. Tier 4 False-proof detection canaries
@@ -47,7 +47,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "$SCRIPT_DIR/ay_python.sh"
 TRUST_MC_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 cd "$TRUST_MC_DIR"
-TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
+# The Trust toolchain's own driver, `targo`, in its explicit unverified lane
+# (a bare `targo check` refuses) -- never the sysroot's stock-cargo frontend.
+# build-trust-mc names the same lane on its nested `$CARGO build` when that is
+# targo (tools/build-trust-mc/src/sysroot.rs `nested_cargo`).
+TRUST_MC_TARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" targo)"
 
 AY_SOLVER="${AY_SOLVER:-auto}"
 AY_TEST_TIMEOUT="${AY_TEST_TIMEOUT:-30}"
@@ -133,7 +137,7 @@ run_compiletest_file() {
     if [[ "$file_timeout" != "$AY_TEST_TIMEOUT" ]]; then
         echo "Timeout override: ${file_timeout}s"
     fi
-    # cargo build-dev above produced the exact driver once. Reuse it, force the
+    # targo --unverified build-dev above produced the exact driver once. Reuse it, force the
     # selected harness to execute even if compiletest has an old input stamp,
     # and bind the run to this file's basename within its exact suite.
     AY_SOLVER="$AY_SOLVER" AY_TEST_TIMEOUT="$file_timeout" \
@@ -151,24 +155,24 @@ echo "Timeout: ${AY_TEST_TIMEOUT}s"
 echo "Mode: $MODE"
 echo "Cargo wrapper cache: disabled for bump gates (CARGO_SKIP_CACHE=1)"
 echo ""
-echo "Native CHC compile gate: cargo check -p trust-mc-driver --all-targets --features \"$NATIVE_FEATURES\""
+echo "Native CHC compile gate: targo --unverified check -p trust-mc-driver --all-targets --features \"$NATIVE_FEATURES\""
 
 export CARGO_SKIP_CACHE=1
 
 run_compile_gate \
     "Compile gate 1/3: ay-chc-native consumer check" \
-    "$TRUST_MC_CARGO" check -p trust-mc-driver --all-targets --features "$NATIVE_FEATURES"
+    "$TRUST_MC_TARGO" --unverified check -p trust-mc-driver --all-targets --features "$NATIVE_FEATURES"
 
 run_compile_gate \
-    "Compile gate 2/3: workspace cargo check" \
-    "$TRUST_MC_CARGO" check --all-targets
+    "Compile gate 2/3: workspace targo --unverified check" \
+    "$TRUST_MC_TARGO" --unverified check --all-targets
 
 echo ""
 echo "Fresh sysroot build: compiletest only checks whether target/trust-mc/lib/libstd.rlib exists."
-echo "Run cargo build-dev here so stale artifacts cannot mask a broken clean rebuild."
+echo "Run targo --unverified build-dev here so stale artifacts cannot mask a broken clean rebuild."
 run_compile_gate \
     "Compile gate 3/3: fresh sysroot build" \
-    "$TRUST_MC_CARGO" build-dev
+    "$TRUST_MC_TARGO" --unverified build-dev
 
 if [[ "$MODE" == "compile-only" ]]; then
     echo ""

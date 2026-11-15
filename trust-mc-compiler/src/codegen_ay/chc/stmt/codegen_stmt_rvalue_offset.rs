@@ -8,6 +8,7 @@
 //! contention. Contains `translate_pointer_offset_with_modified` and
 //! `ptr_offset_overflow_conditions`.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue};
@@ -22,14 +23,15 @@ use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 use super::pointer_step::step_split_pointer;
+use crate::codegen_ay::shared::const_pointer::{self, ConstRead, TargetKey};
 
 use super::ChcCtx;
 use super::codegen_ctx::diagnostics::CellCounter;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 
 /// One hop of the fail-closed offset-provenance walk
 /// (`single_assign_stack_owner_local`).
-enum OffsetProvenanceStep {
+pub(super) enum OffsetProvenanceStep {
     /// The chain terminates: this local OWNS the allocation.
     Owner(usize),
     /// Part of #72: the chain terminates at a promoted-const `&T` operand
@@ -38,7 +40,21 @@ enum OffsetProvenanceStep {
     /// const addresses are encoded `obj_id ## 0`
     /// (`promoted_const_address_for`), so walked offset lanes are
     /// allocation-relative exactly as for stack owners.
-    ConstRef(rustc_public::ty::Ty),
+    ///
+    /// Also carries the target the constant's pointer names
+    /// (`const_pointer::ConstPtr::key`): the ONE global object of that static
+    /// or constant allocation (`decl::global_objects`), whose extent is the
+    /// whole allocation however far into it the constant points.
+    ConstRef(rustc_public::ty::Ty, Option<TargetKey>),
+    /// The chain terminates at a constant RAW pointer operand
+    /// (`_2 = const {alloc}` of type `*mut T`, which `addr_of_mut!` of a
+    /// `static mut` lowers to). Only the global-object lane
+    /// (`const_object_provenance_for_local`) consumes it: the pointee type of
+    /// a raw pointer says nothing about the allocation's extent. The flag is
+    /// whether the constant is a bare INTEGER address (initialized bytes, no
+    /// relocation: `0x1000 as *const u32`, `NonNull::dangling()`), which has
+    /// no provenance at all.
+    ConstRawPtr(Option<TargetKey>, bool),
     /// Allocation-preserving hop to the defining source local.
     Through(usize),
     /// Raw-alloc route: the chain terminates at the destination local of a
@@ -106,9 +122,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // double-counting: returning None would trigger the parent
             // self-loop handler's record_fallback() (DEMOTED).
             warn!("CHC: Offset pointee size unknown — sound over-approximation");
-            self.record_sound_fallback_reason("offset_pointee_size_unknown");
+            let booked = self.record_sound_fallback_reason("offset_pointee_size_unknown");
             let name = chc_fresh_name("__ptr_offset_nondet");
-            return Some(declare_pending_var(name, ptr_sort()));
+            return Some(Havoc::booked(booked, name, ptr_sort()));
         };
 
         let byte_offset = if pointee_size == 1 {
@@ -466,7 +482,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     let src = match rhs {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => p,
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => p,
                         Rvalue::CopyForDeref(p) => p,
                         Rvalue::Cast(kind, Operand::Copy(p) | Operand::Move(p), _)
                             if matches!(
@@ -658,26 +674,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// stack-local layout, then known heap allocations, then the `obj_size`
     /// metadata array (which the entry rule seeds for statics and promoted
     /// constants).
-    /// Real byte length of a promoted-constant allocation, derived from its
-    /// seeded memory-init entries (max byte_offset + element byte width).
-    /// The entry rule seeds `obj_size` with a GENEROUS 4096 for promoted
-    /// regions (dealloc-check convention), so the metadata array is useless
-    /// for offset-bound precision; this is the exact object extent, enabling
-    /// the constant fast-path to fold offset bound checks statically instead
-    /// of dragging the obj_size array into the solver query.
+    /// Real byte length of a constant-memory object (D3): its allocation's
+    /// length (`global_objects`). The entry rule seeds `obj_size` with a
+    /// GENEROUS 4096 for these regions (dealloc-check convention; residual),
+    /// so the metadata array is useless for offset-bound precision; this is
+    /// the exact object extent, enabling the constant fast-path to fold offset
+    /// bound checks statically. It was the furthest SEEDED byte, which for a
+    /// constant into the middle of an array was the pointee's own window: the
+    /// in-bounds `E.add(1)` read as past the end.
     fn promoted_const_byte_size(&self, obj_id: u32) -> Option<u32> {
-        let mut end: Option<u32> = None;
-        for (_, elem_sort, _, promoted_obj_id, byte_offset) in
-            &self.ref_resolution.const_ref_memory_inits
-        {
-            if *promoted_obj_id != obj_id {
-                continue;
-            }
-            let width = elem_sort.bitvec_width().unwrap_or(8).div_ceil(8) as u64;
-            let entry_end = u32::try_from(byte_offset + width).ok()?;
-            end = Some(end.map_or(entry_end, |e| e.max(entry_end)));
-        }
-        end
+        u32::try_from(self.const_memory_object_size(obj_id)?).ok()
     }
 
     /// Metadata-side-channel provenance for a pointer operand: the allocation
@@ -691,9 +697,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !place.projection.is_empty() {
             return None;
         }
-        let id = self.known_alloc_ids.get(&place.local).copied().or_else(|| {
-            self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
-        })?;
+        let id = self
+            .known_alloc_ids
+            .get(&place.local)
+            .copied()
+            .or_else(|| {
+                self.ref_resolution.const_ref_objects.get(&place.local).map(|object| object.obj_id)
+            })
+            .or_else(|| self.ref_resolution.const_memory_provenance.get(&place.local).copied())?;
         // SCOPE: promoted-const allocations ONLY. For str/slice literals the
         // FULL check chain is verified to engage (offset alloc-bound with the
         // real byte length + deref-site `idx < len`). For heap/stack ids the
@@ -701,7 +712,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // over missing models (e.g. -Z uninit-checks shadow memory:
         // alloc-to-slice went false-Safe when heap provenance resolved) — do
         // NOT resolve those here until their real checks exist.
-        self.is_promoted_const_obj_id(id).then_some(id)
+        self.is_const_memory_obj_id(id).then_some(id)
     }
 
     /// Offset-site provenance for the ALLOC-BOUND-emitting offset paths
@@ -895,7 +906,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     let src = match rhs {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                             if p.projection.is_empty() =>
                         {
                             p.local
@@ -1003,31 +1014,70 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `*arr.as_ptr().add(len)` / `*alloc_ptr.add(size)` is only caught
     /// here). Purely additive: pushing extra obligations can only turn proofs
     /// into failures, never the reverse.
+    ///
+    /// `displacement`: how far past `ptr_local`'s value the access at `addr`
+    /// starts, when the caller knows it (`Some(0)` for a whole-pointee access
+    /// at the pointer). The global-object lane folds the bound with it.
+    ///
+    /// The span is checked in the pointer's own lane: the lane (the identity
+    /// term's high 32 bits) must be the provenance object's id. A wrapping
+    /// step moves an address by any amount and only the low 32 bits are the
+    /// offset this bound reads, so a step of 2^32 bytes or more (whose carry
+    /// is in the lane, or which landed in another object's region and carries
+    /// the landed mark there) passed it with an offset back inside the object:
+    /// `*a.as_ptr().wrapping_byte_add(k)` with `k` in `[2^32, 2^32 + 4)` on a
+    /// `[u8; 4]` was a clean proof where Kani reports a pointer outside object
+    /// bounds (fifth round of fix/chc-false-certificates, 2026-10-01; the same
+    /// on main edc662a62).
     pub(in crate::codegen_ay::chc) fn provenance_deref_bound_checks(
         &self,
         addr: &Expr,
         pointee_ty: rustc_public::ty::Ty,
         ptr_local: usize,
+        displacement: Option<u64>,
     ) -> Vec<Expr> {
-        let Some((_, alloc_size)) = self
-            .stack_provenance_for_local(ptr_local)
-            .or_else(|| self.heap_alloc_provenance_for_local(ptr_local))
-        else {
-            return Vec::new();
-        };
         let Some(access_size) =
             self.get_type_size(pointee_ty).filter(|&s| s > 0).and_then(|s| u32::try_from(s).ok())
         else {
             return Vec::new();
         };
-        let Some((_, offset)) = self.split_pointer(addr) else {
+        let Some((obj_id, alloc_size)) = self
+            .stack_provenance_for_local(ptr_local)
+            .or_else(|| self.heap_alloc_provenance_for_local(ptr_local))
+        else {
+            // The global-object lane (`codegen_stmt_rvalue_offset_const_object`):
+            // a pointer into a static or constant allocation, reached through a
+            // constant pointer and moved (`*(&V as *const u32).add(1)`).
+            return match self.const_provenance_for_local(ptr_local) {
+                Some(provenance) => self.const_provenance_checks(
+                    provenance,
+                    ptr_local,
+                    Some(addr),
+                    access_size,
+                    displacement,
+                ),
+                None => Vec::new(),
+            };
+        };
+        let Some((lane, offset)) = self.split_pointer(addr) else {
             return Vec::new();
         };
+        let in_lane = lane.eq(Expr::bitvec_const(obj_id as u128, 32));
+        let in_lane =
+            trust_mc_core::chc_const_prop::eval::try_eval_to_const(&in_lane).unwrap_or(in_lane);
         let end = offset.clone().bvadd(Expr::bitvec_const(access_size as u128, 32));
         let no_wrap = end.clone().bvuge(offset);
         let in_bounds = end.bvule(Expr::bitvec_const(alloc_size as u128, 32));
         debug!(ptr_local, alloc_size, access_size, "CHC: provenance strict deref bound emitted");
-        vec![no_wrap, in_bounds]
+        // The lane condition joins the bound's obligation rather than adding
+        // one: each obligation of a harness shares its time budget, and a third
+        // one cost `c_symderef.rs` `sd_sym_wrapping_deref_in_bounds_safe` its
+        // proof inside 30 s (measured 2026-10-01).
+        if in_lane == Expr::bool_const(true) {
+            vec![no_wrap, in_bounds]
+        } else {
+            vec![no_wrap, in_lane.and(in_bounds)]
+        }
     }
 
     /// Fail-closed use-def walk from a pointer local to the STACK local that
@@ -1058,14 +1108,89 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &self,
         start_local: usize,
     ) -> Option<OffsetProvenanceStep> {
+        self.provenance_terminal_with(
+            start_local,
+            &|local| self.encode.single_assign_locals.contains(&local),
+            false,
+        )
+    }
+
+    /// [`Self::single_assign_provenance_terminal`] with the hop precondition
+    /// as a parameter: `single(local)` must hold of every local the walk
+    /// passes through, or the local must have several agreeing definitions
+    /// (`offset_walk_agreeing_multi_def_source`).
+    ///
+    /// `through_fields`: the global-object lane's extra hops
+    /// (`pointer_field_source`, `nonnull_call_source`): a pointer COPIED OUT
+    /// OF A FIELD of an aggregate local (`_6 = copy (_1.0)` with `_1 = H { p:
+    /// move _2 }`) to the operand the field was built from, a one-field
+    /// struct (`NonNull { pointer: p }`) to its field, a pointer read through
+    /// a shared reference to it (`copy (*_3)` with `_3 = &_1`) to `_1`, and
+    /// the `NonNull` calls that pass the pointer through. `single` must then
+    /// hold of every local on the way too. Only the global-object lane asks
+    /// for them: its precondition also refuses a local written through a
+    /// projection or whose address is taken other than by a shared borrow of
+    /// a `Freeze` value, which is what makes each still hold the operand it
+    /// was built from.
+    pub(super) fn provenance_terminal_with(
+        &self,
+        start_local: usize,
+        single: &dyn Fn(usize) -> bool,
+        through_fields: bool,
+    ) -> Option<OffsetProvenanceStep> {
         let mut local = start_local;
         let mut seen = HashSet::from([local]);
-        for _ in 0..12 {
-            if !self.encode.single_assign_locals.contains(&local) {
-                debug!(local, start_local, "offset stack lane: refused (not single-assignment)");
-                return None;
+        // Hop budget. MIR inlining of the std pointer API stretches a chain
+        // well past a dozen hops: `byte_add` alone contributes the return-place
+        // copy, the `from_raw_parts` aggregate, the offset model and the
+        // `cast::<u8>`, before the Unsize / `&raw const *` / `&` that reach the
+        // owner. At 12 the walk ran out SILENTLY on
+        // `ptr.byte_add(1).byte_sub(1)` and `slice_from_raw_parts(..).byte_add(1)`,
+        // leaving the offset bound unresolved (a demotion) and the slice
+        // reference extent unresolved (fail closed). Every hop still requires a
+        // single-assignment local and cycles are refused, so a longer budget
+        // cannot resolve a different object — only reach the same owner.
+        const MAX_HOPS: usize = 32;
+        for _ in 0..MAX_HOPS {
+            if !single(local) {
+                match self.offset_walk_agreeing_multi_def_source(local) {
+                    Some(src) => {
+                        if !seen.insert(src) {
+                            debug!(local, start_local, "offset stack lane: refused (cyclic chain)");
+                            return None;
+                        }
+                        debug!(local, src, start_local, "offset stack lane: agreeing multi-def hop");
+                        local = src;
+                        continue;
+                    }
+                    None => {
+                        debug!(
+                            local,
+                            start_local, "offset stack lane: refused (not single-assignment)"
+                        );
+                        return None;
+                    }
+                }
             }
-            match self.offset_walk_unique_def(local) {
+            let step = self.offset_walk_unique_def(local).or_else(|| {
+                if !through_fields {
+                    return None;
+                }
+                let (aggregates, operand) =
+                    self.pointer_field_source(local).or_else(|| self.nonnull_call_source(local))?;
+                if !aggregates.iter().all(|&aggregate| single(aggregate)) {
+                    debug!(local, start_local, "offset stack lane: refused (aggregate not single)");
+                    return None;
+                }
+                match operand {
+                    Operand::Copy(src) | Operand::Move(src) if src.projection.is_empty() => {
+                        Some(OffsetProvenanceStep::Through(src.local))
+                    }
+                    Operand::Constant(const_op) => self.offset_walk_classify_constant(&const_op),
+                    _ => None,
+                }
+            });
+            match step {
                 Some(OffsetProvenanceStep::Through(src)) => {
                     if !seen.insert(src) {
                         debug!(local, start_local, "offset stack lane: refused (cyclic chain)");
@@ -1075,11 +1200,37 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 Some(terminal) => return Some(terminal),
                 None => {
+                    if through_fields && tracing::enabled!(tracing::Level::DEBUG) {
+                        let def = self.body.blocks.iter().find_map(|bb| {
+                            bb.statements
+                                .iter()
+                                .find_map(|stmt| match &stmt.kind {
+                                    rustc_public::mir::StatementKind::Assign(lhs, rhs)
+                                        if lhs.local == local =>
+                                    {
+                                        Some(format!("{rhs:?}"))
+                                    }
+                                    _ => None,
+                                })
+                                .or_else(|| match &bb.terminator.kind {
+                                    rustc_public::mir::TerminatorKind::Call {
+                                        func,
+                                        destination,
+                                        ..
+                                    } if destination.local == local => {
+                                        Some(format!("call {:?}", self.resolve_callee_path(func)))
+                                    }
+                                    _ => None,
+                                })
+                        });
+                        debug!(local, start_local, ?def, "const-object lane: untraceable def");
+                    }
                     debug!(local, start_local, "offset stack lane: refused (untraceable def)");
                     return None;
                 }
             }
         }
+        debug!(start_local, MAX_HOPS, "offset stack lane: refused (hop budget exhausted)");
         None
     }
 
@@ -1113,9 +1264,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     .and_then(|decl| self.get_type_size(decl.ty))
                     .and_then(|size| u32::try_from(size).ok())
             }
-            OffsetProvenanceStep::ConstRef(pointee) => {
+            OffsetProvenanceStep::ConstRef(pointee, _) => {
                 self.get_type_size(pointee).and_then(|size| u32::try_from(size).ok())
             }
+            OffsetProvenanceStep::ConstRawPtr(..) => None,
             // Raw-alloc route: real extent of a `__rust_alloc` allocation —
             // same gates as `heap_alloc_provenance_for_local` (single-
             // assignment stub destination, concrete recorded size).
@@ -1132,74 +1284,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// the provenance walk. Returns `None` for any shape the walk does not
     /// positively understand (fail-closed).
     fn offset_walk_unique_def(&self, target: usize) -> Option<OffsetProvenanceStep> {
-        use rustc_public::mir::{Rvalue, StatementKind, TerminatorKind};
+        use rustc_public::mir::{StatementKind, TerminatorKind};
         for bb in &self.body.blocks {
             for stmt in &bb.statements {
                 let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
                 if lhs.local != target || !lhs.projection.is_empty() {
                     continue;
                 }
-                return match rhs {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                        if src.projection.is_empty() =>
-                    {
-                        Some(OffsetProvenanceStep::Through(src.local))
-                    }
-                    // Part of #72: promoted-const `&T` root (`let v = &[0; 10]`
-                    // where the array is lifetime-promoted). The ref names the
-                    // WHOLE promoted allocation, whose extent is the pointee
-                    // layout size.
-                    Rvalue::Use(Operand::Constant(const_op)) => match const_op.const_.ty().kind() {
-                        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
-                            Some(OffsetProvenanceStep::ConstRef(pointee))
-                        }
-                        _ => None,
-                    },
-                    // Casts: ONLY bit-value-preserving pointer casts. A
-                    // numeric cast (IntToInt et al.) can TRUNCATE the address
-                    // — walking through one would claim (obj, size) for a
-                    // value whose obj_id lane the cast destroyed, and at the
-                    // demotion-suppressing offset site that is a false-Safe
-                    // factory. (`Transmute` is same-size by construction, so
-                    // it preserves the 64-bit pointer value.)
-                    Rvalue::Cast(kind, Operand::Copy(src) | Operand::Move(src), _)
-                        if src.projection.is_empty()
-                            && matches!(
-                                kind,
-                                rustc_public::mir::CastKind::PtrToPtr
-                                    | rustc_public::mir::CastKind::PointerCoercion(_)
-                                    | rustc_public::mir::CastKind::PointerExposeAddress
-                                    | rustc_public::mir::CastKind::PointerWithExposedProvenance
-                                    | rustc_public::mir::CastKind::Transmute
-                                    | rustc_public::mir::CastKind::Subtype
-                            ) =>
-                    {
-                        Some(OffsetProvenanceStep::Through(src.local))
-                    }
-                    Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
-                        let mut projs = place.projection.iter();
-                        let leading_deref = matches!(
-                            place.projection.first(),
-                            Some(rustc_public::mir::ProjectionElem::Deref)
-                        );
-                        if leading_deref {
-                            projs.next();
-                        }
-                        if projs.any(|p| matches!(p, rustc_public::mir::ProjectionElem::Deref)) {
-                            // A deref DEEPER in the chain reads a pointer out
-                            // of memory — not traceable syntactically.
-                            None
-                        } else if leading_deref {
-                            // Reborrow `&(*p)[i]` / `&(*p).f`: points into the
-                            // SAME allocation as `p` — continue the walk
-                            // through the base pointer local.
-                            Some(OffsetProvenanceStep::Through(place.local))
-                        } else {
-                            Some(OffsetProvenanceStep::Owner(place.local))
-                        }
-                    }
-                    _ => None,
-                };
+                return self.offset_walk_classify_assign(rhs);
             }
             let TerminatorKind::Call { func, args, destination, .. } = &bb.terminator.kind else {
                 continue;
@@ -1207,32 +1299,220 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if destination.local != target || !destination.projection.is_empty() {
                 continue;
             }
-            // Raw-alloc route: terminate at a raw allocator stub call. The
-            // stub registers a fresh heap object at offset 0 for this
-            // destination; `heap_alloc_provenance_for_local` recovers its
-            // (obj_id, concrete size) — fail-closed when either is missing.
-            if let Some(stub) = self.detect_alloc_stub(func)
-                && matches!(
-                    stub,
-                    crate::codegen_ay::stubs::StubKind::RustAlloc
-                        | crate::codegen_ay::stubs::StubKind::RustAllocZeroed
-                )
-            {
-                return Some(OffsetProvenanceStep::HeapAlloc(target));
-            }
-            let path = self.resolve_callee_path(func)?;
-            if !Self::offset_walk_identity_callee(&path) {
-                debug!(target, %path, "offset stack lane: refused (non-identity callee)");
-                return None;
-            }
-            return args.first().and_then(|arg| match arg {
-                Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
-                    Some(OffsetProvenanceStep::Through(p.local))
-                }
-                _ => None,
-            });
+            return self.offset_walk_classify_call(target, func, args);
         }
         None
+    }
+
+    /// One whole-local assignment's classification for the provenance walk
+    /// (`None`: a shape the walk does not positively understand).
+    fn offset_walk_classify_assign(
+        &self,
+        rhs: &rustc_public::mir::Rvalue,
+    ) -> Option<OffsetProvenanceStep> {
+        use rustc_public::mir::Rvalue;
+        match rhs {
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+                if src.projection.is_empty() =>
+            {
+                Some(OffsetProvenanceStep::Through(src.local))
+            }
+            // Part of #72: promoted-const `&T` root (`let v = &[0; 10]`
+            // where the array is lifetime-promoted). The ref names the
+            // WHOLE promoted allocation, whose extent is the pointee
+            // layout size.
+            Rvalue::Use(Operand::Constant(const_op), ..) => {
+                self.offset_walk_classify_constant(const_op)
+            }
+            // Casts: ONLY bit-value-preserving pointer casts. A
+            // numeric cast (IntToInt et al.) can TRUNCATE the address
+            // — walking through one would claim (obj, size) for a
+            // value whose obj_id lane the cast destroyed, and at the
+            // demotion-suppressing offset site that is a false-Safe
+            // factory. (`Transmute` is same-size by construction, so
+            // it preserves the 64-bit pointer value.)
+            Rvalue::Cast(kind, Operand::Copy(src) | Operand::Move(src), _)
+                if src.projection.is_empty()
+                    && matches!(
+                        kind,
+                        rustc_public::mir::CastKind::PtrToPtr
+                            | rustc_public::mir::CastKind::PointerCoercion(_)
+                            | rustc_public::mir::CastKind::PointerExposeAddress
+                            | rustc_public::mir::CastKind::PointerWithExposedProvenance
+                            | rustc_public::mir::CastKind::Transmute
+                            | rustc_public::mir::CastKind::Subtype
+                    ) =>
+            {
+                Some(OffsetProvenanceStep::Through(src.local))
+            }
+            // A wide raw pointer assembled from parts
+            // (`ptr::from_raw_parts`, which `with_metadata_of` and the
+            // `byte_add`/`byte_sub`/`byte_offset` family lower to once
+            // inlined): the DATA word is exactly operand 0, so the hop
+            // preserves the allocation. The metadata operand is not
+            // an address and is irrelevant to the walk.
+            Rvalue::Aggregate(rustc_public::mir::AggregateKind::RawPtr(..), ops) => {
+                match ops.first() {
+                    Some(Operand::Copy(src) | Operand::Move(src))
+                        if src.projection.is_empty() =>
+                    {
+                        Some(OffsetProvenanceStep::Through(src.local))
+                    }
+                    _ => None,
+                }
+            }
+            Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                let mut projs = place.projection.iter();
+                let leading_deref = matches!(
+                    place.projection.first(),
+                    Some(rustc_public::mir::ProjectionElem::Deref)
+                );
+                if leading_deref {
+                    projs.next();
+                }
+                if projs.any(|p| matches!(p, rustc_public::mir::ProjectionElem::Deref)) {
+                    // A deref DEEPER in the chain reads a pointer out
+                    // of memory — not traceable syntactically.
+                    None
+                } else if leading_deref {
+                    // Reborrow `&(*p)[i]` / `&(*p).f`: points into the
+                    // SAME allocation as `p` — continue the walk
+                    // through the base pointer local.
+                    Some(OffsetProvenanceStep::Through(place.local))
+                } else {
+                    Some(OffsetProvenanceStep::Owner(place.local))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A constant pointer operand's classification for the provenance walk:
+    /// a `&T` constant ([`OffsetProvenanceStep::ConstRef`]) or a raw-pointer
+    /// constant ([`OffsetProvenanceStep::ConstRawPtr`]).
+    fn offset_walk_classify_constant(
+        &self,
+        const_op: &rustc_public::mir::ConstOperand,
+    ) -> Option<OffsetProvenanceStep> {
+        let key = || {
+            const_pointer::const_bytes(&const_op.const_)
+                .and_then(|bytes| bytes.stored_pointer(0))
+                .and_then(|ptr| ptr.key())
+        };
+        match const_op.const_.ty().kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
+                Some(OffsetProvenanceStep::ConstRef(pointee, key()))
+            }
+            TyKind::RigidTy(RigidTy::RawPtr(..)) => {
+                let integer = const_pointer::const_bytes(&const_op.const_).is_some_and(|bytes| {
+                    bytes.relocation_keys().is_empty() && bytes.stored_word(0).is_some()
+                });
+                Some(OffsetProvenanceStep::ConstRawPtr(key(), integer))
+            }
+            _ => None,
+        }
+    }
+
+    /// One call-destination definition's classification for the provenance
+    /// walk (`None`: not an allocation-preserving callee).
+    fn offset_walk_classify_call(
+        &self,
+        target: usize,
+        func: &Operand,
+        args: &[Operand],
+    ) -> Option<OffsetProvenanceStep> {
+        // Raw-alloc route: terminate at a raw allocator stub call. The
+        // stub registers a fresh heap object at offset 0 for this
+        // destination; `heap_alloc_provenance_for_local` recovers its
+        // (obj_id, concrete size) — fail-closed when either is missing.
+        if let Some(stub) = self.detect_alloc_stub(func)
+            && matches!(
+                stub,
+                crate::codegen_ay::stubs::StubKind::RustAlloc
+                    | crate::codegen_ay::stubs::StubKind::RustAllocZeroed
+            )
+        {
+            return Some(OffsetProvenanceStep::HeapAlloc(target));
+        }
+        let path = self.resolve_callee_path(func)?;
+        if !Self::offset_walk_identity_callee(&path) {
+            debug!(target, %path, "offset stack lane: refused (non-identity callee)");
+            return None;
+        }
+        return args.first().and_then(|arg| match arg {
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
+                Some(OffsetProvenanceStep::Through(p.local))
+            }
+            _ => None,
+        });
+    }
+
+    /// A local with SEVERAL whole definitions, every one an allocation-
+    /// preserving hop from the SAME source local: return that source.
+    ///
+    /// Why: MIR inlining of the std pointer API produces exactly this shape.
+    /// `<*const T>::sub` is `if T::IS_ZST { self } else { offset(self, ..) }`,
+    /// and after inlining the `IS_ZST` test is a `SwitchInt` on an unfolded
+    /// constant, so its result local is written twice — `copy self` on one arm,
+    /// the offset model on `self` on the other. Both name `self`'s allocation,
+    /// so the object is the same on every path; refusing it left
+    /// `&*ptr.byte_add(1).byte_sub(1)` with an unresolved allocation (fail
+    /// closed) although nothing about it is path-dependent.
+    ///
+    /// Gates (each load-bearing):
+    /// - every definition classifies as `Through(src)` with ONE `src`; a
+    ///   terminal (owner / const / alloc) definition refuses, since two
+    ///   terminal sites could name two objects;
+    /// - no definition writes a PROJECTION of the local (partial overwrite);
+    /// - the local is not a `ref_targets` referent nor a deref-store target:
+    ///   the #3937 exclusion in `single_assign_locals` exists because such a
+    ///   local can be written through a pointer, which no MIR count sees.
+    /// The walk then continues at `src`, which must pass the same checks.
+    fn offset_walk_agreeing_multi_def_source(&self, target: usize) -> Option<usize> {
+        use rustc_public::mir::{StatementKind, TerminatorKind};
+        if self.ref_resolution.ref_targets.values().any(|rt| rt.local == target)
+            || self.encode.deref_store_target_locals.contains(&target)
+        {
+            return None;
+        }
+        let mut source: Option<usize> = None;
+        let mut definitions = 0usize;
+        let mut agree = |step: Option<OffsetProvenanceStep>| -> bool {
+            match step {
+                Some(OffsetProvenanceStep::Through(src)) => {
+                    definitions += 1;
+                    match source {
+                        None => {
+                            source = Some(src);
+                            true
+                        }
+                        Some(existing) => existing == src,
+                    }
+                }
+                _ => false,
+            }
+        };
+        for bb in &self.body.blocks {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                if lhs.local != target {
+                    continue;
+                }
+                if !lhs.projection.is_empty() || !agree(self.offset_walk_classify_assign(rhs)) {
+                    return None;
+                }
+            }
+            if let TerminatorKind::Call { func, args, destination, .. } = &bb.terminator.kind
+                && destination.local == target
+            {
+                if !destination.projection.is_empty()
+                    || !agree(self.offset_walk_classify_call(target, func, args))
+                {
+                    return None;
+                }
+            }
+        }
+        if definitions >= 2 { source } else { None }
     }
 
     /// Calls whose destination provably shares the first argument's
@@ -1259,7 +1539,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 || path.ends_with("::wrapping_offset")
                 || path.ends_with("::wrapping_byte_add")
                 || path.ends_with("::wrapping_byte_sub")
-                || path.ends_with("::wrapping_byte_offset"))
+                || path.ends_with("::wrapping_byte_offset")
+                // Byte-granular in-bounds steps: `self.cast::<u8>().add(n)
+                // .with_metadata_of(self)` — same allocation, data word moved.
+                || path.ends_with("::byte_add")
+                || path.ends_with("::byte_sub")
+                || path.ends_with("::byte_offset")
+                // `with_addr(self, a)` is `self.wrapping_byte_offset(a -
+                // self.addr())`: SELF's provenance at another address. Without
+                // this hop a deref of the result had no allocation to bound
+                // it, and one past the end of `self`'s object read clean (third
+                // review of fix/chc-false-certificates: `ad_with_addr_past_end_bug`).
+                || path.ends_with("::with_addr"))
                 && (path.contains("const_ptr") || path.contains("mut_ptr")))
             || path.contains("rustc_intrinsics::offset")
             // Raw-alloc route: `slice::from_raw_parts{,_mut}` /
@@ -1270,17 +1561,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // the real allocation extent.
             || (path.contains("from_raw_parts")
                 && (path.contains("slice") || path.contains("ptr")))
-    }
-
-    /// Whether `obj_id` names a promoted-constant allocation (str/byte-string
-    /// literals collected by Pass 4 / decl-time slice metadata).
-    pub(in crate::codegen_ay::chc) fn is_promoted_const_obj_id(&self, obj_id: u32) -> bool {
-        self.ref_resolution.const_ref_promoted_obj_ids.values().any(|&v| v == obj_id)
-            || self
-                .ref_resolution
-                .const_ref_memory_inits
-                .iter()
-                .any(|(_, _, _, promoted_obj_id, _)| *promoted_obj_id == obj_id)
     }
 
     pub(in crate::codegen_ay::chc) fn ptr_offset_alloc_bound_check(

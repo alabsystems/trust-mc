@@ -273,6 +273,7 @@ fn test_allocate_stack_locals_unknown_type_size_records_sound_fallback() {
 /// Source with a tuple local that ChcCtx flattens into scalar state vars.
 /// Part of #2876: Flattened locals now reconstruct as Datatypes, so
 /// ShallowInitBox passes through the operand (no fallback path exercised).
+#[cfg(not(trust_toolchain))]
 const SHALLOW_INIT_BOX_SOURCE: &str = r#"
     #![allow(dead_code)]
 
@@ -283,6 +284,8 @@ const SHALLOW_INIT_BOX_SOURCE: &str = r#"
 "#;
 
 #[test]
+// Rvalue::ShallowInitBox exists only in the frozen nightly MIR.
+#[cfg(not(trust_toolchain))]
 fn test_shallow_init_box_rvalue_fallback_overflow_returns_none() {
     // Part of #2876: Flattened locals now reconstruct as Datatypes, so
     // ShallowInitBox passes through the reconstructed operand instead of

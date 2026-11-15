@@ -16,6 +16,16 @@ const GENERIC_CLASSIFICATION: (&str, &str) = ("assertion", "property check faile
 const STATEMENT_ROOT: &str = "../trust-mc-compiler/src/codegen_ay/statement";
 // Part of #2740: Also scan context/ for record_property_violation labels.
 const CONTEXT_ROOT: &str = "../trust-mc-compiler/src/codegen_ay/context";
+// codegen_ay's own top-level files (not recursive): codegen_function.rs records
+// whole-function stand-ins such as `bmc_codegen_panic`. The CHC lane (chc/)
+// reports through `PropertyKind`, not this taxonomy, so it is not scanned.
+const CODEGEN_ROOT: &str = "../trust-mc-compiler/src/codegen_ay";
+// Every BMC recorder that takes a literal label as its second argument: the
+// guarded statement forms, with and without a message, the context property
+// forms, with a location or with location and message, and the
+// `emit_division_by_zero_check` helper that forwards its literal label to the
+// guarded form. A form left out here is a label the guard cannot see.
+const RECORDER_LABEL_PATTERN: &str = r#"(?:record_(?:violation_guarded(?:_with_message|_ungated)?|property_violation(?:_with_location|_full)?)|emit_division_by_zero_check)\([^,]+,\s*"([a-z0-9_]+)""#;
 
 // Additional label sources where record_violation_guarded receives a variable label.
 const DYNAMIC_LABEL_PATTERNS: &[(&str, &str)] = &[
@@ -30,6 +40,8 @@ const DYNAMIC_LABEL_PATTERNS: &[(&str, &str)] = &[
         r#"(?s)emit_(?:shl|shr)_constraints\(.*?,\s*"[a-z0-9_]+",\s*"([a-z0-9_]+)""#,
     ),
     ("dispatch/math_unary.rs", r#"EuclidOp::\w+\s*=>\s*"([a-z0-9_]+)""#),
+    // The copy family binds its label once and records it at several sites.
+    ("codegen_copy.rs", r#"let label = "([a-z0-9_]+)";"#),
 ];
 
 // Generated labels without literal forms in source.
@@ -79,8 +91,8 @@ fn emitted_violation_labels() -> BTreeSet<String> {
     let mut files = Vec::new();
     collect_rs_files_recursively(&statement_root, &mut files);
 
-    let label_pattern = Regex::new(r#"record_violation_guarded\([^,]+,\s*"([a-z0-9_]+)""#)
-        .expect("record_violation_guarded regex must compile");
+    let label_pattern =
+        Regex::new(RECORDER_LABEL_PATTERN).expect("recorder label regex must compile");
     let mut labels = BTreeSet::new();
     for file in &files {
         let contents = fs::read_to_string(file).expect("failed to read statement file");
@@ -93,15 +105,18 @@ fn emitted_violation_labels() -> BTreeSet<String> {
     let context_root = Path::new(env!("CARGO_MANIFEST_DIR")).join(CONTEXT_ROOT);
     let mut context_files = Vec::new();
     collect_rs_files_recursively(&context_root, &mut context_files);
-    let property_pattern = Regex::new(r#"record_property_violation\([^,]+,\s*"([a-z0-9_]+)""#)
-        .expect("record_property_violation regex must compile");
-    let property_with_loc_pattern =
-        Regex::new(r#"record_property_violation_with_location\([^,]+,\s*"([a-z0-9_]+)""#)
-            .expect("record_property_violation_with_location regex must compile");
     for file in &context_files {
         let contents = fs::read_to_string(file).expect("failed to read context file");
-        collect_regex_labels(&contents, &property_pattern, &mut labels);
-        collect_regex_labels(&contents, &property_with_loc_pattern, &mut labels);
+        collect_regex_labels(&contents, &label_pattern, &mut labels);
+    }
+
+    let codegen_root = Path::new(env!("CARGO_MANIFEST_DIR")).join(CODEGEN_ROOT);
+    for entry in fs::read_dir(&codegen_root).expect("failed to read codegen_ay dir") {
+        let path = entry.expect("failed to read codegen_ay dir entry").path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            let contents = fs::read_to_string(&path).expect("failed to read codegen_ay file");
+            collect_regex_labels(&contents, &label_pattern, &mut labels);
+        }
     }
 
     labels
@@ -130,8 +145,8 @@ fn test_classify_violation_expanded_families() {
     assert_maps("bigint_div_by_zero", "division-by-zero", "division by zero");
     assert_maps("bigint_mod_by_zero", "division-by-zero", "division by zero");
 
-    assert_maps("simd_extract", "array_bounds", "simd_extract: SIMD index out of bounds");
-    assert_maps("simd_insert", "array_bounds", "simd_insert: SIMD index out of bounds");
+    assert_maps("simd_extract", "undefined-behavior", "simd_extract: SIMD index out of bounds");
+    assert_maps("simd_insert", "undefined-behavior", "simd_insert: SIMD index out of bounds");
 
     assert_maps("offset_value_overflow", "pointer-overflow", "pointer arithmetic overflow");
     assert_maps("offset_bytes_overflow", "pointer-overflow", "pointer arithmetic overflow");
@@ -174,6 +189,18 @@ fn test_classify_violation_expanded_families() {
         "overflow",
         "attempt to calculate the remainder with overflow",
     );
+    // SIMD lane checks keep Kani's `arithmetic_overflow` class: wrapping
+    // simd_add/sub/mul and UB simd_div/rem `MIN / -1` are never a Rust panic.
+    assert_maps(
+        "overflow_check_simd_arith",
+        "arithmetic_overflow",
+        "SIMD lane arithmetic overflow",
+    );
+    assert_maps(
+        "overflow_check_simd_div_rem",
+        "arithmetic_overflow",
+        "SIMD lane signed division overflow",
+    );
     assert_maps(
         "dealloc_size_mismatch",
         "pointer_dereference",
@@ -182,6 +209,11 @@ fn test_classify_violation_expanded_families() {
     assert_maps("double_free_check", "pointer_dereference", "dereference failure: double free");
 
     assert_maps("unsupported_check", "unsupported_construct", "unsupported construct");
+    assert_maps(
+        "unsupported_loop_decreases",
+        "loop_decreases",
+        "loop `decreases` ranking not proven (termination measure)",
+    );
     assert_maps(
         "iterator_sort_mismatch_unsound",
         "unsoundness",
@@ -192,6 +224,11 @@ fn test_classify_violation_expanded_families() {
         "unsoundness",
         "interior-mutable read over-approximation",
     );
+    assert_maps(
+        "unsound_raw_ptr_cached_read",
+        "unsoundness",
+        "raw pointer read through a cached value that byte memory contradicts",
+    );
 
     // Part of #3404: div_euclid/rem_euclid violation labels.
     assert_maps("div_euclid_zero", "division-by-zero", "euclidean division by zero");
@@ -200,7 +237,123 @@ fn test_classify_violation_expanded_families() {
     assert_maps("rem_euclid_overflow", "overflow", "euclidean division signed overflow");
 
     // Part of #3406: Step unchecked overflow label.
-    assert_maps("step_unchecked_overflow", "overflow", "step unchecked overflow");
+    assert_maps("step_unchecked_overflow", "undefined-behavior", "step unchecked overflow");
+
+    // simd_div/simd_rem zero lane divisor: UB, not the scalar panic class.
+    assert_maps("simd_div_by_zero_check", "undefined-behavior", "division by zero");
+    // The intercepted integer methods' zero-divisor checks: wrapping_,
+    // saturating_ and overflowing_ div/rem panic on a zero divisor, and the
+    // unchecked_ intrinsic makes it UB.
+    assert_maps("wrapping_div_by_zero", "division-by-zero", "division by zero");
+    assert_maps("saturating_div_by_zero", "division-by-zero", "division by zero");
+    assert_maps("overflowing_div_by_zero", "division-by-zero", "division by zero");
+    assert_maps("unchecked_div_by_zero", "undefined-behavior", "division by zero");
+    // `unchecked_add`/`sub`/`mul` overflow: UB, Kani's `arithmetic_overflow`
+    // class and text (tests/ui/Property-Class-UI/arithmetic_overflow), never the
+    // safe operators' `overflow` panic class.
+    for (label, op) in [
+        ("unchecked_add_overflow", "unchecked_add"),
+        ("unchecked_sub_overflow", "unchecked_sub"),
+        ("unchecked_mul_overflow", "unchecked_mul"),
+    ] {
+        let (class, description) = classify_violation(label);
+        assert_eq!(class, "arithmetic_overflow", "{label}");
+        assert_eq!(
+            description,
+            format!("attempt to compute `{op}` which would overflow"),
+            "{label}"
+        );
+        assert!(!super::class_is_rust_panic(class), "{label} must NOT be a Rust panic");
+    }
+    // `unchecked_shl`/`unchecked_shr` distance: UB, Kani's `arithmetic_overflow`
+    // class and texts, never the MIR `Assert`'s or CBMC's shift classes.
+    for (label, description) in [
+        ("unchecked_shift_distance_check", "attempt to shift by excessive shift distance"),
+        ("unchecked_shift_distance_check_negative", "attempt to shift by negative distance"),
+    ] {
+        assert_maps(label, "arithmetic_overflow", description);
+        assert!(!super::class_is_rust_panic("arithmetic_overflow"), "{label}");
+    }
+    // The safe operators keep their panic labels and Kani's rustc texts.
+    assert_maps("overflow_check_add", "overflow", "attempt to add with overflow");
+    assert_maps("overflow_check_sub", "overflow", "attempt to subtract with overflow");
+    assert_maps("overflow_check_mul", "overflow", "attempt to multiply with overflow");
+    // Operator-level integer Div/Rem checks (statement/rvalue.rs): Kani's
+    // `check_div_overflow` class and texts, never the MIR Assert's panic class.
+    assert_maps("binop_div_by_zero", "arithmetic_overflow", "attempt to divide by zero");
+    assert_maps(
+        "binop_rem_by_zero",
+        "arithmetic_overflow",
+        "attempt to calculate the remainder with a divisor of zero",
+    );
+    assert_maps("binop_div_overflow", "arithmetic_overflow", "attempt to divide with overflow");
+    assert_maps(
+        "binop_rem_overflow",
+        "arithmetic_overflow",
+        "attempt to calculate the remainder with overflow",
+    );
+
+    // Native BMC Box validity (048c5fabb): UB, so it must stay out of the panic
+    // family a `#[kani::should_panic]` harness may bank.
+    assert_maps(
+        "box_deref_validity",
+        "undefined-behavior",
+        "Box pointer validity: non-null, aligned, inhabited pointee; live and in bounds unless zero-sized",
+    );
+    assert!(!super::class_is_rust_panic(classify_violation("box_deref_validity").0));
+
+    // Labels emitted only through `record_violation_guarded_with_message`, a
+    // `let label` binding or codegen_function.rs, which the drift guard did not
+    // scan: each fell to the panic-family `assertion` default.
+    assert_maps(
+        "float_to_int_unchecked_non_finite",
+        "undefined-behavior",
+        "float_to_int_unchecked: attempt to convert a non-finite value to an integer",
+    );
+    assert_maps(
+        "float_to_int_unchecked_out_of_range",
+        "undefined-behavior",
+        "float_to_int_unchecked: attempt to convert a value out of range of the target integer",
+    );
+    assert_maps(
+        "copy_byte_count_overflow",
+        "undefined-behavior",
+        "attempt to compute number in bytes which would overflow",
+    );
+    assert_maps("copy_overlap_check", "pointer_dereference", "memcpy src/dst overlap");
+    assert_maps(
+        "simd_shuffle_index_check",
+        "undefined-behavior",
+        "index out of bounds: the length is less than or equal to the given index",
+    );
+    assert_maps(
+        "unstable_vtable_comparison",
+        "safety_check",
+        "unstable vtable comparison must not be reached: vtable identity is unspecified",
+    );
+    assert_maps(
+        "unsupported_foreign_function",
+        "unsupported_construct",
+        "unsupported construct: call to a foreign function with no model or --c-lib definition",
+    );
+    assert_maps(
+        "unsupported_loop_contract",
+        "unsupported_construct",
+        "unsupported construct: loop invariant captures a dereference the loop-contract encoding does not support",
+    );
+    assert_maps(
+        "bmc_codegen_panic",
+        "unsupported_construct",
+        "unsupported construct: BMC codegen panic while encoding this function",
+    );
+
+    // `exact_div` is an unsafe intrinsic: Kani gives all three obligations its
+    // own `exact_div` class (tests/ui/Property-Class-UI/exact_div/expected), and
+    // keeping them there is what stops `class_is_rust_panic` banking UB as the
+    // panic a `#[kani::should_panic]` harness asked for.
+    assert_maps("exact_div_not_exact", "exact_div", "exact_div arguments divide exactly");
+    assert_maps("exact_div_zero", "exact_div", "exact_div divisor is nonzero");
+    assert_maps("exact_div_overflow", "exact_div", "exact_div division does not overflow");
 
     // Compile-time type-validity assertion (assert_inhabited/assert_zero_valid/
     // assert_mem_uninitialized_valid); classified with the assertion siblings.
@@ -257,4 +410,15 @@ fn test_classify_violation_label_drift_guard() {
         "emitted labels still falling back to generic assertion classification: {:?}",
         generic_fallback_labels
     );
+}
+
+#[test]
+fn test_classify_violation_nan_check_labels() {
+    // `--nan-check` obligations carry Kani's `NaN` class and "NaN on <op>" text;
+    // the soundness-dual gate keys the `nan` property off this wording.
+    assert_maps("nan_check_add", "NaN", "NaN on +");
+    assert_maps("nan_check_sub", "NaN", "NaN on -");
+    assert_maps("nan_check_mul", "NaN", "NaN on *");
+    assert_maps("nan_check_div", "NaN", "NaN on /");
+    assert_maps("nan_check_rem", "NaN", "NaN on %");
 }

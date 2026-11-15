@@ -119,8 +119,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let resolved = self.resolve_collection_base(&args[0]);
                 debug!("CowToString: resolved={:?}", resolved.as_ref().map(|(b, _)| b));
 
-                if let Some((_base, s)) = resolved {
-                    // Cow is modeled as String - just pass through
+                // Only a Cow the model already carries as a String (the one
+                // `StringFromUtf8Lossy` builds) passes through. A Cow built
+                // as the enum it is (`Cow::Borrowed(s)`, whose `Owned` field
+                // Rule A now resolves to `String`) has its own datatype sort;
+                // writing it into the `String` destination would mis-sort the
+                // destination, so it gets a fresh String instead (an
+                // over-approximation of `to_string`'s content).
+                let passthrough = resolved
+                    .map(|(_base, s)| s)
+                    .filter(|s| s.sort().datatype_name() == Some(RUST_STRING_SORT));
+                if let Some(s) = passthrough {
                     self.assign_value_to_place(destination, s);
                 } else {
                     // Fallback: create a new symbolic String
@@ -187,6 +196,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let cap = self.ctx.declare_var(&cap_name, ptr_sort());
         let data_name = self.ctx.fresh_name_with_suffix(prefix, "data");
         let data = self.ctx.declare_var(&data_name, array_sort);
+        self.ctx.bmc_sound_havoc("symbolic_string");
         // Standard String invariant: cap >= len
         self.ctx.assert(cap.clone().bvuge(len.clone()));
 

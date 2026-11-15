@@ -170,26 +170,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         src_local: Option<usize>,
         ptr_expr: &Expr,
     ) {
-        let source_local = self.raw_ptr_from_raw_parts_source_local(src_local, ptr_expr);
-
-        if let Some(obj_id) = source_local
-            .and_then(|sl| self.known_alloc_ids.get(&sl).copied())
-            .or_else(|| source_local.and_then(|sl| self.trace_deref_store_alloc_id(sl)))
-            .or_else(|| src_local.and_then(|sl| self.known_alloc_ids.get(&sl).copied()))
-            .or_else(|| src_local.and_then(|sl| self.trace_deref_store_alloc_id(sl)))
-        {
+        // Backing lookup may name an interior pointer's owning array, but a
+        // base id must describe the original pointer value, including offset.
+        let interior =
+            Self::try_extract_constant_addr(ptr_expr).is_some_and(|(_, offset)| offset != 0);
+        let source = src_local.filter(|sl| !self.local_has_multiple_whole_definitions(*sl));
+        let base_obj_id = if interior {
+            None
+        } else {
+            source
+                .and_then(|sl| self.trace_deref_store_alloc_id(sl))
+                .or_else(|| Self::try_extract_base_obj_id(ptr_expr))
+        };
+        if let Some(obj_id) = base_obj_id {
             self.known_alloc_ids.insert(dest_local, obj_id);
         } else {
             self.known_alloc_ids.remove(&dest_local);
         }
 
-        let ref_target = source_local
+        // A precise projected target stays useful for an interior pointer.
+        // Never recover a whole-owner target from coarse backing lookup.
+        let ref_target = source
             .and_then(|sl| self.ref_resolution.ref_targets.get(&sl).cloned())
-            .or_else(|| source_local.and_then(|sl| trace_pointer_identity_ref_target(self, sl)))
-            .or_else(|| src_local.and_then(|sl| self.ref_resolution.ref_targets.get(&sl).cloned()))
-            .or_else(|| src_local.and_then(|sl| trace_pointer_identity_ref_target(self, sl)))
             .or_else(|| {
-                ChcCtx::try_extract_obj_id(ptr_expr).and_then(|obj_id| {
+                base_obj_id
+                    .and_then(|_| source.and_then(|sl| trace_pointer_identity_ref_target(self, sl)))
+            })
+            .filter(|target| !interior || !target.projections.is_empty())
+            .or_else(|| {
+                Self::try_extract_base_obj_id(ptr_expr).and_then(|obj_id| {
                     self.heap_state
                         .local_idx_for_obj_id(obj_id)
                         .map(|local| RefTarget::with_projections(local, vec![]))

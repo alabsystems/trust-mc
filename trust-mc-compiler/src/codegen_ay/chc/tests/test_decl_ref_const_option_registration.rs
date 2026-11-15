@@ -13,6 +13,8 @@
 
 use super::common::*;
 use crate::kani_middle::abi::LayoutOf;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 const CONST_REF_OPTION_REF_ZST_SOURCE: &str = r#"
     #![allow(dead_code)]

@@ -172,7 +172,7 @@ fn rewrite_terminator(
     src: usize,
     ucx: &UnrollContext<'_>,
 ) -> Terminator {
-    let span = term.span;
+    let span = mir_span!(term);
     let kind = match &term.kind {
         TerminatorKind::Goto { target } => {
             TerminatorKind::Goto { target: remap_target(*target, iter, src, ucx) }
@@ -213,7 +213,7 @@ fn rewrite_terminator(
         TerminatorKind::Abort => TerminatorKind::Abort,
         TerminatorKind::InlineAsm { .. } => term.kind.clone(),
     };
-    Terminator { kind, span }
+    crate::rustc_compat::mir_terminator(kind, span)
 }
 
 pub(super) fn unroll_natural_loop(
@@ -243,14 +243,14 @@ pub(super) fn unroll_natural_loop(
         maps.push(BlockMap::with_remaps(remaps));
     }
 
-    let span = body.blocks[lp.header].terminator.span;
+    let span = mir_span!(body.blocks[lp.header].terminator);
 
     // Add a shared failure block for this loop (Unreachable → error rule in CHC).
     // Used when unwinding_assertions is true: signals insufficient unwind.
     let fail_bb = body.blocks.len();
     body.blocks.push(BasicBlock {
         statements: Vec::new(),
-        terminator: Terminator { kind: TerminatorKind::Unreachable, span },
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, span),
     });
 
     // Part of #4175: Add a silent dead-end block (Return → no error rule in CHC).
@@ -261,7 +261,7 @@ pub(super) fn unroll_natural_loop(
     let silent_fail_bb = body.blocks.len();
     body.blocks.push(BasicBlock {
         statements: Vec::new(),
-        terminator: Terminator { kind: TerminatorKind::Return, span },
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, span),
     });
 
     let ucx = UnrollContext {

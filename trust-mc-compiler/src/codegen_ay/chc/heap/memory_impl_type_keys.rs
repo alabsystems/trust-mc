@@ -7,6 +7,9 @@ use super::codegen_types::CodegenTypes;
 use super::memory_impl_layout::unwrap_heap_transparent_ty;
 use super::types::{bool_sort, bv8_sort, ptr_sort};
 use super::{ChcCtx, record_type_sort_fallback};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_middle::ty::TypingEnv;
 use rustc_public::CrateDef;
@@ -83,7 +86,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             {
                 let fields = def.variants().first()?.fields();
                 let last_field = fields.last()?;
-                self.unsized_slice_tail_elem_ty(last_field.ty_with_args(&args))
+                self.unsized_slice_tail_elem_ty(mono_ty::field_ty(last_field, &args)?)
             }
             TyKind::RigidTy(RigidTy::Tuple(elems)) => {
                 self.unsized_slice_tail_elem_ty(*elems.last()?)
@@ -271,6 +274,117 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
+    /// Rule C (design trust-mc-reds-final §4.3): memory cells are keyed by
+    /// REPRESENTATION, and a type's key and its SMT sort move together. One
+    /// step of the one predicate: the type whose memory representation `ty`
+    /// is, when that is a different type of the SAME sort:
+    /// - a pattern type is its base (`NonNull<T>`'s field is
+    ///   `pattern_type!(*const T is !null)`);
+    /// - `Box<T, A>` with a zero-sized allocator `A` and a sized `T` is
+    ///   `*const T` (both `ptr_sort`);
+    /// - a `#[repr(transparent)]` ADT (rustc's flag) is its unique
+    ///   non-zero-sized field (`ManuallyDrop`, `MaybeDangling`, `Unique`, ...).
+    ///
+    /// The step is taken only when `translate_ty` gives the wrapper and the
+    /// peeled type the same sort: a key collapse alone would put a datatype
+    /// value (`#[repr(transparent)] struct W(u32)` is a datatype sort) into a
+    /// bitvector array. Before, one value was stored under one key and read
+    /// under another (`Box<i128>`'s slot stored under
+    /// `std_boxed_Box_i128_std_alloc_Global`, read back under
+    /// `std_ptr_NonNull_i128`), an array no rule wrote, so the read was free
+    /// and a counterexample through it was certified Genuine
+    /// (`negative/box_wide_payload.rs`, `negative/stack_heap_disjoint.rs`).
+    pub(in crate::codegen_ay::chc) fn representation_peel(
+        ty: rustc_public::ty::Ty,
+    ) -> Option<rustc_public::ty::Ty> {
+        let peeled = Self::representation_peel_step(ty)?;
+        let sort = Self::translate_ty(ty)?;
+        (Self::translate_ty(peeled).as_ref() == Some(&sort)).then_some(peeled)
+    }
+
+    fn representation_peel_step(ty: rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+        let is_zst = |t: rustc_public::ty::Ty| {
+            t.layout().ok().is_some_and(|l| l.shape().is_sized() && l.shape().size.bytes() == 0)
+        };
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Pat(base, _)) => Some(base),
+            TyKind::RigidTy(RigidTy::Adt(def, args)) if def.is_box() => {
+                let [GenericArgKind::Type(pointee), GenericArgKind::Type(alloc)] =
+                    args.0.as_slice()
+                else {
+                    return None;
+                };
+                // `dyn Trait` is keyed as `u8` (#3608: MIR erases a
+                // `Box<dyn Trait>`'s cell to `Box<u8>`), so its box is the
+                // same `*const u8` as `Box<u8>`'s. Peeling `Box<u8>` alone
+                // split the two: a `Box<Box<dyn Trait>>`'s inner data pointer,
+                // stored under the `Box<dyn Trait>` key, was read back under
+                // `ptr_u8` from a cell no rule wrote
+                // (`test_double_box_dyn_semantic_solver_produces_proof`).
+                let pointee = if matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+                    rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8)
+                } else {
+                    *pointee
+                };
+                let sized = pointee.layout().ok().is_some_and(|l| l.shape().is_sized());
+                (sized && is_zst(*alloc)).then(|| {
+                    rustc_public::ty::Ty::new_ptr(pointee, rustc_public::mir::Mutability::Not)
+                })
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) if def.repr().flags.is_transparent => {
+                let variants = def.variants();
+                let [variant] = variants.as_slice() else { return None };
+                let mut non_zst = Vec::new();
+                for field in variant.fields() {
+                    let field_ty = mono_ty::field_ty(&field, &args)?;
+                    if !is_zst(field_ty) {
+                        non_zst.push(field_ty);
+                    }
+                }
+                let [inner] = non_zst.as_slice() else { return None };
+                Some(*inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a value of `ty` IS an address: a reference or a raw pointer,
+    /// or a type whose representation peels ([`Self::representation_peel`],
+    /// the one Rule C predicate) to one: `NonNull<T>` (its field is
+    /// `pattern_type!(*const T is !null)`), `Unique<T>`, `Box<T, ZST>` (a
+    /// `Box<dyn Trait>` peels to `*const u8`). The named heap wrappers of
+    /// `unwrap_heap_transparent_ty` (`RefCell`, `Mutex`, ...) are a key
+    /// choice, not a representation, and stay out.
+    pub(in crate::codegen_ay::chc) fn value_is_address(ty: rustc_public::ty::Ty) -> bool {
+        let mut ty = ty;
+        for _ in 0..8 {
+            if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))) {
+                return true;
+            }
+            match Self::representation_peel(ty) {
+                Some(peeled) => ty = peeled,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// `ty` through every [`Self::representation_peel`] step and the named
+    /// heap wrappers (`unwrap_heap_transparent_ty`, a model choice that stays
+    /// as it is): the type a memory cell of `ty` is keyed by.
+    pub(in crate::codegen_ay::chc) fn representation_canonical_ty(
+        ty: rustc_public::ty::Ty,
+    ) -> rustc_public::ty::Ty {
+        let mut ty = unwrap_heap_transparent_ty(ty);
+        for _ in 0..8 {
+            match Self::representation_peel(ty) {
+                Some(peeled) => ty = unwrap_heap_transparent_ty(peeled),
+                None => break,
+            }
+        }
+        ty
+    }
+
     /// Generates a type key string for type-indexed memory partitioning.
     ///
     /// Type keys group memory accesses by type signature for scalability.
@@ -279,7 +393,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn type_key_for_ty(
         ty: rustc_public::ty::Ty,
     ) -> Cow<'static, str> {
-        let ty = unwrap_heap_transparent_ty(ty);
+        let ty = Self::representation_canonical_ty(ty);
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => Cow::Borrowed("bool"),
             TyKind::RigidTy(RigidTy::Char) => Cow::Borrowed("char"),

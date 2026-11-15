@@ -1,0 +1,11 @@
+Status: SUCCESS\
+Description: "assertion failed: r.expect_err("expected Err") == 3"
+
+Status: SUCCESS\
+Description: "assertion failed: r.expect_err("expected Err") == e"
+
+Status: FAILURE\
+Description: "panic reached"
+
+VERIFICATION:- SUCCESSFUL
+VERIFICATION:- FAILED

@@ -17,7 +17,7 @@ use crate::kani_middle::transform::body::{
 };
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
-use rustc_hir::LangItem;
+use crate::rustc_compat::LangItem;
 use rustc_middle::ty::{self as internal_ty, TyCtxt};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
@@ -121,8 +121,8 @@ impl RustcIntrinsicsPass {
         // Double check input parameters of `offset` operation.
         let offset_ty = op2.ty(body.locals()).expect("offset operand should have type");
         let pointer_ty = op1.ty(body.locals()).expect("pointer operand should have type");
-        validate_offset(tcx, offset_ty, statement.span);
-        validate_raw_ptr(tcx, pointer_ty, statement.span);
+        validate_offset(tcx, offset_ty, mir_span!(statement));
+        validate_raw_ptr(tcx, pointer_ty, mir_span!(statement));
         tcx.dcx().abort_if_errors();
 
         let pointee_ty = pointer_ty
@@ -385,7 +385,7 @@ impl MutMirVisitor for ReplaceIntrinsicCallVisitor<'_, '_> {
             // back into the MIR as an operand.
             let literal = MirConst::try_new_zero_sized(new_instance.ty())
                 .expect("instance type should be zero-sized");
-            let span = term.span;
+            let span = mir_span!(term);
             let new_func = ConstOperand { span, user_ty: None, const_: literal };
             *func = Operand::Constant(new_func);
             self.changed = true;
@@ -441,7 +441,9 @@ fn simd_len_and_type(tcx: TyCtxt, simd_ty: Ty) -> Option<(rustc_public::ty::TyCo
                 return None;
             }
             let variant = def.non_enum_variant();
-            let f0_ty = variant.fields[rustc_abi::FieldIdx::from_usize(0)].ty(tcx, args);
+            let f0_ty = crate::rustc_compat::skip_normalization(
+                variant.fields[rustc_abi::FieldIdx::from_usize(0)].ty(tcx, args),
+            );
 
             if let internal_ty::TyKind::Array(elem_ty, len) = f0_ty.kind() {
                 // Convert back to stable MIR types

@@ -531,7 +531,12 @@ fn test_untransformed_loop_contract_breadcrumb_fails_closed_in_bmc() {
         let body = instance.body().expect("body");
         let name = instance.name();
         ctx.set_current_fn(instance);
+        crate::codegen_ay::chc::take_sound_havoc_drop_by_fn();
         codegen_function_with_body(&mut ctx, instance, body, &name);
+        // The forced violation must carry the SAT-only taint, or classify_ctrex
+        // certifies its counterexample Genuine.
+        let havocs = crate::codegen_ay::chc::take_sound_havoc_drop_by_fn();
+        assert_eq!(havocs.get(&name).copied().unwrap_or(0), 1, "{havocs:?}");
 
         assert!(ctx.current_fn().is_none(), "fail-closed path must reset current_fn");
         assert!(
@@ -571,6 +576,138 @@ fn test_untransformed_loop_contract_breadcrumb_fails_closed_in_chc() {
             ctx.chc_vc.as_ref().and_then(|vc| vc.query.target.as_deref()),
             Some("chc_loop_contract_unsupported")
         );
+        // The forced fact must book the DEMOTED fallback, or its
+        // counterexample is certified Genuine.
+        assert_eq!(crate::codegen_ay::chc::get_chc_fallback_count_for_fn(&name), 1);
+    });
+}
+
+// =========================================================================
+// codegen_function_with_body: unencoded loop-decreases breadcrumb (BMC)
+// =========================================================================
+
+const LOOP_DECREASES_BREADCRUMB_SOURCE: &str = r#"#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+#[inline(never)]
+#[kanitool::fn_marker = "kani_register_loop_decreases"]
+fn kani_register_loop_decreases7<T, F: Fn() -> T>(_f: &F, _transformed: usize) -> bool {
+    true
+}
+
+struct Counter {
+    val: u8,
+}
+
+fn unencoded_decreases() -> bool {
+    let c = Counter { val: 5 };
+    kani_register_loop_decreases7(&|| c.val, 0)
+}
+
+fn calls_unencoded_decreases() -> bool {
+    unencoded_decreases()
+}
+
+fn no_decreases() -> bool {
+    let x = 5_u8;
+    x == 5
+}
+"#;
+
+#[test]
+fn test_loop_decreases_breadcrumb_scan() {
+    with_test_ay_ctx_for_source(LOOP_DECREASES_BREADCRUMB_SOURCE, |ctx| {
+        let with_call = find_instance_by_suffix(ctx.tcx, "unencoded_decreases");
+        let without = find_instance_by_suffix(ctx.tcx, "no_decreases");
+        assert!(body_has_loop_decreases_call(&with_call.body().expect("body")));
+        assert!(!body_has_loop_decreases_call(&without.body().expect("body")));
+    });
+}
+
+/// Soundness: an unencoded decreases measure must never let a BMC harness
+/// prove. Before this gate only the CHC lane failed closed.
+#[test]
+fn test_unencoded_loop_decreases_fails_closed_in_bmc() {
+    with_test_ay_ctx_for_source(LOOP_DECREASES_BREADCRUMB_SOURCE, |ctx| {
+        let mut ctx = ctx;
+        let mut args = crate::args::Arguments::default();
+        args.unstable_features.push("loop-contracts".to_string());
+        ctx.queries.set_args(args);
+        ctx.config.use_chc = false;
+
+        let instance = find_instance_by_suffix(ctx.tcx, "calls_unencoded_decreases");
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+
+        assert!(ctx.current_fn().is_none(), "fail-closed path must reset current_fn");
+        assert!(ctx.chc_vc.is_none(), "BMC gate must not populate chc_vc");
+        assert!(ctx.unsupported_constructs.contains_key("loop decreases measure not encoded"));
+        assert!(ctx.bmc_vc.violations.iter().any(|violation| {
+            violation
+                .smt_var
+                .as_deref()
+                .is_some_and(|name| name.contains("unsupported_loop_decreases"))
+        }));
+    });
+}
+
+/// The CHC gate's failing VC is a refusal, not a ranking counterexample, so it
+/// must carry the unsupported-construct fallback that keeps the driver from
+/// certifying it Genuine — the record the BMC gate above already makes.
+/// tests/expected/loop-contract/decreases_binary_search.rs (`hi - lo`, Kani
+/// SUCCESSFUL) was certified Genuine on the CHC lane without it.
+#[test]
+fn test_unencoded_loop_decreases_chc_gate_records_fallback() {
+    with_test_ay_ctx_for_source(LOOP_DECREASES_BREADCRUMB_SOURCE, |ctx| {
+        let mut ctx = ctx;
+        let mut args = crate::args::Arguments::default();
+        args.unstable_features.push("loop-contracts".to_string());
+        ctx.queries.set_args(args);
+        ctx.config.use_chc = true;
+
+        let instance = find_instance_by_suffix(ctx.tcx, "calls_unencoded_decreases");
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+
+        assert!(ctx.current_fn().is_none(), "fail-closed path must reset current_fn");
+        let vc = ctx.chc_vc.as_ref().expect("CHC gate must populate the failing VC");
+        assert!(
+            vc.properties.iter().any(|p| p.kind == PropertyKind::LoopDecreases),
+            "the failing VC names the loop_decreases property"
+        );
+        assert!(
+            ctx.unsupported_constructs.contains_key("loop decreases measure not encoded"),
+            "the refusal is recorded as an unsupported-construct fallback"
+        );
+    });
+}
+
+/// Without `-Z loop-contracts` the clause is a no-op (Kani ignores it too).
+#[test]
+fn test_loop_decreases_breadcrumb_ignored_without_flag_in_bmc() {
+    with_test_ay_ctx_for_source(LOOP_DECREASES_BREADCRUMB_SOURCE, |ctx| {
+        let mut ctx = ctx;
+        ctx.queries.set_args(crate::args::Arguments::default());
+        ctx.config.use_chc = false;
+
+        let instance = find_instance_by_suffix(ctx.tcx, "calls_unencoded_decreases");
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+
+        assert!(!ctx.unsupported_constructs.contains_key("loop decreases measure not encoded"));
+        assert!(ctx.bmc_vc.violations.iter().all(|violation| {
+            !violation
+                .smt_var
+                .as_deref()
+                .is_some_and(|name| name.contains("unsupported_loop_decreases"))
+        }));
     });
 }
 

@@ -139,7 +139,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dst_local: usize,
     ) -> Option<Expr> {
         let deref_load = match rhs {
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => {
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) => {
                 place.projection.first() == Some(&ProjectionElem::Deref)
             }
             Rvalue::CopyForDeref(place) => place.projection.first() == Some(&ProjectionElem::Deref),
@@ -163,7 +163,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 /// Handles projected places (e.g., `_123.0.0` → base local 123).
 pub(in crate::codegen_ay::chc) fn extract_vtable_source_local(rvalue: &Rvalue) -> Option<usize> {
     match rvalue {
-        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p.local),
+        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p.local),
         Rvalue::Ref(_, _, place) | Rvalue::CopyForDeref(place) => Some(place.local),
         Rvalue::AddressOf(_, place) => Some(place.local),
         Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(p.local),

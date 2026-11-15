@@ -15,13 +15,30 @@ use super::heap_state::ChcHeapState;
 impl ChcHeapState {
     /// Allocates a fresh object ID for a new allocation.
     ///
-    /// Returns `None` if allocation ID would overflow u32::MAX, matching the
-    /// BMC path's `fresh_alloc_id()` graceful-failure pattern. Callers emit
-    /// a warning and skip the allocation rather than crashing the compiler.
+    /// Returns `None` once the ids reach `stack_address::OBJECT_ID_LIMIT`
+    /// (half the 16-bit object field of an identity term: an address is
+    /// `region << 48 | offset`, a wrapping step's carry lands in the lane's
+    /// high 16 bits, and a lane past the limit names no object), matching the
+    /// BMC path's
+    /// `fresh_alloc_id()` graceful-failure pattern. Callers emit a warning and
+    /// skip the allocation rather than crashing the compiler.
     pub(in crate::codegen_ay::chc) fn next_alloc_id(&mut self) -> Option<u32> {
         let id = self.next_alloc_id;
+        if id >= super::stack_address::OBJECT_ID_LIMIT {
+            return None;
+        }
         self.next_alloc_id = id.checked_add(1)?;
+        self.note_inline_walk_alloc(id);
+        self.alloc_block.insert(id, self.encode_bb);
         Some(id)
+    }
+
+    /// Record `id` as allocated during the active inline walk, if one is
+    /// active (`inline_walk_alloc_ids`).
+    fn note_inline_walk_alloc(&mut self, id: u32) {
+        if let Some(ids) = self.inline_walk_alloc_ids.as_mut() {
+            ids.insert(id);
+        }
     }
 
     /// Reserves a heap allocation ID for predeclaring heap regions.
@@ -38,10 +55,23 @@ impl ChcHeapState {
     /// Returns `None` on allocation ID overflow (only reachable when
     /// preallocated queue is empty and `next_alloc_id` overflows).
     pub(in crate::codegen_ay::chc) fn next_heap_alloc_id(&mut self) -> Option<u32> {
-        if let Some(id) = self.preallocated_heap_ids.pop_front() {
-            return Some(id);
+        let id = match self.preallocated_heap_ids.pop_front() {
+            Some(id) => Some(id),
+            None => self.next_alloc_id(),
+        };
+        id.map(|id| self.activate_reserved_heap_alloc_id(id))
+    }
+
+    pub(in crate::codegen_ay::chc) fn activate_reserved_heap_alloc_id(&mut self, id: u32) -> u32 {
+        self.note_inline_walk_alloc(id);
+        self.alloc_block.insert(id, self.encode_bb);
+        // DFCC freshness: an allocation made while a modifies-frame extent is
+        // being encoded is storage the CHECKED FUNCTION created, so writes to
+        // it are assignable whatever the frame declares.
+        if let Some(frame) = self.current_modifies_frame {
+            self.frame_fresh_heap_objs.entry(frame).or_default().insert(id);
         }
-        self.next_alloc_id()
+        id
     }
 
     /// Sets the next allocation ID counter. Test-only: enables overflow testing
@@ -66,8 +96,14 @@ impl ChcHeapState {
     /// assigning a symbolic dealloc pointer an obj_id that aliases with
     /// a stack local. Stack locals are valid for the entire function
     /// lifetime -- they are never freed.
+    ///
+    /// Ascending: callers emit one disequality per id, so the order is the
+    /// order of conjuncts in the CHC text (it used to be `HashMap` order, and
+    /// the same harness got differently ordered rules from run to run).
     pub(in crate::codegen_ay::chc) fn stack_local_obj_ids(&self) -> Vec<u32> {
-        self.obj_id_to_local.keys().copied().collect()
+        let mut ids: Vec<u32> = self.obj_id_to_local.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Inserts a local address mapping and updates the reverse index.
@@ -91,6 +127,29 @@ impl ChcHeapState {
     /// Returns the concrete size of a heap allocation when it is known.
     pub(in crate::codegen_ay::chc) fn heap_alloc_size(&self, obj_id: u32) -> Option<u32> {
         self.known_heap_alloc_sizes.get(&obj_id).copied()
+    }
+
+    /// Record only the alignment supplied to an actual allocator contract.
+    /// A second observation can reduce the guarantee, never strengthen it.
+    pub(in crate::codegen_ay::chc) fn record_heap_alloc_alignment(
+        &mut self,
+        obj_id: u32,
+        alignment: Option<u64>,
+    ) {
+        let alignment = alignment.filter(|align| align.is_power_of_two());
+        self.heap_alloc_alignments
+            .entry(obj_id)
+            .and_modify(|prior| {
+                *prior = match (*prior, alignment) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                };
+            })
+            .or_insert(alignment);
+    }
+
+    pub(in crate::codegen_ay::chc) fn heap_alloc_alignment(&self, obj_id: u32) -> Option<u64> {
+        self.heap_alloc_alignments.get(&obj_id).copied().flatten()
     }
 
     /// Marks a fresh obj_id as the backing buffer of a provably-valid,
@@ -201,25 +260,5 @@ impl ChcHeapState {
         bb_idx: usize,
     ) {
         self.write_used_type_arrays.entry(Arc::clone(arr_name)).or_default().insert(bb_idx);
-    }
-
-    /// Allocates a fresh object ID for a promoted constant.
-    ///
-    /// Promoted constants share the same `obj_valid` / `obj_size` namespace as
-    /// heap and stack objects, so they must consume IDs from the same counter to
-    /// avoid collisions.
-    pub(in crate::codegen_ay::chc) fn next_promoted_const_obj_id(&mut self) -> Option<u32> {
-        self.next_alloc_id()
-    }
-
-    /// Returns the split-pointer address for the promoted constant memory region.
-    /// Part of #2958: Use proper obj_id so `obj_valid[extract(63,32,addr)]` checks pass.
-    pub(in crate::codegen_ay::chc) fn promoted_const_address(&self) -> Expr {
-        self.promoted_const_address_for(self.promoted_const_obj_id)
-    }
-
-    /// Returns the split-pointer base address for a promoted constant object ID.
-    pub(in crate::codegen_ay::chc) fn promoted_const_address_for(&self, obj_id: u32) -> Expr {
-        Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32))
     }
 }

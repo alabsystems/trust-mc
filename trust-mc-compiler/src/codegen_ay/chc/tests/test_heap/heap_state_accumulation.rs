@@ -266,3 +266,20 @@ fn test_pending_checks_reset() {
     heap.reset_pending_checks();
     assert!(heap.pending_checks.is_empty(), "Pending checks should be cleared after reset");
 }
+
+/// The stack-local object ids come back ascending, whatever order the locals
+/// were registered in: callers emit one disequality per id, so this order is
+/// the order of conjuncts in the CHC text. It used to be the iteration order of
+/// a `HashMap`, and one harness got differently ordered rules from run to run
+/// (measured 2026-10-01, `walker_drop_body_dual.rs::bug_drop_box_dyn_multi`).
+/// Eight ids: a random order is ascending once in 40320.
+#[test]
+fn test_stack_local_obj_ids_are_ascending() {
+    let mut heap = ChcHeapState::new();
+    for (local, obj_id) in
+        [(3usize, 31u32), (1, 17), (8, 40), (2, 5), (6, 29), (4, 12), (7, 23), (5, 9)]
+    {
+        heap.insert_local_address(local, obj_id, format!("addr_{local}"));
+    }
+    assert_eq!(heap.stack_local_obj_ids(), vec![5, 9, 12, 17, 23, 29, 31, 40]);
+}

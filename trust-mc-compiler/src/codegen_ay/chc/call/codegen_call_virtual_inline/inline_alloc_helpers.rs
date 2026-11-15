@@ -9,6 +9,7 @@
 //! dedicated allocation stubs would have produced.
 
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 
@@ -21,7 +22,8 @@ pub(super) fn inline_alloc_size_expr<'tcx, 'body>(
     outer_body: &rustc_public::mir::Body,
     translated_args: &[Expr],
 ) -> Expr {
-    if callee_path.contains("Box") && callee_path.ends_with("::new") {
+    // Every path that reaches the fresh size books why it is fresh (Rule E).
+    let booked = if callee_path.contains("Box") && callee_path.ends_with("::new") {
         if let Some(arg_ty) = args
             .first()
             .and_then(|arg| arg.ty(outer_body.locals()).ok())
@@ -30,22 +32,19 @@ pub(super) fn inline_alloc_size_expr<'tcx, 'body>(
         {
             return Expr::bitvec_const(size as i128, 32);
         }
-        ctx.record_sound_fallback_reason("inline_box_new_size_unknown");
+        ctx.record_sound_fallback_reason("inline_box_new_size_unknown")
     } else if let Some(size_expr) =
         translated_args.first().cloned().and_then(|expr| ctx.coerce_to_heap_bv32(expr))
     {
         return size_expr;
     } else if !translated_args.is_empty() {
-        ctx.record_sound_fallback_reason("inline_alloc_size_bv32_coercion_failed");
+        ctx.record_sound_fallback_reason("inline_alloc_size_bv32_coercion_failed")
     } else {
-        ctx.record_sound_fallback_reason("inline_alloc_size_missing");
-    }
+        ctx.record_sound_fallback_reason("inline_alloc_size_missing")
+    };
 
     ctx.record_aggregate_gap("inline_alloc_size_symbolic");
-    super::super::declare_pending_var(
-        super::super::chc_fresh_name("__inline_alloc_size"),
-        Sort::bitvec(32),
-    )
+    Havoc::booked(booked, super::super::chc_fresh_name("__inline_alloc_size"), Sort::bitvec(32))
 }
 
 pub(super) fn emit_inline_alloc_metadata<'tcx, 'body>(

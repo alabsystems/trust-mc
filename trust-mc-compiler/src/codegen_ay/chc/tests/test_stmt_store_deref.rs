@@ -775,7 +775,9 @@ fn test_oi2_detection_non_into_iter_deref_store_emits_memory_store() {
             "raw pointer source should have no collection projection locals"
         );
 
-        let (vc, _) = chc_ctx.translate();
+        // Pre-pass VC: the raw-pointer write is never read back, so write-only array
+        // elimination (85da41dad) removes the memory store from the translated VC.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         // The memory store should be present in the SMT output.

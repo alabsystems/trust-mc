@@ -89,15 +89,148 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             true
         };
 
-        // Create or reuse stable address symbol (thin data pointer)
-        let addr = self.get_or_create_address_symbol(base_name.as_ref(), place, pointee_ty)?;
+        // Create or reuse stable address symbol (thin data pointer). A field or
+        // an element of a local, and the payload of a `Box` local, are placed
+        // inside the object they belong to rather than getting a symbol of their
+        // own (`derived_place_address`).
+        let addr = match self.derived_place_address(place, pointee_ty) {
+            Some(addr) => addr,
+            None => self.get_or_create_address_symbol(base_name.as_ref(), place, pointee_ty)?,
+        };
 
-        if !use_thin
-            && let Some(fat) = self.try_build_fat_pointer(base_name.as_ref(), &addr, rvalue)
-        {
-            return Some(fat);
+        if !use_thin {
+            // `&*p`, `&mut *p` and `&raw const *p` (the `FakeForPtrMetadata`
+            // borrow every bounds check on a `&mut [T]` takes) carry exactly
+            // the metadata of `p`. Read `p`'s own value here, before the fat
+            // pointer is built from the REFERENT: an array local behind the
+            // reference has no length of its own, and the fresh length symbol
+            // built for it was unrelated to `p`'s, so `source.len() == 2` and
+            // `source[0] = 9` for `let source: &mut [u8] = &mut [1u8, 2]`
+            // FAILED with a Genuine counterexample (main 31793ccc3).
+            let reborrowed_wide = (place.projection.len() == 1
+                && Self::is_wide_pointer_ty(self.body.locals()[place.local].ty))
+            .then(|| self.codegen_place(&Place { local: place.local, projection: vec![] }))
+            .flatten();
+            if let Some(fat) = self.try_build_fat_pointer(
+                base_name.as_ref(),
+                &addr,
+                rvalue,
+                reborrowed_wide.as_ref(),
+            ) {
+                return Some(fat);
+            }
         }
 
+        Some(addr)
+    }
+
+    /// The address of a place INSIDE another object, derived from that object's
+    /// address instead of minted as an unrelated symbol:
+    ///
+    /// - `&s.a`, `&a[i]`, `&s.inner.buf[K]` on a local: the local's own stable
+    ///   address (which registers it as a stack object, disjoint from every
+    ///   other) plus rustc's field offsets and `index * size_of::<T>()`;
+    /// - `&*b`, `&(*b).f` for a `Box` local: the heap allocation the box holds
+    ///   (its value after `Box::new`) plus the field offsets.
+    ///
+    /// Two fields of one struct, two elements of one array, two boxes and a local
+    /// beside a box each got a fresh address with only non-null / alignment
+    /// constraints, so `ptr::eq(&s.a, &s.b)`, `ptr::eq(&*b1, &*b2)` and
+    /// `ptr::eq(&x, &*b)` were satisfiable and `&a[1] as usize == &a[0] as usize
+    /// + 1` was not: the safe harnesses FAILED with a Genuine counterexample
+    /// (negative/alloc_id_fields_offsets.rs, main 31793ccc3). Cached under the
+    /// place's base name like every other address. `None` (the caller keeps the
+    /// unrelated symbol) for a place this cannot place: a symbolic index with no
+    /// value, an index from the end, a `Downcast`, an unsized or unlaid-out
+    /// field, a dereference of anything but a `Box` local.
+    pub(super) fn derived_place_address(
+        &mut self,
+        place: &Place,
+        pointee_ty: Option<rustc_public::ty::Ty>,
+    ) -> Option<Expr> {
+        if place.projection.is_empty() {
+            return None;
+        }
+        let cache_key = self.ssa_base_name(place);
+        if let Some(cached) = self.addr_symbols.get(cache_key.as_str()) {
+            return Some(cached.clone());
+        }
+        let root_ty = self.body.locals()[place.local].ty;
+        let root_place = Place { local: place.local, projection: vec![] };
+        let (mut addr, mut current_ty, rest): (Expr, rustc_public::ty::Ty, &[ProjectionElem]) =
+            match place.projection.first()? {
+                ProjectionElem::Deref => {
+                    // A Box local: its value is the allocation's address.
+                    if let Some(pointee) = Self::box_pointee_ty(root_ty) {
+                        let ptr = self.codegen_place(&root_place)?;
+                        if ptr.sort().bitvec_width() != Some(POINTER_WIDTH) {
+                            return None;
+                        }
+                        (ptr, pointee, &place.projection[1..])
+                    } else {
+                        // A reference to a CONSTANT ALLOCATION (a `static`, a
+                        // promoted constant). Its object is keyed on the
+                        // allocation, so two borrows of one static agree and two
+                        // statics are disjoint; `&S[i]` is then placed inside it
+                        // instead of getting a symbol of its own.
+                        let TyKind::RigidTy(
+                            RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _),
+                        ) = root_ty.kind()
+                        else {
+                            return None;
+                        };
+                        let ref_base = self.ssa_base_name(&root_place);
+                        if self.ref_pointees.is_poisoned(ref_base.as_str()) {
+                            return None;
+                        }
+                        let pointee_base = self.ref_pointees.get(ref_base.as_str()).cloned()?;
+                        let ptr = self.const_pointee_objects.get(pointee_base.as_ref()).copied()?;
+                        let naming = self.global_alloc_naming();
+                        let target_base = super::global_alloc::global_alloc_address(
+                            self.ctx,
+                            &ptr.key()?,
+                            naming,
+                        )?;
+                        let base = ptr.address(&target_base, POINTER_WIDTH)?;
+                        (base, pointee, &place.projection[1..])
+                    }
+                }
+                _ => {
+                    let root_base = self.ssa_base_name(&root_place);
+                    let base =
+                        self.get_or_create_address_symbol(&root_base, &root_place, Some(root_ty))?;
+                    (base, root_ty, &place.projection[..])
+                }
+            };
+        for proj in rest {
+            match proj {
+                ProjectionElem::Field(field_idx, field_ty) => {
+                    let offset = LayoutOf::new(current_ty).field_offset(*field_idx)?;
+                    if offset > 0 {
+                        addr = addr.bvadd(Expr::bitvec_const(offset as u128, POINTER_WIDTH));
+                    }
+                    current_ty = *field_ty;
+                }
+                ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                    let elem_ty = match current_ty.kind() {
+                        TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
+                        _ => return None, // external enum: TyKind (a slice has no static layout here)
+                    };
+                    let elem_size = LayoutOf::new(elem_ty).size_of()?;
+                    let idx = self.projection_index_value(proj, POINTER_WIDTH)?;
+                    if elem_size > 0 {
+                        addr = addr.bvadd(
+                            idx.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH)),
+                        );
+                    }
+                    current_ty = elem_ty;
+                }
+                _ => return None, // external enum: ProjectionElem (Downcast, Deref, Subslice, ...)
+            }
+        }
+        let _ = pointee_ty;
+        self.addr_symbols.insert(cache_key.into(), addr.clone());
+        debug!(?place, "addr_of_place: derived the address from the enclosing object");
         Some(addr)
     }
 
@@ -176,9 +309,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         place: &Place,
         pointee_ty: Option<rustc_public::ty::Ty>,
     ) -> Option<Expr> {
-        if let Some(cached_addr) = self.addr_symbols.get(base_name) {
+        if let Some(cached_addr) = self.addr_symbols.get(base_name).cloned() {
             debug!("addr_of_place: reusing cached address for {} (stable aliasing)", base_name);
-            return Some(cached_addr.clone());
+            self.revalidate_alloc_view(&cached_addr, place, base_name);
+            return Some(cached_addr);
         }
 
         let addr_name = crate::codegen_ay::names::addr_name(base_name);
@@ -218,9 +352,30 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // single heap region so raw-pointer dereferences of stack
                     // locals pass the same-allocation (use_after_free) check.
                     self.ctx.heap_constrain_within_region(addr.clone(), size as u64);
+                    // A whole local is its own object: keep it off heap objects
+                    // and other stack objects. A field or a place under a
+                    // dereference gets its own unrelated symbol here (it lies
+                    // inside another object), so separating it would be false.
+                    if place.projection.is_empty() {
+                        self.ctx.register_stack_object(addr.clone(), size as u64);
+                    }
                 }
             }
         }
+
+        // Name the allocation this symbol points into, for the exact
+        // same-allocation obligation of pointer offsets (alloc_view.rs).
+        self.register_alloc_view(&addr, place);
+
+        // The address of a PROJECTED place (`&a[3]`, `&s.f`) is a pointer into
+        // its root local, and pointer arithmetic from it reads the root's other
+        // bytes. Only the projected value was stored below, so
+        // `(&a[3] as *const i32).sub(1)` read an unconstrained byte of `memory`
+        // and `assert_eq!(*before, 2)` failed certified Genuine
+        // (kani/PointerOffset/offset_sub.rs). Store the whole root at its base
+        // first, when the view is known; the projected store below then writes
+        // the same bytes again.
+        self.materialize_root_of_projected_view(&addr, place);
 
         // #1246: Store stack local's value to memory when its address is taken.
         if place.projection.first() != Some(&ProjectionElem::Deref) {
@@ -235,7 +390,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     false
                 };
                 if !materialized {
-                    self.ctx.store_memory_bytes(addr.clone(), local_value);
+                    match pointee_ty {
+                        Some(ty) => self.store_typed_value_to_memory(addr.clone(), local_value, ty),
+                        None => self.ctx.store_memory_bytes(addr.clone(), local_value),
+                    }
                 }
             } else {
                 debug!("#1246: Could not get value for {} to store to memory", base_name);
@@ -250,11 +408,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Slice-like fat pointers may include an extra `fld_data` backing array.
     /// When no precise backing is available at this layer, emit a symbolic
     /// const-array with the correct element sort to preserve constructor shape.
+    ///
+    /// `reborrowed_wide` is the value of the wide pointer `p` when the borrowed
+    /// place is exactly `*p`; its metadata is the result's metadata.
     fn try_build_fat_pointer(
         &mut self,
         base_name: &str,
         addr: &Expr,
         rvalue: &Rvalue,
+        reborrowed_wide: Option<&Expr>,
     ) -> Option<Expr> {
         debug!("addr_of_place: unsized type, creating fat pointer for {}", base_name);
         let ref_ty = rvalue.ty(self.body.locals()).into_option()?;
@@ -315,13 +477,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 _ => None,
             })
             .unwrap_or((None, None));
-        let meta = if let Some(len) = real_len {
+        // A reborrow of a wide pointer keeps that pointer's metadata exactly:
+        // take it from a constructor value (the fat pointer an unsize cast or
+        // `&str` literal built) or select it off any other fat-sorted value.
+        // Only a value of this same fat sort is read, so `fld_len` means the
+        // same thing on both sides.
+        let reborrowed_len = reborrowed_wide
+            .map(|w| self.follow_ssa(w, 64))
+            .filter(|w| *w.sort() == fat_sort)
+            .and_then(|w| {
+                let fields = &sort_ref.datatype_sort()?.constructors.first()?.fields;
+                let len_idx = fields.iter().position(|f| f.name == "fld_len")?;
+                let len = match w.value() {
+                    ExprValue::DatatypeConstructor { args, .. } => args.get(len_idx)?.clone(),
+                    _ => super::extract_fat_ptr_metadata(&w)?,
+                };
+                (*len.sort() == meta_sort).then_some(len)
+            });
+        let meta = if let Some(len) = real_len.or(reborrowed_len) {
             len
         } else if let Some(cached_meta) = self.addr_metadata_symbols.get(base_name) {
             cached_meta.clone()
         } else {
             let meta_name = crate::codegen_ay::names::meta_name(base_name);
             let meta_var = self.ctx.declare_var(&meta_name, meta_sort);
+            // A fabricated length (or vtable) for a view whose real metadata
+            // is not in scope: a stand-in the program did not produce, so a
+            // counterexample that reads it must not be certified Genuine
+            // (bmc_fresh_value_certificate_dual.rs: `s.len() == 3` on `&mut a`).
+            self.ctx.bmc_sound_havoc("fat_ptr_metadata");
             self.addr_metadata_symbols.insert(base_name.into(), meta_var.clone());
             meta_var
         };
@@ -330,13 +514,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let real = real_data.filter(|d| *d.sort() == data_field.sort);
             let data = if let Some(real) = real {
                 real
-            } else if let Some(array_sort) = data_field.sort.array_sort() {
+            } else if data_field.sort.array_sort().is_some() {
+                // A fresh ARRAY. `const_array(one fresh element)` made every
+                // element of the view EQUAL — `"123".as_ptr()` could not read
+                // '1' then '2', and `assert!(s[0] == s[1])` held for any slice:
+                // an under-approximation, not a havoc.
                 let default_name = self.ctx.fresh_name("slice_default");
-                let default_elem =
-                    self.ctx.declare_var(&default_name, array_sort.element_sort.clone());
-                Expr::const_array(ptr_sort(), default_elem)
+                self.ctx.bmc_sound_havoc("fat_ptr_slice_data");
+                self.ctx.declare_var(&default_name, data_field.sort.clone())
             } else {
                 let fresh_name = self.ctx.fresh_name("fat_ptr_field");
+                self.ctx.bmc_sound_havoc("fat_ptr_field");
                 self.ctx.declare_var(&fresh_name, data_field.sort.clone())
             };
             args.push(data);

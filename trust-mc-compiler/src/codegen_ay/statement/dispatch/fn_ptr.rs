@@ -17,6 +17,7 @@
 //!
 //! Part of #3377: BMC missing fn_ptr dispatch capability.
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::Expr;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
@@ -126,7 +127,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             if !target_locals.contains(&place.local) {
                                 continue;
                             }
-                            if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
+                            if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rvalue
+                            {
                                 if src.projection.is_empty() {
                                     new_locals.push(src.local);
                                 }
@@ -160,7 +162,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     }
                     match rvalue {
                         Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer { .. }),
                             operand,
                             _,
                         ) => {
@@ -207,7 +209,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             for stmt in &bb.statements {
                 if let StatementKind::Assign(_, rvalue) = &stmt.kind
                     && let Rvalue::Cast(
-                        CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                        CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer { .. }),
                         operand,
                         _,
                     ) = rvalue
@@ -232,7 +234,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let StatementKind::Assign(_place, rvalue) = &stmt.kind {
                     match rvalue {
                         Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer { .. }),
                             operand,
                             _,
                         ) => {
@@ -266,7 +268,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         let instance = Instance::resolve(fn_def, &fn_substs).into_option()?;
         // Verify the instance has a body we can inline.
-        instance.body()?;
+        instance.callee_body()?;
         Some(instance)
     }
 
@@ -280,7 +282,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             TyKind::RigidTy(RigidTy::Closure(def, args)) => {
                 for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
                     if let Ok(inst) = Instance::resolve_closure(def, &args, kind) {
-                        if inst.body().is_some() {
+                        if inst.callee_body().is_some() {
                             return Some(inst);
                         }
                     }
@@ -289,7 +291,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
             TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_substs)) => {
                 let instance = Instance::resolve(fn_def, &fn_substs).into_option()?;
-                instance.body()?;
+                instance.callee_body()?;
                 Some(instance)
             }
             _ => None,

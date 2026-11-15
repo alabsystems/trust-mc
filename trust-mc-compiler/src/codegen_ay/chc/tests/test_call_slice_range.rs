@@ -363,7 +363,7 @@ fn test_range_index_mir_constant_bounds_do_not_require_flattened_state() {
         );
 
         let before_rules = chc_ctx.vc.rules.len();
-        let before_fallback = chc_ctx.sound_fallback_count();
+        let before = bookings(&chc_ctx);
         let dest_local = destination.local;
 
         let cx = ChcCallContext {
@@ -378,10 +378,12 @@ fn test_range_index_mir_constant_bounds_do_not_require_flattened_state() {
         chc_ctx.codegen_call_slice_range_index(&cx, dest_local, slice_arg, index_arg, false);
 
         assert!(chc_ctx.vc.rules.len() > before_rules, "expected range codegen to emit rules");
-        assert_eq!(
-            chc_ctx.sound_fallback_count(),
-            before_fallback,
-            "MIR aggregate bounds should avoid sound fallback without flattened state"
+        // The rebased subslice's cells past MAX_SUBSLICE_ELEMS are a booked,
+        // identified havoc (Rule E), not a fallback.
+        assert_precise_up_to_attributed_havocs(
+            &chc_ctx,
+            &before,
+            "MIR aggregate bounds should avoid a fallback without flattened state",
         );
 
         let subslice_len = chc_ctx
@@ -578,7 +580,11 @@ fn test_range_index_happy_path_emits_bounds_guards() {
     });
 }
 
-/// Inclusive range (RangeInclusive) also emits bounds guard rules.
+/// Inclusive range (RangeInclusive) also emits bounds guard rules. The range
+/// carries its `exhausted` flag as its third field (`RangeInclusive`'s
+/// layout): the slice is `start'..end + 1` with `start'` the end once it is
+/// exhausted (walker fail-closed repair round 5); without the flag the index
+/// takes the sound fallback.
 #[test]
 fn test_range_index_inclusive_emits_rules() {
     with_range_scaffold(|chc_ctx, destination, target, from_app, sc, ml| {
@@ -588,6 +594,11 @@ fn test_range_index_inclusive_emits_rules() {
         let base_idx = chc_ctx.state_var_mgr.state_vars.len();
         chc_ctx.push_state_var_pair("range_start_1", "range_start_1_out", bv_sort.clone());
         chc_ctx.push_state_var_pair("range_end_1", "range_end_1_out", bv_sort);
+        chc_ctx.push_state_var_pair(
+            "range_exhausted_1",
+            "range_exhausted_1_out",
+            ay_bindings::Sort::bool(),
+        );
         chc_ctx.state_var_mgr.local_to_state_idx.insert(10, base_idx);
 
         let slice_op = Operand::Copy(Place { local: 1usize, projection: vec![] });
@@ -778,7 +789,7 @@ fn test_ptr_comparison_exact_file_box_slice_fallback_reasons() {
 }
 
 #[test]
-fn test_ptr_comparison_exact_file_slice_len_proves() {
+fn test_ptr_comparison_exact_file_slice_len_keeps_dispatch_and_names_its_residual() {
     let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -786,12 +797,14 @@ fn test_ptr_comparison_exact_file_slice_len_proves() {
     let source = strip_ptr_comparison_for_unit_ctx(PTR_COMPARISON_REAL_FILE);
     crate::codegen_ay::context::with_test_ay_ctx_for_source_with_edition(&source, "2021", |ctx| {
         let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+        let _ = crate::codegen_ay::chc::codegen_ctx::diagnostics::GLOBAL_COUNTERS
+            .take_aggregate_gap_reasons_by_fn();
         let fn_name = "check_slice_len";
         reset_slice_range_dispatch_metadata();
 
         let instance = find_instance_by_suffix(ctx.tcx, fn_name);
         let body = instance.body().expect("function body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default());
+        let chc_ctx = ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig { straightline_discharge: true, ..ChcConfig::default() });
         let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
         let smt = crate::codegen_ay::emit_chc(&vc).to_string();
         let translation_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
@@ -812,6 +825,24 @@ fn test_ptr_comparison_exact_file_slice_len_proves() {
             0,
             "{fn_name} should not rely on inferable summaries"
         );
-        assert_z3_result(&smt, "unsat");
+        // The inlined comparison helpers' `assert!`s are obligations now
+        // (switchint.rs, `is_panic_arm`): a diverging SwitchInt arm used to be
+        // filtered out of the ITE and silently assumed not taken. The ones
+        // riding conditions the walker could not compute cannot be discharged,
+        // so `check_slice_len` is no longer SMT-`unsat` — strictly stricter
+        // than the proof it used to report, which held only because those
+        // assertions were dropped. The DISPATCH properties this test exists
+        // for are unchanged and still asserted above; the residual must be
+        // named rather than anonymous.
+        let gap_reasons = crate::codegen_ay::chc::codegen_ctx::diagnostics::GLOBAL_COUNTERS
+            .take_aggregate_gap_reasons_by_fn()
+            .remove(fn_name)
+            .unwrap_or_default();
+        assert!(
+            gap_reasons.contains_key("switchint_panic_arm_on_overapprox"),
+            "{fn_name}: the un-dischargeable panic-arm obligations must be NAMED; \
+             gap_reasons={gap_reasons:?}"
+        );
+        assert_z3_result(&smt, "sat");
     });
 }

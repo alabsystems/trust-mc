@@ -1,0 +1,5395 @@
+{
+  "provenance": {
+    "ay": {
+      "build_commit": "48c98a43d90c627d5643b3240c1ff8db86b1b6b4",
+      "cargo_toml_pin": "48c98a43d90c627d5643b3240c1ff8db86b1b6b4",
+      "path": "$SCRATCH/r10/trustmc-chc-design-457bf7/ay-cli-cache/trust-mc-ay-cli-48c98a43d/release/ay",
+      "pin_match": true,
+      "version": "ay 0.27.0+build.11390.48c98a43d90c627d5643b3240c1ff8db86b1b6b4@2026-09-30T10:30:06Z"
+    },
+    "bundle": {
+      "checkout_at_run": null,
+      "compiler_sha256": "be8f8ff1a45158b5193ef77f9f289b278548cf22dd4c1c25206d972f5be224ad",
+      "dir": "$SCRATCH/r10/trustmc-chc-design-457bf7/bundle-main",
+      "driver_mtime_utc": "2026-09-30T10:47:43+00:00",
+      "driver_sha256": "88b298d7be6a25ba2fcda9a669c65d113885821167cc400864d71fffb5289789",
+      "driver_version": "trust-mc 0.6.0"
+    },
+    "config": {
+      "env": {
+        "PATH_first": "$SCRATCH/r10/trustmc-chc-design-457bf7/ay-cli-cache/trust-mc-ay-cli-48c98a43d/release",
+        "RUSTFLAGS": "-Awarnings",
+        "TRUST_MC_SYSROOT": "$SCRATCH/r10/trustmc-chc-design-457bf7/bundle-main"
+      },
+      "harness_timeout_s": 30,
+      "inherited_env": {},
+      "jobs": 2,
+      "kinds": [],
+      "lanes": [
+        "bmc"
+      ],
+      "only": [
+        "const_pointer_"
+      ],
+      "strict": false,
+      "wall_timeout_rule": "180 + harnesses * (2 * 30 + 30) seconds per file"
+    },
+    "finished_at_utc": "2026-09-30T13:32:40+00:00",
+    "host": {
+      "cpu_count": 14,
+      "load_average_end": [
+        29.16,
+        24.03,
+        23.26
+      ],
+      "load_average_start": [
+        20.24,
+        21.71,
+        22.48
+      ],
+      "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+      "python": "3.14.5"
+    },
+    "manifest": {
+      "changed_during_run": false,
+      "path": "tools/soundness-duals/manifest.toml",
+      "sha256": "cc4ef8f03a735a5b5bbc693ef6a313163e70f59a22d0493ac35361b0f2b3be09"
+    },
+    "runtime_seconds": 175.2,
+    "started_at_utc": "2026-09-30T13:29:44+00:00",
+    "trust_mc": {
+      "dirty": true,
+      "dirty_tracked_paths": 1,
+      "head": "5b8582dd4677e8c31d9b5b96eab0dfef71cbb0f4",
+      "path": "$SCRATCH/r10/trustmc-chc-wt-b5a7c7/trust-mc",
+      "untracked_paths": 7
+    },
+    "trust_mc_changed_during_run": false
+  },
+  "rows": [
+    {
+      "check_expectations": [],
+      "checks": 10,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(E as *const u32).sub(1) } == 2"
+        ]
+      ],
+      "harness": "bug_back_past_pointee",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=3,offset_provenance_unresolved=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 10,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(F1 as *const u32).sub(1) } == 2"
+        ]
+      ],
+      "harness": "bug_back_to_static_base",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=3,offset_provenance_unresolved=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(E as *const u32).add(1) } == 2"
+        ]
+      ],
+      "harness": "bug_forward_past_pointee",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:offset_provenance_unresolved=1,pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(ONE as *const u32).add(1) } == 1"
+        ]
+      ],
+      "harness": "bug_offset0_arith",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:offset_provenance_unresolved=1,pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 10,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(E as *const u32).sub(1) } == 1"
+        ]
+      ],
+      "harness": "safe_back_past_pointee",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=3,offset_provenance_unresolved=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 10,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(F1 as *const u32).sub(1) } == 1"
+        ]
+      ],
+      "harness": "safe_back_to_static_base",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=3,offset_provenance_unresolved=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(E as *const u32).add(1) } == 3"
+        ]
+      ],
+      "harness": "safe_forward_past_pointee",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:offset_provenance_unresolved=1,pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *(ONE as *const u32).add(1) } == 2"
+        ]
+      ],
+      "harness": "safe_offset0_arith",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:offset_provenance_unresolved=1,pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_arith_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": "CHC lane, separate root cause R12: the driver ICEs in chc::dyn_coercion::single_field_storage_ty on an AtomicU32 static (AtomicPrimitive::Storage), measured on main 5b8582dd4 (round-10 design, harness-not-run); the same ICE kills the 26 rows of rc_shared_handle_dual.rs. Marked so it cannot mask any other class.",
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: ATOMS[1].load(Ordering::SeqCst) == 2"
+        ]
+      ],
+      "harness": "bug_atomic_through_offset_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_atomic_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": "CHC lane, separate root cause R12: the driver ICEs in chc::dyn_coercion::single_field_storage_ty on an AtomicU32 static (AtomicPrimitive::Storage), measured on main 5b8582dd4 (round-10 design, harness-not-run); the same ICE kills the 26 rows of rc_shared_handle_dual.rs. Marked so it cannot mask any other class.",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: ATOMS[1].load(Ordering::SeqCst) == 5"
+        ]
+      ],
+      "harness": "safe_atomic_through_offset_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_atomic_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *RP.0 == 1"
+        ]
+      ],
+      "harness": "bug_interior_read_initial",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_interior_mut_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 12,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: (*RC.0.get())[1] == 2"
+        ]
+      ],
+      "harness": "bug_interior_write_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_interior_mut_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *RP.0 == 2"
+        ]
+      ],
+      "harness": "safe_interior_read_initial",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_interior_mut_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 12,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: (*RC.0.get())[1] == 7"
+        ]
+      ],
+      "harness": "safe_interior_write_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_interior_mut_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *BT"
+        ]
+      ],
+      "harness": "bug_bool",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *C == 'a'"
+        ]
+      ],
+      "harness": "bug_char",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *E == 1"
+        ]
+      ],
+      "harness": "bug_e",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: matches!(*OE, None)"
+        ]
+      ],
+      "harness": "bug_enum_tagged",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: v == 0"
+        ]
+      ],
+      "harness": "bug_enum_tagged_match",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: matches!(*DR, Dir::B)"
+        ]
+      ],
+      "harness": "bug_enum_unit",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: v == 2"
+        ]
+      ],
+      "harness": "bug_enum_unit_match",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: v[0] == b'h'"
+        ]
+      ],
+      "harness": "bug_extend_subslice",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *FL == 1.0"
+        ]
+      ],
+      "harness": "bug_float",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 5,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_from_utf8",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unsupported_construct_fallback=2,chc_sound_havoc_drop=4",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *I == -1"
+        ]
+      ],
+      "harness": "bug_i16",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(E0, E1)"
+        ]
+      ],
+      "harness": "bug_identity",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **NN == 1"
+        ]
+      ],
+      "harness": "bug_nested",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SS.as_bytes()[0] == b'a'"
+        ]
+      ],
+      "harness": "bug_nested_str",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *O.unwrap() == 1"
+        ]
+      ],
+      "harness": "bug_option_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: OS.unwrap().as_bytes()[0] == b'h'"
+        ]
+      ],
+      "harness": "bug_option_str",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion",
+        "memory-safety",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *P } == 1"
+        ]
+      ],
+      "harness": "bug_raw_static_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(SECOND, &PAIR.0)"
+        ]
+      ],
+      "harness": "bug_second_base",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *SECOND == 1"
+        ]
+      ],
+      "harness": "bug_second_value",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(R, &ARR[0])"
+        ]
+      ],
+      "harness": "bug_static_ref_base",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *R == 1"
+        ]
+      ],
+      "harness": "bug_static_ref_value",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *HS.r == 1"
+        ]
+      ],
+      "harness": "bug_static_struct_ptr_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_str_nth",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unsupported_construct_fallback=1,chc_sound_havoc_drop=1",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "missed-bug",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful-on-bug",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_subslice_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": true,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SL.len() == 4"
+        ]
+      ],
+      "harness": "bug_subslice_len",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "missed-bug",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful-on-bug",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_substr_byte",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": true,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: T.len() == 5"
+        ]
+      ],
+      "harness": "bug_substr_len",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *TF == 7"
+        ]
+      ],
+      "harness": "bug_tuple_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_bool",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_char",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_e",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_enum_tagged",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_enum_tagged_match",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_enum_unit",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_enum_unit_match",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: v[0] == b'l'"
+        ]
+      ],
+      "harness": "safe_extend_subslice",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_float",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 5,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_from_utf8",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unsupported_construct_fallback=2,chc_sound_havoc_drop=4",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_i16",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_identity",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **NN == 3"
+        ]
+      ],
+      "harness": "safe_nested",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_nested_str",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *O.unwrap() == 2"
+        ]
+      ],
+      "harness": "safe_option_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: OS.unwrap().len() == 4"
+        ],
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: OS.unwrap().as_bytes()[0] == b'e'"
+        ]
+      ],
+      "harness": "safe_option_str",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion",
+        "memory-safety",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_raw_static_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_second",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *R == 2"
+        ],
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(R, &ARR[1])"
+        ]
+      ],
+      "harness": "safe_static_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *HS.r == 2"
+        ]
+      ],
+      "harness": "safe_static_struct_ptr_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_str_nth",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unsupported_construct_fallback=1,chc_sound_havoc_drop=1",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SL[0] == 2"
+        ]
+      ],
+      "harness": "safe_subslice",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: T.as_bytes()[0] == b'l'"
+        ]
+      ],
+      "harness": "safe_substr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_tuple_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_offset_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: !std::ptr::eq(&PAIR.y, F1)"
+        ]
+      ],
+      "harness": "bug_const_vs_runtime_projection",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *DEEP == 3"
+        ]
+      ],
+      "harness": "bug_deep_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(RA, RB)"
+        ]
+      ],
+      "harness": "bug_equal_statics_same",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 17,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_mut_static_read_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "DEMOTION_REASONS:unsupported_construct_fallback=1",
+        "DEMOTED_NOT_A_COUNTEREXAMPLE"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": false,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 17,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: MP[1] == 2"
+        ]
+      ],
+      "harness": "bug_mut_static_write_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 16,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: X == 1"
+        ]
+      ],
+      "harness": "bug_ptr_static_offset0_write",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **RR == 1"
+        ]
+      ],
+      "harness": "bug_ref_array_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 21,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: Y2 == 2"
+        ]
+      ],
+      "harness": "bug_repointed_static_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 16,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: MQ[1] == 2"
+        ]
+      ],
+      "harness": "bug_runtime_ptr_into_mut_static",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,pointee_synthesis_fallback=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 4,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: !std::ptr::eq(p, E1)"
+        ]
+      ],
+      "harness": "bug_same_alloc_arith",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine:certified independent of the unresolved offset allocation(s) (was OverApproximation)",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: !std::ptr::eq(&PAIR as *const PairC as *const u32, F0)"
+        ]
+      ],
+      "harness": "bug_static_base_vs_first_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(F0, F1)"
+        ]
+      ],
+      "harness": "bug_static_distinct_fields",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **R2 == 1"
+        ]
+      ],
+      "harness": "bug_static_ref_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *FC == 2"
+        ]
+      ],
+      "harness": "bug_static_reordered_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: SLS[0] == 1"
+        ]
+      ],
+      "harness": "bug_static_slice_window_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion",
+        "memory-safety"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SLS.len() == 3"
+        ]
+      ],
+      "harness": "bug_static_slice_window_len",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "missed-bug",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful-on-bug",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_static_substr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": true,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(T1.as_ptr(), T2.as_ptr())"
+        ]
+      ],
+      "harness": "bug_str_windows_claimed_same_start",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_const_vs_runtime_projection",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_deep_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_equal_statics_distinct",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 17,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *PP == 9"
+        ]
+      ],
+      "harness": "safe_mut_static_read_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 17,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: MP[1] == 7"
+        ]
+      ],
+      "harness": "safe_mut_static_write_through_offset_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 16,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_ptr_static_offset0_write",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **RR == 2"
+        ]
+      ],
+      "harness": "safe_ref_array_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 27,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_repointed_static_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 16,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: MQ[1] == 7"
+        ]
+      ],
+      "harness": "safe_runtime_ptr_into_mut_static",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,pointee_synthesis_fallback=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 10,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *p } == 20"
+        ]
+      ],
+      "harness": "safe_same_alloc_arith",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:offset_provenance_unresolved=1,pointee_synthesis_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_static_base_vs_first_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_static_distinct_fields",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: **R2 == 3"
+        ]
+      ],
+      "harness": "safe_static_ref_ref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_static_reordered_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SLS.len() == 2"
+        ],
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: SLS[0] == 2"
+        ]
+      ],
+      "harness": "safe_static_slice_window",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion",
+        "memory-safety"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SS2.as_bytes()[0] == b'l'"
+        ]
+      ],
+      "harness": "safe_static_substr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(T1.as_ptr(), T2.as_ptr().wrapping_add(1))"
+        ]
+      ],
+      "harness": "safe_str_windows_share_allocation",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_static_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *REFS[1] == 10"
+        ]
+      ],
+      "harness": "bug_array_value_refs",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: FS[1]() == 1"
+        ]
+      ],
+      "harness": "bug_fn_ptr_array",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 7,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *PTRS[1] } == 1"
+        ]
+      ],
+      "harness": "bug_raw_ptr_array_deref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(PTRS[0], PTRS[1])"
+        ]
+      ],
+      "harness": "bug_raw_ptr_array_identity",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "missed-bug",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful-on-bug",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_raw_ptr_array_null",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": true,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: WORDS[1].as_bytes()[0] == b'a'"
+        ]
+      ],
+      "harness": "bug_str_slice_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion",
+        "memory-safety"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: RH.p.is_null()"
+        ]
+      ],
+      "harness": "bug_struct_value_raw_ptr_null",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *HC.r == 1"
+        ]
+      ],
+      "harness": "bug_struct_value_ref_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *T2.1 == 10"
+        ]
+      ],
+      "harness": "bug_tuple_value_refs",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *REFS[1] == 20"
+        ]
+      ],
+      "harness": "safe_array_value_refs",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: FS[1]() == 2"
+        ]
+      ],
+      "harness": "safe_fn_ptr_array",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 7,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *PTRS[1] } == 2"
+        ]
+      ],
+      "harness": "safe_raw_ptr_array_deref",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 4,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(PTRS[1], &PAIR.1)"
+        ]
+      ],
+      "harness": "safe_raw_ptr_array_identity",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 4,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: !PTRS[0].is_null()"
+        ]
+      ],
+      "harness": "safe_raw_ptr_array_non_null",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 5,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "array_bounds",
+          "index out of bounds: the length is less than or equal to the given index"
+        ],
+        [
+          "assertion",
+          "assertion failed: WORDS[1].as_bytes()[0] == b'c'"
+        ]
+      ],
+      "harness": "safe_str_slice_elem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unconstrained_assignment=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion",
+        "memory-safety"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 7,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: unsafe { *RH.p } == 2"
+        ]
+      ],
+      "harness": "safe_struct_value_raw_ptr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *HC.r == 2"
+        ]
+      ],
+      "harness": "safe_struct_value_ref_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *T2.0 == 10"
+        ],
+        [
+          "assertion",
+          "assertion failed: *T2.1 == 30"
+        ]
+      ],
+      "harness": "safe_tuple_value_refs",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=2",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_value_slots_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: generic::<X>() == 1"
+        ]
+      ],
+      "harness": "bug_assoc_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_big_enum_discr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unconstrained_assignment=1,chc_sound_havoc_drop=1",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *get() == 7"
+        ]
+      ],
+      "harness": "bug_callee_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *DEEPC == 3"
+        ]
+      ],
+      "harness": "bug_deep_const_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: std::ptr::eq(G0, G1)"
+        ]
+      ],
+      "harness": "bug_distinct_fields_const_mem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: (G1 as *const u32 as usize) - (G0 as *const u32 as usize) == 0"
+        ]
+      ],
+      "harness": "bug_distinct_fields_const_mem_addr_diff",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: D.get() == 1"
+        ]
+      ],
+      "harness": "bug_dyn_offset",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *r == 1"
+        ]
+      ],
+      "harness": "bug_inline_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *NH.r == 1"
+        ]
+      ],
+      "harness": "bug_ptr_inside_window",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: ROW[0] == 1"
+        ]
+      ],
+      "harness": "bug_row",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: !std::ptr::eq(W as *const [u32; 3] as *const u32, W0)"
+        ]
+      ],
+      "harness": "bug_same_base_two_types",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SB.c == 3"
+        ]
+      ],
+      "harness": "bug_struct_elem_reordered",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *SC == 2"
+        ]
+      ],
+      "harness": "bug_struct_field_reordered",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "missed-bug",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful-on-bug",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_symbolic_index_offset_slice",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": true,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: i < SL.len()"
+        ]
+      ],
+      "harness": "bug_symbolic_index_offset_slice_len",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_wide_enum_discr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_assoc_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_big_enum_discr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Mixed:unconstrained_assignment=1,chc_sound_havoc_drop=1",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_callee_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_deep_const_field",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_distinct_fields_const_mem",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "EncodingGap",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: D.get() == 2"
+        ]
+      ],
+      "harness": "safe_dyn_offset",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:EncodingGap:unsupported_construct_fallback=1,unconstrained_assignment=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_elem_pair_distinct",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_inline_const",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "OverApproximation",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: *NH.r == 3"
+        ]
+      ],
+      "harness": "safe_ptr_inside_window",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:OverApproximation:chc_sound_havoc_drop=1",
+        "CTREX_NOT_CERTIFIED"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 4,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_row",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_same_base_two_types",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 3,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_struct_elem_reordered",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_struct_field_reordered",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed-on-safe-genuine",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: SL[i] != 1"
+        ]
+      ],
+      "harness": "safe_symbolic_index_offset_slice",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_wide_enum_discr",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "const_pointer_window_dual.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    }
+  ],
+  "runs": [
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_arith_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_arith_dual.rs",
+      "seconds": 45.5,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 900
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_atomic_static_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_atomic_static_dual.rs",
+      "seconds": 1.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_interior_mut_static_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_interior_mut_static_dual.rs",
+      "seconds": 10.0,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 540
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_offset_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_offset_dual.rs",
+      "seconds": 10.9,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 4860
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_static_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_static_dual.rs",
+      "seconds": 134.1,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 3330
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_value_slots_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_value_slots_dual.rs",
+      "seconds": 29.9,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 1800
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "const_pointer_window_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "const_pointer_window_dual.rs",
+      "seconds": 4.1,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 2970
+    }
+  ],
+  "schema": "trust-mc.soundness-dual-gate-report/v2",
+  "summary": {
+    "decided_rows": 142,
+    "false_certificate_rows": [
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_interior_read_initial",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_interior_mut_static_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_subslice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_static_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_static_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_deref",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_identity",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_non_null",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_struct_value_raw_ptr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_symbolic_index_offset_slice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_window_dual.rs"
+      }
+    ],
+    "gate": "fail",
+    "gate_reasons": [
+      "gating-rows"
+    ],
+    "gating_rows": [
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_interior_read_initial",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_interior_mut_static_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_subslice_elem",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_substr_byte",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_subslice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_static_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_static_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_static_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_static_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_raw_ptr_array_null",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_deref",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_identity",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_raw_ptr_array_non_null",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_struct_value_raw_ptr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_symbolic_index_offset_slice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_window_dual.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "failed-on-safe-genuine",
+        "evidence": null,
+        "harness": "safe_symbolic_index_offset_slice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_window_dual.rs"
+      }
+    ],
+    "known_red_class_changed": [],
+    "known_red_now_green": [],
+    "needs_review": [],
+    "per_lane": {
+      "bmc": {
+        "error": 0,
+        "false-certificate": 9,
+        "false-failure": 27,
+        "match": 101,
+        "missed-bug": 5,
+        "property_mismatch": 1,
+        "total": 150,
+        "unclassified": 0,
+        "unknown": 8
+      }
+    },
+    "soundness_rows": [
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_subslice_elem",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_substr_byte",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_offset_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_static_substr",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_static_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_raw_ptr_array_null",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_value_slots_dual.rs"
+      },
+      {
+        "class": "missed-bug",
+        "detail": "successful-on-bug",
+        "evidence": null,
+        "harness": "bug_symbolic_index_offset_slice",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "bmc",
+        "path": "const_pointer_window_dual.rs"
+      }
+    ]
+  }
+}

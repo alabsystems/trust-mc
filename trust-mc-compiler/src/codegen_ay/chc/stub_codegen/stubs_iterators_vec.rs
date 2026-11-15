@@ -81,6 +81,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ctx: &StubTranslateArgs<'_>,
     ) -> Option<CollectionCallResult> {
         let arg = ctx.args.first()?;
+        if let Some(dest) = ctx.dest_local
+            && let Some(iter) = self.static_borrowed_iter_constructor(arg, dest, ctx.modified_locals) {
+            return Some(CollectionCallResult::read_only(iter));
+        }
         let vec = self.get_collection_arg(arg, ctx.modified_locals)?;
 
         // When the collection is a bare Array (from [T; N] array literal),
@@ -384,7 +388,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3012: Use "SliceIter_" prefix when the inner collection is a Slice
         // (from VecAsSlice bv64 path) to avoid sort name collision with Vec-backed
         // VecIntoIter which has a different fld_vec sort.
-        let is_slice = vec_sort.datatype_name().map_or(false, |n| n.starts_with("Slice_"));
+        let is_slice = vec_sort
+            .datatype_name()
+            .map_or(false, |n| crate::codegen_ay::names::is_slice_sort_name(n));
         let iter_sort_name = if is_slice {
             let mut s = String::with_capacity(10 + elem_short.len());
             s.push_str("SliceIter_");

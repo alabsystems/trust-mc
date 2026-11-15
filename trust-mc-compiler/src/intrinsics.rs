@@ -8,11 +8,17 @@
 //! Single source of truth about which intrinsics we support.
 
 use rustc_public::{
-    mir::{Mutability, mono::Instance},
-    ty::{FloatTy, FnSig, IntTy, RigidTy, TyKind, UintTy},
+    mir::{
+        Mutability,
+        mono::{Instance, InstanceKind},
+    },
+    ty::{FloatTy, FnDef, FnSig, GenericArgKind, GenericArgs, IntTy, RigidTy, TyKind, UintTy},
 };
 
 /// Extract the intrinsic name string and function signature from an intrinsic instance.
+///
+/// The name is the one trust-mc's models match on: a float intrinsic that Trust core spells
+/// differently reads as its frozen-nightly spelling (see [`nightly_float_intrinsic_name`]).
 fn intrinsic_preamble(instance: &Instance) -> (String, FnSig) {
     let name = instance.intrinsic_name().expect("intrinsic instance should have intrinsic name");
     let sig = instance
@@ -21,7 +27,143 @@ fn intrinsic_preamble(instance: &Instance) -> (String, FnSig) {
         .fn_sig()
         .expect("intrinsic instance should have function signature")
         .skip_binder();
-    (name, sig)
+    let float_input = sig.inputs().first().and_then(|input| match input.kind() {
+        TyKind::RigidTy(RigidTy::Float(float_ty)) => Some(float_ty),
+        _ => None, // external enum: TyKind
+    });
+    (float_intrinsic_model_name(name, float_input), sig)
+}
+
+/// The frozen nightly-2025-12-03 name of a float intrinsic that Trust core renamed.
+///
+/// Inventory, from `library/core/src/intrinsics/mod.rs` of trust `45dc60873` against the
+/// nightly's rust-src, restricted to the float intrinsics:
+///
+/// | nightly | Trust |
+/// |---|---|
+/// | `fabsf16`, `fabsf32`, `fabsf64`, `fabsf128` | `fabs::<T: bounds::FloatPrimitive>` |
+/// | `minnumf16` ... `minnumf128` | `minimum_number_nsz_f16` ... `minimum_number_nsz_f128` |
+/// | `maxnumf16` ... `maxnumf128` | `maximum_number_nsz_f16` ... `maximum_number_nsz_f128` |
+///
+/// Same types and meaning: `fabs` takes and returns the float it is instantiated at, and the
+/// `*_number_nsz_*` pair returns the other argument when one is NaN and either argument when
+/// the two compare equal, as `minnum`/`maxnum` do. Trust gives the pair a fallback body;
+/// that body is one of the behaviours the nightly spec allows, and it is not what trust-mc
+/// models on nightly, so the intrinsic is still modelled rather than inlined. Every other
+/// float intrinsic trust-mc models (`sqrt`, `powi`, `sin`, `cos`, `pow`, `exp`, `exp2`, `log`,
+/// `log2`, `log10`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `copysign`, `fma`,
+/// `fmuladd`, `minimum`, `maximum`) keeps its name and signature, and the fast-math,
+/// algebraic and `float_to_int_unchecked` intrinsics only moved a bound from `Copy` to
+/// `bounds::FloatPrimitive`.
+///
+/// `float_ty` is the float `fabs` is instantiated at; the other names carry their width.
+pub(crate) fn nightly_float_intrinsic_name(
+    trust_name: &str,
+    float_ty: Option<FloatTy>,
+) -> Option<&'static str> {
+    Some(match (trust_name, float_ty) {
+        ("fabs", Some(FloatTy::F16)) => "fabsf16",
+        ("fabs", Some(FloatTy::F32)) => "fabsf32",
+        ("fabs", Some(FloatTy::F64)) => "fabsf64",
+        ("fabs", Some(FloatTy::F128)) => "fabsf128",
+        ("minimum_number_nsz_f16", _) => "minnumf16",
+        ("minimum_number_nsz_f32", _) => "minnumf32",
+        ("minimum_number_nsz_f64", _) => "minnumf64",
+        ("minimum_number_nsz_f128", _) => "minnumf128",
+        ("maximum_number_nsz_f16", _) => "maxnumf16",
+        ("maximum_number_nsz_f32", _) => "maxnumf32",
+        ("maximum_number_nsz_f64", _) => "maxnumf64",
+        ("maximum_number_nsz_f128", _) => "maxnumf128",
+        _ => return None, // non-enum: &str (intrinsic name)
+    })
+}
+
+/// An intrinsic's name as trust-mc's models match on it. On Trust the float intrinsics Trust
+/// core renamed read as their nightly spelling; on the frozen nightly this is the identity.
+#[cfg(trust_toolchain)]
+pub(crate) fn float_intrinsic_model_name(name: String, float_ty: Option<FloatTy>) -> String {
+    nightly_float_intrinsic_name(&name, float_ty).map_or(name, str::to_string)
+}
+
+/// See the Trust definition above.
+#[cfg(not(trust_toolchain))]
+pub(crate) fn float_intrinsic_model_name(name: String, float_ty: Option<FloatTy>) -> String {
+    let _ = float_ty;
+    name
+}
+
+/// A call's def path as trust-mc's models match on it: the def path of a float intrinsic
+/// Trust core renamed ends in its nightly name, so `std::intrinsics::fabs` called at `f64`
+/// reads `std::intrinsics::fabsf64` and `std::intrinsics::minimum_number_nsz_f32` reads
+/// `std::intrinsics::minnumf32`. Every other path is returned unchanged. On the frozen
+/// nightly this is the identity.
+#[cfg(trust_toolchain)]
+pub(crate) fn callee_path_model_spelling(path: String, def: FnDef, args: &GenericArgs) -> String {
+    let Some(intrinsic) = def.as_intrinsic() else {
+        return path;
+    };
+    let trust_name = intrinsic.fn_name();
+    let Some(nightly_name) = nightly_float_intrinsic_name(&trust_name, first_float_type_arg(args))
+    else {
+        return path;
+    };
+    match path.strip_suffix(trust_name.as_str()) {
+        Some(prefix) if prefix.is_empty() || prefix.ends_with("::") => {
+            format!("{prefix}{nightly_name}")
+        }
+        _ => path,
+    }
+}
+
+/// See the Trust definition above.
+#[cfg(not(trust_toolchain))]
+pub(crate) fn callee_path_model_spelling(path: String, def: FnDef, args: &GenericArgs) -> String {
+    let _ = (def, args);
+    path
+}
+
+/// [`callee_path_model_spelling`] for the def path of a resolved instance.
+pub(crate) fn instance_path_model_spelling(path: String, instance: &Instance) -> String {
+    match instance.ty().kind() {
+        TyKind::RigidTy(RigidTy::FnDef(def, args)) => callee_path_model_spelling(path, def, &args),
+        _ => path, // external enum: TyKind
+    }
+}
+
+/// `instance.intrinsic_name()` as trust-mc's models match on it (see
+/// [`float_intrinsic_model_name`]).
+pub(crate) fn intrinsic_model_name(instance: &Instance) -> Option<String> {
+    let name = instance.intrinsic_name()?;
+    Some(float_intrinsic_model_name(name, first_float_type_arg(&instance.args())))
+}
+
+/// Whether a call to `instance` must reach trust-mc's model and never a body.
+///
+/// True exactly for an intrinsic whose Trust spelling reads as a different nightly name
+/// ([`nightly_float_intrinsic_name`]). Its nightly counterpart has no body, so on the nightly
+/// the inliners find nothing to inline and the call reaches the model. On Trust,
+/// `minimum_number_nsz_*` and `maximum_number_nsz_*` carry a fallback body, and inlining it
+/// replaces the model with that body's single choice (`y` whenever the arguments compare equal)
+/// where the intrinsic may return either zero: a property that depends on it could be proved
+/// here and fail when the program runs. Every inliner asks this before fetching a callee body.
+/// On the frozen nightly it is always false.
+pub(crate) fn is_modelled_renamed_intrinsic(instance: &Instance) -> bool {
+    matches!(instance.kind, InstanceKind::Intrinsic)
+        && instance
+            .intrinsic_name()
+            .zip(intrinsic_model_name(instance))
+            .is_some_and(|(name, model)| name != model)
+}
+
+/// The first generic argument, when it is a float type.
+fn first_float_type_arg(args: &GenericArgs) -> Option<FloatTy> {
+    match args.0.first()? {
+        GenericArgKind::Type(ty) => match ty.kind() {
+            TyKind::RigidTy(RigidTy::Float(float_ty)) => Some(float_ty),
+            _ => None, // external enum: TyKind
+        },
+        _ => None, // external enum: GenericArgKind
+    }
 }
 
 // Enumeration of all intrinsics we support right now, with the last option being a catch-all. This
@@ -327,7 +469,19 @@ impl Intrinsic {
                 }
             }
             "catch_unwind" => {
-                assert_sig_matches!(sig, RigidTy::FnPtr(_), RigidTy::RawPtr(_, Mutability::Mut), RigidTy::FnPtr(_) => RigidTy::Int(IntTy::I32));
+                // The RETURN type is deliberately unconstrained. Upstream changed
+                // it: the frozen nightly-2025-12-03 declares `-> i32`, Trust seal
+                // 8595 declares `-> bool` (core/src/intrinsics/mod.rs). Pinning
+                // `Int(I32)` made every harness that merely REACHES catch_unwind
+                // abort the whole compilation with an assertion ICE — measured on
+                // `tools/soundness-duals/catch_unwind_dual.rs`, whose two rows
+                // scored `error / harness-not-run` rather than any verdict.
+                //
+                // This arm yields `Unimplemented` on every toolchain, so the
+                // return type buys nothing, while an ICE costs every other
+                // harness in the file. The ARGUMENT shapes are still asserted:
+                // they agree across both toolchains.
+                assert_sig_matches!(sig, RigidTy::FnPtr(_), RigidTy::RawPtr(_, Mutability::Mut), RigidTy::FnPtr(_) => _);
                 Self::Unimplemented {
                     name: intrinsic_str,
                     issue_link: "https://github.com/model-checking/kani/issues/267".into(),
@@ -645,3 +799,7 @@ fn try_match_float(intrinsic_instance: &Instance) -> Option<Intrinsic> {
         "round_ties_even" => (RoundTiesEvenF32, RoundTiesEvenF64, 1),
     )
 }
+
+#[cfg(test)]
+#[path = "intrinsics_test.rs"]
+mod intrinsics_test;

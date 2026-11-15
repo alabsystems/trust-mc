@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //
-//! Precise nested-call fast path for slice/Vec iterator `next()`.
+//! Precise nested-call fast paths for slice/Vec and authenticated Chars `next()`.
 //!
 //! When `fn_inline` walks a function body that calls `<Iter as Iterator>::next()`,
 //! the generic `translate_inline_body_with_metadata` fallback recursively inlines
@@ -14,15 +14,22 @@
 //! This handler intercepts `IntoIterNext` in the inline walker and produces a
 //! correct `Option<T>` DT result with both discriminant and element value.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use ay_bindings::{Expr, Sort};
+use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
+use rustc_public::mir::mono::Instance;
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
+use trust_mc_core::violation::PropertyKind;
 
 use super::super::ChcCtx;
+use super::super::codegen_types::CodegenTypes;
+use super::super::inline_body::DeferredInlineCheck;
 use super::super::inline_shared::PlaceResolver;
 use super::super::stubs_option_helpers::OptionHelpers;
 use super::InlineReturn;
@@ -45,6 +52,7 @@ struct IterCarrier {
 /// receiver with incremented position.
 pub(super) fn try_inline_iter_next_call(
     ctx: &mut ChcCtx<'_, '_>,
+    func: &Operand,
     callee_path: &str,
     args: &[Operand],
     translated_args: &[Expr],
@@ -52,7 +60,22 @@ pub(super) fn try_inline_iter_next_call(
     local_exprs: &HashMap<usize, Expr>,
     resolver: &PlaceResolver<'_>,
 ) -> Option<InlineReturn> {
+    if let Some((chars_sort, output_sort)) = authenticated_chars_next_sorts(ctx, func, outer_body) {
+        let chars = args
+            .first()
+            .and_then(|arg| {
+                resolve_nested_ref_arg_referent(ctx, arg, outer_body, local_exprs, resolver)
+            })
+            .filter(|value| value.sort() == &chars_sort)
+            .or_else(|| {
+                translated_args.first().filter(|value| value.sort() == &chars_sort).cloned()
+            })?;
+        return inline_chars_next(ctx, chars, &output_sort);
+    }
     if is_next_code_point_call(callee_path) {
+        if crate::kani_middle::transform::unit_has_stubs() {
+            return None;
+        }
         return try_inline_next_code_point_call(
             ctx,
             args,
@@ -65,6 +88,20 @@ pub(super) fn try_inline_iter_next_call(
 
     // Only match IntoIterNext (covers slice::Iter::next, Vec IntoIter::next).
     if !matches!(ctx.stub_registry.lookup(callee_path)?, StubKind::IntoIterNext) {
+        return None;
+    }
+    // A printed path can mention slice::Iter only as an adapter's type
+    // argument. Walking through arbitrary fields would implement Rev/Take/Map
+    // as their inner iterator and erase their behavior. Authenticate the
+    // actual receiver before looking for the model's carrier fields.
+    let mut receiver_ty = ctx.resolve_body_ty(args.first()?.ty(outer_body.locals()).ok()?);
+    while let TyKind::RigidTy(RigidTy::Ref(_, inner, _)) = receiver_ty.kind() {
+        receiver_ty = ctx.resolve_body_ty(inner);
+    }
+    let TyKind::RigidTy(RigidTy::Adt(def, _)) = receiver_ty.kind() else { return None };
+    if !matches!(def.krate().name.as_str(), "core" | "std" | "alloc")
+        || !matches!(def.trimmed_name().as_str(), "Iter" | "IterMut" | "IntoIter")
+    {
         return None;
     }
     if translated_args.is_empty() {
@@ -113,19 +150,7 @@ pub(super) fn try_inline_iter_next_call(
     // Compute bounds check and element.
     let in_bounds = pos.clone().bvult(len);
     let element = data.select(pos.clone());
-    let is_chars_next = is_str_chars_next_call(callee_path)
-        || carrier.wrappers.iter().any(|frame| {
-            frame.outer.sort().datatype_name().is_some_and(|name| name.contains("Chars"))
-        });
-    let payload = if is_chars_next && element.sort().is_bitvec() {
-        match element.sort().bitvec_width()? {
-            width if width < 32 => element.zero_extend(32 - width),
-            32 => element,
-            _ => return None,
-        }
-    } else {
-        element
-    };
+    let payload = element;
     let payload_sort = payload.sort().clone();
 
     debug!(
@@ -158,6 +183,54 @@ pub(super) fn try_inline_iter_next_call(
         alloc_id: None,
         alias_updates,
         deferred_checks: Vec::new(),
+    })
+}
+
+// Resolve in the nested body's namespace. A path mentioning Chars (including
+// as an adapter parameter) never authenticates either the method or receiver.
+fn authenticated_chars_next_sorts(
+    ctx: &ChcCtx<'_, '_>,
+    func: &Operand,
+    body: &rustc_public::mir::Body,
+) -> Option<(Sort, Sort)> {
+    let ty = ctx.resolve_body_ty(func.ty(body.locals()).ok()?);
+    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = ty.kind() else { return None };
+    let instance = Instance::resolve(def, &args).ok()?;
+    if !crate::kani_middle::std_abstraction::is_core_chars_next(ctx.tcx, &instance) {
+        return None;
+    }
+    let signature = instance.ty().kind().fn_sig()?.skip_binder();
+    let [receiver] = signature.inputs() else { return None };
+    let TyKind::RigidTy(RigidTy::Ref(_, chars, _)) = receiver.kind() else { return None };
+    Some((
+        ChcCtx::translate_ty(ctx.resolve_body_ty(chars))?,
+        ChcCtx::translate_ty(ctx.resolve_body_ty(signature.output()))?,
+    ))
+}
+
+fn inline_chars_next(
+    ctx: &mut ChcCtx<'_, '_>,
+    chars: Expr,
+    output_sort: &Sort,
+) -> Option<InlineReturn> {
+    let (value, updated, valid) =
+        super::super::inline_str_chars::build_chars_next(ctx, chars, output_sort)?;
+    ctx.declare_datatype_sort_if_needed(output_sort);
+    Some(InlineReturn {
+        value,
+        vtable: None,
+        alloc_id: None,
+        alias_updates: BTreeMap::from([(1usize, updated)]),
+        // Keep the obligation independent of the returned Option. The walker
+        // weakens it by the current assume/branch guards and carries it even
+        // when a Map closure or a discarded destination consumes the value.
+        deferred_checks: vec![DeferredInlineCheck {
+            check: valid,
+            kind: PropertyKind::UndefinedBehavior,
+            message: Some("Chars::next requires a valid UTF-8 suffix".to_string()),
+            write_mark: ctx.heap_state.write_mark(),
+            merge_key: None,
+        }],
     })
 }
 
@@ -244,7 +317,9 @@ fn try_inline_next_code_point_call(
         return None;
     };
     let none_expr = ctx.make_none_expr(&payload_sort);
-    let fallback_result = super::super::declare_pending_var(
+    let fallback_result = Havoc::mint(
+        ctx,
+        sound_havoc::UNTRACKED_CALL_RESULT,
         super::super::chc_fresh_name("__next_code_point_nonascii"),
         opt_sort.clone(),
     );
@@ -262,7 +337,9 @@ fn try_inline_next_code_point_call(
         debug!("nested next_code_point: failed to rebuild ASCII iterator");
         return None;
     };
-    let fallback_iter = super::super::declare_pending_var(
+    let fallback_iter = Havoc::mint(
+        ctx,
+        sound_havoc::UNTRACKED_CALL_RESULT,
         super::super::chc_fresh_name("__next_code_point_iter_nonascii"),
         updated_ascii.sort().clone(),
     );
@@ -287,14 +364,6 @@ fn try_inline_next_code_point_call(
 fn has_iter_next_core_fields(expr: &Expr) -> bool {
     ChcCtx::get_dt_field_sort(expr, "fld_pos").is_some()
         && ChcCtx::get_dt_field_sort(expr, "fld_vec").is_some()
-}
-
-fn is_str_chars_next_call(callee_path: &str) -> bool {
-    callee_path.contains("str::iter::Chars")
-        || callee_path.contains("str::Chars")
-        || (callee_path.contains("Iterator for")
-            && callee_path.contains("Chars")
-            && callee_path.contains("str"))
 }
 
 fn is_next_code_point_call(callee_path: &str) -> bool {
@@ -361,3 +430,6 @@ fn reconstruct_datatype_replacing_fields(
     }
     Some(Expr::datatype_constructor(&dt.name, &ctor.name, fields, sort.clone()))
 }
+
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+mod tests;

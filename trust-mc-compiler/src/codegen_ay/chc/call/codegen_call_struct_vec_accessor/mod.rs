@@ -17,8 +17,12 @@
 
 mod codegen_call_struct_vec_accessor_scan;
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
+use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{ConstOperand, Operand, ProjectionElem};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
@@ -37,6 +41,11 @@ use codegen_call_struct_vec_accessor_scan::{
     resolve_callee_body, scan_vec_access_pattern, scan_vec_as_slice_pattern,
     scan_vec_is_empty_pattern, scan_vec_len_pattern, type_is_vec,
 };
+
+/// Fail-closed record of an accessor model whose method can fail for its
+/// caller: the model states only the matched Vec access.
+pub(in crate::codegen_ay::chc) const STRUCT_VEC_ACCESSOR_UNSTATED_CHECK: &str =
+    "struct_vec_accessor_unstated_check";
 
 /// Extension trait for Vec accessor/mutator method dispatch on `ChcCtx`.
 pub(in crate::codegen_ay::chc) trait CallDispatchStructVecAccessor {
@@ -124,7 +133,24 @@ impl<'tcx, 'body> CallDispatchStructVecAccessor for ChcCtx<'tcx, 'body> {
             return false;
         };
 
-        self.emit_vec_access(dcx, target, &receiver, &pattern)
+        // The model states the matched access and nothing else: not the
+        // index's bounds check, not any other check in the method's body
+        // (`assert!(i != 1)` beside `self.v[i]` verified SUCCESSFUL clean
+        // where Kani fails, walker_caller_fallback_dual.rs). A method that
+        // can fail for its caller fails closed.
+        let may_fail = Instance::resolve(fn_def, &fn_substs).ok().is_none_or(|instance| {
+            crate::codegen_ay::obligation_free_walk::callee_may_fail_for_caller(
+                self.tcx,
+                instance,
+                &crate::kani_middle::transform::walker_stub_map(),
+            )
+        });
+        let handled = self.emit_vec_access(dcx, target, &receiver, &pattern);
+        if handled && may_fail {
+            debug!(callee = %callee_name, "struct_vec_accessor: the method can fail — fail closed");
+            self.record_sound_fallback_reason(STRUCT_VEC_ACCESSOR_UNSTATED_CHECK);
+        }
+        handled
     }
 }
 
@@ -160,7 +186,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
         let fields = variants[0].fields();
-        if !fields.iter().any(|f| type_is_vec(&f.ty_with_args(&adt_args))) {
+        if !fields.iter().any(|f| mono_ty::field_ty(f, &adt_args).is_some_and(|t| type_is_vec(&t)))
+        {
             debug!(callee = %callee_name, adt = %adt_def.trimmed_name(), "struct_vec_accessor: no Vec field");
             return None;
         }
@@ -198,7 +225,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if pattern.vec_field_idx >= fields.len() {
             return false;
         }
-        let field_ty = fields[pattern.vec_field_idx].ty_with_args(&adt_args);
+        let Some(field_ty) = mono_ty::field_ty(&fields[pattern.vec_field_idx], &adt_args) else {
+            return false;
+        };
         if !type_is_vec(&field_ty) {
             return false;
         }
@@ -411,7 +440,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if variants.is_empty() || vec_field_idx >= variants[0].fields().len() {
             return false;
         }
-        let field_ty = variants[0].fields()[vec_field_idx].ty_with_args(&adt_args);
+        let Some(field_ty) = mono_ty::field_ty(&variants[0].fields()[vec_field_idx], &adt_args)
+        else {
+            return false;
+        };
         if !type_is_vec(&field_ty) {
             return false;
         }

@@ -54,6 +54,34 @@ pub(in crate::codegen_ay::chc) enum DerefCascadeResult {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Does a one-level read `*local` NOT read an element of the Array-valued
+    /// constant fact `val`: the local's pointee is encoded unlike the array's
+    /// element (a pointer read out of `&&[u16; 2]`, a `u8` read of a `[u16; 2]`
+    /// constant)? Selecting an element then fabricates the value: `*r` with
+    /// `r: &&[u16; 2]` (a static's reference `static R: &[u16; 2] = &[..]`)
+    /// wrote the first element, zero-extended, into the pointer local, so an
+    /// alignment check on it failed, certified Genuine (review of
+    /// fix/chc-lost-writes round 3, found beside finding 2). The memory path
+    /// answers instead. A datatype element is held flattened, so a datatype
+    /// pointee against a bitvector element still reads the element.
+    fn const_array_element_read_mismatch(&self, local_idx: usize, val: &Expr) -> bool {
+        let Some(elem_sort) = val.sort().array_sort().map(|a| a.element_sort.clone()) else {
+            return false;
+        };
+        let Some(pointee_ty) =
+            self.body.locals().get(local_idx).and_then(|decl| Self::deref_pointee_ty(decl.ty))
+        else {
+            return false;
+        };
+        if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Array(..) | RigidTy::Slice(_))) {
+            return false;
+        }
+        match Self::translate_ty(pointee_ty) {
+            Some(sort) => sort != elem_sort && !(sort.is_datatype() && elem_sort.is_bitvec()),
+            None => false,
+        }
+    }
+
     /// Resolve `*_ref` reads of coroutine state through the pre-registered
     /// coroutine root expression instead of falling back to a generic memory load.
     ///
@@ -224,6 +252,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // unconstrained memory load or a sound fallback.
         // See expr/codegen_expr_deref_null_check.rs.
         self.emit_raw_ptr_null_deref_check(place, modified_locals);
+        // The same for the object bound of a pointer into a static or a
+        // constant allocation (`codegen_stmt_rvalue_offset_const_object`).
+        self.emit_const_object_deref_bound_check(place, modified_locals);
+
+        // A read through a pointer chosen on a path resolves one referent in the
+        // value lanes below; fail closed (see the store side in
+        // codegen_stmt_assign_projection.rs).
+        if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && self.pointer_value_is_path_dependent(local_idx)
+        {
+            self.record_sound_fallback_reason("deref_through_path_merged_pointer");
+        }
 
         // Prefer ref-target resolution for reference-backed derefs so reads like
         // `*ref` keep concrete value flow. Raw pointers at Mem level stay on the
@@ -232,6 +272,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.try_resolve_deref_via_ref_targets(place, local_idx, modified_locals)
         {
             return DerefCascadeResult::Resolved(resolved);
+        }
+
+        // A pointer out of a value-semantic reference payload (`Option<&u8>`
+        // keeps the pointee's value, stmt/codegen_stmt_value_ref_payload.rs):
+        // its pointee is that value, and memory at it is nothing.
+        if let Some(value) = self.try_resolve_value_payload_deref(place, local_idx, modified_locals)
+        {
+            return DerefCascadeResult::Resolved(value);
         }
 
         // `ref_targets` only records an unprojected `_p = &_L` in this block's
@@ -282,7 +330,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             {
                 return result;
             }
-            if place.projection.len() == 1 {
+            // A recorded tag is the whole referent only for a fieldless enum;
+            // for `&Some(..)` it would drop the payload (see Tier 3 of
+            // `resolve_ref_or_const_referent_tagged`).
+            if place.projection.len() == 1
+                && self.pointee_is_fieldless_enum(self.body.locals()[local_idx].ty)
+            {
                 if let Some(discr) = self.ref_resolution.const_ref_discriminants.get(&local_idx) {
                     debug!(local_idx, discr, "CHC: resolved deref via const_ref_discriminants");
                     return DerefCascadeResult::Resolved(Expr::bitvec_const(*discr as u128, 32));
@@ -300,6 +353,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Helpers in codegen_expr_deref_static.rs (Part of #2884).
         if let Some(result) = self.resolve_static_ref_deref(place, local_idx, modified_locals) {
             return DerefCascadeResult::Resolved(result);
+        }
+
+        if let Some(result) = self.try_resolve_owned_array_byte(place, modified_locals) {
+            return result;
+        }
+
+        // The referent of this reference was known only through a VALUE fact that
+        // an ambiguous producer dropped (see `record_dropped_deref_value_fact`). Its
+        // state variable may hold the referent's value rather than an address, so
+        // a memory load would read an unwritten cell. Fail closed.
+        if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && self.ref_resolution.deref_value_fact_dropped.contains(&local_idx)
+        {
+            debug!(local_idx, ?place, "CHC: deref through a reference whose value fact was dropped");
+            self.record_sound_fallback_reason("deref_value_fact_dropped");
+            return DerefCascadeResult::Bail;
+        }
+
+        // A reference that may hold a narrow `Option<&scalar>` payload's VALUE
+        // rather than an address (stmt/codegen_stmt_value_ref_payload.rs), and
+        // that no value lane above resolved: the memory path would load typed
+        // memory at that value, a cell no rule writes. Fail closed.
+        if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && self.deref_of_narrow_payload_ref_unresolved(local_idx)
+        {
+            debug!(local_idx, ?place, "CHC: unresolved deref of a narrow Option payload reference");
+            self.record_sound_fallback_reason("narrow_ref_payload_deref_unresolved");
+            return DerefCascadeResult::Bail;
         }
 
         // Part of #3871: Heap-backed derefs with a concrete alloc_id can safely
@@ -356,13 +437,84 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<DerefCascadeResult> {
         let val = self.ref_resolution.const_ref_values.get(&local_idx)?.clone();
 
+        // D10, second line of defence: a non-array fact describes the window
+        // its pointer named. A pointer moved off it (a present, not
+        // constant-zero `subslice_offset`) reads another window, so the fact
+        // answers no read through it — not `*p`, and no field of it; the
+        // memory path does. (An ARRAY fact is re-indexed by the offset below.)
+        if !val.sort().is_array()
+            && self
+                .ref_resolution
+                .subslice_offset
+                .get(&local_idx)
+                .is_some_and(|offset| Self::const_usize_from_expr(offset) != Some(0))
+        {
+            debug!(local_idx, "CHC: const_ref_value refused under a moved pointer (D10)");
+            return None;
+        }
+
         if place.projection.len() == 1 {
+            if let Some(value) = self.direct_fixed_array_window_value(local_idx) {
+                debug!(local_idx, "CHC: resolved direct fixed typed array window");
+                return Some(DerefCascadeResult::Resolved(value));
+            }
             // Part of #4022 D3: When the const_ref_values entry is
             // Array-sorted (e.g., `*ptr` where ptr points to a const
             // array literal), apply subslice_offset selection if the
             // pointer was offset via ptr.add/offset. Without this,
             // `*offset(ptr, N)` returns the whole Array -> sort mismatch.
-            if val.sort().is_array() {
+            if val.sort().is_array()
+                && let Some(pointee_ty) = self
+                    .body
+                    .locals()
+                    .get(local_idx)
+                    .and_then(|decl| Self::deref_pointee_ty(decl.ty))
+                && crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::is_slice_len_pointer_ty(
+                    pointee_ty,
+                )
+            {
+                // Design 4: `*r` with `r: &&str` / `&&[T]` pointing at a
+                // promoted constant reads the inner WIDE pointer, and the
+                // const value is the byte array behind it. Selecting element 0
+                // wrote the first byte, zero-extended, into a slice slot: a
+                // fabricated address with a fabricated length 0. The inner
+                // pointer is the relocation at the outer pointee's own offset
+                // — its string's object plus ITS offset (`const_pointer`),
+                // never the outer constant's object base — with the constant's
+                // length; without both the memory path answers.
+                let len = self.ref_resolution.subslice_len.get(&local_idx).cloned();
+                let inner = self
+                    .ref_resolution
+                    .const_ref_objects
+                    .get(&local_idx)
+                    .and_then(|object| object.nested);
+                if let Some(len) = len.filter(|len| len.sort().bitvec_width() == Some(POINTER_WIDTH))
+                    && let Some((inner_obj, inner_offset)) = inner
+                {
+                    let base = crate::codegen_ay::chc::decl::global_objects::object_base_for(inner_obj);
+                    let addr = if inner_offset == 0 {
+                        base
+                    } else {
+                        base.bvadd(Expr::bitvec_const(u128::from(inner_offset), POINTER_WIDTH))
+                    };
+                    debug!(
+                        local_idx,
+                        "CHC: const-ref deref of a wide pointer reads the promoted slice (design 4)"
+                    );
+                    return Some(DerefCascadeResult::Resolved(self.pack_slice_slot(addr, len)));
+                }
+                debug!(
+                    local_idx,
+                    "CHC: const-ref deref of a wide pointer without a length; memory path answers"
+                );
+            } else if val.sort().is_array() && self.const_array_element_read_mismatch(local_idx, &val)
+            {
+                debug!(
+                    local_idx,
+                    "CHC: const-ref deref reads a view unlike the array's element; memory path answers"
+                );
+                // Fall through (don't return) -- let memory load handle it.
+            } else if val.sort().is_array() {
                 let offset_expr =
                     self.ref_resolution.subslice_offset.get(&local_idx).cloned().or_else(|| {
                         let local_ty = self.body.locals().get(local_idx)?.ty;

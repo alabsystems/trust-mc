@@ -4,8 +4,6 @@
 //
 //! Constant expression evaluation for CHC constant propagation. Part of #3371.
 
-use std::collections::HashMap;
-
 use ay_bindings::{Expr, ExprValue};
 use num_bigint::BigInt;
 
@@ -452,88 +450,6 @@ pub fn try_eval_to_const(expr: &Expr) -> Option<Expr> {
             try_eval_to_const(args.get(idx)?)
         }
         _ => None,
-    }
-}
-
-/// Propagates constants to unconstrained `__out` head variables.
-///
-/// SOUNDNESS INVARIANT: `__out` suffix implies identity pass-through (created
-/// via `StateVarManager::push_state_var_pair()`). When `X__out` is unconstrained
-/// in a rule body, it is universally quantified, equivalent to `X__out == X`.
-/// If `X` is known-constant, propagates that constant to `X__out`.
-pub(super) fn propagate_to_unconstrained_out_vars(
-    head_args: &[Expr],
-    constraints: &Constraints,
-    known: &mut HashMap<String, Expr>,
-) {
-    use std::collections::HashSet;
-
-    // Collect all variable names mentioned in constraints via flattening.
-    let flat = flatten_conjunctions(constraints);
-    let mut constrained_vars: HashSet<String> = HashSet::new();
-    for expr in &flat {
-        if !collect_constraint_vars(expr, &mut constrained_vars, false) {
-            // Unknown expression variant encountered — can't safely determine
-            // which head vars are constrained. Abort to prevent unsound propagation.
-            return;
-        }
-    }
-
-    // For each head arg that's an unconstrained `__out` variable, check if
-    // the base name (without `__out`) is in the known map.
-    for arg in head_args {
-        if let ExprValue::Var { name } = arg.value() {
-            if let Some(base) = name.strip_suffix("__out") {
-                if !constrained_vars.contains(name.as_str()) && !known.contains_key(name.as_str()) {
-                    if let Some(constant) = known.get(base) {
-                        known.insert(name.clone(), constant.clone());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Collects all variable names referenced in an expression tree.
-///
-/// Returns `true` if all sub-expressions were successfully traversed, `false`
-/// if an unrecognized `ExprValue` variant was encountered. When `false`, the
-/// caller should treat the collection as incomplete and avoid optimizations
-/// that depend on knowing ALL constrained variables (soundness guard for
-/// `#[non_exhaustive]` `ExprValue`).
-///
-/// `in_dt`: when `true`, variables are visited (for traversal completeness)
-/// but NOT added to the constrained set. DatatypeConstructor/FuncApp set this
-/// to `true` for their arguments — field args are value-defining, not
-/// value-restricting (#3398 design).
-///
-/// Uses `ExprValue::children()` and `is_known_variant()` from ay_bindings
-/// instead of manually enumerating every variant. Part of #3415.
-fn collect_constraint_vars(
-    expr: &Expr,
-    out: &mut std::collections::HashSet<String>,
-    in_dt: bool,
-) -> bool {
-    match expr.value() {
-        ExprValue::Var { name } => {
-            if !in_dt {
-                out.insert(name.clone());
-            }
-            true
-        }
-        // DT/FuncApp args are value-defining, not value-restricting.
-        // Recurse with in_dt=true so variables inside are visited for
-        // traversal completeness but NOT added to the constrained set. (#3398)
-        ExprValue::DatatypeConstructor { args, .. } | ExprValue::FuncApp { args, .. } => {
-            args.iter().all(|a| collect_constraint_vars(a, out, true))
-        }
-        // All other known variants: recurse children generically.
-        _ if expr.value().is_known_variant() => {
-            expr.value().children().all(|c| collect_constraint_vars(c, out, in_dt))
-        }
-        // Unknown variant: conservative abort — can't safely determine
-        // which variables are constrained.
-        _ => false,
     }
 }
 

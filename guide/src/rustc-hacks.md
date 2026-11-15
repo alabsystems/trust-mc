@@ -27,11 +27,8 @@ Ensure that any packages that use `rustc` data structures have the following lin
 rustc_private=true
 ```
 
-You may also need to install the `rustc-dev` package using rustup
-
-```
-rustup toolchain install nightly --component rustc-dev
-```
+The Trust toolchain (`rust-toolchain.toml`: `channel = "trust"`) ships the
+`rustc-dev` libraries trust-mc-compiler links; nothing extra is installed.
 
 #### Debugging in VS code
 
@@ -78,7 +75,7 @@ clion = ['rustc_public_bridge', 'rustc_public']
 **Don't forget to rollback the changes before you create your PR.**
 
 ### EMACS (with `use-package`)
-First, `Cargo.toml` and `rustup toolchain` steps are identical to VS
+First, the `Cargo.toml` step is identical to VS
 Code. Install Rust-analyzer binary under `~/.cargo/bin/`.
 
 On EMACS, add the following to your EMACS lisp files. They will
@@ -171,43 +168,21 @@ There are a few reasons why you may want to use your own copy of `rustc`. E.g.:
 
 We will assume that you already have a trust-mc setup and that the variable `TRUST_MC_WORKSPACE` contains the path to your trust-mc workspace.
 
-**It's highly recommended that you start from the commit that corresponds to the current `rustc` version from your workspace.**
+**It's highly recommended that you start from the commit that corresponds to the current `trustc` version from your workspace.**
 To get that information, run the following command:
 ```bash
 cd ${TRUST_MC_WORKSPACE} # Go to your trust-mc workspace.
-rustc --version # This will print the commit id. Something like:
-# rustc 1.60.0-nightly (0c292c966 2022-02-08)
-#                       ^^^^^^^^^ this is used as the ${COMMIT_ID} below
-# E.g.:
-COMMIT_ID=0c292c966
+trustc -vV | grep commit-hash # the ${COMMIT_ID} below
 ```
 
-First you need to clone and build stage 2 of the compiler.
-You should tweak the configuration to satisfy your use case.
-For more details, see <https://rustc-dev-guide.rust-lang.org/building/how-to-build-and-run.html> and <https://rustc-dev-guide.rust-lang.org/building/suggested.html>.
-
-```bash
-git clone https://github.com/rust-lang/rust.git
-cd rust
-git checkout ${COMMIT_ID:?"Missing rustc commit id"}
-./configure --enable-extended --tools=src,rustfmt,cargo --enable-debug --set=llvm.download-ci-llvm=true
-./x.py build -i --stage 2
-```
-
-Now create a custom toolchain (here we name it `custom-toolchain`):
-
-```bash
-# Use x86_64-apple-darwin for MacOs
-rustup toolchain link custom-toolchain build/x86_64-unknown-linux-gnu/stage2
-cp build/x86_64-unknown-linux-gnu/stage2-tools-bin/* build/x86_64-unknown-linux-gnu/stage2/bin/
-```
-
-Finally, override the current toolchain in your trust-mc workspace and rebuild trust-mc:
+First you need a [Trust](https://github.com/alabsystems/trust) checkout at that
+commit, with your compiler change, built as its `BUILD_AND_INSTALL.md`
+describes. Then build trust-mc with that toolchain's `targo` (for example with
+its `bin/` first on PATH) and rebuild everything the compiler produced:
 ```bash
 cd ${TRUST_MC_WORKSPACE}
-rustup override set custom-toolchain
-cargo clean
-cargo build-dev
+targo clean
+targo --unverified build-dev --trust-checkout <your trust checkout>
 ```
 # Rust compiler utilities to debug `trust-mc-compiler`
 

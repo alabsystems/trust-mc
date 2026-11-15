@@ -67,7 +67,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let def_id =
             instance_opt.as_ref().map_or_else(|| fn_def.def_id(), |instance| instance.def.def_id());
         let internal_def_id = rustc_internal::internal(self.tcx, def_id);
-        Some(self.tcx.def_path_str(internal_def_id))
+        // A float intrinsic Trust core renamed reads as its nightly name, which the
+        // math handlers match on (`crate::intrinsics::nightly_float_intrinsic_name`).
+        Some(crate::intrinsics::callee_path_model_spelling(
+            self.tcx.def_path_str(internal_def_id),
+            fn_def,
+            &fn_args,
+        ))
     }
 
     /// Fallback callee name recovery: extract def path from FnDef's def_id
@@ -87,12 +93,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         locals: &[rustc_public::mir::LocalDecl],
     ) -> Option<String> {
         let func_ty = func.ty(locals).ok()?;
-        let fn_def = match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, _)) => def,
+        let (fn_def, fn_args) = match func_ty.kind() {
+            TyKind::RigidTy(RigidTy::FnDef(def, args)) => (def, args),
             _ => return None,
         };
         let internal_def_id = rustc_internal::internal(self.tcx, fn_def.def_id());
-        Some(self.tcx.def_path_str(internal_def_id))
+        Some(crate::intrinsics::callee_path_model_spelling(
+            self.tcx.def_path_str(internal_def_id),
+            fn_def,
+            &fn_args,
+        ))
     }
 
     /// Check if the callee is a foreign (FFI) function.
@@ -142,7 +152,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             return Some(stub);
         }
-        self.stub_registry.lookup(&callee_path)
+        let stub = self.stub_registry.lookup(chc_stub_lookup_path(&callee_path))?;
+        // The registry matches path text; a callee of the local crate is the
+        // user's code, never std's item (`shared::callee_is_local_item`).
+        if crate::codegen_ay::shared::callee_is_local_item(func, locals) {
+            debug!(%callee_path, ?stub, "a local item named like a std stub: not a stub");
+            return None;
+        }
+        // `Iterator::sum` is matched by NAME; only core's numeric `Sum` impls
+        // are the fold the reduction arms encode. Any other impl (a user
+        // `Sum`, `Wrapping`, `Saturating`) is no stub: the ordinary call path
+        // walks the impl the call runs.
+        if stub == StubKind::IterSum && !crate::codegen_ay::reduce_loop_rule::iter_sum_call_is_core_numeric_fold(func, locals) {
+            debug!(%callee_path, "Iterator::sum over a non-core-numeric Sum impl: not a stub");
+            return None;
+        }
+        Some(stub)
     }
 
     /// Filtered stub detector: resolve callee, look up in registry, apply predicate.
@@ -548,6 +573,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `None` otherwise.
     fn extract_adapter_name(ty: &rustc_public::ty::Ty) -> Option<&'static str> {
         match ty.kind() {
+            // A type of the crate under verification is never std's adapter
+            // (`shared::callee_is_local_item`).
+            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.krate().is_local => None,
             TyKind::RigidTy(RigidTy::Adt(def, _)) => {
                 let name = def.trimmed_name();
                 match name.as_str() {
@@ -567,3 +595,45 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 }
+
+/// The registry spelling the CHC lane looks a resolved callee path up under.
+///
+/// `str::from_utf8` resolves to the std re-export `std::str::from_utf8`, but the
+/// registry's str category is keyed on `core::str::` (`core::str::from_utf8`,
+/// `core::str::converts::from_utf8`). The inline pass already keeps the call as
+/// a stub boundary for every spelling ("Not inlining str::from_utf8
+/// conversion"), so under the std spelling the CHC lane missed `StrFromUtf8`,
+/// walked core's body instead, havocked `run_utf8_validation` and dropped the
+/// Bool-into-`Result` equality (`kani/FatPointers/boxslice2.rs`). Only that one
+/// exact path is re-spelled, and only for the CHC lane: the BMC lane keeps its
+/// own lookup unchanged.
+pub(in crate::codegen_ay::chc) fn chc_stub_lookup_path(callee_path: &str) -> &str {
+    match callee_path {
+        "std::str::from_utf8" => "core::str::from_utf8",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod chc_stub_lookup_path_tests {
+    use super::chc_stub_lookup_path;
+
+    #[test]
+    fn std_str_from_utf8_is_looked_up_under_its_core_spelling() {
+        assert_eq!(chc_stub_lookup_path("std::str::from_utf8"), "core::str::from_utf8");
+    }
+
+    #[test]
+    fn every_other_path_is_unchanged() {
+        for path in [
+            "core::str::from_utf8",
+            "core::str::converts::from_utf8",
+            "std::string::String::from_utf8",
+            "std::str::from_utf8_unchecked",
+            "my_crate::std::str::from_utf8",
+        ] {
+            assert_eq!(chc_stub_lookup_path(path), path);
+        }
+    }
+}
+

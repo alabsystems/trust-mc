@@ -63,6 +63,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         | rustc_public::mir::Operand::Copy(place) => {
                             Self::resolve_str_from_local_assign(&self.body.blocks, place.local)
                         }
+                        #[cfg(trust_toolchain)]
+                        rustc_public::mir::Operand::RuntimeChecks(_) => None,
                     })
                     .collect();
                 if let Some(s) = strs {
@@ -164,9 +166,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         blocks: &[rustc_public::mir::BasicBlock],
         local: usize,
     ) -> Option<String> {
-        use rustc_public::mir::alloc::GlobalAlloc;
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
         use rustc_public::mir::{Operand, Rvalue, StatementKind};
-        use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+        use rustc_public::ty::{RigidTy, TyKind};
 
         for bb in blocks {
             for stmt in &bb.statements {
@@ -176,7 +178,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if place.local != local {
                     continue;
                 }
-                let Rvalue::Use(Operand::Constant(c)) = rvalue else {
+                let Rvalue::Use(Operand::Constant(c), ..) = rvalue else {
                     continue;
                 };
                 let mir_const = &c.const_;
@@ -187,32 +189,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if !matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Str)) {
                     continue;
                 }
-                let alloc = match mir_const.kind() {
-                    ConstantKind::Allocated(alloc) => alloc.clone(),
-                    ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                        TyConstKind::Value(_, alloc) => alloc.clone(),
-                        _ => continue,
-                    },
-                    _ => continue,
-                };
-                let ptr_bytes = (crate::codegen_ay::types::POINTER_WIDTH / 8) as usize;
-                let (_, prov) = alloc.provenance.ptrs.first()?;
-                let GlobalAlloc::Memory(target) = GlobalAlloc::from(prov.0) else {
+                // The string is the window `[k, k + len)` the fat pointer
+                // names (`const_pointer::fixed_pointee`), not its target from
+                // byte 0.
+                let Some(const_bytes) = const_pointer::const_bytes(mir_const) else {
                     continue;
                 };
-                if alloc.bytes.len() < ptr_bytes * 2 {
+                let Some((r, window)) = rustc_middle::ty::tls::with(|tcx| {
+                    const_pointer::fixed_pointee(tcx, &const_bytes, 0, pointee_ty)
+                }) else {
+                    continue;
+                };
+                let Some(len) = r.metadata.and_then(|len| usize::try_from(len).ok()) else {
+                    continue;
+                };
+                if len == 0 || len > 256 {
                     continue;
                 }
-                let mut len_arr = [0u8; 8];
-                for (i, opt_byte) in alloc.bytes[ptr_bytes..ptr_bytes * 2].iter().enumerate() {
-                    len_arr[i] = (*opt_byte)?;
-                }
-                let len = u64::from_le_bytes(len_arr) as usize;
-                if len == 0 || len > 256 || target.bytes.len() < len {
-                    continue;
-                }
-                let bytes: Option<Vec<u8>> =
-                    (0..len).map(|i| target.bytes.get(i).copied()?).collect();
+                let bytes = window.read_data_bytes(0, len);
                 return String::from_utf8(bytes?).ok();
             }
         }

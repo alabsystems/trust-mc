@@ -53,16 +53,36 @@ impl TypeInfo {
         }
     }
 
+    /// The type of a variable that `map_var` already mapped.
+    ///
+    /// `MappedVar::sort` is `translate_sort(&meta)`, computed (and its failure
+    /// reported) once during bundle ingestion, so the non-arithmetic case reuses
+    /// it instead of translating `meta` again. That keeps this infallible:
+    /// there is no second, unreachable-by-construction translation failure to
+    /// `expect` away. Arithmetic sorts still come from `meta`, which is the
+    /// only place the bitvector signedness lives.
+    fn from_mapped_var(var: &MappedVar) -> Self {
+        match &var.meta {
+            SortMeta::Bool => Self::Bool,
+            SortMeta::MathInt => Self::Int,
+            SortMeta::BitVector { width, signed } => {
+                Self::BitVector { width: *width, signed: *signed }
+            }
+            _ => Self::Other(var.sort.clone()),
+        }
+    }
+
     fn from_sort(sort: &Sort) -> Result<Self, IngestError> {
         if sort.is_bool() {
             Ok(Self::Bool)
         } else if sort.is_int() {
             Ok(Self::Int)
-        } else if sort.is_bitvec() {
-            Ok(Self::BitVector {
-                width: sort.bitvec_width().expect("bitvector sort should expose width"),
-                signed: false,
-            })
+        } else if let Some(width) = sort.bitvec_width() {
+            // `bitvec_width` is `Some` exactly for bitvector sorts, so this one
+            // query both classifies the sort and yields its width; a separate
+            // `is_bitvec` test followed by `.expect` on the width left a panic
+            // path that no caller-visible fact rules out.
+            Ok(Self::BitVector { width, signed: false })
         } else {
             Ok(Self::Other(sort.clone()))
         }
@@ -127,11 +147,7 @@ impl ExprMapper {
     pub(crate) fn new(variables: &[MappedVar]) -> Self {
         let variables = variables
             .iter()
-            .map(|var| {
-                let ty = TypeInfo::from_sort_meta(&var.meta)
-                    .expect("variable sorts already validated during bundle ingestion");
-                (var.name.clone(), SymbolInfo { ty })
-            })
+            .map(|var| (var.name.clone(), SymbolInfo { ty: TypeInfo::from_mapped_var(var) }))
             .collect();
         Self { variables, functions: BTreeMap::new() }
     }

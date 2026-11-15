@@ -14,9 +14,11 @@ use rustc_span::DUMMY_SP;
 use std::collections::HashMap;
 use tracing::{debug, trace};
 
+use crate::rustc_compat::early_binder_bind;
+
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::Const;
-use rustc_middle::ty::{self, EarlyBinder, TyCtxt, TypeFoldable, TypingEnv};
+use rustc_middle::ty::{self, TyCtxt, TypeFoldable, TypingEnv};
 use rustc_public::mir::ConstOperand;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::visit::{Location, MirVisitor};
@@ -319,7 +321,7 @@ impl<'tcx> StubConstChecker<'tcx> {
         self.instance.instantiate_mir_and_normalize_erasing_regions(
             self.tcx,
             TypingEnv::fully_monomorphized(),
-            EarlyBinder::bind(value),
+            early_binder_bind(self.tcx, value),
         )
     }
 

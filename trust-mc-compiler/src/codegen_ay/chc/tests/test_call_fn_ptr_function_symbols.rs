@@ -56,7 +56,11 @@ fn assert_function_symbols_probe_is_non_degenerate(fn_name: &str) {
             ctx.tcx,
             &body,
             fn_name,
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                straightline_discharge: true,
+                ..ChcConfig::default()
+            },
         );
         let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
         let smt = emit_chc(&vc).to_string();

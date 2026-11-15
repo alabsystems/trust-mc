@@ -8,10 +8,10 @@
 //! The goal is to provide one project view independent on the build system (cargo / standalone
 //! rustc) and its configuration (e.g.: linker type).
 
-use crate::call_single_file::LibConfig;
+use crate::call_single_file::{LibConfig, ambient_rustflags};
 use crate::metadata::from_json;
-use crate::session::{KaniSession, lib_folder};
-use crate::util::args::{CommandWrapper, PassTo, RustcArg, encode_as_rustc_arg};
+use crate::session::KaniSession;
+use crate::util::args::{CommandWrapper, PassTo, RustcArg};
 use crate::util::{apply_rust_min_stack, crate_name, info_operation};
 use anyhow::{Context, Result};
 use std::env::current_dir;
@@ -123,7 +123,9 @@ pub(crate) fn cargo_project(session: &mut KaniSession, keep_going: bool) -> Resu
         );
         return Ok(Project::default());
     }
-    let outdir = outputs.outdir.canonicalize()?;
+    let outdir = outputs.outdir.canonicalize().with_context(|| {
+        format!("Failed to locate build output directory {}", outputs.outdir.display())
+    })?;
     // For the MIR Linker we know there is only one metadata per crate. Use that in our favor.
     let metadata =
         outputs.metadata.iter().map(|md_file| from_json(md_file)).collect::<Result<Vec<_>>>()?;
@@ -237,11 +239,40 @@ impl<'a> StandaloneProjectBuilder<'a> {
     /// This was moved from `KaniSession::compile_single_rust_file` to be part of the builder
     /// pattern, as it's only used by standalone projects (#957).
     fn compile(&self) -> Result<()> {
-        let mut kani_args = self.session.kani_compiler_local_flags();
+        let lib_path = self
+            .session
+            .route
+            .library_folder("lib")
+            .context("Failed to locate Kani library folder")?;
+        let program = self.session.compiler_program()?;
+        let cmd = self.compile_command(&program, lib_path, ambient_rustflags().as_deref())?;
+
+        // Use timeout protection to prevent runaway compiler processes (#995). On the
+        // Trustc route the backend is re-hashed after the compile (a dylib replaced
+        // since the preflight is refused).
+        self.session.with_backend_recheck(|| {
+            if self.session.args.common_args.quiet {
+                self.session.run_suppress_with_tool_timeout(cmd)
+            } else {
+                self.session.run_terminal_with_tool_timeout(cmd)
+            }
+        })
+    }
+
+    /// The exact compile command [`Self::compile`] runs, as a pure function of the
+    /// session, the resolved compiler program, the library folder and `RUSTFLAGS`.
+    fn compile_command(
+        &self,
+        program: &Path,
+        lib_path: PathBuf,
+        rustflags: Option<&str>,
+    ) -> Result<Command> {
+        let mut kani_args = self.session.route_check_version_flags();
+        kani_args.extend(self.session.kani_compiler_local_flags());
         kani_args.push(format!("--reachability={}", self.session.reachability_mode()).into());
 
-        let lib_path = lib_folder().context("Failed to locate Kani library folder")?;
-        let mut rustc_args = self.session.kani_rustc_flags(LibConfig::new(lib_path)?);
+        let mut rustc_args =
+            self.session.kani_rustc_flags_with(LibConfig::new(lib_path)?, rustflags);
         rustc_args.push((&self.input).into());
         rustc_args.push("--out-dir".into());
         rustc_args.push(RustcArg::from(self.outdir.as_os_str()));
@@ -264,9 +295,9 @@ impl<'a> StandaloneProjectBuilder<'a> {
 
         // Note that the order of arguments is important. Kani specific flags should precede
         // rustc ones.
-        let mut cmd = Command::new(self.session.kani_compiler()?);
+        let mut cmd = Command::new(program);
 
-        cmd.pass_rustc_arg(encode_as_rustc_arg(&kani_args), PassTo::OnlyLocalCrate)
+        cmd.pass_rustc_arg(self.session.encode_kani_args(&kani_args), PassTo::OnlyLocalCrate)
             .pass_rustc_args(&rustc_args, PassTo::OnlyLocalCrate);
 
         // This is only required for stable but is a no-op for nightly channels
@@ -275,16 +306,14 @@ impl<'a> StandaloneProjectBuilder<'a> {
 
         // Ensure compiler has enough stack for complex MIR patterns (#1572).
         apply_rust_min_stack(&mut cmd);
-
-        // Use timeout protection to prevent runaway compiler processes (#995)
-        if self.session.args.common_args.quiet {
-            self.session.run_suppress_with_tool_timeout(cmd)?;
-        } else {
-            self.session.run_terminal_with_tool_timeout(cmd)?;
-        }
-        Ok(())
+        self.session.apply_route_env(&mut cmd);
+        Ok(cmd)
     }
 }
+
+#[cfg(test)]
+#[path = "project_compiler_route_tests.rs"]
+mod compiler_route_tests;
 
 /// Pre-codegen harness-count estimate for a standalone input file (P5.2).
 ///

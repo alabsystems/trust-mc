@@ -11,7 +11,7 @@ use crate::codegen_ay::chc::{ChcConfig, ChcDebugMode, WideMemMode, mir_to_chc_wi
 use crate::codegen_ay::context::AYCtx;
 use crate::codegen_ay::statement::StatementCodegen;
 use crate::kani_middle::attributes;
-use crate::kani_middle::reachability::is_prefix_abstracted;
+use crate::kani_middle::reachability::harness_stub_replaces_body;
 use crate::kani_middle::tuple_usage::TupleUsageAnalysis;
 use rustc_public::mir::{Operand, TerminatorKind};
 use std::collections::{HashMap, VecDeque};
@@ -76,7 +76,12 @@ pub(crate) fn codegen_function_with_body(
         crate::codegen_ay::obligation_free_walk::body_is_transitively_obligation_free(
             ay_ctx.tcx, instance, &body, &stubs,
         );
-    ay_ctx.obligation_free_body_by_fn.insert(name.to_string(), obligation_free);
+    // ArtifactMetadata is keyed by the public, crate-relative harness name.
+    // Instance::name carries the local crate prefix on Trust; keep the same
+    // typed name spelling used when the artifact is built.
+    ay_ctx
+        .obligation_free_body_by_fn
+        .insert(crate::rustc_compat::instance_name(ay_ctx.tcx, instance), obligation_free);
     tracing::debug!(name, certified = obligation_free, "obligation-free walk");
     // Contract-heavy functions can require more than the default inline depth
     // to fully inline `kani_register_contract`/closure-call shims.
@@ -124,7 +129,11 @@ pub(crate) fn codegen_function_with_body(
         // CHC keeps `block_on` as a boundary for its single-poll specializer;
         // BMC inlines it so the busy-poll loop is unrolled with the harness.
         preserve_block_on: ay_ctx.config.use_chc,
+        preserve_array_comparisons: ay_ctx.config.use_chc,
+        bmc_native_box_validity: !ay_ctx.config.use_chc,
+        chc_native_box_drop: ay_ctx.config.use_chc,
     });
+    let inline_custody = super::unstubbed_accounting::before_root_inline(instance, &body);
     let (inlined, mut body) =
         inline_pass.transform_with_body_provider(ay_ctx.tcx, body, instance, |callee_instance| {
             if !callee_instance.has_body() {
@@ -137,22 +146,19 @@ pub(crate) fn codegen_function_with_body(
             // datatypes (Slice, Vec, VecIntoIter), causing type mismatches
             // (BV→DT casts) and dual-model conflicts with stubs.
             let callee_name = callee_instance.name();
-            if is_prefix_abstracted(&callee_name) {
-                debug!("skip inlining abstracted function: {}", callee_name);
-                return None;
-            }
-            // Part of #3924: In CHC mode, don't inline kani::any_where — the
-            // CHC translator has a dedicated handler (try_dispatch_call_any_where)
-            // that correctly resolves closure captures and bridges the nondet
-            // result with the predicate. MIR-inlining any_where breaks this:
-            // the closure call becomes an opaque inferable predicate,
-            // disconnecting the assume from the returned value.
-            // BMC mode is unaffected — it handles the inlined any/assume/closure
-            // primitives individually via StatementCodegen.
-            if ay_ctx.config.use_chc
-                && (callee_name.ends_with("::any_where") || callee_name.contains("::any_where::"))
+            let in_std_set =
+                ay_ctx.std_abstraction.abstracts_public_instance(ay_ctx.tcx, callee_instance);
+            // A harness `#[kani::stub]` replaced this body with user code; that the
+            // ORIGINAL (`std::fs::read`) is abstracted says nothing about the stub.
+            // `Iterator::sum` into a `Sum` impl other than core's numeric ones,
+            // and that impl, are inlined: the reduction models are the integer
+            // fold, so the impl the call runs has to reach the encoders as the
+            // code it is (`reduce_loop_rule::iter_sum_is_core_numeric_fold`).
+            if in_std_set
+                && !harness_stub_replaces_body(&stubs, callee_instance)
+                && !crate::codegen_ay::reduce_loop_rule::is_inlined_sum_instance(&callee_instance)
             {
-                debug!("skip inlining any_where in CHC mode (dedicated handler): {}", callee_name);
+                debug!("skip inlining abstracted function: {}", callee_name);
                 return None;
             }
             // CHC has a metadata-preserving handler for `str::as_bytes`. If
@@ -169,8 +175,32 @@ pub(crate) fn codegen_function_with_body(
                 );
                 return None;
             }
+            // CHC models `kani::vec::{any_vec, exact_vec}` natively
+            // (codegen_call_kani_any_vec.rs). Inlining them expands into
+            // `Box::new(any())` / `into_vec` / `truncate` / `shrink_to_fit`,
+            // whose RawVecInner / Layout internals the walker cannot follow.
+            if ay_ctx.config.use_chc
+                && crate::codegen_ay::chc::call::codegen_call_kani_any_vec::is_kani_vec_ctor_name(
+                    &callee_name,
+                )
+            {
+                debug!("skip inlining kani vec generator in CHC mode (native model): {}", callee_name);
+                return None;
+            }
+            // Same for `<Vec<T> as kani::BoundedArbitrary>::bounded_any`
+            // (native model: `bounded_any_call`), whose body goes through
+            // `Vec::from`, `truncate` and `as_mut_ptr`.
+            if ay_ctx.config.use_chc
+                && crate::codegen_ay::chc::call::codegen_call_kani_any_vec::is_bounded_any_ctor_name(
+                    &callee_name,
+                )
+            {
+                debug!("skip inlining bounded_any in CHC mode (native model): {}", callee_name);
+                return None;
+            }
             ay_ctx.body_or_instance_body(callee_instance)
         });
+    super::unstubbed_accounting::after_root_inline(inline_custody, &body);
     if inlined {
         debug!("AY codegen: inlined function calls in {}", name);
     }
@@ -240,12 +270,65 @@ pub(crate) fn codegen_function_with_body(
             ));
             failing_vc.query.target = Some("chc_loop_contract_unsupported".to_string());
             ay_ctx.chc_vc = Some(failing_vc);
+            // As the CHC codegen-panic stand-in below: a forced nullary fact
+            // refutes nothing, and `unsupported()` reaches no counter
+            // `classify_ctrex` reads, so its counterexample was certified
+            // Genuine. Book the DEMOTED per-fn `chc_fallback` so it is
+            // EncodingGap and no proof can rest on this VC.
+            let cur = super::chc::get_chc_fallback_count_for_fn(name);
+            super::chc::set_chc_fallback_count_for_fn(name, cur + 1);
         } else {
+            // FORCED and unguarded, like `unsupported_cfg_cycle` below: the
+            // invariant capture was never encoded (Kani's pass reaches
+            // `unreachable!` on this shape), so a counterexample to this check
+            // proves nothing about the program and must never certify Genuine.
+            // Recorded before `reset_current_fn`, which clears the root key.
+            ay_ctx.bmc_sound_havoc("unsupported_loop_contract");
             ay_ctx.record_property_violation(
                 ay_bindings::Expr::bool_const(true),
                 "unsupported_loop_contract",
             );
         }
+        ay_ctx.reset_current_fn();
+        return;
+    }
+
+    // A `#[kani::loop_decreases]` clause whose measure `instrument_loop_decreases`
+    // could NOT encode keeps its `kani_register_loop_decreases` register call
+    // (transform.rs guards: struct-field and multi-dimensional tuple measures,
+    // nested contracted loops, decreases + loop_modifies, non-unsigned or
+    // non-identity measures). The register fn is `#[inline(never)]`, so the
+    // breadcrumb survives the inline pass above.
+    //
+    // CHC fail-closes on that breadcrumb in `codegen_chc_path`. The BMC lane had
+    // no such gate: it encoded the loop's invariant proof rule and silently
+    // dropped the ranking obligation, so a measure that NEVER decreases reported
+    // a clean SUCCESSFUL (tools/soundness-duals negative pack
+    // `loop_decreases_ignored.rs`; upstream `fixme_decreases_struct_field` and
+    // `fixme_multi_dim_decreases` scored as missed bugs). Fail closed here too:
+    //   * an unconditional violation, so the harness can never PROVE;
+    //   * a recorded unsupported-construct FALLBACK, so the demotion pipeline
+    //     sees the encoding gap and the counterexample is not certified
+    //     Genuine — this failure is a statement about the encoder, not a proven
+    //     termination bug, and a correct measure of an unsupported shape must
+    //     not read as a real one.
+    // Gated on `-Z loop-contracts` exactly like the CHC gate: without the flag
+    // Kani ignores the clause and `LoopContractPass` (which would encode it)
+    // does not run, so flag-less proofs (`decreases_no_flag`) are untouched.
+    if loop_contracts_enabled && !ay_ctx.config.use_chc && body_has_loop_decreases_call(&body) {
+        debug!(name, "BMC: loop `decreases` measure not encoded — fail-closed violation");
+        // Same wording as the CHC gate; `loop_decreases_unsupported.expected` reads it.
+        ay_ctx.tcx.dcx().warn(
+            "`#[kani::loop_decreases]` is parsed but termination checking for loop \
+             variants is not supported by trust-mc yet",
+        );
+        ay_ctx.unsupported_with_fallback("loop decreases measure not encoded", name.to_owned());
+        ay_ctx.record_property_violation_full(
+            ay_bindings::Expr::bool_const(true),
+            "unsupported_loop_decreases",
+            None,
+            Some("loop `decreases` ranking not proven (termination measure)".to_string()),
+        );
         ay_ctx.reset_current_fn();
         return;
     }
@@ -337,6 +420,11 @@ pub(crate) fn codegen_function_with_body(
             Err(err) => {
                 let location = format!("function {} has CFG cycle ({err:?})", name);
                 ay_ctx.unsupported("CFG cycle/loop", location);
+                // FORCED and unguarded: it fails whether or not the function is
+                // ever reached, so a counterexample to it proves nothing about
+                // the program and must never certify Genuine. `bmc_sound_havoc`
+                // records the demoting `chc_sound_havoc_drop` category.
+                ay_ctx.bmc_sound_havoc("unsupported_cfg_cycle");
                 ay_ctx.record_property_violation(
                     ay_bindings::Expr::bool_const(true),
                     "unsupported_cfg_cycle",
@@ -350,6 +438,8 @@ pub(crate) fn codegen_function_with_body(
     if topo_order.len() != reachable_count {
         let location = format!("function {} has CFG cycle (unrolling failed)", name);
         ay_ctx.unsupported("CFG cycle/loop", location);
+        // FORCED and unguarded, as above.
+        ay_ctx.bmc_sound_havoc("unsupported_cfg_cycle");
         ay_ctx.record_property_violation(
             ay_bindings::Expr::bool_const(true),
             "unsupported_cfg_cycle",
@@ -388,6 +478,13 @@ pub(crate) fn codegen_function_with_body(
                 bb_idx
             );
             let successors = codegen.codegen_terminator_with_successors(&block.terminator);
+            // A call writes its destination like an assignment: points-at facts
+            // of a destination local with several producers are path-insensitive.
+            if let rustc_public::mir::TerminatorKind::Call { destination, .. } =
+                &block.terminator.kind
+            {
+                codegen.forget_joined_ref_pointees(destination);
+            }
             for (target_bb, branch_cond) in successors {
                 codegen.record_outgoing_edge(target_bb, branch_cond);
             }
@@ -397,6 +494,10 @@ pub(crate) fn codegen_function_with_body(
     match result {
         Ok(()) => {}
         Err(panic_payload) => {
+            // A translation timeout is not a codegen panic: hand it on to the
+            // per-harness boundary in `compiler_interface`.
+            let panic_payload =
+                crate::codegen_ay::translation_deadline::resume_if_timeout(panic_payload);
             let panic_msg = panic_payload
                 .downcast_ref::<String>()
                 .map(|s| s.as_str())
@@ -404,6 +505,11 @@ pub(crate) fn codegen_function_with_body(
                 .unwrap_or("unknown panic");
             let location = format!("BMC codegen panic in {}: {}", name, panic_msg);
             tracing::error!("{}", location);
+            // The violation below is FORCED, so a counterexample to it proves
+            // nothing about the program: the exact shape bmc_sound_havoc is for
+            // (kani/Refs/main.rs was certified Genuine on a forced
+            // `bmc_codegen_panic`).
+            ay_ctx.bmc_sound_havoc("bmc_codegen_panic");
             ay_ctx.unsupported("BMC codegen panic", location);
             ay_ctx.record_property_violation(
                 ay_bindings::Expr::bool_const(true),
@@ -597,6 +703,13 @@ fn body_has_untransformed_loop_contract_call(body: &rustc_public::mir::Body) -> 
 /// crashing the entire verification run. Part of #3124.
 fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, name: &str) {
     tracing::debug!("AY codegen: taking CHC path for {}", name);
+    // The body the CHC encoder reads, after trust-mc's own MIR transforms and
+    // inlining (`--emit mir` dumps it before them). `--log-level=trust_mc_chc_body=debug`.
+    if tracing::enabled!(target: "trust_mc_chc_body", tracing::Level::DEBUG) {
+        let mut out = Vec::new();
+        let _ = body.dump(&mut out, name);
+        tracing::debug!(target: "trust_mc_chc_body", "{}", String::from_utf8_lossy(&out));
+    }
     let instance =
         ay_ctx.current_fn().expect("CHC path requires active current_fn context").instance;
     let mut local_to_state_idx = HashMap::new();
@@ -632,6 +745,15 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
             "`#[kani::loop_decreases]` is parsed but termination checking for loop \
              variants is not supported by trust-mc yet",
         );
+        // The failing VC below is a REFUSAL, not a ranking counterexample: the
+        // measure was never encoded, so nothing about the program was refuted.
+        // Record the unsupported-construct fallback exactly as the BMC gate does
+        // (`unsupported_loop_decreases` above), so the demotion pipeline reports
+        // EncodingGap instead of certifying `Genuine`.
+        // tests/expected/loop-contract/decreases_binary_search.rs (`hi - lo`,
+        // guard 6) was certified Genuine against a SUCCESSFUL Kani oracle;
+        // tools/soundness-duals/lc_dual_decreases_compound_measure.rs pins it.
+        ay_ctx.unsupported_with_fallback("loop decreases measure not encoded", name.to_owned());
         // Attributed failing VC: a registered `loop_decreases` PROPERTY whose
         // error_p1 relation is a reachable fact, bridged into the aggregate
         // `error` query. The harness reports a named failing check
@@ -660,6 +782,7 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
             message: Some("loop `decreases` ranking not proven (termination measure)".to_string()),
             location: None,
             approximation_dependent: Some(false),
+            discharged_at_encode: None,
         });
         ay_ctx.chc_vc = Some(failing_vc);
         ay_ctx.reset_current_fn();
@@ -673,6 +796,7 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
     let chc_cfg = ChcConfig {
         frame_narrowing: crate::codegen_ay::chc::frame_narrowing_enabled(),
         frame_narrowing_flattened: crate::codegen_ay::chc::frame_narrowing_flattened_enabled(),
+        straightline_discharge: ay_ctx.config.chc_straightline_discharge,
         track_level: ay_ctx.config.chc_track_level,
         step_mode: ay_ctx.config.chc_step_mode,
         int_lift: ay_ctx.config.chc_int_lift,
@@ -697,6 +821,8 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
         // included: replacement havocs its `modifies` targets at the call
         // site (existing mechanism), matching Kani.
         contract_static_havoc: ay_ctx.config.is_contract_proof,
+        keep_error_obligations: false,
+        loop_contracts: loop_contracts_enabled,
     };
 
     // Route the CHC inline walker's callee-body fetches through the SAME
@@ -710,7 +836,12 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
     // patterns and convert them to a trivially-failing CHC VC instead of
     // crashing the entire verification process.
     let result = catch_unwind(AssertUnwindSafe(|| {
-        mir_to_chc_with_instance(tcx, body, instance, name, chc_cfg)
+        let vc = mir_to_chc_with_instance(tcx, body, instance, name, chc_cfg);
+        let recovery_disabled = crate::codegen_ay::chc::lost_obligation_recovery_disabled();
+        crate::codegen_ay::chc::recover_lost_error_obligations(vc, recovery_disabled, || {
+            let keep_cfg = ChcConfig { keep_error_obligations: true, ..chc_cfg };
+            mir_to_chc_with_instance(tcx, body, instance, name, keep_cfg)
+        })
     }));
 
     match result {
@@ -718,6 +849,10 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
             ay_ctx.chc_vc = Some(chc_vc);
         }
         Err(panic_payload) => {
+            // A translation timeout is not a codegen panic: hand it on to the
+            // per-harness boundary in `compiler_interface`.
+            let panic_payload =
+                crate::codegen_ay::translation_deadline::resume_if_timeout(panic_payload);
             let panic_msg = panic_payload
                 .downcast_ref::<String>()
                 .map(|s| s.as_str())
@@ -728,6 +863,22 @@ fn codegen_chc_path(ay_ctx: &mut AYCtx<'_, '_>, body: &rustc_public::mir::Body, 
 
             // Record the unsupported construct for diagnostic reporting.
             ay_ctx.unsupported("CHC codegen panic", location);
+
+            // The violation below is FORCED, so its counterexample proves
+            // nothing about the program. `unsupported()` reaches no counter the
+            // driver's `classify_ctrex` reads, and the panic discards the
+            // ChcCtx's own drop diagnostics, so without a record here the forced
+            // CTREX was certified `[AY:CTREX_CAT:Genuine]`:
+            // expected/derive-bounded-arbitrary/enum.rs (Kani SUCCESSFUL) FAILED
+            // Genuine once ay ad07c5cc63 made `datatype_constructor` check its
+            // argument sorts and the inline ADT aggregate panicked on a
+            // mismatched payload field. The BMC twin records
+            // `bmc_sound_havoc("bmc_codegen_panic")`; the CHC lane bumps the
+            // per-fn `chc_fallback` count, a DEMOTED category, as the
+            // emit-time degenerate-system fail-close does, so the category is
+            // EncodingGap and no proof can ever rest on this VC.
+            let cur = super::chc::get_chc_fallback_count_for_fn(name);
+            super::chc::set_chc_fallback_count_for_fn(name, cur + 1);
 
             // Create a trivially-failing CHC VC: a single fact rule makes
             // the error relation reachable, so the solver returns CTREX
@@ -895,11 +1046,21 @@ fn compute_topo(body: &rustc_public::mir::Body) -> (Vec<usize>, usize) {
 #[cfg(test)]
 pub(in crate::codegen_ay) mod integration_ay_runner;
 #[cfg(test)]
+mod integration_bmc_collect_adapter_tests;
+#[cfg(test)]
+mod integration_bmc_extend_adapter_tests;
+#[cfg(test)]
+mod integration_bmc_merge_review1_tests;
+#[cfg(test)]
+mod integration_bmc_model_unwind_tests;
+#[cfg(test)]
+mod integration_bmc_reduce_unwind_tests;
+#[cfg(test)]
 mod integration_bmc_tests;
 #[cfg(test)]
-mod integration_chc_kani_hook_tests;
-#[cfg(test)]
 mod integration_chc_dyn_vtable_tests;
+#[cfg(test)]
+mod integration_chc_kani_hook_tests;
 #[cfg(test)]
 mod integration_chc_tests;
 #[cfg(test)]

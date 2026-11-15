@@ -699,7 +699,14 @@ fn decode_enum_constructor_fields(
         return None;
     }
     if total_field_width == 0 {
-        return Some(Vec::new());
+        // Only a FIELDLESS constructor decodes from zero bits. A constructor
+        // whose every field is zero-width in the enum encoding (an array, which
+        // the flatten skips — `Foo::B([i32; 0])`) carries no bits to rebuild
+        // them from; answering `Some(vec![])` handed `datatype_constructor` an
+        // argument list shorter than the declaration, which AY rejects with a
+        // panic (`expected/niche2/main.rs`, row 72). Bail like the loop below
+        // does for a zero-width field beside wider ones.
+        return cons.fields.is_empty().then(Vec::new);
     }
     let payload_bits = value.clone().extract(payload_space - 1, 0);
     let field_data = if payload_space == total_field_width {
@@ -757,6 +764,13 @@ fn rebuild_enum_expr_from_flat_bits(bits: Expr, target_sort: &Sort) -> Option<Ex
         let bits_width = bits.sort().bitvec_width()?;
         if bits_width < total_width {
             return None;
+        }
+        if total_width == 0 {
+            // Same rule as `decode_enum_constructor_fields`: nothing to decode
+            // from, and `total_width - 1` below would underflow.
+            return cons.fields.is_empty().then(|| {
+                Expr::datatype_constructor(&*dt.name, &*cons.name, vec![], target_sort.clone())
+            });
         }
         let payload_bits =
             if bits_width == total_width { bits } else { bits.extract(total_width - 1, 0) };
@@ -1471,7 +1485,7 @@ pub fn construct_dyn_fat_pointer(
     out_sort: Sort,
     vtable_value: Expr,
 ) -> Option<Expr> {
-    if !tgt_dt.name.starts_with("Dyn_") {
+    if !crate::names::is_dyn_sort_name(&tgt_dt.name) {
         return None;
     }
     if tgt_dt.constructors.len() != 1 {
@@ -1788,6 +1802,64 @@ mod tests {
         assert!(
             decode_enum_constructor_fields(&payload_bits, &nested_payload, 32).is_none(),
             "nested zero-width fields should bail during recursive enum rebuild"
+        );
+    }
+
+    /// `expected/niche2/main.rs` (row 72): `enum Foo { A(i32), B([i32; 0]) }`.
+    /// The flatten skips B's array, so B's payload is zero bits wide; decoding
+    /// it used to answer an EMPTY argument list for a one-field constructor and
+    /// `datatype_constructor` panicked on the arity mismatch. Every unflatten
+    /// entrance must now decline instead.
+    #[test]
+    fn test_unflatten_enum_whose_payload_is_only_zero_width_fields_declines() {
+        let array_sort = Sort::array(Sort::bitvec(64), Sort::bitvec(32));
+        let foo_sort = enum_sort(
+            "FooZstArrayPayload",
+            [("A", vec![("fld_0", Sort::bitvec(32))]), ("B", vec![("fld_0", array_sort.clone())])],
+        );
+        let b_ctor = foo_sort
+            .datatype_sort()
+            .expect("test enum sort should be a datatype")
+            .constructors
+            .get(1)
+            .expect("B constructor should exist")
+            .clone();
+        let payload_bits = Expr::bitvec_const(10u64, 32);
+        assert!(
+            decode_enum_constructor_fields(&payload_bits, &b_ctor, 32).is_none(),
+            "a constructor whose fields are all zero-width must not decode to zero arguments"
+        );
+
+        // The whole-value entrance (tag bit + 32-bit payload), as the Option
+        // payload coercion calls it.
+        let whole = Expr::bitvec_const(10u64, 33);
+        assert!(
+            unflatten_bitvec_to_datatype(&whole, &foo_sort).is_none(),
+            "unflatten must decline (not panic) when a constructor cannot be rebuilt"
+        );
+
+        // The nested entrance: the same enum as a single-constructor struct field.
+        let wrapper_sort = struct_sort(
+            "WrapperOfZstArrayStruct",
+            [("fld_inner", struct_sort("OnlyZstArray", [("fld_data", array_sort)]))],
+        );
+        assert!(
+            rebuild_enum_expr_from_flat_bits(Expr::bitvec_const(0u64, 8), &wrapper_sort).is_none(),
+            "a struct whose only leaf is zero-width must not decode to zero arguments"
+        );
+
+        // A genuinely fieldless constructor still decodes from zero bits.
+        let unit_ctor = enum_sort(
+            "OptionUnitForZeroWidth",
+            [("None", Vec::<(&str, Sort)>::new()), ("Some", vec![("fld_0", Sort::bitvec(8))])],
+        )
+        .datatype_sort()
+        .expect("datatype")
+        .constructors[0]
+            .clone();
+        assert_eq!(
+            decode_enum_constructor_fields(&payload_bits, &unit_ctor, 32).map(|f| f.len()),
+            Some(0)
         );
     }
 

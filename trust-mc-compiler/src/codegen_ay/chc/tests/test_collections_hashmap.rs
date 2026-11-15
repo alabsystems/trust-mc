@@ -423,8 +423,9 @@ fn test_iterator_result_option_construction() {
 
     let option_name =
         option_sort.datatype_name().expect("Option datatype name should exist").to_string();
-    let some_ctor = crate::codegen_ay::names::option_some_constructor_name(&option_name);
-    let none_ctor = crate::codegen_ay::names::option_none_constructor_name(&option_name);
+    // `option_datatype_sort` declares the bare `Some` / `None` constructors.
+    let some_ctor = "Some";
+    let none_ctor = "None";
     let some_elem =
         Expr::datatype_constructor(&option_name, some_ctor, vec![elem], option_sort.clone());
     let none_val = Expr::datatype_constructor(&option_name, none_ctor, vec![], option_sort.clone());

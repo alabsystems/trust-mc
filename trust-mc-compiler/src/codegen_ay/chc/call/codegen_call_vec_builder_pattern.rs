@@ -7,12 +7,18 @@
 //! Part of #3348: detects `Bits::from_u64`-style push loops and synthesizes
 //! concrete `Vec<bool>` backing arrays from the source bitvector.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::{BinOp, Body, Operand, Rvalue, StatementKind, TerminatorKind};
 use rustc_public::ty::{RigidTy, TyKind};
 
+/// The built Vec's data array: the pushed value's own array, the bits of a
+/// `from_u64`-style source, or else a booked havoc (Rule E:
+/// `sound_havoc::UNTRACKED_COLLECTION_STATE`), a value the builder lane does not
+/// compute.
 pub(in crate::codegen_ay::chc) fn make_vec_builder_data_expr(
+    ctx: &super::ChcCtx<'_, '_>,
     dest_local: usize,
     data_sort: &ay_bindings::Sort,
     vec_data_expr: Option<&Expr>,
@@ -22,7 +28,12 @@ pub(in crate::codegen_ay::chc) fn make_vec_builder_data_expr(
         .cloned()
         .or_else(|| build_from_u64_bool_data_expr(data_sort, vec_data_expr))
         .unwrap_or_else(|| {
-            super::declare_pending_var(format!("vec_builder_data_{dest_local}"), data_sort.clone())
+            Havoc::mint_deferred(
+                ctx,
+                sound_havoc::UNTRACKED_COLLECTION_STATE,
+                format!("vec_builder_data_{dest_local}"),
+                data_sort.clone(),
+            )
         })
 }
 
@@ -96,7 +107,7 @@ fn push_value_locals_in_loops(body: &Body) -> Vec<usize> {
 
 fn local_has_bool_const_assignment(body: &Body, dest_local: usize, expected: bool) -> bool {
     body.blocks.iter().flat_map(|block| &block.statements).any(|stmt| {
-        let StatementKind::Assign(place, Rvalue::Use(op)) = &stmt.kind else {
+        let StatementKind::Assign(place, Rvalue::Use(op, ..)) = &stmt.kind else {
             return false;
         };
         place.local == dest_local
@@ -192,31 +203,13 @@ fn has_lt_const_check(body: &Body, local: usize, upper_bound: u128) -> bool {
 }
 
 pub(in crate::codegen_ay::chc) fn extract_operand_const_uint(operand: &Operand) -> Option<u128> {
-    use rustc_public::ty::{ConstantKind, TyConstKind};
-
     let Operand::Constant(const_op) = operand else { return None };
-    match const_op.const_.kind() {
-        ConstantKind::Allocated(alloc) => alloc.read_uint().ok(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_value_ty, alloc) => alloc.read_uint().ok(),
-            _ => None,
-        },
-        _ => None,
-    }
+    crate::codegen_ay::shared::const_pointer::const_uint(&const_op.const_)
 }
 
 fn extract_operand_const_bool(operand: &Operand) -> Option<bool> {
-    use rustc_public::ty::{ConstantKind, TyConstKind};
-
     let Operand::Constant(const_op) = operand else { return None };
-    match const_op.const_.kind() {
-        ConstantKind::Allocated(alloc) => alloc.read_bool().ok(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_value_ty, alloc) => alloc.read_bool().ok(),
-            _ => None,
-        },
-        _ => None,
-    }
+    crate::codegen_ay::shared::const_pointer::const_bool(&const_op.const_)
 }
 
 /// Check whether a local is provably zero by following copy/cast/deref chains.
@@ -245,7 +238,7 @@ pub(in crate::codegen_ay::chc) fn local_is_known_zero(body: &Body, mut local: us
                 }
                 assign_count += 1;
                 match rvalue {
-                    Rvalue::Use(op) => {
+                    Rvalue::Use(op, ..) => {
                         if extract_operand_const_uint(op) == Some(0) {
                             found_zero = true;
                         } else if let Some(src) = extract_operand_local(op) {
@@ -294,7 +287,7 @@ pub(in crate::codegen_ay::chc) fn trace_local_to_param(
             for stmt in &block.statements {
                 if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                     if place.local == local && place.projection.is_empty() {
-                        if let Rvalue::Use(op) = rvalue {
+                        if let Rvalue::Use(op, ..) = rvalue {
                             if let Some(src) = extract_operand_local(op) {
                                 found_source = Some(src);
                             }

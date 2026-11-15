@@ -16,11 +16,22 @@ use rustc_middle::ty::{self as rustc_ty, TyCtxt};
 use rustc_public::mir::{
     AggregateKind, AssertMessage, Body, BorrowKind, CastKind, ConstOperand, CopyNonOverlapping,
     CoroutineDesugaring, CoroutineKind, CoroutineSource, FakeBorrowKind, FakeReadCause, LocalDecl,
-    MutBorrowKind, NonDivergingIntrinsic, NullOp, Operand, PointerCoercion, RetagKind,
-    RuntimeChecks, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
-    UnwindAction, UserTypeProjection, Variance,
+    MutBorrowKind, NonDivergingIntrinsic, Operand, PointerCoercion, RuntimeChecks, Rvalue,
+    Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnwindAction,
+    UserTypeProjection, Variance,
 };
+// Trust removed `NullOp` (its runtime-checks form is now `Operand::RuntimeChecks`) and
+// `StatementKind::Retag` with its `RetagKind`, and added the `Rvalue::Use` retag flag.
+#[cfg(trust_toolchain)]
+use rustc_public::mir::WithRetag;
+#[cfg(not(trust_toolchain))]
+use rustc_public::mir::{NullOp, RetagKind};
 use rustc_public::rustc_internal::internal;
+// Trust made the `rustc_span::source_map` re-export private; the item lives at the crate root.
+#[cfg(trust_toolchain)]
+use rustc_span::dummy_spanned;
+#[cfg(not(trust_toolchain))]
+use rustc_span::source_map::dummy_spanned;
 
 pub(crate) trait RustcInternalMir {
     type T<'tcx>;
@@ -96,6 +107,10 @@ impl RustcInternalMir for Operand {
             Operand::Constant(const_operand) => {
                 rustc_middle::mir::Operand::Constant(Box::new(const_operand.internal_mir(tcx)))
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(runtime_checks) => {
+                rustc_middle::mir::Operand::RuntimeChecks(runtime_checks.internal_mir(tcx))
+            }
         }
     }
 }
@@ -105,8 +120,13 @@ impl RustcInternalMir for PointerCoercion {
 
     fn internal_mir<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
         match self {
+            #[cfg(not(trust_toolchain))]
             PointerCoercion::ReifyFnPointer => {
                 rustc_middle::ty::adjustment::PointerCoercion::ReifyFnPointer
+            }
+            #[cfg(trust_toolchain)]
+            PointerCoercion::ReifyFnPointer(safety) => {
+                rustc_middle::ty::adjustment::PointerCoercion::ReifyFnPointer(internal(tcx, safety))
             }
             PointerCoercion::UnsafeFnPointer => {
                 rustc_middle::ty::adjustment::PointerCoercion::UnsafeFnPointer
@@ -150,6 +170,9 @@ impl RustcInternalMir for CastKind {
             CastKind::PtrToPtr => rustc_middle::mir::CastKind::PtrToPtr,
             CastKind::FnPtrToPtr => rustc_middle::mir::CastKind::FnPtrToPtr,
             CastKind::Transmute => rustc_middle::mir::CastKind::Transmute,
+            // Preserve the extra Box-validity semantics; conversion is not a check.
+            #[cfg(all(trust_toolchain, version("1.101")))]
+            CastKind::BoxDerefTransmute => rustc_middle::mir::CastKind::BoxDerefTransmute,
             CastKind::Subtype => rustc_middle::mir::CastKind::Subtype,
         }
     }
@@ -194,6 +217,20 @@ impl RustcInternalMir for BorrowKind {
     }
 }
 
+#[cfg(trust_toolchain)]
+impl RustcInternalMir for RuntimeChecks {
+    type T<'tcx> = rustc_middle::mir::RuntimeChecks;
+
+    fn internal_mir<'tcx>(&self, _tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
+        match self {
+            RuntimeChecks::UbChecks => rustc_middle::mir::RuntimeChecks::UbChecks,
+            RuntimeChecks::ContractChecks => rustc_middle::mir::RuntimeChecks::ContractChecks,
+            RuntimeChecks::OverflowChecks => rustc_middle::mir::RuntimeChecks::OverflowChecks,
+        }
+    }
+}
+
+#[cfg(not(trust_toolchain))]
 impl RustcInternalMir for NullOp {
     type T<'tcx> = rustc_middle::mir::NullOp;
 
@@ -261,6 +298,7 @@ impl RustcInternalMir for Rvalue {
                 operand.internal_mir(tcx),
                 internal(tcx, ty_const),
             ),
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(operand, ty) => rustc_middle::mir::Rvalue::ShallowInitBox(
                 operand.internal_mir(tcx),
                 internal(tcx, ty),
@@ -268,13 +306,25 @@ impl RustcInternalMir for Rvalue {
             Rvalue::ThreadLocalRef(crate_item) => {
                 rustc_middle::mir::Rvalue::ThreadLocalRef(internal(tcx, crate_item.0))
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(null_op) => {
                 rustc_middle::mir::Rvalue::NullaryOp(null_op.internal_mir(tcx))
             }
             Rvalue::UnaryOp(un_op, operand) => {
                 rustc_middle::mir::Rvalue::UnaryOp(internal(tcx, un_op), operand.internal_mir(tcx))
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::Use(operand) => rustc_middle::mir::Rvalue::Use(operand.internal_mir(tcx)),
+            #[cfg(trust_toolchain)]
+            Rvalue::Use(operand, retag) => {
+                rustc_middle::mir::Rvalue::Use(operand.internal_mir(tcx), retag.internal_mir(tcx))
+            }
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(ty, mutability, place) => rustc_middle::mir::Rvalue::Reborrow(
+                internal(tcx, ty),
+                internal(tcx, mutability),
+                internal(tcx, place),
+            ),
         }
     }
 }
@@ -306,6 +356,19 @@ impl RustcInternalMir for FakeReadCause {
     }
 }
 
+#[cfg(trust_toolchain)]
+impl RustcInternalMir for WithRetag {
+    type T<'tcx> = rustc_middle::mir::WithRetag;
+
+    fn internal_mir<'tcx>(&self, _tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
+        match self {
+            WithRetag::Yes => rustc_middle::mir::WithRetag::Yes,
+            WithRetag::No => rustc_middle::mir::WithRetag::No,
+        }
+    }
+}
+
+#[cfg(not(trust_toolchain))]
 impl RustcInternalMir for RetagKind {
     type T<'tcx> = rustc_middle::mir::RetagKind;
 
@@ -401,6 +464,7 @@ impl RustcInternalMir for StatementKind {
             StatementKind::StorageDead(local) => rustc_middle::mir::StatementKind::StorageDead(
                 rustc_middle::mir::Local::from_usize(*local),
             ),
+            #[cfg(not(trust_toolchain))]
             StatementKind::Retag(retag_kind, place) => rustc_middle::mir::StatementKind::Retag(
                 retag_kind.internal_mir(tcx),
                 internal(tcx, place).into(),
@@ -437,7 +501,7 @@ impl RustcInternalMir for Statement {
     type T<'tcx> = rustc_middle::mir::Statement<'tcx>;
 
     fn internal_mir<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
-        let source_info = rustc_middle::mir::SourceInfo::outermost(internal(tcx, self.span));
+        let source_info = rustc_middle::mir::SourceInfo::outermost(internal(tcx, mir_span!(self)));
         let kind = self.kind.internal_mir(tcx);
         rustc_middle::mir::Statement::new(source_info, kind)
     }
@@ -541,6 +605,10 @@ impl RustcInternalMir for AssertMessage {
             AssertMessage::NullPointerDereference => {
                 rustc_middle::mir::AssertMessage::NullPointerDereference
             }
+            #[cfg(trust_toolchain)]
+            AssertMessage::NullReferenceConstructed => {
+                rustc_middle::mir::AssertMessage::NullReferenceConstructed
+            }
             AssertMessage::Overflow(bin_op, left_operand, right_operand) => {
                 rustc_middle::mir::AssertMessage::Overflow(
                     internal(tcx, bin_op),
@@ -578,6 +646,11 @@ impl RustcInternalMir for TerminatorKind {
         match self {
             TerminatorKind::Goto { target } => rustc_middle::mir::TerminatorKind::Goto {
                 target: rustc_middle::mir::BasicBlock::from_usize(*target),
+                // This conversion already synthesizes no source attributes.
+                // Modern MIR puts loop hints on the edge instead of the
+                // enclosing terminator; dataflow does not consume them.
+                #[cfg(all(trust_toolchain, version("1.101")))]
+                loop_hint_attrs: Default::default(),
             },
             TerminatorKind::SwitchInt { discr, targets } => {
                 rustc_middle::mir::TerminatorKind::SwitchInt {
@@ -598,6 +671,7 @@ impl RustcInternalMir for TerminatorKind {
                     unwind: unwind.internal_mir(tcx),
                     replace: false,
                     drop: None,
+                    #[cfg(not(trust_toolchain))]
                     async_fut: None,
                 }
             }
@@ -605,9 +679,7 @@ impl RustcInternalMir for TerminatorKind {
                 rustc_middle::mir::TerminatorKind::Call {
                     func: func.internal_mir(tcx),
                     args: Box::from_iter(
-                        args.iter().map(|arg| {
-                            rustc_span::source_map::dummy_spanned(arg.internal_mir(tcx))
-                        }),
+                        args.iter().map(|arg| dummy_spanned(arg.internal_mir(tcx))),
                     ),
                     destination: internal(tcx, destination),
                     target: target.map(|basic_block_idx| {
@@ -641,8 +713,12 @@ impl RustcInternalMir for Terminator {
 
     fn internal_mir<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
         rustc_middle::mir::Terminator {
-            source_info: rustc_middle::mir::SourceInfo::outermost(internal(tcx, self.span)),
+            source_info: rustc_middle::mir::SourceInfo::outermost(internal(tcx, mir_span!(self))),
             kind: self.kind.internal_mir(tcx),
+            // Trust terminators carry MIR-level attributes. The stable representation has no
+            // equivalent, and no dataflow analysis run over this converted body reads them.
+            #[cfg(all(trust_toolchain, not(version("1.101"))))]
+            attributes: Default::default(),
         }
     }
 }

@@ -13,7 +13,26 @@ import re
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-TESTS = ROOT / "target/kani-domination/kani/tests"
+KANI_REV = "4c0fce8c300e1f049f2b0c6766a5111dfc9ff32e"
+
+
+def corpus_tests():
+    """The Kani corpus kani-domination uses: KANI_DOMINATION_CORPUS_DIR, then the
+    per-rev user cache, then the pre-2026-09-11 in-tree checkout."""
+    import os
+    import sys
+    if os.environ.get("KANI_DOMINATION_CORPUS_DIR"):
+        return pathlib.Path(os.environ["KANI_DOMINATION_CORPUS_DIR"]) / "tests"
+    home = pathlib.Path.home()
+    if sys.platform == "darwin":
+        cache = home / "Library/Caches"
+    else:
+        cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or home / ".cache")
+    cached = cache / "trust-mc/kani-domination" / KANI_REV / "tests"
+    return cached if cached.is_dir() else ROOT / "target/kani-domination/kani/tests"
+
+
+TESTS = corpus_tests()
 DRIVER = ROOT / "target/trust-mc/bin/trust-mc-driver"
 
 def expected_fail_set(exp_path):

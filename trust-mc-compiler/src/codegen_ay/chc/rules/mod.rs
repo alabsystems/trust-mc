@@ -11,7 +11,7 @@
 pub(super) use super::{
     CallCoerce, CallTerminator, ChcCtx, KaniHook, KaniModel, chc_call_context, chc_fresh_name,
     codegen_call_coerce, codegen_expr_heap, codegen_types, collect_constructor_guards,
-    declare_pending_var, dyn_coercion, heap_store_chains,
+    dyn_coercion, heap_store_chains,
 };
 pub(super) use codegen_rules_pointer_check::CodegenRulesPointerCheck;
 

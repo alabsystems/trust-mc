@@ -57,6 +57,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             StubKind::LayoutMaxSizeForAlign => {
                 self.codegen_alloc_extra_layout_max_size(cx);
             }
+            StubKind::AllocatorAllocate | StubKind::GlobalAllocImpl
+                if self.codegen_call_allocator_allocate_ok(bb_idx, cx) => {}
             StubKind::AllocatorAllocate
             | StubKind::GlobalAllocImpl
             | StubKind::VecFromRawPartsIn => {
@@ -154,16 +156,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     fn codegen_alloc_extra_alignment_new(&mut self, cx: &ChcCallContext<'_>) {
         let dest_local: usize = cx.destination.local;
         let align_expr = cx.args.first().and_then(|arg| {
-            self.translate_operand_with_modified(arg, cx.modified_locals).or_else(|| {
-                Self::resolve_bare_local(
-                    arg,
-                    &self.state_var_mgr.state_vars,
-                    &self.state_var_mgr.output_state_vars,
-                    cx.modified_locals,
-                    &self.state_var_mgr.local_to_state_idx,
-                    &self.fn_name,
-                )
-            })
+            self.translate_operand_with_modified(arg, cx.modified_locals)
+                .or_else(|| self.bare_local_value(arg, cx.modified_locals))
         });
 
         if let Some(raw_align) = align_expr {
@@ -273,16 +267,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     fn codegen_alloc_extra_alignment_as_usize(&mut self, cx: &ChcCallContext<'_>) {
         let dest_local: usize = cx.destination.local;
         let align_expr = cx.args.first().and_then(|arg| {
-            self.translate_operand_with_modified(arg, cx.modified_locals).or_else(|| {
-                Self::resolve_bare_local(
-                    arg,
-                    &self.state_var_mgr.state_vars,
-                    &self.state_var_mgr.output_state_vars,
-                    cx.modified_locals,
-                    &self.state_var_mgr.local_to_state_idx,
-                    &self.fn_name,
-                )
-            })
+            self.translate_operand_with_modified(arg, cx.modified_locals)
+                .or_else(|| self.bare_local_value(arg, cx.modified_locals))
         });
 
         if let Some(align_expr) = align_expr

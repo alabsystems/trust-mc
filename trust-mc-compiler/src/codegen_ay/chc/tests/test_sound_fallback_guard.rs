@@ -55,7 +55,7 @@ fn is_test_context(lines: &[&str], line_idx: usize) -> bool {
 /// `record_sound_fallback_categorized` calls.
 #[test]
 fn test_sound_fallback_sites_use_fresh_symbolic() {
-    let chc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codegen_ay/chc");
+    let chc_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mc-compiler")).join("src/codegen_ay/chc");
 
     let mut violations = Vec::new();
 
@@ -174,7 +174,7 @@ fn test_sound_fallback_concrete_override_increments_both_counters() {
 /// safety valve — 0 initial callers is correct.
 #[test]
 fn test_no_production_callers_of_concrete_override() {
-    let chc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codegen_ay/chc");
+    let chc_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mc-compiler")).join("src/codegen_ay/chc");
 
     let mut rs_files = Vec::new();
     collect_rs_files(&chc_dir, &mut rs_files);

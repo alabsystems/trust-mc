@@ -270,6 +270,52 @@ pub(crate) fn kill_pid_or_group(pid: u32) {
     }
 }
 
+/// SIGTERM a child that was spawned as the leader of its own process group,
+/// and its group: the polite half of a timeout stop
+/// (`session::process::stop_timed_out_group_leader`). A pid that no longer
+/// leads a group (it already exited) gets nothing: signalling `-pid` there
+/// could reach our own group, and the single pid may already be recycled.
+pub(crate) fn terminate_group_leader(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid = pid as i32;
+        // SAFETY: raw getpgid/kill syscalls, valid for any pid value; an
+        // already-gone pid fails with ESRCH, which is ignored.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// SIGKILL what is left of the process group a REAPED leader led. The leader
+/// is gone, so `getpgid(pid)` can no longer say whether it led a group; the
+/// caller knows it did (it spawned it with `process_group(0)`). A process
+/// group id is not reused while any member lives, so this reaches only
+/// stragglers of that group, or nobody (ESRCH).
+pub(crate) fn kill_group_of_reaped_leader(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid = pid as i32;
+        if pid > 1 {
+            // SAFETY: raw kill syscall on a negative (group) id > 1, never our
+            // own group (the leader was a child placed in a fresh group).
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
 /// RAII guard that automatically unregisters a subprocess when dropped.
 ///
 /// Use this to ensure subprocesses are properly unregistered even if the

@@ -17,12 +17,13 @@
 //!
 //! Extracted from `codegen_expr_deref.rs` per #4125 (500 LOC threshold).
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use ay_bindings::{Expr, Sort};
 
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_types::CodegenTypes;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -62,7 +63,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3447: base array unconstrained beyond copied range.
         self.record_aggregate_gap("deref_subslice_unconstrained");
         let name = chc_fresh_name("__subslice_arr");
-        let mut result = declare_pending_var(name, result_sort);
+        let mut result = ExactVar::unobserved(name, result_sort);
         for i in 0..result_len {
             let src_idx = Expr::bitvec_const((start + i) as u128, POINTER_WIDTH);
             let dst_idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);

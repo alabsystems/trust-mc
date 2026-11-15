@@ -503,9 +503,30 @@ fn test_box_dyn_drop_retains_obj_valid_in_all_relations() {
             let config =
                 ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() };
             let vc = mir_to_chc(ctx.tcx, &body, "probe_d2_drop", config);
-            let smt = crate::codegen_ay::emit_chc(&vc).to_string();
+            // On the translated VC the pruning invariant stays: a relation that keeps obj_size
+            // keeps obj_valid. Pruning may drop obj_size entirely, so none is required here.
+            let obj_valid_sort = crate::codegen_ay::chc::codegen_expr_heap::obj_valid_sort();
+            let obj_size_sort = crate::codegen_ay::chc::codegen_expr_heap::obj_size_sort();
+            for rel in vc.relations.iter().filter(|rel| rel.arg_sorts.contains(&obj_size_sort)) {
+                assert!(
+                    rel.arg_sorts.contains(&obj_valid_sort),
+                    "probe_d2_drop: relation {} has obj_size but not obj_valid (#3793)",
+                    rel.name.as_str()
+                );
+            }
 
-            assert_obj_size_relations_keep_obj_valid(&vc, "probe_d2_drop", "#3793");
+            // Pre-pass VC, full frame as `mir_to_chc` encodes first: write-only array
+            // elimination (85da41dad) and constant-index scalarization (7faa74cf9) remove the
+            // obj_size columns and the `obj_valid__out` store from the translated VC.
+            let pre_pass = pre_pass_vc(ChcCtx::new(
+                ctx.tcx,
+                &body,
+                "probe_d2_drop",
+                ChcConfig { frame_narrowing: false, frame_narrowing_flattened: false, ..config },
+            ));
+            let smt = crate::codegen_ay::emit_chc(&pre_pass).to_string();
+
+            assert_obj_size_relations_keep_obj_valid(&pre_pass, "probe_d2_drop", "#3793");
             // D2 dealloc constraints must be present.
             assert!(
                 smt.contains("obj_valid__out"),

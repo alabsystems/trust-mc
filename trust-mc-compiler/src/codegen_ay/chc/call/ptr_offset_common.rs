@@ -147,23 +147,86 @@ fn build_ptr_offset_constraint(
                 same_alloc = same_alloc.and(in_bounds);
             }
         }
+        // A far operand (heap/stack_address.rs): Kani's same-allocation check
+        // reads its low 48 offset bits under a symbolic count and the full
+        // offset under a literal one, so where the low bits would pass it the
+        // check is a fail-closed observation.
+        let size_bound = [lhs_op, rhs_op].into_iter().find_map(|op| match op {
+            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                ctx.provenance_alloc_size_for_local(place.local).map(u64::from)
+            }
+            _ => None,
+        });
+        ctx.note_ptr_offset_from(&lhs_ptr, &rhs_ptr, size_bound);
         // models.rs:90-91 — equal pointers short-circuit to distance 0 with
         // no same-allocation requirement (never UB, even out of bounds).
         let same_alloc_ok = lhs_ptr.clone().eq(rhs_ptr.clone()).or(same_alloc);
         // Part of #72: exact kani_core model message (models.rs) so the
         // expected-output comparison matches Kani verbatim.
+        //
+        // Kind: the model states these obligations with `kani::safety_check`,
+        // which is UB detection, never a panic, and CHC's own safety_check hook
+        // records `MemorySafety`. `Assertion` rendered as class `assertion`,
+        // which should_panic counts as a panic: an out-of-bounds `offset_from`
+        // under `#[kani::should_panic]` printed SUCCESSFUL where Kani prints
+        // FAILED (expected/offset-bounds-check/offset_from.rs
+        // `check_offset_from_oob_ptr`; the BMC lane maps these labels to
+        // `safety_check`). The same holds for the two checks below.
         ctx.emit_error_rule_for_condition_with_kind(
             dcx.from_app,
             same_alloc_ok.clone(),
             dcx.stmt_constraints,
             dcx.bb_idx,
-            trust_mc_core::violation::PropertyKind::Assertion,
+            trust_mc_core::violation::PropertyKind::MemorySafety,
             Some(
                 "Offset result and original pointer should point to the same allocation"
                     .to_string(),
             ),
         );
         let mut assumed = same_alloc_ok;
+        // S12 SOUNDNESS FIX: the THIRD UB precondition the kani_core model
+        // carries (`library/kani_core/src/models.rs`, `ptr_offset_from`) —
+        // the byte distance must be an EXACT multiple of `size_of::<T>()`.
+        // The BMC lane has emitted it since #72
+        // (`statement/dispatch/ptr_arithmetic.rs`,
+        // `ptr_offset_from_exact_multiple`); this CHC interception replaces
+        // the model body wholesale and emitted only the same-allocation and
+        // non-negative halves, so the obligation existed NOWHERE on the CHC
+        // lane. Measured consequence: `expected/offset-from-distance-check`
+        // — a harness whose entire purpose is this UB — proved
+        // `VERIFICATION:- SUCCESSFUL` with `[AY:PROOF_QUALIFIERS:clean]` on
+        // the trustc route (S11 ledger row 63, all three CHC runs). It also
+        // reads SUCCESSFUL on dev-cli once the unrelated
+        // `copy_nonoverlapping::precondition_check` over-approximation that
+        // happened to fail there is out of the way: the gap is the ENGINE's,
+        // not either route's.
+        //
+        // `size == 1` needs no check (every distance is a multiple of 1),
+        // which is also why the BMC lane guards on `elem_size > 1`.
+        // `bvsrem` matches the model's `offset_bytes % t_size` (Rust `%` on
+        // `isize` is truncated, i.e. sign-of-dividend remainder), and the
+        // equal-pointer short circuit is the same `models.rs:90-91` arm the
+        // same-allocation check uses.
+        if pointee_size > 1 {
+            let zero = Expr::bitvec_const(0u128, POINTER_WIDTH);
+            let elem = Expr::bitvec_const(pointee_size as u128, POINTER_WIDTH);
+            let rem_zero = lhs_ptr.clone().bvsub(rhs_ptr.clone()).bvsrem(elem).eq(zero);
+            let exact_multiple = lhs_ptr.clone().eq(rhs_ptr.clone()).or(rem_zero);
+            ctx.emit_error_rule_for_condition_with_kind(
+                dcx.from_app,
+                exact_multiple.clone(),
+                dcx.stmt_constraints,
+                dcx.bb_idx,
+                trust_mc_core::violation::PropertyKind::MemorySafety,
+                // Verbatim kani_core model message so the corpus
+                // `expected`-file comparison matches Kani.
+                Some(
+                    "Expected the distance between the pointers, in bytes, to be a multiple of the size of `T`"
+                        .to_string(),
+                ),
+            );
+            assumed = assumed.and(exact_multiple);
+        }
         // `offset_from_unsigned` additionally requires a non-negative distance
         // (`self >= origin`); a smaller `self` is UB.
         if unsigned {
@@ -173,7 +236,7 @@ fn build_ptr_offset_constraint(
                 non_negative.clone(),
                 dcx.stmt_constraints,
                 dcx.bb_idx,
-                trust_mc_core::violation::PropertyKind::Assertion,
+                trust_mc_core::violation::PropertyKind::MemorySafety,
                 Some("Expected non-negative distance between pointers".to_string()),
             );
             assumed = assumed.and(non_negative);
@@ -185,6 +248,25 @@ fn build_ptr_offset_constraint(
         // the pruned paths).
         assume_cond = Some(assumed);
         debug!(call = constraint_label, "CHC: emitted offset_from same-allocation safety check");
+    } else {
+        // S12: the `else` arm used to be silent, and silence here is a
+        // FAIL-OPEN — the interception still replaced the model body, so
+        // none of the three UB preconditions were stated and the harness
+        // could still reach a CLEAN proof. Under `int_lift` (or a
+        // non-64-bit pointer) the split-pointer representation the checks
+        // are written against does not exist, so the honest answer is not
+        // to emit a weaker check but to say the engine could not state the
+        // obligation. `ptr_offset_from_ub_checks_unavailable` is NOT in
+        // `fallback_soundness`'s blessed list, so it lands in the
+        // `FailClose` lane and demotes the verdict: the harness cannot come
+        // back as a clean proof while its UB preconditions are unstated.
+        ctx.record_sound_fallback_reason("ptr_offset_from_ub_checks_unavailable");
+        warn!(
+            call = constraint_label,
+            int_lift = ctx.int_lift,
+            pointer_width = POINTER_WIDTH,
+            "CHC: offset_from UB preconditions not stateable — failing closed"
+        );
     }
 
     let diff_bytes = lhs_ptr.bvsub(rhs_ptr);

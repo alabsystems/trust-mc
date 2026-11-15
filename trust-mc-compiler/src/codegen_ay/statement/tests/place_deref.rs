@@ -306,6 +306,53 @@ fn test_dead_locals_index_extraction() {
     assert_eq!(StatementCodegen::resolve_ref_chain_target(&ref_pointees, "my_fn::local_5"), 5);
 }
 
+#[test]
+fn test_storage_live_reactivates_a_previous_frame_slot() {
+    with_test_ay_ctx_for_source("pub fn slot(value: u8) -> u8 { value }", |mut ctx| {
+        let instance = find_instance_by_suffix(&ctx, "slot");
+        let body = instance.body().expect("slot body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        let span = mir_span!(body.blocks[0].terminator);
+        let dead = crate::rustc_compat::mir_statement(StatementKind::StorageDead(1), span);
+        let live = crate::rustc_compat::mir_statement(StatementKind::StorageLive(1), span);
+        codegen.codegen_statement(&dead);
+        assert!(codegen.dead_locals.contains(&1));
+        codegen.codegen_statement(&live);
+        assert!(!codegen.dead_locals.contains(&1));
+        codegen.codegen_statement(&dead);
+        assert!(codegen.dead_locals.contains(&1));
+    });
+}
+
+#[test]
+fn test_storage_live_reused_address_requires_generations_except_for_zst() {
+    let source = r#"
+        pub fn address_byte(value: u8) -> *const u8 { &value }
+        pub fn address_zst(value: ()) -> *const () { &value }
+    "#;
+    for (name, refused) in [("address_byte", true), ("address_zst", false)] {
+        with_test_ay_ctx_for_source(source, |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, name);
+            let mut body = instance.body().expect("address body");
+            let span = mir_span!(body.blocks[0].terminator);
+            let live = crate::rustc_compat::mir_statement(StatementKind::StorageLive(1), span);
+            let dead = crate::rustc_compat::mir_statement(StatementKind::StorageDead(1), span);
+            body.blocks[0].statements.splice(0..0, [live.clone(), dead, live.clone()]);
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            codegen.codegen_statement(&live);
+            assert_eq!(
+                codegen.ctx.unsupported_constructs.contains_key("reused_stack_allocation_identity"),
+                refused,
+                "{name}",
+            );
+        });
+    }
+}
+
 /// Test dead locals extraction from complex base name (with field suffix).
 /// Uses production `resolve_ref_chain_target` instead of duplicating parsing logic.
 #[test]
@@ -314,6 +361,97 @@ fn test_dead_locals_index_extraction_with_fields() {
     assert_eq!(
         StatementCodegen::resolve_ref_chain_target(&ref_pointees, "my_fn::local_12_field_0"),
         12
+    );
+}
+
+/// An unresolved `X_deref` alias names what pointer X points to, so it has no
+/// allocation to size-check: `Box::into_raw` leaves `p -> local_22_deref` with
+/// `local_22` an 8-byte pointer, and an i128 payload read was reported as a
+/// 16-byte access to it. A resolved alias and a plain local keep their target.
+#[test]
+fn test_unresolved_deref_alias_has_no_allocation() {
+    let mut ref_pointees = std::collections::BTreeMap::new();
+    assert_eq!(
+        StatementCodegen::resolve_ref_chain_allocation(&ref_pointees, "my_fn::local_22_deref"),
+        None
+    );
+    assert_eq!(
+        StatementCodegen::resolve_ref_chain_allocation(&ref_pointees, "my_fn::local_5"),
+        Some(5)
+    );
+    ref_pointees.insert(Arc::from("my_fn::local_22"), Arc::from("my_fn::local_19"));
+    assert_eq!(
+        StatementCodegen::resolve_ref_chain_allocation(&ref_pointees, "my_fn::local_22_deref"),
+        Some(19)
+    );
+}
+
+/// A pointee name is an alias because its LOCAL suffix says so, never because the
+/// enclosing FUNCTION is named `*_deref`. `expected/ptr_to_ref_cast::check_zst_deref`
+/// verified SUCCESSFUL against an oracle of FAILED for exactly this reason: the
+/// whole-name `contains("_deref")` matched the harness name, skipped the early
+/// return, and the object-extent obligation -- the only one that could be false for
+/// a cast out of a zero-sized allocation -- was never emitted.
+#[test]
+fn test_deref_alias_is_a_local_suffix_not_a_function_name() {
+    // The collision: six of that corpus file's seven harnesses are named `*_deref`.
+    for name in [
+        "check_zst_deref::local_2",
+        "check_larger_deref::local_1",
+        "check_larger_deref_into_ptr::local_1",
+        "check_larger_deref_struct::local_1",
+        "check_equal_size_deref::local_1",
+        "check_smaller_deref::local_2",
+    ] {
+        assert!(
+            !StatementCodegen::is_deref_alias(name),
+            "{name}: a function named *_deref must not make its plain locals look like aliases"
+        );
+    }
+    // A genuine alias still reads as one.
+    assert!(StatementCodegen::is_deref_alias("my_fn::local_22_deref"));
+    // And the two together: an alias inside a `*_deref` function.
+    assert!(StatementCodegen::is_deref_alias("check_zst_deref::local_22_deref"));
+}
+
+/// The same collision for `_field_`: a function named `*_field_*` must not suppress
+/// the obligation for every local inside it.
+#[test]
+fn test_field_chain_is_a_local_suffix_not_a_function_name() {
+    assert!(!StatementCodegen::is_field_chain("check_field_access::local_1"));
+    assert!(StatementCodegen::is_field_chain("my_fn::local_12_field_0"));
+}
+
+/// The LOCAL is the LAST `::local_` segment. `split("::local_").nth(1)` yields
+/// `1::inner` on a nested name, which then parses to the `usize::MAX` sentinel.
+#[test]
+fn test_local_part_takes_the_last_segment() {
+    assert_eq!(StatementCodegen::local_part("check_zst_deref::local_2"), Some("2"));
+    // Consistent with the resolvers' own `split("::local_").nth(1)` / `split_once`: the
+    // FIRST separator. Pathological and unobserved, pinned only so the predicate and the
+    // index cannot drift apart.
+    assert_eq!(
+        StatementCodegen::local_part("outer::local_1::inner::local_3"),
+        Some("1::inner::local_3")
+    );
+    assert_eq!(StatementCodegen::local_part("Store::<'a, LEN>::from::local_1"), Some("1"));
+    assert_eq!(StatementCodegen::local_part("some_opaque_name"), None);
+}
+
+/// A plain local inside a `*_deref` function resolves to an allocation. Before the
+/// fix this returned None and the caller's `continue` dropped the size check.
+#[test]
+fn test_plain_local_in_a_deref_named_function_resolves() {
+    let ref_pointees = std::collections::BTreeMap::new();
+    assert_eq!(
+        StatementCodegen::resolve_ref_chain_allocation(&ref_pointees, "check_zst_deref::local_2"),
+        Some(2),
+        "a plain local must resolve even when the function name contains _deref"
+    );
+    // The alias behaviour the original guard was written for is unchanged.
+    assert_eq!(
+        StatementCodegen::resolve_ref_chain_allocation(&ref_pointees, "my_fn::local_22_deref"),
+        None
     );
 }
 
@@ -398,27 +536,44 @@ fn test_resolve_ref_chain_target_no_local_separator() {
     );
 }
 
-/// Test dead_object path condition gating: dead local is NOT flagged without path_condition.
-/// Mirrors the guard at place_deref.rs:245-247.
 #[test]
-fn test_dead_object_path_condition_gate() {
-    let dead_locals: std::collections::HashSet<usize> = [5].iter().copied().collect();
-    let target_local_idx: usize = 5;
-
-    // Without path condition: no violation
-    let path_condition: Option<Expr> = None;
-    let should_emit = dead_locals.contains(&target_local_idx) && path_condition.is_some();
-    assert!(!should_emit, "dead_object should NOT fire without path condition");
-
-    // With path condition: violation
-    let path_condition = Some(Expr::var("pc_bb3", Sort::bool()));
-    let should_emit = dead_locals.contains(&target_local_idx) && path_condition.is_some();
-    assert!(should_emit, "dead_object should fire with path condition and dead local");
-
-    // With path condition but local NOT dead: no violation
-    let target_local_idx: usize = 99;
-    let should_emit = dead_locals.contains(&target_local_idx) && path_condition.is_some();
-    assert!(!should_emit, "dead_object should NOT fire when local is not dead");
+fn test_storage_lifetime_join_does_not_inherit_previous_block() {
+    with_test_ay_ctx_for_source(
+        "pub fn join(flag: bool, value: u8) -> u8 { if flag { value } else { 0 } }",
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "join");
+            let mut body = instance.body().expect("join body");
+            let span = mir_span!(body.blocks[0].terminator);
+            let dead = crate::rustc_compat::mir_statement(StatementKind::StorageDead(2), span);
+            let block = |statements, kind| rustc_public::mir::BasicBlock {
+                statements,
+                terminator: crate::rustc_compat::mir_terminator(kind, span),
+            };
+            use rustc_public::mir::{SwitchTargets, TerminatorKind};
+            body.blocks = vec![
+                block(
+                    vec![],
+                    TerminatorKind::SwitchInt {
+                        discr: Operand::Copy(Place::from(1)),
+                        targets: SwitchTargets::new(vec![(0, 1)], 2),
+                    },
+                ),
+                block(vec![dead.clone()], TerminatorKind::Goto { target: 3 }),
+                block(vec![], TerminatorKind::Goto { target: 3 }),
+                block(vec![], TerminatorKind::Return),
+            ];
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            codegen.initialize_storage_block(1);
+            codegen.codegen_statement(&dead);
+            assert_eq!(codegen.stack_local_is_live(2), Some(false));
+            codegen.initialize_storage_block(2);
+            assert_eq!(codegen.stack_local_is_live(2), Some(true));
+            codegen.initialize_storage_block(3);
+            assert_eq!(codegen.stack_local_is_live(2), None);
+        },
+    );
 }
 
 // =============================================================================

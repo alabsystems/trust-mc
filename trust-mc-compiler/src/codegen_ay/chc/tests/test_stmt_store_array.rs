@@ -34,7 +34,18 @@ fn test_array_index_store_generates_vc() {
     with_test_ay_ctx_for_source(ARRAY_INDEX_STORE_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_array_index_store");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_array_index_store", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the stored array is write-only, so
+        // write-only array elimination (85da41dad) removes the store and its bv32 columns.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_array_index_store",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_array_index_store", body.blocks.len());
 

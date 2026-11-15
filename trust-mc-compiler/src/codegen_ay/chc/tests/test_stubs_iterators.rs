@@ -846,7 +846,7 @@ fn test_range_spec_next_flattened_update_has_constraints_without_symbolic_fallba
             stmt_constraints: &stmt_constraints,
             modified_locals: &modified_locals,
         };
-        chc_ctx.codegen_call_iterator_adapter(&cx);
+        chc_ctx.codegen_call_iterator_adapter(&cx, None);
 
         assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one transition rule");
         let rule = chc_ctx.vc.rules.last().expect("RangeSpecNext should emit transition rule");

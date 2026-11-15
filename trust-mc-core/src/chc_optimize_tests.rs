@@ -12,6 +12,15 @@ use ay_bindings::expr::RoundingMode;
 #[path = "chc_optimize_dead_scalar_array_tests.rs"]
 mod dead_scalar_array_tests;
 
+#[path = "chc_optimize_unconstrained_tests.rs"]
+mod unconstrained_tests;
+
+#[path = "chc_optimize_datatypes_tests.rs"]
+mod datatypes_tests;
+
+#[path = "chc_normalize_free_arrays_tests.rs"]
+mod normalize_free_arrays_tests;
+
 #[test]
 fn test_var_eq_var_classified_as_transfer() {
     let x = Expr::var("x", Sort::int());

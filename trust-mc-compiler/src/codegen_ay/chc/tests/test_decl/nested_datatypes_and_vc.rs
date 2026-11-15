@@ -141,7 +141,14 @@ fn test_block_relations_consistent_arity() {
     with_test_ay_ctx_for_source(DECL_PROBE_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "multi_local");
         let body = instance.body().expect("function body");
-        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "multi_local", ChcConfig::default());
+        // Full frame: with frame narrowing (default on since fcdc0472e) each block relation
+        // carries only its live columns, so arities legitimately differ.
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "multi_local",
+            ChcConfig { frame_narrowing: false, ..ChcConfig::default() },
+        );
         chc_ctx.declare_block_relations();
 
         let state_var_count = chc_ctx.state_var_mgr.state_vars.len();

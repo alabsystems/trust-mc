@@ -108,7 +108,8 @@ fn test_codegen_call_hashset_direct_tracks_len_output() {
             .expect("expected tracked len output variable slot");
 
         let len_head_arg =
-            rule.head.args.get(len_idx).expect("len output slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, len_idx)
+                .expect("len output slot should exist in rule head");
         assert!(
             matches!(len_head_arg.value(), ExprValue::Var { name } if name == &len_out_name),
             "hashset direct call should route tracked len slot through output var, \
@@ -148,7 +149,9 @@ fn test_codegen_call_hashset_direct_empty_args_no_len_update() {
         };
         chc_ctx.codegen_call_hashset(&cx);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one hashset rule");
+        // BSEM-18: the fail-closed check rule plus its error_p bridge.
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one hashset rule and its bridge");
+        assert!(is_error_check_rule(chc_ctx.vc.rules.last().expect("rule")), "fallback must be an error-family check rule");
         let rule = chc_ctx.vc.rules.last().expect("hashset fallback call should emit one rule");
         assert_eq!(
             rule.body.constraints.len(),
@@ -196,11 +199,12 @@ fn test_codegen_call_hashset_direct_non_array_sort_emits_error_rule() {
 
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before_rules + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before_rules + 2,
             "forced-failure hashset path should emit one fail-closed rule"
         );
         let rule = chc_ctx.vc.rules.last().expect("hashset fail-closed call should emit a rule");
-        assert_eq!(rule.head.name, "error", "forced-failure path should emit error()");
+        assert!(is_error_check_rule(rule), "forced-failure path should emit an error-family check rule");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),

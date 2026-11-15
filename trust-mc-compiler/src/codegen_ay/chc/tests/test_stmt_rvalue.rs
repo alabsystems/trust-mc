@@ -93,9 +93,9 @@ fn test_mir_to_chc_repeat_produces_const_array() {
 // =============================================================================
 
 #[test]
-fn test_nullary_op_ub_checks_produces_true() {
-    // NullOp::RuntimeChecks(UbChecks) should produce true so MIR-generated
-    // UB assertions are reachable (#3299).
+fn test_nullary_op_ub_checks_bounds_error_rules() {
+    // NullOp::RuntimeChecks(UbChecks) evaluates to false, as Kani; MIR-generated
+    // bounds assertions stay reachable regardless.
     //
     // NOTE: In recent nightly, `unchecked_add` is lowered as an intrinsic
     // call without MIR Assert terminators. We test the error-rule pipeline
@@ -177,6 +177,10 @@ fn test_reinterpret_fixed_layout_expr_unwraps_single_array_field_datatype() {
         matches!(
             result.value(),
             ay_bindings::ExprValue::DatatypeSelector { selector_name, .. } if selector_name == "fld_0"
+            ) || matches!(
+                result.value(),
+                // ay folds fld_0 over the constructor (8a7c063209): the array itself.
+                ay_bindings::ExprValue::Var { name } if name == "simd_arr"
         ),
         "repr-SIMD datatype should unwrap through fld_0, got {:?}",
         result.value()
@@ -476,15 +480,25 @@ fn test_mir_to_chc_copy_for_deref_field_projection() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_copy_deref_field");
         let body = instance.body().expect("function body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_copy_deref_field", ChcConfig::default());
+        // Mem level: `*p.second` loads through the pointer the field holds.
+        // At Reg level the BV32 state var this test asserted came from reading
+        // the POINTER field `(*p).second` as if it were the `u32` it points at
+        // (a value-of ref_target edge taken as points-at, dropped by
+        // `drop_pointer_field_value_of_edges`); Reg level has no memory to
+        // load the referent from.
+        let vc = mir_to_chc(
+            ctx.tcx,
+            &body,
+            "probe_copy_deref_field",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
 
         // Should produce valid CHC rules without panic.
         // Before #3059 fix, the Deref was prepended before Field, which could
         // produce incorrect memory loads for projected CopyForDeref.
         assert!(!vc.rules.is_empty(), "copy deref field should produce CHC rules");
 
-        // The Pair struct has two &u32 fields; at Reg level the return u32
-        // should produce BV32 state vars.
+        // The Pair struct has two &u32 fields; the loaded u32 is a BV32 value.
         let has_bv32 =
             vc.relations.iter().any(|r| r.arg_sorts.iter().any(|s| s.bitvec_width() == Some(32)));
         assert!(has_bv32, "copy deref through struct field should produce BV32 state vars");
@@ -717,6 +731,7 @@ pub fn probe_array_len_direct(arr: [u32; 4]) -> usize {
 }
 "#;
 
+#[cfg(not(trust_toolchain))]
 const SHALLOW_INIT_BOX_FALLBACK_SOURCE: &str = r#"
 #![allow(dead_code)]
 
@@ -927,6 +942,8 @@ fn test_rvalue_len_array_does_not_increment_fallback_counter_with_modified() {
 /// Covers the `record_fallback()` inside `Rvalue::ShallowInitBox` handling when
 /// the operand cannot be translated.
 #[test]
+// Rvalue::ShallowInitBox exists only in the frozen nightly MIR.
+#[cfg(not(trust_toolchain))]
 fn test_shallow_init_box_operand_translate_failure_increments_fallback_counter() {
     with_test_ay_ctx_for_source(SHALLOW_INIT_BOX_FALLBACK_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_shallow_box_fallback_ty");

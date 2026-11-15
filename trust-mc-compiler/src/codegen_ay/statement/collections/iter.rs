@@ -48,6 +48,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
         callee_path: &str,
+        // The call's own callee operand; `None` only where no call exists
+        // (unit tests), which leaves an `Iterator::sum` unclassified.
+        func: Option<&Operand>,
     ) -> Option<BasicBlockIdx> {
         use StubKind::{
             ChainNext, FlattenNext, HashMapIterNext, IntoIterNext, IterCollect, IterFlatten,
@@ -55,6 +58,47 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
 
         debug!(?stub_kind, %callee_path, "codegen_iter_stub");
+
+        // `collect` over a `map` chain on a slice iterator is replayed element
+        // by element with each closure run in order, its checks included
+        // (`try_collect_map_chain`), so it is tried before the check below,
+        // which is for the stubs that run no closure. Booking that check first
+        // failed the replayed chain closed (`closure_helper_obligation_dual.rs`
+        // `h05`, `mc1`; `collect_map_chain_dual.rs` `fs2`, `fs3`: false
+        // failures on BMC after the merge of fix/chc-walker-fail-closed with
+        // main, which the branch proved).
+        if stub_kind == IterCollect
+            && let Some(receiver) = args.first()
+            && self.collect_receiver_changing_adapter(receiver).is_some()
+            && let Some(result) = self.try_collect_map_chain(receiver, destination)
+        {
+            self.assign_value_to_place(destination, result);
+            return target;
+        }
+
+        // These stubs never run the closures of their receiver's adapter chain
+        // (a `Filter`'s predicate, a `Map`'s function); `sum` and `fold`
+        // replay them (`try_iter_sum_unroll`, `try_iter_fold_unroll`) or fail
+        // closed (AY alignment round 8, review round 5, finding 1).
+        if matches!(
+            stub_kind,
+            StubKind::MapNext
+                | StubKind::FilterNext
+                | StubKind::FilterMapNext
+                | StubKind::ZipNext
+                | ChainNext
+                | FlattenNext
+                | IterCollect
+        ) && let Some(receiver) = args.first()
+            && receiver.ty(self.body.locals()).ok().is_none_or(|ty| {
+                crate::codegen_ay::iter_closure_obligation::ty_may_run_obligated_closure(
+                    self.ctx.tcx,
+                    ty,
+                )
+            })
+        {
+            self.record_unmodeled_closure_check();
+        }
 
         match stub_kind {
             IntoIterNext => {
@@ -96,8 +140,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
                     let vec_sort = self.infer_iter_vec_sort(&iter);
                     let iter_sort = iter.sort().clone();
-                    let vec = iter.clone().field_select(dt_name, "fld_vec", vec_sort);
-                    let pos = iter.field_select(dt_name, "fld_pos", ptr_sort());
+                    let fields = iter.clone().try_field_select(dt_name, "fld_vec", vec_sort).and_then(
+                        |vec| Ok((vec, iter.clone().try_field_select(dt_name, "fld_pos", ptr_sort())?)),
+                    );
+                    let Ok((vec, pos)) = fields else {
+                        error!("UNSOUND: VecIntoIter::next on {:?} has no fld_vec/fld_pos signature - forcing verification failure", iter_sort);
+                        self.record_violation_guarded(
+                            Expr::bool_const(true),
+                            "iterator_sort_mismatch_unsound",
+                        );
+                        return target;
+                    };
 
                     // Get vec length
                     let len = self.vec_field_select_declared(&vec, "fld_len", ptr_sort());
@@ -179,6 +232,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return target;
                 }
 
+                // `codegen_iter_collect_vec` peels one adapter (`fld_iter`) and
+                // returns the Vec underneath, which is the collected value only
+                // when the adapter keeps every element as it is. Through `map`
+                // or `filter_map` it collected the UNMAPPED elements and never
+                // ran the closure: `[1, 2, 3].iter().map(|x| x + 10).collect()`
+                // read `[1, 2, 3]`, and an `assert!` in the closure was dropped
+                // (walker fail-closed review 6 round 3, `h05`, `h21`,
+                // `bmc_collect_adapter_dual.rs`). Any other adapter fails closed.
+                if let Some(adapter) = self.collect_receiver_changing_adapter(&args[0]) {
+                    // A replayable map chain was collected above.
+                    debug!(%adapter, "IterCollect: collect over an adapter the BMC lane does not replay");
+                    self.ctx.unsupported_with_fallback(
+                        "iter_collect_adapter_unmodeled",
+                        "collect over an adapter that runs a closure or changes the elements",
+                    );
+                    self.codegen_symbolic_result(destination);
+                    return target;
+                }
                 let iter_expr = self.codegen_operand(&args[0]);
                 if let Some(iter_expr) = iter_expr {
                     if let Some(result) = self.codegen_iter_collect_vec(&iter_expr) {
@@ -344,7 +415,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Part of #3692: IterFilterMap reuses IterMap handler (sound over-approximation).
             StubKind::IterFilterMap => self.codegen_iter_map_stub(args, destination, target),
             StubKind::IterFold => self.codegen_iter_fold_stub(args, destination, target),
-            StubKind::IterSum => self.codegen_iter_sum_stub(args, destination, target),
+            StubKind::IterSum => self.codegen_iter_sum_stub(func, args, destination, target),
             StubKind::MapNext => self.codegen_map_next_stub(args, destination, target),
             StubKind::FilterNext => self.codegen_filter_next_stub(args, destination, target),
             // Part of #3692: FilterMapNext reuses MapNext handler (sound over-approximation).

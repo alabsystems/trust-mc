@@ -30,7 +30,7 @@ fn test_translate_ty_custom_into_iter_uses_generic_adt_sort() {
         let sort = ChcCtx::translate_ty(sig.inputs()[0]).unwrap();
 
         let dt = sort.datatype_sort().expect("custom IntoIter should translate to a datatype");
-        assert_eq!(dt.name, "IntoIter");
+        assert_eq!(crate::codegen_ay::test_support::local_sort_name(&dt.name), "IntoIter");
         assert_eq!(dt.constructors.len(), 1);
         let fields = &dt.constructors[0].fields;
         assert_eq!(

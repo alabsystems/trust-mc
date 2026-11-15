@@ -10,6 +10,7 @@
 //!
 //! Extracted from quantifier_encoding.rs — Part of #2408.
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -95,15 +96,15 @@ fn inline_simple_fn_call<'tcx, 'body>(
 ) -> Option<Expr> {
     // The receiver OPERAND carries the type the known-call fast paths need to
     // tell a pointer receiver from an integer one (element- vs byte-sized
-    // `wrapping_add`); passing `None` silently drops `size_of::<T>()` scaling.
-    let first_arg = arg_operands.first();
+    // `wrapping_add`); missing operands silently drop `size_of::<T>()` scaling.
+    // Keep the other operands too: either iterator can establish a finite bound.
     if let Some(callee_path) = resolve_closure_body_callee_path(ctx, func_operand, caller_locals)
         && let Some(expr) = inline_known_call_expr_for_callee_path(
             ctx,
             func_operand,
             &callee_path,
             &call_args,
-            first_arg,
+            arg_operands,
             caller_locals,
         )
     {
@@ -115,7 +116,7 @@ fn inline_simple_fn_call<'tcx, 'body>(
     }
 
     if let Some(expr) =
-        inline_known_call_expr(ctx, func_operand, &call_args, first_arg, caller_locals)
+        inline_known_call_expr(ctx, func_operand, &call_args, arg_operands, caller_locals)
     {
         // Part of #4053: declare DT sorts for known-call arg/result accessors.
         for arg in &call_args {
@@ -135,7 +136,7 @@ fn inline_simple_fn_call<'tcx, 'body>(
     // the single-block/Return gate below rejects any transformed instrumented
     // body anyway — a gated-transformed fetch here is behaviorally inert while
     // risking the assert(nondet) fallback on shape mismatch.
-    let fn_body = instance.body()?;
+    let fn_body = instance.callee_body()?;
     if fn_body.blocks.len() != 1
         || !matches!(fn_body.blocks[0].terminator.kind, TerminatorKind::Return)
     {
@@ -226,6 +227,17 @@ pub(in crate::codegen_ay) fn translate_closure_body_with_params<'tcx, 'body>(
     captures: &[Expr],
     bb_idx: usize,
 ) -> Option<ClosureBodyResult> {
+    // This walk records no integer BinOp UB check (the inline walker's
+    // `inline_binop_ub_checks`), and its no-panic guard covers only `Assert`
+    // terminators. A body whose unchecked op or intrinsic Div/Rem carries an
+    // obligation no Assert guards would lose it silently: fail closed.
+    if crate::codegen_ay::chc::call::inline_shared::body_carries_unguarded_binop_ub(body) {
+        debug!(
+            ?bb_idx,
+            "quantifier closure: unguarded integer BinOp UB not checked, failing closed"
+        );
+        ctx.record_sound_fallback_reason("quantifier_closure_ub_check_dropped");
+    }
     // For simple 1-block closures, process directly.
     // For 2-block closures with a Call terminator, delegate to the call handler.
     // For multi-block closures with Assert terminators (from CheckedBinaryOp),

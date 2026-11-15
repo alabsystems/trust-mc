@@ -213,7 +213,7 @@ fn build_div_const_nonzero() -> Module {
     let r = fb.udiv(Ty::U32, a, seven);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// `f(a) = a / 0` (constant zero divisor). ALWAYS panics. Calibration: MUST NOT prove SAFE.
@@ -229,7 +229,7 @@ fn build_div_const_zero() -> Module {
     let r = fb.udiv(Ty::U32, a, zero);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // --- the generator: a combinatorial space of guarded division programs ----------
@@ -370,7 +370,7 @@ fn build_spec(spec: &Spec) -> Module {
         }
     }
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn generated_specs() -> Vec<Spec> {
@@ -485,7 +485,7 @@ fn build_overflow_spec(spec: &OverflowSpec) -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn generated_overflow_specs() -> Vec<OverflowSpec> {
@@ -557,7 +557,7 @@ fn build_debruijn_decrement() -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Models clean-kernel `micro/checker.rs` BVar type-check rule (line ~83):
@@ -629,7 +629,7 @@ fn build_kernel_bvar_ctx_pos() -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Models clean-kernel `bitvec_slice.rs::and_chain` (and the identical `bitvec_compute.rs::
@@ -671,7 +671,7 @@ fn build_kernel_and_chain_width() -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// The UNGUARDED de Bruijn position computation: `depth - 1 - idx` with NO `idx < depth` guard.
@@ -710,7 +710,7 @@ fn build_kernel_bvar_ctx_pos_unguarded() -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// SOUNDNESS of Trust's discharge on the clean kernel's de Bruijn POSITION computation
@@ -893,6 +893,13 @@ fn soundness_oracle_no_false_proofs() {
 // structure + totality to the real `low_mask` is validated by EXECUTION in the trust repo
 // (trust-types test `low_mask_model_matches_and_is_total`).
 fn build_low_mask_model() -> Module {
+    let module = build_low_mask_input(true, true);
+    let errors = trust_ir_build::validate_module(&module);
+    assert!(errors.is_empty(), "positive low_mask input must be canonical: {errors:?}");
+    module
+}
+
+fn build_low_mask_input(normalize_shift_width: bool, canonical_max: bool) -> Module {
     let mut mb = ModuleBuilder::new("trust_types_low_mask");
     let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U128]);
     let mut fb = mb.function("f", ft);
@@ -911,19 +918,84 @@ fn build_low_mask_model() -> Module {
 
     // width >= 128: u128::MAX (all-ones; value irrelevant to panic-freedom).
     fb.switch_to_block(ge_blk);
-    let max = fb.iconst(Ty::U128, -1);
+    let max = if canonical_max {
+        fb.const_value(Ty::U128, trust_ir::Constant::u128(u128::MAX))
+    } else {
+        fb.iconst(Ty::U128, -1)
+    };
     fb.br(exit, vec![max]);
 
     // width < 128: (1u128 << width) - 1 — the GUARDED shift the verifier must prove safe.
     fb.switch_to_block(lt_blk);
     let one = fb.iconst(Ty::U128, 1);
-    let shifted = fb.binop(BinOp::Shl, Ty::U128, one, width); // 1u128 << width (width: U32) — THE panic surface
+    // TrustIR binary operands have the declared integer type. Zero extension
+    // preserves the U32 amount and its dominating width < 128 guard exactly.
+    let amount = if normalize_shift_width { fb.zext(Ty::U32, Ty::U128, width) } else { width };
+    let shifted = fb.binop(BinOp::Shl, Ty::U128, one, amount);
     fb.br(exit, vec![shifted]);
 
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+#[test]
+fn original_mixed_width_low_mask_is_a_canonical_input_refusal() {
+    let original = build_low_mask_input(false, false);
+    let errors = trust_ir_build::validate_module(&original);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            trust_ir_build::ValidationError::BinOpTypeMismatch { .. }
+        )),
+        "the original U128/U32 shift must remain diagnosed: {errors:?}"
+    );
+    let function = original.function_by_name("f").expect("f").id;
+    let output = trust_mc_trust_bmc::trust_ir_function_to_chc_translation_output(
+        &original,
+        function,
+        &TranslateOptions::default(),
+    )
+    .expect("existing selection");
+    assert!(output.module_input_refusal.is_some());
+    assert!(output.diagnostics.is_empty(), "invalidity has no invented instruction site");
+    assert_eq!(output.vc.rules.len(), 1);
+    let rule = &output.vc.rules[0];
+    assert_eq!(rule.head.name, "error");
+    assert!(rule.body.relation.is_none());
+    assert!(rule.body.constraints.is_empty());
+}
+
+#[test]
+fn normalized_shift_with_negative_unsigned_max_is_a_canonical_input_refusal() {
+    // Retain the intermediate repaired input too: Int(-1) denotes a negative
+    // integer, not the canonical unsigned value u128::MAX. An unvalidated
+    // interpreter/SMT bit pattern cannot authorize it as typed U128 input.
+    let original = build_low_mask_input(true, false);
+    let errors = trust_ir_build::validate_module(&original);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            trust_ir_build::ValidationError::ConstTypeMismatch { expected, actual, .. }
+                if expected == "u128" && actual == "int"
+        )),
+        "the original negative unsigned constant must remain diagnosed: {errors:?}"
+    );
+    let function = original.function_by_name("f").expect("f").id;
+    let output = trust_mc_trust_bmc::trust_ir_function_to_chc_translation_output(
+        &original,
+        function,
+        &TranslateOptions::default(),
+    )
+    .expect("existing selection");
+    assert!(output.module_input_refusal.is_some());
+    assert!(output.diagnostics.is_empty(), "invalidity has no invented instruction site");
+    assert_eq!(output.vc.rules.len(), 1);
+    let rule = &output.vc.rules[0];
+    assert_eq!(rule.head.name, "error");
+    assert!(rule.body.relation.is_none());
+    assert!(rule.body.constraints.is_empty());
 }
 
 /// Models trust-types `bitvector.rs::bv_eval` `BvOp::UDiv` arm (line ~172):
@@ -968,7 +1040,7 @@ fn build_trust_types_bv_eval_div() -> Module {
     fb.switch_to_block(exit);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// RUNG 3 (division class): Trust's discharge PROVES the guarded division in its own verifier
@@ -997,12 +1069,9 @@ fn rung3_trust_types_bv_eval_udiv_guarded_division_proven_safe() {
 /// (trust-types `low_mask_model_matches_and_is_total`).
 #[test]
 fn rung3_trust_types_low_mask_guarded_shift_proven_safe() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let module = build_low_mask_model();
     let verdict = verify(&module);
     let panics = actually_panics(&module, "f", &[Ty::U32]);
-    std::panic::set_hook(prev);
 
     assert!(!panics, "low_mask model must be total (the width>=128 guard dominates the shift)");
     assert_eq!(
@@ -1022,9 +1091,6 @@ fn rung3_trust_types_low_mask_guarded_shift_proven_safe() {
 /// soundness counterpart — an UNGUARDED form must be REFUTED, never proven — is checked alongside.
 #[test]
 fn self_verification_suite_trust_proves_its_own_stack() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-
     // (name, subsystem, obligation class, module, param tys) — each a real panic surface.
     let arms: Vec<(&str, &str, &str, Module, Vec<Ty>)> = vec![
         (
@@ -1078,8 +1144,6 @@ fn self_verification_suite_trust_proves_its_own_stack() {
     // (never proven safe) — the suite is not vacuously passing everything.
     let unguarded = build_kernel_bvar_ctx_pos_unguarded();
     let unguarded_refuted = verify(&unguarded) != Verdict::Safe;
-
-    std::panic::set_hook(prev);
 
     eprintln!(
         "self-verification suite: Trust's discharge PROVED {proven}/{} real panic surfaces of its \
@@ -1144,7 +1208,7 @@ fn build_shift(guard: Option<(Cmp, i128)>) -> Module {
         }
     }
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -1275,7 +1339,7 @@ fn build_modular_div(guard: Option<(Cmp, i128)>) -> (Module, FuncId) {
         }
         fb.build()
     };
-    (mb.build(), f_id)
+    (mb.build().expect("ModuleBuilder::build: test fixture"), f_id)
 }
 
 #[test]

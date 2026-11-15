@@ -132,20 +132,20 @@ fn test_loop_invariant_registry_empty_list_not_registered() {
 }
 
 fn mk_call_terminator(dest_local: usize, target: usize) -> Terminator {
-    Terminator {
-        kind: TerminatorKind::Call {
+    crate::rustc_compat::mir_terminator(
+        TerminatorKind::Call {
             func: Operand::Move(Place { local: 100, projection: vec![] }),
             args: vec![],
             destination: Place { local: dest_local, projection: vec![] },
             target: Some(target),
             unwind: UnwindAction::Terminate,
         },
-        span: Span::to_val(0),
-    }
+        Span::to_val(0),
+    )
 }
 
 fn mk_goto_terminator(target: usize) -> Terminator {
-    Terminator { kind: TerminatorKind::Goto { target }, span: Span::to_val(0) }
+    crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, Span::to_val(0))
 }
 
 #[test]

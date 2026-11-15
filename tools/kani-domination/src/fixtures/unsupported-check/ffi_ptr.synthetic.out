@@ -1,0 +1,39 @@
+# Synthetic transcript (never a driver log) for the unsupported-construct parity rule; reconstructed after the original was lost to the root .gitignore's `*.out`.
+Checking harness check_fn_ptr_not_called...
+[AY:PROOF] CHC verification: property proven
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_fn_ptr_not_called.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: call_on(input, None).is_none()"
+	 - Location: /corpus/expected/foreign-function/ffi_ptr.rs:27:5 in function check_fn_ptr_not_called
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_fn_ptr_called...
+[AY:CTREX_CAT:OverApproximation:kani_unsupported_construct_check=1]
+Check 1: check_fn_ptr_called.unsupported_construct.1
+	 - Status: FAILURE
+	 - Description: "call to foreign "C" function `foreign` is not currently supported by Kani"
+	 - Location: /corpus/expected/foreign-function/ffi_ptr.rs:14:9 in function call_on
+
+Check 2: check_fn_ptr_called.assertion.1
+	 - Status: UNDETERMINED
+	 - Description: "assertion failed: call_on(input, Some(foreign)).is_some()"
+	 - Location: /corpus/expected/foreign-function/ffi_ptr.rs:34:5 in function check_fn_ptr_called
+
+SUMMARY:
+ ** 1 of 2 failed (1 undetermined)
+Failed Checks: call to foreign "C" function `foreign` is not currently supported by Kani
+ File: /corpus/expected/foreign-function/ffi_ptr.rs, line 14, in call_on
+
+VERIFICATION:- FAILED
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_fn_ptr_called
+Complete - 1 successfully verified harnesses, 1 failures, 2 total.
+CTREX breakdown: 0 EncodingGap, 1 OverApproximation, 0 Genuine, 0 Unknown

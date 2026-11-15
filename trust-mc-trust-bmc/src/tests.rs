@@ -7,6 +7,21 @@
 //! Uses `trust_ir-build` to construct test programs, then verifies the
 //! generated VCs match expectations.
 
+#[path = "tests/addressable_storage.rs"]
+mod addressable_storage;
+#[path = "tests/complete_aggregate_definedness.rs"]
+mod complete_aggregate_definedness;
+#[path = "tests/native_unary.rs"]
+mod native_unary;
+#[path = "tests/native_wire_identity.rs"]
+mod native_wire_identity;
+#[path = "tests/runtime_closure.rs"]
+mod runtime_closure;
+#[path = "tests/tensor_region.rs"]
+pub(crate) mod tensor_region;
+#[path = "tests/typed_signature_abi.rs"]
+mod typed_signature_abi;
+
 use ay_bindings::{Expr, ExprValue};
 use trust_ir::dialect::{AttrValue, trust_rust};
 use trust_ir::inst::{AllocOrigin, BinOp, CastOp, ICmpOp, OverflowOp, SwitchCase, UnOp};
@@ -29,13 +44,87 @@ use trust_ir_build::ModuleBuilder;
 use trust_mc_core::violation::PropertyKind;
 
 use crate::translate::{TranslateOptions, const_to_expr, trust_ir_to_bmc_vc, ty_to_sort};
+use crate::translate_chc::DIRECT_CALL_SUMMARY_MAX_DEPTH;
 use crate::{
-    ChcTranslationOutput, NativeTrustMcBundleError, SEMANTICS_COVERAGE, SemanticsFamily,
-    SemanticsStatus, TrustIrChcUnsupportedReason, coverage_for_family, family_for_inst,
-    trust_ir_function_to_chc_translation_output, trust_ir_to_chc_translation_outputs,
+    CallSummaryOutcome, ChcTranslationOutput, NativeTrustMcBundleError, SEMANTICS_COVERAGE,
+    SemanticsFamily, SemanticsStatus, TrustIrChcUnsupportedReason, coverage_for_family,
+    family_for_inst, native_unmodeled_obligations, trust_ir_function_to_chc_translation_output,
+    trust_ir_to_chc_translation_outputs, trust_ir_to_chc_translation_outputs_per_block,
     trust_ir_to_chc_vc, trust_mc_bmc_vcs_from_native_bundle,
     trust_mc_chc_pdr_obligations_from_native_bundle,
 };
+
+/// Invalid fixtures stop at complete canonical preflight in both public lanes.
+/// No instruction/site, SSA symbol or proof outcome is fabricated for them.
+pub(crate) fn assert_canonical_refusal(module: &trust_ir::Module, expected: &str) {
+    let errors = trust_ir_build::validate_module(module);
+    assert!(
+        errors.iter().any(|error| error.to_string().contains(expected)),
+        "expected {expected:?}: {errors:?}"
+    );
+    let outputs = trust_ir_to_chc_translation_outputs(module, &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    assert_chc_canonical_refusal(&outputs[0], expected);
+    let vcs = trust_ir_to_bmc_vc(module, &TranslateOptions::default());
+    assert_eq!(vcs.len(), 1);
+    let vc = &vcs[0];
+    assert!(vc.decls.is_empty());
+    assert!(vc.constraints.is_empty());
+    assert_eq!(vc.violations.len(), 1);
+    let refusal = &vc.violations[0];
+    assert_eq!(refusal.kind, PropertyKind::Other);
+    assert!(refusal.message.as_deref().unwrap().contains(expected));
+    assert_eq!(refusal.condition, Expr::true_());
+}
+
+fn assert_chc_canonical_refusal(output: &ChcTranslationOutput, expected: &str) {
+    assert!(
+        output.module_input_refusal.as_deref().is_some_and(|reason| reason.contains(expected)),
+        "expected {expected:?}: {:?}",
+        output.module_input_refusal
+    );
+    assert!(output.diagnostics.is_empty(), "module invalidity has no invented instruction site");
+    assert_eq!(output.vc.rules.len(), 1);
+    let rule = &output.vc.rules[0];
+    assert_eq!(rule.head.name, "error");
+    assert!(rule.body.relation.is_none());
+    assert!(rule.body.constraints.is_empty());
+    assert_eq!(output.vc.query.target.as_deref(), Some("error"));
+}
+
+pub(crate) fn fixture_target() -> trust_ir::TargetInfo {
+    let module: trust_ir::Module =
+        serde_json::from_str(include_str!("../tests/fixtures/typed_signature_abi.module.json"))
+            .unwrap();
+    module.target_info.unwrap()
+}
+
+fn add_dropped_struct(mb: &mut ModuleBuilder) -> Ty {
+    Ty::Struct(mb.add_struct(StructDef {
+        id: StructId::new(0),
+        name: "Dropped".into(),
+        fields: vec![FieldDef { name: "value".into(), ty: Ty::I64, offset: Some(0) }],
+        size: Some(8),
+        align: Some(8),
+        repr: trust_ir::StructRepr::C,
+        origin: None,
+    }))
+}
+
+fn assert_canonical_module(module: &trust_ir::Module) {
+    let report = trust_ir_build::validate_module_report(module);
+    assert!(report.is_ok(), "canonical positive fixture must validate: {:?}", report.errors());
+}
+
+fn assert_no_module_refusal(outputs: &[ChcTranslationOutput]) {
+    for output in outputs {
+        assert!(
+            output.module_input_refusal.is_none(),
+            "unexpected module refusal: {:?}",
+            output.module_input_refusal
+        );
+    }
+}
 
 #[test]
 fn semantics_coverage_matrix_documents_fail_closed_families() {
@@ -55,6 +144,10 @@ fn semantics_coverage_matrix_documents_fail_closed_families() {
     );
     assert_eq!(
         coverage_for_family(SemanticsFamily::Floats).status,
+        SemanticsStatus::FailClosedUnsupported
+    );
+    assert_eq!(
+        coverage_for_family(SemanticsFamily::BitIntrinsics).status,
         SemanticsStatus::FailClosedUnsupported
     );
     assert_eq!(
@@ -125,6 +218,99 @@ fn ty_to_sort_maps_vector_to_packed_bitvec() {
     assert_eq!(ty_to_sort(&Ty::Vector(Box::new(Ty::Bool), 4)).bitvec_width(), Some(4));
 }
 
+/// trust-ir v43: an opaque runtime handle must get an UNINTERPRETED sort, not
+/// a bitvector. A bitvector sort would let the solver pick one of 2^64
+/// concrete values for a value the format says only a pinned external entry
+/// point can produce.
+#[test]
+fn ty_to_sort_maps_handle_to_uninterpreted_sort_not_bitvec() {
+    let handle = Ty::handle("Nat", "trust_bignum::Nat");
+    let sort = ty_to_sort(&handle);
+
+    // The load-bearing negative: NOT a bitvector (and so not an integer/bool
+    // either), so no arithmetic, comparison or literal can apply to it.
+    assert_eq!(sort.bitvec_width(), None, "a handle must not get a bitvector sort");
+    assert!(!sort.is_bitvec());
+    assert!(!sort.is_numeric());
+    assert!(!sort.is_bool());
+    assert!(matches!(sort.inner(), ay_bindings::SortInner::Uninterpreted(_)));
+
+    // A handle is one pointer word wide, which is exactly the trap this test
+    // guards: width equality with `Ptr` must NOT become sort equality.
+    assert_eq!(handle.bit_width_with(64), Some(64));
+    assert_eq!(ty_to_sort(&Ty::Ptr).bitvec_width(), Some(64));
+    assert_ne!(sort, ty_to_sort(&Ty::Ptr), "a handle is never the same sort as a pointer");
+    assert_ne!(sort, ty_to_sort(&Ty::U64));
+    assert_ne!(sort, ty_to_sort(&Ty::Usize));
+}
+
+/// The sort is keyed on the full `(name, runtime)` identity, so two runtimes
+/// cannot be conflated. Under a shared placeholder sort this crate's
+/// sort-equality fences would accept a cross-runtime substitution.
+#[test]
+fn ty_to_sort_keys_handle_sort_on_name_and_runtime_identity() {
+    let nat = ty_to_sort(&Ty::handle("Nat", "trust_bignum::Nat"));
+    let other_runtime = ty_to_sort(&Ty::handle("Nat", "other_bignum::Nat"));
+    let other_name = ty_to_sort(&Ty::handle("Int", "trust_bignum::Nat"));
+
+    assert_ne!(nat, other_runtime, "same type name, different runtime: distinct sorts");
+    assert_ne!(nat, other_name, "same runtime, different type name: distinct sorts");
+    assert_ne!(other_runtime, other_name);
+
+    // Identity is the pair, so the SAME pair is the SAME sort -- transport of
+    // one runtime's handle through copy/select/call must still typecheck.
+    assert_eq!(nat, ty_to_sort(&Ty::handle("Nat", "trust_bignum::Nat")));
+
+    // The name carries both halves, and the pinned v1 runtime reads back
+    // whole in a counterexample.
+    let ay_bindings::SortInner::Uninterpreted(name) = nat.inner() else {
+        panic!("a handle sort is uninterpreted");
+    };
+    assert_eq!(name, "handle<Nat, trust_bignum::Nat>");
+}
+
+/// No constant constructs a handle. `Ty::Handle`'s `bit_width_with` is one
+/// pointer word, so without an explicit guard the integer arms of
+/// `const_to_expr` would hand back a 64-bit literal -- fabricating the one
+/// value the format reserves to a pinned entry point.
+#[test]
+fn const_to_expr_refuses_every_constant_at_handle_type() {
+    use trust_ir::constant::Constant;
+
+    let handle = Ty::handle("Nat", "trust_bignum::Nat");
+    for value in [
+        Constant::Int(0),
+        Constant::Int(1),
+        Constant::Int(0x7fff_ffff_ffff_ffff),
+        Constant::u128(u128::from(u64::MAX) + 1),
+        Constant::Bool(false),
+        Constant::PhantomData,
+        Constant::Aggregate(vec![Constant::Int(0)]),
+    ] {
+        assert!(
+            const_to_expr(&handle, &value).is_none(),
+            "a handle must have no constant encoding, got one for {value:?}"
+        );
+    }
+
+    // Control: the same integer constant at a scalar type still encodes, so
+    // the test is measuring the handle guard and not a dead code path.
+    assert!(const_to_expr(&Ty::U64, &Constant::Int(1)).is_some());
+}
+
+/// `normalize_expr_to_ty` must not coerce anything INTO a handle: with no
+/// bitvector width to target it returns the expression untouched, so the
+/// caller's sort check is the thing that fails, loudly.
+#[test]
+fn normalize_expr_to_ty_leaves_a_handle_target_untouched() {
+    let expr = Expr::bitvec_const(7, 64);
+    let normalized =
+        crate::translate::normalize_expr_to_ty(&expr, &Ty::handle("Nat", "trust_bignum::Nat"));
+
+    assert_eq!(normalized, expr, "no bit-level coercion may produce a handle");
+    assert_ne!(*normalized.sort(), ty_to_sort(&Ty::handle("Nat", "trust_bignum::Nat")));
+}
+
 #[test]
 fn const_to_expr_packs_vector_lanes_with_lane_zero_low_bits() {
     let ty = Ty::Vector(Box::new(Ty::U8), 4);
@@ -185,11 +371,11 @@ fn collect_bitvec_concat_leaves(expr: &Expr, leaves: &mut Vec<(String, u32)>) {
     }
 }
 
-fn native_digest(seed: u8) -> ProofDigest {
+pub(crate) fn native_digest(seed: u8) -> ProofDigest {
     ProofDigest::sha256([seed; 32])
 }
 
-fn native_trust_mc_bundle(mode: TrustMcVerificationMode) -> NativeVerificationBundle {
+pub(crate) fn native_trust_mc_bundle(mode: TrustMcVerificationMode) -> NativeVerificationBundle {
     native_trust_mc_bundle_inner(mode, false)
 }
 
@@ -198,7 +384,7 @@ fn native_trust_mc_bundle(mode: TrustMcVerificationMode) -> NativeVerificationBu
 /// an unconditionally reachable error rule and records a
 /// `FloatingPointArithmetic` diagnostic. Used to pin that the producer records
 /// the DISTINCT typed reasons alongside the fail-closed site count.
-fn native_trust_mc_bundle_with_fail_closed_lowering(
+pub(crate) fn native_trust_mc_bundle_with_fail_closed_lowering(
     mode: TrustMcVerificationMode,
 ) -> NativeVerificationBundle {
     native_trust_mc_bundle_inner(mode, true)
@@ -235,13 +421,15 @@ fn native_trust_mc_bundle_inner(
         fb.set_entry(entry);
         let lhs = fb.add_block_param(entry, add_ty.clone());
         let rhs = fb.add_block_param(entry, add_ty.clone());
-        let sum = fb.add(add_ty, lhs, rhs);
+        let sum =
+            if fail_closed_lowering { fb.fadd(add_ty, lhs, rhs) } else { fb.add(add_ty, lhs, rhs) };
         fb.ret(vec![sum]);
         fb.build();
     }
 
-    let mut module = mb.build();
-    let source_file = module.intern_file("native_trust_mc_bundle.rs");
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let source_file =
+        module.intern_file("native_trust_mc_bundle.rs").expect("Module::intern_file: test fixture");
     let trust_mc_function = module
         .functions
         .iter()
@@ -403,7 +591,7 @@ fn native_trust_mc_bundle_inner(
     bundle
 }
 
-fn native_obligation_identity(
+pub(crate) fn native_obligation_identity(
     file: u32,
     line: u32,
     col: u32,
@@ -463,7 +651,9 @@ fn native_trust_mc_request_mut(bundle: &mut NativeVerificationBundle) -> &mut Tr
         .expect("native fixture includes a trust_mc request")
 }
 
-fn trust_mc_request_provenance(mode: TrustMcVerificationMode) -> NativeRequestProvenance {
+pub(crate) fn trust_mc_request_provenance(
+    mode: TrustMcVerificationMode,
+) -> NativeRequestProvenance {
     let (verifier_version, solver_name) = match mode {
         TrustMcVerificationMode::BoundedModelCheck => ("bmc-v1", "ay-bmc"),
         TrustMcVerificationMode::Chc => ("chc-v1", "ay-chc"),
@@ -505,8 +695,14 @@ fn trust_mc_replay_context() -> NativeReplayContext {
         )
 }
 
-fn trust_mc_request_options(mode: TrustMcVerificationMode) -> trust_ir::TrustMcRequestOptions {
+pub(crate) fn trust_mc_request_options(
+    mode: TrustMcVerificationMode,
+) -> trust_ir::TrustMcRequestOptions {
     let mut options = trust_ir::TrustMcRequestOptions::default();
+    options.slicing = trust_ir::TrustMcSlicingMode::None;
+    options.chc.engine = trust_ir::TrustMcChcEngine::NativePdr;
+    options.chc.invariant_source = trust_ir::TrustMcInvariantSource::None;
+    options.chc.pdr.enabled = true;
     if matches!(mode, TrustMcVerificationMode::Chc | TrustMcVerificationMode::Pdr) {
         options.chc.emit_horn_clauses = true;
     }
@@ -526,6 +722,11 @@ where
     }
 }
 
+/// The last `suffix_len` arguments of the first transition rule into `relation`.
+/// Tests reading a block's transition rules translate PER BLOCK
+/// (`trust_ir_to_chc_translation_outputs_per_block`): in production an acyclic
+/// function is one large-block query with no transition rule
+/// (`translate_chc_large_block.rs`), built from the same block translation.
 fn head_arg_suffix<'a>(
     output: &'a crate::ChcTranslationOutput,
     relation: &str,
@@ -556,37 +757,6 @@ fn emit_thread_local_addr(
     results[0]
 }
 
-fn assert_thread_local_addr_case_fails_closed(module: &trust_ir::Module, case: &str) {
-    let outputs = trust_ir_to_chc_translation_outputs(module, &TranslateOptions::default());
-    assert_eq!(outputs.len(), 1, "{case}: expected one CHC output");
-    assert!(
-        outputs[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.reason == TrustIrChcUnsupportedReason::DialectOperation),
-        "{case}: a non-canonical TLS address op must fail closed in CHC, got {:?}",
-        outputs[0].diagnostics
-    );
-    assert!(
-        outputs[0].vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "{case}: CHC fail-closed lowering must emit a reachable error rule"
-    );
-
-    let vcs = trust_ir_to_bmc_vc(module, &TranslateOptions::default());
-    assert_eq!(vcs.len(), 1, "{case}: expected one BMC VC");
-    assert!(
-        vcs[0].violations.iter().any(|violation| {
-            violation.kind == PropertyKind::Other
-                && violation
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("dialect operation"))
-        }),
-        "{case}: a non-canonical TLS address op must fail closed in BMC, got {:?}",
-        vcs[0].violations
-    );
-}
-
 fn is_bv_zero_eq(expr: &Expr, width: u32) -> bool {
     let zero = Expr::bitvec_const(0u64, width);
     matches!(expr.value(), ExprValue::Eq(lhs, rhs) if lhs == &zero || rhs == &zero)
@@ -611,6 +781,201 @@ fn default_switch_guard_excludes(expr: &Expr, values: &[u64], width: u32) -> boo
     }
 }
 
+/// Two functions, `f` (bb0: `assert(c); br bb1`, bb1: `ret`) and `g`, and no
+/// obligations yet.
+fn obligation_scope_module() -> (trust_ir::Module, trust_ir::FuncId, trust_ir::FuncId) {
+    let mut mb = ModuleBuilder::new("obligation_scope");
+    let ft = mb.add_func_type(vec![Ty::Bool], vec![]);
+    for name in ["f", "g"] {
+        let mut fb = mb.function(name, ft);
+        let entry = fb.create_block();
+        let exit = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let cond = fb.add_block_param(entry, Ty::Bool);
+        fb.assert(cond);
+        fb.br(exit, vec![]);
+        fb.switch_to_block(exit);
+        fb.ret(vec![]);
+        fb.build();
+    }
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let id = |name: &str| module.functions.iter().find(|func| func.name == name).unwrap().id;
+    let (f, g) = (id("f"), id("g"));
+    (module, f, g)
+}
+
+fn scope_probe(
+    id: u32,
+    kind: ObligationKind,
+    function: Option<trust_ir::FuncId>,
+    site: Option<trust_ir::ObligationSite>,
+) -> ProofObligation {
+    let mut obligation =
+        ProofObligation::new(ProofId::new(id), kind, ProofStatus::Pending, "probe");
+    obligation.function = function;
+    obligation.site = site;
+    obligation
+}
+
+/// What the safety encoding of the requested function `f` answers. It answers
+/// a panic-/memory-safety obligation about `f`, whole-function or sited at any
+/// instruction of `f`, and nothing else: a contract or other non-safety kind,
+/// a temporal property, an obligation about `g`, one bound to no function, or
+/// one whose site does not resolve.
+///
+/// Before this, the answer depended on the kind alone: `ScopedToAnotherFunction`,
+/// `SitedInAnotherFunction`, `Unscoped` and `SiteUnresolved` below came back
+/// answered, and so did the five contract kinds.
+#[test]
+fn native_unmodeled_obligations_name_everything_the_safety_encoding_does_not_answer() {
+    use crate::NativeUnmodeledReason as Why;
+
+    let (mut module, f, g) = obligation_scope_module();
+    let block = |function: trust_ir::FuncId, index: usize| {
+        module.function_by_id(function).unwrap().blocks[index].id
+    };
+    let (f_bb0, f_bb1, g_bb0) = (block(f, 0), block(f, 1), block(g, 0));
+    let site = |function, block, index| Some(trust_ir::ObligationSite::new(function, block, index));
+
+    let kinds = [
+        (ObligationKind::PanicFreedom, true),
+        (ObligationKind::ArithmeticSafety, true),
+        (ObligationKind::BoundsCheck, true),
+        (ObligationKind::MemorySafety, true),
+        (ObligationKind::Precondition, false),
+        (ObligationKind::Postcondition, false),
+        (ObligationKind::TypeInvariant, false),
+        (ObligationKind::RefinementType, false),
+        (ObligationKind::LoopInvariant, false),
+        (ObligationKind::TranslationValidation, false),
+        (ObligationKind::TemporalSafety, false),
+        (ObligationKind::Liveness, false),
+        (ObligationKind::GiveBackRefinement, false),
+        (ObligationKind::Termination, false),
+        (ObligationKind::Ownership, false),
+        (
+            ObligationKind::Custom {
+                namespace: "trust.protocol".to_string(),
+                name: "session".to_string(),
+            },
+            false,
+        ),
+    ];
+    for (index, (kind, _)) in kinds.iter().enumerate() {
+        module.proof_obligations.push(scope_probe(index as u32, kind.clone(), Some(f), None));
+    }
+    let requested: Vec<_> = (0..kinds.len() as u32).map(ProofId::new).collect();
+    let unmodeled = native_unmodeled_obligations(&module, f, &requested);
+    let expected: Vec<_> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, answered))| !answered)
+        .map(|(index, _)| (ProofId::new(index as u32), Why::KindNotAnswered))
+        .collect();
+    assert_eq!(
+        unmodeled.iter().map(|u| (u.obligation, u.reason.clone())).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        unmodeled[1].to_string(),
+        "obligation #5 (Postcondition, kind not answered by a safety encoding)"
+    );
+
+    // Scope and site, all on the safety kind the encoding does answer.
+    let cases = [
+        ("whole-function, scoped to f", Some(f), None, None),
+        ("sited in f, scoped to f", Some(f), site(f, f_bb0, 0), None),
+        ("sited in f, scope from the site", None, site(f, f_bb1, 0), None),
+        ("bound to no function", None, None, Some(Why::Unscoped)),
+        ("scoped to g", Some(g), None, Some(Why::ScopedToAnotherFunction(g))),
+        ("sited in g", None, site(g, g_bb0, 0), Some(Why::SitedInAnotherFunction(g))),
+        (
+            "site past the block's end",
+            Some(f),
+            site(f, f_bb0, 9),
+            Some(Why::SiteUnresolved(trust_ir::ObligationSite::new(f, f_bb0, 9))),
+        ),
+    ];
+    for (label, function, site, expected) in cases {
+        module.proof_obligations =
+            vec![scope_probe(0, ObligationKind::PanicFreedom, function, site)];
+        let reasons = native_unmodeled_obligations(&module, f, &[ProofId::new(0)])
+            .into_iter()
+            .map(|u| u.reason)
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, expected.into_iter().collect::<Vec<_>>(), "{label}");
+    }
+
+    // `spec` is modeled nowhere, and an id the module does not declare is
+    // not an obligation anyone may credit.
+    let mut temporal = scope_probe(10, ObligationKind::TemporalSafety, Some(f), None);
+    temporal.spec = Some(trust_ir::proof::SpecObligationRef::new("Counter", "AlwaysBounded"));
+    module.proof_obligations = vec![temporal];
+    let with_spec = native_unmodeled_obligations(&module, f, &[ProofId::new(10), ProofId::new(99)]);
+    assert_eq!(
+        with_spec.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec![
+            "obligation #10 (TemporalSafety, temporal property `Counter`::`AlwaysBounded`, \
+             a temporal property is not a safety question)",
+            "obligation #99 (not declared by the module)",
+        ]
+    );
+}
+
+/// A counterexample of `f`'s safety encoding shows that SOME error site of `f`
+/// is reachable. It refutes a whole-function panic-freedom obligation of `f`
+/// and nothing narrower: not one sited at a single check, not one about a
+/// single class of check, not one about `g`.
+#[test]
+fn a_counterexample_refutes_only_whole_function_panic_freedom() {
+    let (mut module, f, g) = obligation_scope_module();
+    let f_bb0 = module.function_by_id(f).unwrap().blocks[0].id;
+    module.proof_obligations = vec![
+        scope_probe(0, ObligationKind::PanicFreedom, Some(f), None),
+        scope_probe(
+            1,
+            ObligationKind::PanicFreedom,
+            Some(f),
+            Some(trust_ir::ObligationSite::new(f, f_bb0, 0)),
+        ),
+        scope_probe(2, ObligationKind::ArithmeticSafety, Some(f), None),
+        scope_probe(3, ObligationKind::BoundsCheck, Some(f), None),
+        scope_probe(4, ObligationKind::MemorySafety, Some(f), None),
+        scope_probe(5, ObligationKind::PanicFreedom, Some(g), None),
+        scope_probe(6, ObligationKind::PanicFreedom, None, None),
+    ];
+    let requested: Vec<_> = (0..8).map(ProofId::new).collect();
+    assert_eq!(
+        crate::native_obligations_not_refuted_by_a_counterexample(&module, f, &requested),
+        (1..8).map(ProofId::new).collect::<Vec<_>>()
+    );
+}
+
+/// The request's metadata class is the class ALL its obligations share. It was
+/// read from the first one, so `[PanicFreedom, Postcondition]` was filed under
+/// the L0 safety class and admitted to the bounded-unroll refutation lane.
+#[test]
+fn a_mixed_request_is_never_filed_under_the_safety_class() {
+    let class_of = |bundle: &NativeVerificationBundle| {
+        trust_mc_chc_pdr_obligations_from_native_bundle(bundle, &TranslateOptions::default())
+            .expect("the fixture translates")[0]
+            .obligation
+            .kind
+    };
+    // The fixture's request asks for #1; it now asks for #1 (panic freedom)
+    // and #0 (memory safety), then #0 becomes a postcondition.
+    let mut bundle = native_trust_mc_bundle(TrustMcVerificationMode::Chc);
+    bundle.module.proof_obligations[1].kind = ObligationKind::PanicFreedom;
+    native_trust_mc_request_mut(&mut bundle).obligations = vec![ProofId::new(1), ProofId::new(0)];
+    refresh_native_trust_mc_bundle_module_identity(&mut bundle);
+    assert_eq!(class_of(&bundle), trust_mc_core::MirObligationKind::Assertion);
+
+    bundle.module.proof_obligations[0].kind = ObligationKind::Postcondition;
+    refresh_native_trust_mc_bundle_module_identity(&mut bundle);
+    assert_eq!(class_of(&bundle), trust_mc_core::MirObligationKind::Protocol);
+}
+
 #[test]
 fn native_trust_mc_bundle_bmc_request_translates_requested_function() {
     let bundle = native_trust_mc_bundle(TrustMcVerificationMode::BoundedModelCheck);
@@ -621,6 +986,12 @@ fn native_trust_mc_bundle_bmc_request_translates_requested_function() {
     let request_vc = &vcs[0];
     assert_eq!(request_vc.request_id, NativeRequestId::new(1));
     assert_eq!(request_vc.obligations, vec![ProofId::new(1)]);
+    // The requested obligation is TranslationValidation, which this function's
+    // safety VC does not answer; the translation says so.
+    assert_eq!(
+        request_vc.unmodeled_obligations.iter().map(|u| u.obligation).collect::<Vec<_>>(),
+        vec![ProofId::new(1)]
+    );
     assert_eq!(request_vc.lineage_roots, vec![ProofLineageId::new(0)]);
 
     assert!(
@@ -660,6 +1031,11 @@ fn native_trust_mc_bundle_chc_request_translates_requested_function_to_typed_obl
     assert_eq!(request_obligation.lineage_roots, vec![ProofLineageId::new(0)]);
     assert_eq!(request_obligation.obligation.function_name, "trust_mc_checked_add");
     assert_eq!(request_obligation.obligation.kind, trust_mc_core::MirObligationKind::Protocol);
+    assert_eq!(
+        request_obligation.unmodeled_obligations.iter().map(|u| u.obligation).collect::<Vec<_>>(),
+        vec![ProofId::new(1)],
+        "a TranslationValidation obligation is not answered by the safety CHC"
+    );
     request_obligation
         .obligation
         .validate()
@@ -671,7 +1047,7 @@ fn native_trust_mc_bundle_chc_request_translates_requested_function_to_typed_obl
         .expect("native CHC obligation should carry bundle metadata");
     assert_eq!(
         metadata.schema_version,
-        trust_mc_core::NativeTypedChcObligationMetadata::SCHEMA_VERSION
+        trust_mc_core::NativeTypedChcObligationMetadata::REQUEST_CONFIG_SCHEMA_VERSION
     );
     assert_eq!(metadata.producer, "tRust");
     assert_eq!(metadata.adapter_input, "rust-mir");
@@ -1031,7 +1407,7 @@ fn add_two_i32_generates_overflow_vc() {
     fb.ret(vec![sum]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -1065,7 +1441,7 @@ fn add_two_i32_generates_typed_chc_overflow_rule() {
     fb.ret(vec![sum]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let vcs = trust_ir_to_chc_vc(&module, &TranslateOptions::default());
 
     assert_eq!(vcs.len(), 1);
@@ -1093,19 +1469,9 @@ fn typed_chc_translation_rejects_return_arity_mismatch() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::SafetyProperties);
-    assert_eq!(output.diagnostics[0].reason, TrustIrChcUnsupportedReason::ReturnArityMismatch);
-    assert_eq!(output.diagnostics[0].function, "return_arity_mismatch_chc");
-    assert_eq!(output.diagnostics[0].block, entry);
-    assert_eq!(output.diagnostics[0].instruction_index, 0);
-    assert!(
-        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "malformed return arity should fail closed"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "return arity mismatch: expected 1 values, got 0",
     );
 }
 
@@ -1144,7 +1510,7 @@ fn call_summary_models_total_unops_instead_of_failing_closed() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
 
     // The callee with a total unop must be summarized: NO unsupported-call-summary diagnostic
@@ -1221,7 +1587,7 @@ fn call_summary_proves_obligation_free_self_recursion() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
 
     // The caller f lowers cleanly (no diagnostics); the callee g's STANDALONE VC carries a
@@ -1274,7 +1640,7 @@ fn call_summary_fails_closed_on_self_recursion_with_obligation() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
 
     // The summary of the obligation-bearing recursive callee MUST decline: somewhere there is an
@@ -1339,7 +1705,7 @@ fn call_summary_fails_closed_on_unsummarizable_panicking_callee() {
         fb.build()
     };
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let caller = crate::trust_ir_function_to_chc_translation_output(
         &module,
         f_id,
@@ -1357,13 +1723,11 @@ fn call_summary_fails_closed_on_unsummarizable_panicking_callee() {
 
 #[test]
 fn call_summary_declines_select_arm_with_wrong_carrier_without_panicking() {
-    // Exercise only the caller translation so this reaches the direct-summary
-    // interpreter independently of the standalone callee's main translation.
+    // Invalid callee input refuses the complete module even when only its caller
+    // is selected; malformed branches never reach AY's ite constructor.
     let mut mb = ModuleBuilder::new("test_summary_select_wrong_carrier");
-    let callee_ft =
-        mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
-    let caller_ft =
-        mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
+    let callee_ft = mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
+    let caller_ft = mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
 
     let callee = {
         let mut fb = mb.function("summary_select_wrong_carrier_callee", callee_ft);
@@ -1391,23 +1755,12 @@ fn call_summary_declines_select_arm_with_wrong_carrier_without_panicking() {
         fb.build()
     };
 
-    let module = mb.build();
-    let output = trust_ir_function_to_chc_translation_output(
-        &module,
-        caller,
-        &TranslateOptions::default(),
-    )
-    .expect("caller exists");
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::Calls);
-    assert_eq!(
-        output.diagnostics[0].reason,
-        TrustIrChcUnsupportedReason::UnsupportedDirectCallSummary
-    );
-    assert!(
-        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "declining a malformed direct-call summary must fail the caller closed"
-    );
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let selected =
+        trust_ir_function_to_chc_translation_output(&module, caller, &TranslateOptions::default())
+            .expect("caller exists");
+    assert_chc_canonical_refusal(&selected, "select then type mismatch: expected u64, got bool");
+    assert_canonical_refusal(&module, "select then type mismatch: expected u64, got bool");
 }
 
 #[test]
@@ -1437,7 +1790,10 @@ fn cross_block_instruction_result_is_threaded_not_havoced() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
 
@@ -1473,7 +1829,7 @@ fn canonical_thread_local_addr_is_chc_only_and_bmc_fails_closed() {
     fb.ret(vec![addr]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     assert_eq!(
         family_for_inst(&trust_ir::Inst::DialectOp(Box::new(trust_rust::thread_local_addr(
             "crate::TLS"
@@ -1525,7 +1881,10 @@ fn canonical_thread_local_addr_result_is_threaded_across_blocks() {
     fb.ret(vec![addr]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
     assert!(
@@ -1576,7 +1935,10 @@ fn canonical_thread_local_addr_is_supported_in_direct_call_summary() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -1612,7 +1974,10 @@ fn malformed_thread_local_addr_schema_fails_closed() {
     fb.ret(vec![]);
     fb.build();
 
-    assert_thread_local_addr_case_fails_closed(&mb.build(), "schema mismatch");
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "schema attribute does not match version 1",
+    );
 }
 
 #[test]
@@ -1626,7 +1991,7 @@ fn thread_local_addr_node_result_arity_mismatch_fails_closed() {
     emit_thread_local_addr(&mut fb, "crate::TLS");
     fb.ret(vec![]);
     fb.build();
-    let canonical = mb.build();
+    let canonical = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let mut no_results = canonical.clone();
     let node = no_results.functions[0].blocks[0]
@@ -1635,7 +2000,7 @@ fn thread_local_addr_node_result_arity_mismatch_fails_closed() {
         .find(|node| matches!(&node.inst, trust_ir::Inst::DialectOp(_)))
         .expect("TLS dialect node");
     node.results.clear();
-    assert_thread_local_addr_case_fails_closed(&no_results, "zero node results");
+    assert_canonical_refusal(&no_results, "dialect declares 0 SSA results, expected 1");
 
     let mut two_results = canonical;
     let node = two_results.functions[0].blocks[0]
@@ -1644,33 +2009,29 @@ fn thread_local_addr_node_result_arity_mismatch_fails_closed() {
         .find(|node| matches!(&node.inst, trust_ir::Inst::DialectOp(_)))
         .expect("TLS dialect node");
     node.results.push(node.results[0]);
-    assert_thread_local_addr_case_fails_closed(&two_results, "two node results");
+    assert_canonical_refusal(&two_results, "dialect declares 2 SSA results, expected 1");
 }
 
 #[test]
-fn wrapping_add_intrinsic_call_lowers_to_modular_bvadd_not_fresh() {
-    // A `count = count.wrapping_add(1)` reaches the trust-ir as a direct `Call` to a
-    // numeric method whose body the bounded summary interpreter does not model, so it
-    // used to fall through to a fresh-symbolic HAVOC — leaving the loop-carried count
-    // cell unconstrained (`count'` free) and the count-parity loop invariant
-    // unprovable. `translate_call` now recognizes the wrapping intrinsic by its method
-    // name + integer 2-in/1-out signature and models it as the MODULAR `bvadd`, so the
-    // call result is CONSTRAINED (`= bvadd(x, 1)`), not a fresh variable.
+fn wrapping_add_body_lowers_to_modular_bvadd_not_fresh() {
+    // A provided body with an explicit Wrapping-tagged Add must retain its
+    // modular operation through the direct-call summary. A method name and
+    // signature alone cannot replace a different body with arithmetic.
     let mut mb = ModuleBuilder::new("test_wrapping_add_intrinsic");
     let wrap_ft = mb.add_func_type(vec![Ty::U64, Ty::U64], vec![Ty::U64]);
     let f_ft = mb.add_func_type(vec![Ty::U64], vec![]);
 
-    // Intrinsic-shaped callee: named `…::wrapping_add`, (u64, u64) -> u64. Its body is
-    // a stub (never interpreted — `translate_call` intercepts by name/signature and
-    // models the modular BV op directly, exactly as the compiler MIR path does).
+    // The body states the actual operation; its spelling grants no semantics.
     let wrap_id = {
         let mut fb = mb.function("core::num::<impl u64>::wrapping_add", wrap_ft);
         let entry = fb.create_block();
         fb.switch_to_block(entry);
         fb.set_entry(entry);
         let a = fb.add_block_param(entry, Ty::U64);
-        let _b = fb.add_block_param(entry, Ty::U64);
-        fb.ret(vec![a]);
+        let b = fb.add_block_param(entry, Ty::U64);
+        let sum = fb.binop(BinOp::Add, Ty::U64, a, b);
+        fb.annotate_last(ProofAnnotation::Wrapping).expect("existing Add instruction");
+        fb.ret(vec![sum]);
         fb.build()
     };
 
@@ -1692,8 +2053,9 @@ fn wrapping_add_intrinsic_call_lowers_to_modular_bvadd_not_fresh() {
         fb.build();
     }
 
-    let module = mb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
     // The caller is the output carrying the entry->exit transition (`bb1` head).
     let caller = outputs
@@ -1721,26 +2083,22 @@ fn wrapping_add_intrinsic_call_lowers_to_modular_bvadd_not_fresh() {
 }
 
 #[test]
-fn direct_call_body_not_summary_binds_precise_negation_not_fresh() {
-    // A direct call whose callee body is `!x` (`UnOp::Not`) must be summarized so its
-    // result is CONSTRAINED to `not(x)` — this is exactly the shape MIR gives
-    // `xor_accumulate_parity`'s `a ^ true` (`Select(true, !a, a)` → `!a`). Before the
-    // fix the summary interpreter havoced every total unary op (including `Not`) to a
-    // fresh symbolic, so the summarized result — and any loop cell it fed — was
-    // unconstrained (`acc'` free), blocking the count-parity loop invariant. The
-    // summary now models `!x` precisely as boolean `not`.
+fn direct_call_boolean_negation_summary_binds_precise_result_not_fresh() {
+    // Canonical scalar Bool negation is BXor with true. Both direct-call
+    // summaries and inline translation must preserve the exact not(x) result.
     let mut mb = ModuleBuilder::new("test_not_body_summary");
     let g_ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::Bool]);
     let f_ft = mb.add_func_type(vec![Ty::Bool], vec![]);
 
-    // callee g(x) = !x  (bool negation — total, never panics)
+    // callee g(x) = !x (canonical Bool negation)
     let g_id = {
         let mut fb = mb.function("not_body_callee", g_ft);
         let entry = fb.create_block();
         fb.switch_to_block(entry);
         fb.set_entry(entry);
         let x = fb.add_block_param(entry, Ty::Bool);
-        let y = fb.unop(UnOp::Not, Ty::Bool, x);
+        let truth = fb.bool_const(true);
+        let y = fb.binop(BinOp::BXor, Ty::Bool, x, truth);
         fb.ret(vec![y]);
         fb.build()
     };
@@ -1762,9 +2120,12 @@ fn direct_call_body_not_summary_binds_precise_negation_not_fresh() {
         fb.build();
     }
 
-    let module = mb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
+    assert_no_module_refusal(&outputs);
     let caller = outputs
         .iter()
         .find(|o| o.vc.rules.iter().any(|rule| rule.head.name == "bb1"))
@@ -1773,21 +2134,19 @@ fn direct_call_body_not_summary_binds_precise_negation_not_fresh() {
         panic!("bb1 transition should forward the single summarized-call result arg");
     };
     assert!(
-        not_inner_matches(result, |inner| matches!(inner, ExprValue::Var { .. })),
+        not_inner_matches(
+            result,
+            |inner| matches!(inner, ExprValue::Eq(lhs, rhs) if matches!(lhs.value(), ExprValue::Var { name } if name == "bb0_v0") && rhs == &Expr::bool_const(true))
+        ),
         "the summarized `!x` call result must be CONSTRAINED to not(x), got {:?}",
         result.value()
     );
 }
 
 #[test]
-fn inline_unop_not_binds_precise_negation_not_havoc() {
-    // An INLINE `UnOp::Not` on a bool — the shape trustc gives an inlined
-    // `acc = !acc` (and `acc ^ true`, which const-folds to `UnOp::Not`) — must
-    // lower to `not(x)`, NOT a fresh `unsupported_result` havoc. Before the fix
-    // `translate_node`'s `Inst::UnOp` arm failed closed (fresh symbolic), so the
-    // result and any loop cell it fed were left free (`acc'` unconstrained),
-    // making the count-parity loop invariant unprovable. This is the direct
-    // (non-call) twin of `direct_call_body_not_summary_binds_precise_negation_not_fresh`.
+fn inline_boolean_negation_binds_precise_result_not_havoc() {
+    // The inline twin of the direct-call test uses the same canonical Bool
+    // operation and must preserve not(x), rather than an unconstrained result.
     let mut mb = ModuleBuilder::new("test_inline_not");
     let f_ft = mb.add_func_type(vec![Ty::Bool], vec![]);
     let mut fb = mb.function("inline_not_fn", f_ft);
@@ -1796,25 +2155,32 @@ fn inline_unop_not_binds_precise_negation_not_havoc() {
     fb.switch_to_block(entry);
     fb.set_entry(entry);
     let a = fb.add_block_param(entry, Ty::Bool);
-    let r = fb.unop(UnOp::Not, Ty::Bool, a);
+    let truth = fb.bool_const(true);
+    let r = fb.binop(BinOp::BXor, Ty::Bool, a, truth);
     fb.add_block_param(exit, Ty::Bool);
     fb.br(exit, vec![r]);
     fb.switch_to_block(exit);
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
+    assert_no_module_refusal(&outputs);
     let f = outputs
         .iter()
         .find(|o| o.vc.rules.iter().any(|rule| rule.head.name == "bb1"))
         .expect("the fn has an entry->exit transition rule");
     let [result] = head_arg_suffix(f, "bb1", 1) else {
-        panic!("bb1 transition should forward the single UnOp::Not result arg");
+        panic!("bb1 transition should forward the single canonical Bool result arg");
     };
     assert!(
-        not_inner_matches(result, |inner| matches!(inner, ExprValue::Var { .. })),
-        "inline `!x` must be CONSTRAINED to not(x), got {:?}",
+        not_inner_matches(
+            result,
+            |inner| matches!(inner, ExprValue::Eq(lhs, rhs) if matches!(lhs.value(), ExprValue::Var { name } if name == "bb0_v0") && rhs == &Expr::bool_const(true))
+        ),
+        "canonical inline `!x` must be CONSTRAINED to not(x), got {:?}",
         result.value()
     );
 }
@@ -1839,7 +2205,10 @@ fn typed_chc_translation_uses_unsigned_overflow_guard_for_u32_add() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -1899,7 +2268,10 @@ fn typed_chc_translation_lowers_checked_u32_add_overflow_with_real_flag() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
     assert!(
@@ -1934,7 +2306,10 @@ fn typed_bmc_translation_lowers_checked_u32_add_overflow_with_real_flag() {
     fb.ret(vec![]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(vcs.len(), 1);
     let unsupported: Vec<_> = vcs[0]
         .violations
@@ -1966,7 +2341,10 @@ fn typed_bmc_translation_uses_unsigned_overflow_guard_for_u32_sub() {
     fb.ret(vec![diff]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(vcs.len(), 1);
     let overflow_violations: Vec<_> =
@@ -1996,7 +2374,10 @@ fn typed_chc_translation_uses_signed_division_overflow_guard_for_i32_div() {
     fb.ret(vec![result]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2030,7 +2411,10 @@ fn typed_bmc_translation_uses_signed_division_overflow_guard_for_i32_rem() {
     fb.ret(vec![result]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(vcs.len(), 1);
     let overflow_violations: Vec<_> =
@@ -2060,7 +2444,10 @@ fn typed_chc_translation_uses_div_by_zero_guard_for_u32_div_without_overflow_gua
     fb.ret(vec![result]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2101,7 +2488,10 @@ fn typed_bmc_translation_uses_div_by_zero_guard_for_u16_rem_without_overflow_gua
     fb.ret(vec![result]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(vcs.len(), 1);
     let div_violations: Vec<_> =
@@ -2139,8 +2529,11 @@ fn condbr_generates_typed_chc_successor_rules() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
-    let vcs = trust_ir_to_chc_vc(&module, &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let vcs = trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default())
+        .into_iter()
+        .map(|output| output.vc)
+        .collect::<Vec<_>>();
 
     assert_eq!(vcs.len(), 1);
     let vc = &vcs[0];
@@ -2167,24 +2560,9 @@ fn typed_chc_translation_rejects_non_bool_assume_condition() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::SafetyProperties);
-    assert_eq!(output.diagnostics[0].reason, TrustIrChcUnsupportedReason::NonBooleanCondition);
-    assert_eq!(output.diagnostics[0].function, "non_bool_assume_chc");
-    assert_eq!(output.diagnostics[0].block, entry);
-    assert_eq!(output.diagnostics[0].instruction_index, 0);
-    assert!(
-        output
-            .vc
-            .rules
-            .iter()
-            .flat_map(|rule| rule.body.constraints.iter())
-            .all(|constraint| constraint.sort().is_bool()),
-        "non-Bool assume operands must not be emitted as CHC constraints"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "assume predicate must be bool, got u32",
     );
 }
 
@@ -2209,32 +2587,16 @@ fn typed_chc_translation_rejects_non_bool_condbr_condition() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::ControlFlow);
-    assert_eq!(output.diagnostics[0].reason, TrustIrChcUnsupportedReason::NonBooleanCondition);
-    assert_eq!(output.diagnostics[0].function, "non_bool_condbr_chc");
-    assert_eq!(output.diagnostics[0].block, entry);
-    assert_eq!(output.diagnostics[0].instruction_index, 0);
-    assert!(
-        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "malformed branch predicate should fail closed"
-    );
-    assert!(
-        !output.vc.rules.iter().any(|rule| rule.head.name == "bb1" || rule.head.name == "bb2"),
-        "malformed branch predicate must not produce successor facts"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "condbr condition must be bool, got u32",
     );
 }
 
 #[test]
 fn typed_chc_translation_fails_closed_on_select_arm_with_wrong_carrier() {
-    // The builder intentionally permits this malformed shape: the Select declares
-    // U64 while its then arm is Bool. The public translation API does not run the
-    // TrustIR validator, so the CHC boundary must fail closed rather than passing
-    // incompatible branches to AY's `ite` constructor and panicking.
+    // The builder permits this malformed shape, but complete canonical preflight
+    // refuses the wrong Select arm before either public lane translates it.
     let mut mb = ModuleBuilder::new("test_select_wrong_carrier_chc");
     let ft = mb.add_func_type(vec![Ty::Bool, Ty::Bool, Ty::U64], vec![Ty::U64]);
 
@@ -2249,19 +2611,9 @@ fn typed_chc_translation_fails_closed_on_select_arm_with_wrong_carrier() {
     fb.ret(vec![selected]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::Select);
-    assert_eq!(
-        output.diagnostics[0].reason,
-        TrustIrChcUnsupportedReason::MalformedControlFlow
-    );
-    assert_eq!(output.diagnostics[0].result_values, vec![selected]);
-    assert!(
-        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "a Select with a carrier-mismatched arm must fail closed"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "select then type mismatch: expected u64, got bool",
     );
 }
 
@@ -2288,7 +2640,10 @@ fn typed_chc_translation_lowers_bool_eq_comparison() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2330,7 +2685,10 @@ fn typed_chc_translation_rejects_ordered_bool_comparison() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2399,7 +2757,10 @@ fn switch_generates_typed_chc_successor_rules() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2460,7 +2821,10 @@ fn typed_chc_translation_lowers_integer_casts_without_unsupported_diagnostic() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2495,7 +2859,10 @@ fn typed_chc_translation_lowers_bool_to_integer_cast_without_unsupported_diagnos
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2524,22 +2891,26 @@ fn typed_chc_translation_lowers_same_width_integer_cast_without_unsupported_diag
     let mut mb = ModuleBuilder::new("test_same_width_int_cast_chc");
     let ft = mb.add_func_type(vec![Ty::I32], vec![]);
 
-    let mut fb = mb.function("sext_i32_u32_chc", ft);
+    let mut fb = mb.function("bitcast_i32_u32_chc", ft);
     let entry = fb.create_block();
     let exit = fb.create_block();
     fb.switch_to_block(entry);
     fb.set_entry(entry);
 
     let input = fb.add_block_param(entry, Ty::I32);
-    let cast = fb.cast(CastOp::SExt, Ty::I32, Ty::U32, input);
+    let cast = fb.cast(CastOp::Bitcast, Ty::I32, Ty::U32, input);
     fb.add_block_param(exit, Ty::U32);
     fb.br(exit, vec![cast]);
     fb.switch_to_block(exit);
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
+    assert_no_module_refusal(&outputs);
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
     assert!(output.diagnostics.is_empty(), "same-width integer cast should not fail closed");
@@ -2554,18 +2925,10 @@ fn typed_chc_translation_lowers_same_width_integer_cast_without_unsupported_diag
     );
 }
 
-/// A cast operand whose BOUND expression is WIDER than the carrier its declared
-/// `src_ty` names (here a 128-bit value id read by a `Trunc` that declares
-/// `src_ty = U64`) must be unified to the declared carrier BEFORE the
-/// lossless-narrowing obligation compares it against the re-extended low bits.
-///
-/// Regression: `Expr::eq` is contracted `REQUIRES: identical sorts`, and the
-/// narrowing-cast error rule compared the RAW operand (`BitVec 128`) against a
-/// re-extension built at `src_ty`'s width (`BitVec 64`), so trustc aborted with
-/// `EQ requires same sort: ... (_ BitVec 128) and (_ BitVec 64)` while verifying
-/// `num-bigint`/`num-traits` (u64 limbs with u128 intermediates).
+/// A mismatched integer carrier is rejected before any AY cast expression is
+/// constructed; the declared source type cannot relabel a wider SSA operand.
 #[test]
-fn typed_chc_translation_unifies_over_wide_operand_carrier_on_narrowing_cast() {
+fn typed_chc_translation_refuses_over_wide_operand_on_narrowing_cast() {
     let mut mb = ModuleBuilder::new("test_over_wide_trunc_operand_chc");
     let ft = mb.add_func_type(vec![Ty::U128], vec![]);
 
@@ -2586,37 +2949,15 @@ fn typed_chc_translation_unifies_over_wide_operand_carrier_on_narrowing_cast() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    // Explicit widening, NOT a give-up: the cast stays modeled.
-    assert!(
-        output.diagnostics.is_empty(),
-        "width-unified narrowing cast must not be demoted to an unsupported construct: {:?}",
-        output.diagnostics
-    );
-    // FAIL-CLOSED: the lossless-narrowing obligation must still be emitted.
-    assert!(
-        output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "narrowing cast must keep its lossless-narrowing error rule"
-    );
-    // The cast result is a value of `dst_ty`, at `dst_ty`'s width.
-    let branch_arg = &head_arg_suffix(output, "bb1", 1)[0];
-    assert_eq!(
-        branch_arg.sort().bitvec_width(),
-        Some(32),
-        "trunc to U32 must produce a 32-bit result"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "cast trunc operand type u128 does not match declared source type u64",
     );
 }
 
-/// The widening direction of the same defect: a `ZExt` whose operand is bound at
-/// a carrier WIDER than the declared `src_ty` did not panic — it silently built
-/// `zero_extend(BitVec 128, 128 - 64)`, i.e. a **192-bit** expression bound to a
-/// `U128`-typed result, corrupting every downstream obligation that read it.
-/// Unifying to `src_ty` first makes the result exactly `dst_ty`-wide.
+/// The widening direction must stop at the same canonical operand-type check.
 #[test]
-fn typed_chc_translation_unifies_over_wide_operand_carrier_on_widening_cast() {
+fn typed_chc_translation_refuses_over_wide_operand_on_widening_cast() {
     let mut mb = ModuleBuilder::new("test_over_wide_zext_operand_chc");
     let ft = mb.add_func_type(vec![Ty::U128], vec![]);
 
@@ -2634,16 +2975,66 @@ fn typed_chc_translation_unifies_over_wide_operand_carrier_on_widening_cast() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-
-    assert_eq!(outputs.len(), 1);
-    let output = &outputs[0];
-    let branch_arg = &head_arg_suffix(output, "bb1", 1)[0];
-    assert_eq!(
-        branch_arg.sort().bitvec_width(),
-        Some(128),
-        "zext U64 -> U128 must produce a 128-bit result, never a 192-bit one"
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "cast zext operand type u128 does not match declared source type u64",
     );
+}
+
+/// Build `fn(bool)` whose Bool-sorted value id is read by an integer cast that
+/// DECLARES an integer `src_ty`, and translate it through the CHC lowering.
+fn chc_outputs_for_integer_cast_over_bool_binding(
+    op: CastOp,
+    src_ty: Ty,
+    dst_ty: Ty,
+) -> Vec<ChcTranslationOutput> {
+    let mut mb = ModuleBuilder::new("test_bool_binding_integer_cast_chc");
+    let ft = mb.add_func_type(vec![Ty::Bool], vec![]);
+
+    let mut fb = mb.function("integer_cast_over_bool_binding_chc", ft);
+    let entry = fb.create_block();
+    let exit = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+
+    // The value id is bound at the Bool carrier (SMT `Bool`, no bitvector width) ...
+    let input = fb.add_block_param(entry, Ty::Bool);
+    // ... but the cast declares an integer source.
+    let cast = fb.cast(op, src_ty, dst_ty.clone(), input);
+    fb.add_block_param(exit, dst_ty);
+    fb.br(exit, vec![cast]);
+    fb.switch_to_block(exit);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_refusal(&module, "operand type bool does not match declared source type");
+    trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default())
+}
+
+/// A Bool operand cannot be relabeled as an integer source. Complete canonical
+/// preflight refuses it before bitvector extraction or successor facts exist.
+#[test]
+fn typed_chc_translation_fails_closed_on_trunc_over_bool_sorted_binding() {
+    let outputs = chc_outputs_for_integer_cast_over_bool_binding(CastOp::Trunc, Ty::U64, Ty::U32);
+    assert_eq!(outputs.len(), 1);
+    assert_chc_canonical_refusal(
+        &outputs[0],
+        "cast trunc operand type bool does not match declared source type u64",
+    );
+}
+
+/// The widening arms of the same shape (`zero_extend`/`sign_extend` carry the
+/// same `REQUIRES: BitVec` contract as `extract`) must fail closed identically.
+#[test]
+fn typed_chc_translation_fails_closed_on_extension_over_bool_sorted_binding() {
+    for (op, src_ty, dst_ty) in [(CastOp::ZExt, Ty::U8, Ty::U64), (CastOp::SExt, Ty::I8, Ty::I64)] {
+        let expected =
+            format!("cast {op} operand type bool does not match declared source type {src_ty}");
+        let outputs = chc_outputs_for_integer_cast_over_bool_binding(op, src_ty, dst_ty);
+        assert_eq!(outputs.len(), 1);
+        assert_chc_canonical_refusal(&outputs[0], &expected);
+    }
 }
 
 #[test]
@@ -2667,7 +3058,10 @@ fn typed_chc_translation_lowers_thin_pointer_to_pointer_cast_without_unsupported
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2702,7 +3096,10 @@ fn typed_chc_translation_lowers_thin_pointer_to_integer_cast_without_unsupported
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -2742,7 +3139,7 @@ fn pointer_parts_roundtrip_lowers_without_unsupported_diagnostics() {
     fb.ret(vec![roundtrip_data, roundtrip_len]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let bmc_vcs = trust_ir_to_bmc_vc(&module, &options);
     assert_eq!(bmc_vcs.len(), 1);
@@ -2784,15 +3181,14 @@ fn typed_chc_translation_reuses_one_length_symbol_per_fat_value() {
     let len_b = fb.ptr_metadata(fat_str.clone(), Ty::U64, v);
     fb.ret(vec![len_a, len_b]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(outputs[0].diagnostics.is_empty(), "modeled U64 metadata must not fail closed");
-    let slice_len_syms = outputs[0]
-        .vc
-        .vars()
-        .iter()
-        .filter(|var| var.name.contains("_slice_len_"))
-        .count();
+    let slice_len_syms =
+        outputs[0].vc.vars().iter().filter(|var| var.name.contains("_slice_len_")).count();
     assert_eq!(
         slice_len_syms, 1,
         "two PtrMetadata reads of one SSA value must share one length symbol"
@@ -2811,19 +3207,15 @@ fn typed_chc_translation_reuses_one_length_symbol_per_fat_value() {
     let len_2 = fb.ptr_metadata(fat_str, Ty::U64, v2);
     fb.ret(vec![len_1, len_2]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(outputs[0].diagnostics.is_empty());
-    let slice_len_syms = outputs[0]
-        .vc
-        .vars()
-        .iter()
-        .filter(|var| var.name.contains("_slice_len_"))
-        .count();
-    assert_eq!(
-        slice_len_syms, 2,
-        "distinct fat values must keep independent length symbols"
-    );
+    let slice_len_syms =
+        outputs[0].vc.vars().iter().filter(|var| var.name.contains("_slice_len_")).count();
+    assert_eq!(slice_len_syms, 2, "distinct fat values must keep independent length symbols");
 }
 
 /// A `NonNull`-shaped single-pointer-newtype struct for the cast-leg tests.
@@ -2836,6 +3228,7 @@ fn nonnull_shaped_struct(mb: &mut ModuleBuilder) -> Ty {
         fields: vec![FieldDef { name: "pointer".to_owned(), ty: Ty::Ptr, offset: None }],
         size: None,
         align: None,
+        origin: None,
     });
     Ty::Struct(id)
 }
@@ -2860,19 +3253,18 @@ fn typed_chc_usize_newtype_pack_unpack_lowers_exactly() {
     let bits = fb.cast(CastOp::Bitcast, newtype, Ty::U64, packed);
     fb.ret(vec![bits]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(
         outputs[0].diagnostics.is_empty(),
         "the usize<->newtype bit-identity legs must not fail closed: {:?}",
         outputs[0].diagnostics
     );
-    let havoc_stand_ins = outputs[0]
-        .vc
-        .vars()
-        .iter()
-        .filter(|var| var.name.contains("unsupported_result"))
-        .count();
+    let havoc_stand_ins =
+        outputs[0].vc.vars().iter().filter(|var| var.name.contains("unsupported_result")).count();
     assert_eq!(havoc_stand_ins, 0, "neither leg may degrade to a havoc cast result");
 }
 
@@ -2892,10 +3284,10 @@ fn typed_chc_narrow_int_newtype_pack_stays_fail_closed() {
     let _packed = fb.cast(CastOp::Bitcast, Ty::U32, newtype, x);
     fb.ret(vec![]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].diagnostics.len(), 1);
-    assert_eq!(outputs[0].diagnostics[0].reason, TrustIrChcUnsupportedReason::Cast);
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "lacks valid layout evidence",
+    );
 }
 
 #[test]
@@ -2918,15 +3310,14 @@ fn typed_chc_same_type_fat_bitcast_forwards_deterministic_metadata() {
     let len_via_cast = fb.ptr_metadata(fat_str, Ty::U64, cast);
     fb.ret(vec![len_direct, len_via_cast]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(outputs[0].diagnostics.is_empty(), "{:?}", outputs[0].diagnostics);
-    let slice_len_syms = outputs[0]
-        .vc
-        .vars()
-        .iter()
-        .filter(|var| var.name.contains("_slice_len_"))
-        .count();
+    let slice_len_syms =
+        outputs[0].vc.vars().iter().filter(|var| var.name.contains("_slice_len_")).count();
     assert_eq!(
         slice_len_syms, 1,
         "a metadata read through a same-type fat Bitcast must reuse the operand's symbol"
@@ -2950,7 +3341,10 @@ fn typed_chc_mismatched_fat_bitcast_stays_fail_closed() {
     let _cast = fb.cast(CastOp::Bitcast, fat_str, fat_slice, v);
     fb.ret(vec![]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].diagnostics.len(), 1);
     assert_eq!(outputs[0].diagnostics[0].reason, TrustIrChcUnsupportedReason::Cast);
@@ -2972,15 +3366,14 @@ fn typed_chc_fat_to_thin_bitcast_is_the_data_lane() {
     let thin = fb.cast(CastOp::Bitcast, fat_str, Ty::Ptr, v);
     fb.ret(vec![thin]);
     fb.build();
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(outputs[0].diagnostics.is_empty(), "{:?}", outputs[0].diagnostics);
-    let havoc_stand_ins = outputs[0]
-        .vc
-        .vars()
-        .iter()
-        .filter(|var| var.name.contains("unsupported_result"))
-        .count();
+    let havoc_stand_ins =
+        outputs[0].vc.vars().iter().filter(|var| var.name.contains("unsupported_result")).count();
     assert_eq!(havoc_stand_ins, 0);
 }
 
@@ -3003,7 +3396,10 @@ fn typed_chc_translation_fails_closed_for_unknown_fat_pointer_metadata() {
     fb.ret(vec![metadata]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].diagnostics.len(), 1);
     assert_eq!(outputs[0].diagnostics[0].reason, TrustIrChcUnsupportedReason::PointerMetadata);
@@ -3030,7 +3426,10 @@ fn typed_chc_translation_models_slice_length_metadata() {
     fb.ret(vec![metadata]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     assert!(
         outputs[0].diagnostics.is_empty(),
@@ -3073,8 +3472,10 @@ fn chc_slice_len_plus_one_vc(
     let sum = fb.add(Ty::U64, metadata, one);
     fb.ret(vec![sum]);
     fb.build();
-    let mut outputs =
-        trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let mut outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     outputs.remove(0)
 }
@@ -3145,8 +3546,7 @@ fn typed_chc_nonzst_slice_length_metadata_keeps_isize_bound() {
 /// slice gets NO bound; a struct with one non-ZST field does.
 #[test]
 fn typed_chc_slice_length_bound_follows_aggregate_element_zst_ness() {
-    for (struct_name, field_ty, expect_bound) in
-        [("Pad", Ty::Unit, false), ("Cell", Ty::U32, true)]
+    for (struct_name, field_ty, expect_bound) in [("Pad", Ty::Unit, false), ("Cell", Ty::U32, true)]
     {
         let output = chc_slice_len_plus_one_vc("aggregate_slice_len", |mb| {
             let struct_id = mb.add_struct(StructDef {
@@ -3159,6 +3559,7 @@ fn typed_chc_slice_length_bound_follows_aggregate_element_zst_ness() {
                 size: None,
                 align: None,
                 repr: Default::default(),
+                origin: None,
             });
             let elem = mb.add_type(Ty::Struct(struct_id));
             Ty::FatPtr(FatPtrKind::Slice(elem))
@@ -3182,6 +3583,9 @@ fn typed_chc_translation_fails_closed_for_heap_and_global_addresses() {
         linkage: trust_ir::Linkage::External,
         tls: None,
         align: None,
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
     });
     let ft = mb.add_func_type(vec![], vec![]);
 
@@ -3201,7 +3605,10 @@ fn typed_chc_translation_fails_closed_for_heap_and_global_addresses() {
     global_fb.ret(vec![]);
     global_fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
 
     let heap = outputs
@@ -3232,7 +3639,9 @@ fn typed_chc_translation_fails_closed_for_heap_and_global_addresses() {
 #[test]
 fn typed_chc_translation_fails_closed_for_symbol_address_constants() {
     let mut module = trust_ir::Module::new("test_symbol_address_constant_chc");
-    let ft = module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+    let ft = module
+        .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+        .expect("Module::add_func_type: test fixture");
     let entry = trust_ir::value::BlockId::new(0);
     let symbol = trust_ir::value::ValueId::new(0);
     let mut func = trust_ir::Function::new(
@@ -3289,7 +3698,10 @@ fn typed_chc_translation_lowers_signed_integer_to_pointer_cast_without_unsupport
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -3324,6 +3736,7 @@ fn typed_chc_translation_lowers_scalar_struct_field_insert_extract() {
         ],
         size: None,
         align: None,
+        origin: None,
     });
     let ft = mb.add_func_type(vec![pair_ty.clone(), Ty::U32], vec![]);
 
@@ -3346,7 +3759,10 @@ fn typed_chc_translation_lowers_scalar_struct_field_insert_extract() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -3394,7 +3810,10 @@ fn typed_chc_translation_lowers_scalar_stack_store_load() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -3428,6 +3847,7 @@ fn typed_chc_translation_lowers_scalar_struct_stack_store_load() {
         ],
         size: None,
         align: None,
+        origin: None,
     });
     let ft = mb.add_func_type(vec![pair_ty.clone()], vec![]);
 
@@ -3440,7 +3860,7 @@ fn typed_chc_translation_lowers_scalar_struct_stack_store_load() {
     let pair = fb.add_block_param(entry, pair_ty.clone());
     let slot = fb.alloca(pair_ty.clone());
     fb.store(pair_ty.clone(), slot, pair);
-    let loaded = fb.load(pair_ty, slot);
+    let loaded = fb.load(pair_ty.clone(), slot);
     let loaded_x = fb.extract_field(Ty::U32, loaded, 0);
     let loaded_flag = fb.extract_field(Ty::Bool, loaded, 1);
     fb.add_block_param(exit, Ty::U32);
@@ -3450,7 +3870,15 @@ fn typed_chc_translation_lowers_scalar_struct_stack_store_load() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_legacy_source_ub_is_refused(
+        &original,
+        trust_ir::value::FuncId::new(0),
+        vec![legacy_unwritten_pair(pair_ty)],
+    );
+    let (module, fields) = initialized_pair_entry_twin(&original, trust_ir::value::FuncId::new(0));
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -3465,11 +3893,11 @@ fn typed_chc_translation_lowers_scalar_struct_stack_store_load() {
 
     let transition_args = head_arg_suffix(output, "bb1", 2);
     assert!(
-        matches!(transition_args[0].value(), ExprValue::Var { name } if name == "bb0_v0_field0"),
+        matches!(transition_args[0].value(), ExprValue::Var { name } if name == &format!("bb0_v{}", fields[0][0].index())),
         "loaded struct field 0 should preserve the stored aggregate field"
     );
     assert!(
-        matches!(transition_args[1].value(), ExprValue::Var { name } if name == "bb0_v0_field1"),
+        matches!(transition_args[1].value(), ExprValue::Var { name } if name == &format!("bb0_v{}", fields[0][1].index())),
         "loaded struct field 1 should preserve the stored aggregate field"
     );
 }
@@ -3503,7 +3931,10 @@ fn typed_chc_translation_lowers_direct_scalar_leaf_call() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -3532,8 +3963,15 @@ fn typed_chc_translation_lowers_direct_scalar_leaf_call() {
     );
 }
 
+/// Trust (2026-09-14): a DIRECT SELF-call whose function passes the inductive-
+/// hypothesis fence (pointer-free scalar signature, frame-local body, no entry
+/// precondition) is modeled by the INDUCTIVE HYPOTHESIS: results havoc'd, NO
+/// error rule, one `inductive_hypothesis_sites` row and no fail-closed
+/// diagnostic. This flips the pre-2026-09-14 pin that every self-call fails
+/// closed; the fence negatives below keep that old behaviour for everything the
+/// fence refuses.
 #[test]
-fn typed_chc_translation_fails_closed_for_recursive_direct_call() {
+fn typed_chc_translation_models_direct_self_call_by_inductive_hypothesis() {
     let mut mb = ModuleBuilder::new("test_recursive_direct_call_chc");
     let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
 
@@ -3546,21 +3984,404 @@ fn typed_chc_translation_fails_closed_for_recursive_direct_call() {
     fb.ret(vec![call_result]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
-    assert_eq!(output.diagnostics.len(), 1);
-    assert_eq!(output.diagnostics[0].family, SemanticsFamily::Calls);
-    assert_eq!(output.diagnostics[0].reason, TrustIrChcUnsupportedReason::RecursiveDirectCall);
-    assert_eq!(output.diagnostics[0].function, "countdown_recursive_chc");
-    assert_eq!(output.diagnostics[0].block, entry);
-    assert_eq!(output.diagnostics[0].instruction_index, 0);
-    assert_eq!(output.diagnostics[0].result_values, vec![call_result]);
+    assert!(output.diagnostics.is_empty(), "no fail-closed diagnostic: {:?}", output.diagnostics);
+    assert_eq!(output.inductive_hypothesis_sites.len(), 1);
+    let site = &output.inductive_hypothesis_sites[0];
+    assert_eq!(site.family, SemanticsFamily::Calls);
+    assert_eq!(site.reason, TrustIrChcUnsupportedReason::RecursiveSelfCallInductiveHypothesis);
+    assert_eq!(site.function, "countdown_recursive_chc");
+    assert_eq!(site.block, entry);
+    assert_eq!(site.instruction_index, 0);
+    assert_eq!(site.result_values, vec![call_result]);
+    assert!(
+        !output.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "a self-call modeled by the inductive hypothesis contributes NO error rule"
+    );
+}
+
+/// The fence's negatives keep the historical fail-closed handling VERBATIM: a
+/// pointer parameter, a pointer result, a mutual 2-cycle, a global address in the
+/// body, a store through a non-frame pointer, and an entry `Assume` the evaluator
+/// cannot re-instantiate. Each still carries the `RecursiveDirectCall` diagnostic
+/// (or the mutual half's) and an `error` rule.
+fn self_call_module(params: Vec<Ty>, returns: Vec<Ty>, shape: &str) -> trust_ir::Module {
+    let mut mb = ModuleBuilder::new("test_self_call_fence");
+    let ft = mb.add_func_type(params.clone(), returns.clone());
+    if shape == "global" {
+        mb.add_global(trust_ir::Global {
+            name: "G".to_string(),
+            ty: Ty::U32,
+            mutable: false,
+            initializer: Some(trust_ir::constant::Constant::Int(7)),
+            linkage: trust_ir::Linkage::Internal,
+            tls: None,
+            align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+        });
+    }
+    let mut fb = mb.function("f", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let mut args = Vec::new();
+    for ty in &params {
+        args.push(fb.add_block_param(entry, ty.clone()));
+    }
+    match shape {
+        "global" => {
+            let g = fb.global_addr(trust_ir::value::GlobalId::new(0));
+            let _ = fb.load(Ty::U32, g);
+        }
+        "wild_store" => {
+            let p = fb.undef(Ty::Ptr);
+            let v = fb.iconst(Ty::U32, 1);
+            fb.store(Ty::U32, p, v);
+        }
+        "frame_store" => {
+            let cell = fb.alloca(Ty::U32);
+            let v = fb.iconst(Ty::U32, 1);
+            fb.store(Ty::U32, cell, v);
+        }
+        "complete_aggregate_frame_store" | "complete_aggregate_wild_store" => {
+            let ty = Ty::Tuple(vec![Ty::U32, Ty::Bool]);
+            let flag = fb.bool_const(true);
+            let aggregate = fb.make_aggregate(ty.clone(), vec![args[0], flag]);
+            let pointer = if shape == "complete_aggregate_frame_store" {
+                fb.alloca(ty.clone())
+            } else {
+                fb.null_ptr()
+            };
+            fb.store(ty, pointer, aggregate);
+        }
+        "opaque_assume" => {
+            // An entry Assume whose condition depends on a parameter through an
+            // ADD — a shape the re-instantiation evaluator does not model.
+            let one = fb.iconst(Ty::U32, 1);
+            let t = fb.binop(BinOp::Add, Ty::U32, args[0], one);
+            let c = fb.icmp(ICmpOp::Ugt, Ty::U32, t, one);
+            fb.assume(c);
+        }
+        _ => {}
+    }
+    let result = fb.call(trust_ir::value::FuncId::new(0), args);
+    if returns.is_empty() {
+        fb.ret(vec![]);
+    } else {
+        fb.ret(vec![result]);
+    }
+    fb.build();
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+fn assert_self_call_fails_closed(module: &trust_ir::Module, why: &str) {
+    let outputs = trust_ir_to_chc_translation_outputs(module, &TranslateOptions::default());
+    let output = &outputs[0];
+    assert!(output.inductive_hypothesis_sites.is_empty(), "{why}: no IH site may be admitted");
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|d| d.reason == TrustIrChcUnsupportedReason::RecursiveDirectCall),
+        "{why}: the historical RecursiveDirectCall diagnostic must stand, got {:?}",
+        output.diagnostics
+    );
     assert!(
         output.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "recursive direct calls must fail closed instead of silently using a symbolic summary"
+        "{why}: the unconditional error rule must stand"
     );
+}
+
+#[test]
+fn self_call_inductive_hypothesis_fence_refuses_pointer_params_and_results() {
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::Ptr], vec![Ty::U32], "plain"),
+        "pointer parameter",
+    );
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::U32], vec![Ty::Ptr], "plain"),
+        "pointer result",
+    );
+}
+
+#[test]
+fn self_call_inductive_hypothesis_fence_refuses_non_frame_local_bodies() {
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "global"),
+        "global address",
+    );
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "wild_store"),
+        "store through a non-frame pointer",
+    );
+    // A store through the function's OWN alloca is frame-local and admitted.
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "frame_store"),
+        &TranslateOptions::default(),
+    );
+    assert_eq!(outputs[0].inductive_hypothesis_sites.len(), 1, "a frame-local store is admitted");
+}
+
+#[test]
+fn complete_aggregate_construction_does_not_hide_non_frame_writes_from_self_call_fence() {
+    let complete = self_call_module(vec![Ty::U32], vec![Ty::U32], "complete_aggregate_frame_store");
+    let output = trust_ir_to_chc_translation_outputs(&complete, &TranslateOptions::default());
+    assert_eq!(output[0].inductive_hypothesis_sites.len(), 1);
+    assert!(output[0].diagnostics.is_empty(), "{:?}", output[0].diagnostics);
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "complete_aggregate_wild_store"),
+        "a pure complete constructor cannot authorize a store outside the frame",
+    );
+}
+
+#[test]
+fn self_call_inductive_hypothesis_fence_refuses_an_unmodeled_entry_assume() {
+    assert_self_call_fails_closed(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "opaque_assume"),
+        "entry assume over an arithmetic shape",
+    );
+}
+
+#[test]
+fn self_call_inductive_hypothesis_leaves_mutual_recursion_fail_closed() {
+    let mut mb = ModuleBuilder::new("test_mutual_recursion");
+    let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+    for (name, other) in [("ping", 1u32), ("pong", 0u32)] {
+        let mut fb = mb.function(name, ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let input = fb.add_block_param(entry, Ty::U32);
+        let r = fb.call(trust_ir::value::FuncId::new(other), vec![input]);
+        fb.ret(vec![r]);
+        fb.build();
+    }
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
+    for output in &outputs {
+        assert!(
+            output.inductive_hypothesis_sites.is_empty(),
+            "mutual recursion is not the self-call arm"
+        );
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.reason == TrustIrChcUnsupportedReason::RecursiveDirectCall),
+            "mutual recursion keeps the fail-closed diagnostic: {:?}",
+            output.diagnostics
+        );
+    }
+}
+
+/// The OTHER half of the Hoare rule: every entry `Assume` (the bridge's spelling
+/// of `requires`) is RE-ASSERTED over the actuals at the self-call. `f(n)`
+/// requires `n > 0` and calls `f(n - 1)`: the VC gains an error rule reachable
+/// exactly when `n - 1 > 0` is false on the path — the deeper activation's
+/// input must satisfy the precondition, or the aggregate is not proved. A
+/// `requires n == 0` body that calls `f(1)` (the "requires laundering" attack)
+/// therefore carries an error rule whose condition is `not(1 == 0)` — true —
+/// so the aggregate refutes instead of proving under the hypothesis.
+#[test]
+fn self_call_inductive_hypothesis_reasserts_entry_preconditions_over_the_actuals() {
+    let build = |launder: bool| {
+        let mut mb = ModuleBuilder::new("test_self_call_precondition");
+        let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+        let mut fb = mb.function("f", ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let n = fb.add_block_param(entry, Ty::U32);
+        let zero = fb.iconst(Ty::U32, 0);
+        let one = fb.iconst(Ty::U32, 1);
+        let pre = if launder {
+            fb.icmp(ICmpOp::Eq, Ty::U32, n, zero)
+        } else {
+            fb.icmp(ICmpOp::Ugt, Ty::U32, n, zero)
+        };
+        fb.assume(pre);
+        let actual = if launder { one } else { fb.binop(BinOp::Sub, Ty::U32, n, one) };
+        let r = fb.call(trust_ir::value::FuncId::new(0), vec![actual]);
+        fb.ret(vec![r]);
+        fb.build();
+        mb.build().expect("ModuleBuilder::build: test fixture")
+    };
+    for launder in [false, true] {
+        let outputs =
+            trust_ir_to_chc_translation_outputs(&build(launder), &TranslateOptions::default());
+        let output = &outputs[0];
+        assert!(output.diagnostics.is_empty(), "launder={launder}: no fail-closed diagnostic");
+        assert_eq!(output.inductive_hypothesis_sites.len(), 1, "launder={launder}");
+        let error_rules: Vec<String> = output
+            .vc
+            .rules
+            .iter()
+            .filter(|rule| rule.head.name == "error")
+            .map(|rule| format!("{rule:?}"))
+            .collect();
+        eprintln!("launder={launder} error rules: {error_rules:#?}");
+        // The `Debug` rendering wraps every operand in `Expr { sort: …, value: … }`,
+        // so the shape checks are on operator presence within ONE rule.
+        if launder {
+            // `f(1)` under `requires n == 0`: the re-asserted precondition over the
+            // actual is `1 == 0`; its negation (or its constant folding) is an error
+            // rule reachable on every path that satisfies the entry assume.
+            assert!(
+                error_rules.iter().any(|r| {
+                    r.contains("Not(")
+                        && (r.contains("value: 1, width: 32") || r.contains("Bool(true)"))
+                }),
+                "launder: the re-asserted `1 == 0` must be an error rule, got {error_rules:#?}"
+            );
+        } else {
+            // `f(n - 1)` under `requires n > 0`: the re-asserted precondition is
+            // `n - 1 > 0`; its negation is an error rule beside the translator's own
+            // underflow obligation on `n - 1`.
+            assert!(
+                error_rules
+                    .iter()
+                    .any(|r| r.contains("Not(") && r.contains("BvUGt(") && r.contains("BvSub(")),
+                "the re-asserted `n - 1 > 0` must be an error rule, got {error_rules:#?}"
+            );
+        }
+    }
+}
+
+/// The shape the BRIDGE actually emits (measured 2026-09-14 on
+/// `tests/ui/trust/native_recursive_requires_fresh_context.rs`): the entry
+/// block carries the `requires` assume and the parameter's range assume, both
+/// spelled over entry-block CONSTANTS, and the self-call sits in a NON-ENTRY
+/// block behind the recursion guard, with the actual computed by a checked
+/// subtraction. `translate_block` clears the value map at every block, so an
+/// evaluator that looked the constants up there missed every one of them and
+/// the fence fell through to the historical error rule — this is the
+/// regression test for that miss. The census must name the fence point when a
+/// miss does happen, so the negative half checks the reason string too.
+#[test]
+fn self_call_in_a_non_entry_block_reinstantiates_entry_constants() {
+    let mut mb = ModuleBuilder::new("test_self_call_non_entry_block");
+    let ft = mb.add_func_type(vec![Ty::U32], vec![]);
+    let mut fb = mb.function("recursive_requires", ft);
+    let entry = fb.create_block();
+    let recurse = fb.create_block();
+    let done = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let n = fb.add_block_param(entry, Ty::U32);
+    // requires n > 0
+    let zero = fb.iconst(Ty::U32, 0);
+    let pre = fb.icmp(ICmpOp::Ugt, Ty::U32, n, zero);
+    fb.assume(pre);
+    // the parameter range assume, as the bridge spells it: select(n >= 0, n <= MAX, false)
+    let zero2 = fb.iconst(Ty::U32, 0);
+    let ge = fb.icmp(ICmpOp::Uge, Ty::U32, n, zero2);
+    let max = fb.iconst(Ty::U32, u32::MAX as i128);
+    let le = fb.icmp(ICmpOp::Ule, Ty::U32, n, max);
+    let ff = fb.bool_const(false);
+    let range = fb.select(Ty::Bool, ge, le, ff);
+    fb.assume(range);
+    // if n > 1 { recurse } else { done }
+    let one = fb.iconst(Ty::U32, 1);
+    let guard = fb.icmp(ICmpOp::Ugt, Ty::U32, n, one);
+    fb.condbr(guard, recurse, vec![], done, vec![]);
+    fb.switch_to_block(recurse);
+    let one2 = fb.iconst(Ty::U32, 1);
+    let (diff, _overflowed) = fb.overflow(OverflowOp::SubOverflow, Ty::U32, n, one2);
+    // `call_void`: the builder's `call` mints a result even for a unit-returning
+    // callee, which the arity fence (rightly) refuses.
+    fb.call_void(trust_ir::value::FuncId::new(0), vec![diff]);
+    fb.br(done, vec![]);
+    fb.switch_to_block(done);
+    fb.ret(vec![]);
+    fb.build();
+    let census =
+        TranslateOptions { collect_call_summary_census: true, ..TranslateOptions::default() };
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &census,
+    );
+    let output = &outputs[0];
+    assert!(
+        !output
+            .diagnostics
+            .iter()
+            .any(|d| d.reason == TrustIrChcUnsupportedReason::RecursiveDirectCall),
+        "the self-call in a non-entry block must take the inductive hypothesis, got {:?}",
+        output.diagnostics
+    );
+    assert_eq!(output.inductive_hypothesis_sites.len(), 1);
+    assert!(
+        output
+            .call_summary_census
+            .iter()
+            .any(|a| a.outcome == CallSummaryOutcome::InductiveHypothesis),
+        "census: {:?}",
+        output.call_summary_census
+    );
+    // The re-asserted `requires` over the actual `n - 1`: an error rule on its negation.
+    let error_rules: Vec<String> = output
+        .vc
+        .rules
+        .iter()
+        .filter(|rule| rule.head.name == "error")
+        .map(|rule| format!("{rule:?}"))
+        .collect();
+    assert!(
+        error_rules
+            .iter()
+            .any(|r| r.contains("Not(") && r.contains("BvUGt(") && r.contains("BvSub(")),
+        "the re-asserted `n - 1 > 0` must be an error rule, got {error_rules:#?}"
+    );
+}
+
+/// A fence miss is NAMED in the census: the `opaque_assume` shape (an entry
+/// assume over an arithmetic the evaluator does not model) records
+/// `ih_fence:entry_assume_unmodeled`, not the bare historical reason.
+#[test]
+fn self_call_inductive_hypothesis_fence_miss_is_named_in_the_census() {
+    let census =
+        TranslateOptions { collect_call_summary_census: true, ..TranslateOptions::default() };
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &self_call_module(vec![Ty::U32], vec![Ty::U32], "opaque_assume"),
+        &census,
+    );
+    let reasons: Vec<&str> = outputs[0]
+        .call_summary_census
+        .iter()
+        .filter_map(|a| match &a.outcome {
+            CallSummaryOutcome::NotAttempted { reason } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["ih_fence:entry_assume_unmodeled"],
+        "{:?}",
+        outputs[0].call_summary_census
+    );
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &self_call_module(vec![Ty::Ptr], vec![Ty::U32], "plain"),
+        &census,
+    );
+    let reasons: Vec<&str> = outputs[0]
+        .call_summary_census
+        .iter()
+        .filter_map(|a| match &a.outcome {
+            CallSummaryOutcome::NotAttempted { reason } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, vec!["ih_fence:pointer_or_non_scalar_signature"]);
 }
 
 #[test]
@@ -3587,7 +4408,10 @@ fn typed_chc_translation_fails_closed_for_unsummarizable_direct_call() {
     fb.ret(vec![call_result]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -3610,6 +4434,18 @@ fn typed_chc_translation_fails_closed_for_unsummarizable_direct_call() {
 #[test]
 fn typed_chc_translation_fails_closed_for_heap_alloc_and_global_addr() {
     let mut mb = ModuleBuilder::new("test_heap_global_chc");
+    mb.add_global(trust_ir::Global {
+        name: "defined_global".into(),
+        ty: Ty::I32,
+        mutable: true,
+        initializer: Some(trust_ir::Constant::Int(0)),
+        linkage: trust_ir::Linkage::Internal,
+        tls: None,
+        align: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
+    });
     let ft = mb.add_func_type(vec![], vec![Ty::Ptr]);
 
     let mut fb = mb.function("heap_global_chc", ft);
@@ -3621,7 +4457,9 @@ fn typed_chc_translation_fails_closed_for_heap_alloc_and_global_addr() {
     fb.ret(vec![heap]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
 
     assert_eq!(outputs.len(), 1);
     let reasons =
@@ -3658,7 +4496,10 @@ fn typed_chc_translation_propagates_direct_call_assertion() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -3728,7 +4569,10 @@ fn typed_chc_translation_summarizes_direct_call_with_unreachable_panic_block() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -3802,7 +4646,10 @@ fn typed_chc_translation_summarizes_direct_call_with_checked_overflow() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -3829,7 +4676,21 @@ fn typed_chc_translation_summarizes_direct_call_with_checked_overflow() {
 }
 
 #[test]
-fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
+fn typed_chc_translation_refuses_legacy_aggregate_undef_nested_wrapper() {
+    nested_wrapper_summary(false, false);
+}
+
+#[test]
+fn make_aggregate_summarizes_nested_wrapper_without_dropping_panic() {
+    nested_wrapper_summary(true, true);
+}
+
+#[test]
+fn initialized_insert_field_summarizes_nested_wrapper_without_dropping_panic() {
+    nested_wrapper_summary(false, true);
+}
+
+fn nested_wrapper_summary(complete: bool, initialized_seed: bool) {
     // The operative `proc_macro2::Literal { inner: imp::Literal, _marker }` shape: a
     // callee that CONSTRUCTS a wrapper whose field is itself an aggregate, then reads
     // that field back out. BEFORE nested-aggregate field support in the call-summary
@@ -3852,6 +4713,7 @@ fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
         fields: vec![FieldDef { name: "v".to_owned(), ty: Ty::U32, offset: None }],
         size: None,
         align: None,
+        origin: None,
     });
 
     let outer_id = StructId::new(1);
@@ -3866,6 +4728,7 @@ fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
         ],
         size: None,
         align: None,
+        origin: None,
     });
 
     let callee_ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
@@ -3881,13 +4744,37 @@ fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
     fb.set_entry(entry);
     let n = fb.add_block_param(entry, Ty::U32);
 
-    let inner_undef = fb.undef(inner_ty.clone());
-    let inner = fb.insert_field(inner_ty.clone(), inner_undef, 0, n);
-    let outer_undef = fb.undef(outer_ty.clone());
-    // The nested-aggregate VALUE insert — the arm that used to bail.
-    let outer_with_inner = fb.insert_field(outer_ty.clone(), outer_undef, 0, inner);
     let zero = fb.iconst(Ty::U32, 0);
-    let outer = fb.insert_field(outer_ty.clone(), outer_with_inner, 1, zero);
+    let inner = if complete {
+        fb.make_aggregate(inner_ty.clone(), vec![n])
+    } else {
+        let seed = if initialized_seed {
+            fb.const_value(
+                inner_ty.clone(),
+                trust_ir::constant::Constant::Aggregate(vec![trust_ir::constant::Constant::Uninit]),
+            )
+        } else {
+            fb.undef(inner_ty.clone())
+        };
+        fb.insert_field(inner_ty.clone(), seed, 0, n)
+    };
+    let outer = if complete {
+        fb.make_aggregate(outer_ty.clone(), vec![inner, zero])
+    } else {
+        let seed = if initialized_seed {
+            fb.const_value(
+                outer_ty.clone(),
+                trust_ir::constant::Constant::Aggregate(vec![
+                    trust_ir::constant::Constant::Uninit;
+                    2
+                ]),
+            )
+        } else {
+            fb.undef(outer_ty.clone())
+        };
+        let with_inner = fb.insert_field(outer_ty.clone(), seed, 0, inner);
+        fb.insert_field(outer_ty.clone(), with_inner, 1, zero)
+    };
     // The nested-aggregate RESULT extract — the mirror arm that used to bail.
     let read_inner = fb.extract_field(inner_ty.clone(), outer, 0);
     let v = fb.extract_field(Ty::U32, read_inner, 0);
@@ -3911,7 +4798,31 @@ fn typed_chc_translation_summarizes_direct_call_constructing_nested_wrapper() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    if !complete && !initialized_seed {
+        for function in [0, 1] {
+            assert_legacy_source_ub_is_refused(
+                &module,
+                trust_ir::value::FuncId::new(function),
+                vec![trust_ir::interpret::InterpretValue::int(Ty::U32, 2).unwrap()],
+            );
+        }
+        return;
+    }
+    for n in [0, 2] {
+        let run = trust_ir::interpret::Interpreter::with_module(&module).execute_func(
+            trust_ir::value::FuncId::new(1),
+            [trust_ir::interpret::InterpretValue::int(Ty::U32, n).unwrap()],
+        );
+        if n == 0 {
+            let error = run.unwrap_err();
+            assert_eq!(error.code, trust_ir::interpret::InterpretErrorCode::UndefinedBehavior);
+            assert_eq!(error.message, "executed unreachable");
+        } else {
+            run.unwrap();
+        }
+    }
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -3968,7 +4879,10 @@ fn typed_chc_translation_summarizes_direct_call_with_signed_negation() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -4032,7 +4946,10 @@ fn typed_chc_translation_summarizes_realcall_parity_toggle_as_not_acc() {
         fb.build();
     }
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2, "callee + caller");
 
     // The direct call to a TOTAL bool-xor callee must be summarized cleanly —
@@ -4065,22 +4982,8 @@ fn typed_chc_translation_summarizes_realcall_parity_toggle_as_not_acc() {
 
 #[test]
 fn typed_chc_translation_declines_direct_call_with_no_terminator_leaf() {
-    // CASE-2 SOUNDNESS SENTINEL — the reverted `7e5a2e345` false-proof class.
-    //
-    // A callee whose block falls off the end with NO terminator models a MALFORMED
-    // CFG in which a successor EDGE was dropped (trust-ir's validator forbids a
-    // missing terminator: `BlockMissingTerminator`). The dropped edge can lead to a
-    // panic — e.g. the `?`/`Try::branch` continuation holding a post-`?`
-    // `assert!(x == 0)`. The unsound predecessor of the fix treated such a leaf as a
-    // clean havoc-return + `continue`, so the dropped block's panic vanished from the
-    // summary → a false PROVE (`let x = r?; assert!(x == 0); Ok(x)` over an
-    // unconstrained `Result` reported "1 proved").
-    //
-    // The fix FAILS CLOSED: `try_direct_call_summary` returns `None`, so the caller
-    // gets an `UnsupportedDirectCallSummary` diagnostic + an unconditional (TOP) error
-    // rule — i.e. the caller is NOT proved. If this test ever sees empty `diagnostics`
-    // or no caller error rule, CASE 2 has leaked back in (the call was summarized as
-    // clean, masking the dropped panic).
+    // A missing terminator may hide a dropped panic edge. Canonical preflight
+    // refuses the whole module rather than summarizing the leaf as a return.
     let mut mb = ModuleBuilder::new("test_direct_call_no_terminator_leaf_chc");
     let callee_ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
     let caller_ft = mb.add_func_type(vec![Ty::U32], vec![]);
@@ -4105,17 +5008,9 @@ fn typed_chc_translation_declines_direct_call_with_no_terminator_leaf() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
-    assert_eq!(outputs.len(), 2);
-    let caller = &outputs[1];
-    assert!(
-        !caller.diagnostics.is_empty(),
-        "a no-terminator-leaf callee MUST be DECLINED (UnsupportedDirectCallSummary), \
-         never summarized as clean — CASE 2 leaked back if diagnostics is empty"
-    );
-    caller.vc.rules.iter().find(|rule| rule.head.name == "error").expect(
-        "declining a malformed (no-terminator) callee must emit an unconditional \
-             caller error rule (TOP / may-panic), i.e. the caller is NOT proved",
+    assert_canonical_refusal(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        "has no terminator instruction",
     );
 }
 
@@ -4157,7 +5052,10 @@ fn typed_chc_translation_lowers_direct_scalar_multiblock_call() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs_per_block(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -4226,7 +5124,10 @@ fn typed_chc_translation_propagates_multiblock_direct_call_assertion_guard() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -4259,15 +5160,9 @@ fn typed_chc_translation_propagates_multiblock_direct_call_assertion_guard() {
 }
 
 #[test]
-fn typed_chc_translation_summarizes_paramless_merge_value_return() {
-    // Reproduces the lowering shape of `divide_safe`/`unsigned_subtract_safe`: a
-    // guarded value flows to a PARAMLESS merge block that `Return`s a value
-    // defined on only one incoming path. The direct-call summary must resolve the
-    // undefined-on-path return to a fresh symbolic (mirroring the main
-    // translation) instead of bailing to an unconditional unsupported-error rule,
-    // which produced a spurious counterexample and made a caller's whole-function
-    // panic-freedom unprovable.
-    let mut mb = ModuleBuilder::new("test_paramless_merge_value_return_chc");
+fn typed_chc_translation_summarizes_seeded_merge_value_return() {
+    // Explicit block arguments preserve each path's value at the merge.
+    let mut mb = ModuleBuilder::new("test_seeded_merge_value_return_chc");
     let callee_ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::U32]);
     let caller_ft = mb.add_func_type(vec![Ty::Bool], vec![]);
 
@@ -4276,21 +5171,19 @@ fn typed_chc_translation_summarizes_paramless_merge_value_return() {
     let then_b = fb.create_block();
     let else_b = fb.create_block();
     let merge = fb.create_block();
+    let merged = fb.add_block_param(merge, Ty::U32);
     fb.switch_to_block(entry);
     fb.set_entry(entry);
     let cond = fb.add_block_param(entry, Ty::Bool);
     fb.condbr(cond, then_b, vec![], else_b, vec![]);
     fb.switch_to_block(then_b);
     let then_val = fb.iconst(Ty::U32, 7);
-    fb.br(merge, vec![]);
+    fb.br(merge, vec![then_val]);
     fb.switch_to_block(else_b);
-    let _else_val = fb.iconst(Ty::U32, 9);
-    fb.br(merge, vec![]);
+    let else_val = fb.iconst(Ty::U32, 9);
+    fb.br(merge, vec![else_val]);
     fb.switch_to_block(merge);
-    // `then_val` is defined only on the then-path; the merge block carries no
-    // params to thread it, so the else-path reaches this `Return` with `then_val`
-    // undefined.
-    fb.ret(vec![then_val]);
+    fb.ret(vec![merged]);
     fb.build();
 
     let mut fb = mb.function("caller_discards_value_chc", caller_ft);
@@ -4302,28 +5195,27 @@ fn typed_chc_translation_summarizes_paramless_merge_value_return() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    assert_no_module_refusal(&outputs);
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
         caller.diagnostics.is_empty(),
-        "paramless-merge value return must summarize without unsupported diagnostics, got {:?}",
+        "seeded-merge value return must summarize without unsupported diagnostics, got {:?}",
         caller.diagnostics
     );
     assert!(
         !caller.vc.rules.iter().any(|rule| rule.head.name == "error"),
-        "a non-panicking callee returned through a paramless merge must not inject a spurious error rule"
+        "a non-panicking callee returned through a seeded merge must not inject a spurious error rule"
     );
 }
 
 #[test]
-fn typed_chc_translation_paramless_merge_preserves_branch_panic() {
-    // Soundness guard for the paramless-merge return fix: minting a fresh value
-    // for the undefined-on-path return must NOT suppress an error condition raised
-    // on the OTHER path. The else-branch subtracts (unsigned underflow when
-    // x < y) and returns the result through a paramless merge; the caller must
-    // still receive the guarded error rule. This is the no-false-proof check.
-    let mut mb = ModuleBuilder::new("test_paramless_merge_panic_chc");
+fn typed_chc_translation_seeded_merge_preserves_branch_panic() {
+    // Explicit block arguments preserve each path's value at the merge.
+    let mut mb = ModuleBuilder::new("test_seeded_merge_panic_chc");
     let callee_ft = mb.add_func_type(vec![Ty::Bool, Ty::U32, Ty::U32], vec![Ty::U32]);
     let caller_ft = mb.add_func_type(vec![Ty::Bool, Ty::U32, Ty::U32], vec![]);
 
@@ -4332,6 +5224,7 @@ fn typed_chc_translation_paramless_merge_preserves_branch_panic() {
     let safe_b = fb.create_block();
     let sub_b = fb.create_block();
     let merge = fb.create_block();
+    let merged = fb.add_block_param(merge, Ty::U32);
     fb.switch_to_block(entry);
     fb.set_entry(entry);
     let cond = fb.add_block_param(entry, Ty::Bool);
@@ -4339,15 +5232,13 @@ fn typed_chc_translation_paramless_merge_preserves_branch_panic() {
     let y = fb.add_block_param(entry, Ty::U32);
     fb.condbr(cond, safe_b, vec![], sub_b, vec![]);
     fb.switch_to_block(safe_b);
-    fb.br(merge, vec![]);
+    let safe = fb.iconst(Ty::U32, 0);
+    fb.br(merge, vec![safe]);
     fb.switch_to_block(sub_b);
     let diff = fb.sub(Ty::U32, x, y); // unsigned underflow obligation when x < y
-    fb.br(merge, vec![]);
+    fb.br(merge, vec![diff]);
     fb.switch_to_block(merge);
-    // `diff` is defined only on the sub-path; safe-path reaches this Return with
-    // `diff` undefined (-> fresh symbolic), but the underflow error condition on
-    // the sub-path must survive.
-    fb.ret(vec![diff]);
+    fb.ret(vec![merged]);
     fb.build();
 
     let mut fb = mb.function("caller_maybe_subtracts_chc", caller_ft);
@@ -4361,12 +5252,15 @@ fn typed_chc_translation_paramless_merge_preserves_branch_panic() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    assert_no_module_refusal(&outputs);
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
         caller.diagnostics.is_empty(),
-        "subtraction through a paramless merge should summarize without unsupported diagnostics, got {:?}",
+        "subtraction through a seeded merge should summarize without unsupported diagnostics, got {:?}",
         caller.diagnostics
     );
     assert!(
@@ -4411,7 +5305,10 @@ fn typed_chc_translation_summarizes_direct_call_with_overflow_intrinsic() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -4460,7 +5357,10 @@ fn typed_chc_translation_summarizes_direct_call_with_boolean_binop() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
     assert!(
@@ -4489,6 +5389,7 @@ fn typed_chc_translation_lowers_direct_aggregate_param_return_call() {
         ],
         size: None,
         align: None,
+        origin: None,
     });
     let callee_ft = mb.add_func_type(vec![pair_ty.clone(), Ty::U32], vec![pair_ty.clone()]);
     let caller_ft = mb.add_func_type(vec![pair_ty.clone(), Ty::U32], vec![]);
@@ -4521,7 +5422,18 @@ fn typed_chc_translation_lowers_direct_aggregate_param_return_call() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_legacy_source_ub_is_refused(
+        &original,
+        trust_ir::value::FuncId::new(1),
+        vec![
+            legacy_unwritten_pair(pair_ty),
+            trust_ir::interpret::InterpretValue::int(Ty::U32, 7).unwrap(),
+        ],
+    );
+    let (module, fields) = initialized_pair_entry_twin(&original, trust_ir::value::FuncId::new(1));
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -4539,7 +5451,7 @@ fn typed_chc_translation_lowers_direct_aggregate_param_return_call() {
         "aggregate return field 0 should carry the replacement scalar"
     );
     assert!(
-        matches!(transition_args[1].value(), ExprValue::Var { name } if name == "bb0_v0_field1"),
+        matches!(transition_args[1].value(), ExprValue::Var { name } if name == &format!("bb0_v{}", fields[0][1].index())),
         "aggregate return field 1 should preserve the original aggregate field"
     );
 }
@@ -4559,6 +5471,7 @@ fn typed_chc_translation_combines_multiblock_direct_aggregate_return_call() {
         ],
         size: None,
         align: None,
+        origin: None,
     });
     let callee_ft =
         mb.add_func_type(vec![Ty::Bool, pair_ty.clone(), pair_ty.clone()], vec![pair_ty.clone()]);
@@ -4585,7 +5498,7 @@ fn typed_chc_translation_combines_multiblock_direct_aggregate_return_call() {
     fb.set_entry(entry);
     let caller_choose_lhs = fb.add_block_param(entry, Ty::Bool);
     let caller_lhs = fb.add_block_param(entry, pair_ty.clone());
-    let caller_rhs = fb.add_block_param(entry, pair_ty);
+    let caller_rhs = fb.add_block_param(entry, pair_ty.clone());
     let call_result =
         fb.call(trust_ir::value::FuncId::new(0), vec![caller_choose_lhs, caller_lhs, caller_rhs]);
     let result_x = fb.extract_field(Ty::U32, call_result, 0);
@@ -4595,7 +5508,19 @@ fn typed_chc_translation_combines_multiblock_direct_aggregate_return_call() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_legacy_source_ub_is_refused(
+        &original,
+        trust_ir::value::FuncId::new(1),
+        vec![
+            trust_ir::interpret::InterpretValue::bool(true),
+            legacy_unwritten_pair(pair_ty.clone()),
+            legacy_unwritten_pair(pair_ty),
+        ],
+    );
+    let (module, fields) = initialized_pair_entry_twin(&original, trust_ir::value::FuncId::new(1));
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
 
     assert_eq!(outputs.len(), 2);
     let caller = &outputs[1];
@@ -4612,11 +5537,11 @@ fn typed_chc_translation_combines_multiblock_direct_aggregate_return_call() {
         "aggregate return guard should be expressed over the caller condition"
     );
     assert!(
-        matches!(then_expr.value(), ExprValue::Var { name } if name == "bb0_v1_field0"),
+        matches!(then_expr.value(), ExprValue::Var { name } if name == &format!("bb0_v{}", fields[0][0].index())),
         "then aggregate field should come from the caller lhs"
     );
     assert!(
-        matches!(else_expr.value(), ExprValue::Var { name } if name == "bb0_v2_field0"),
+        matches!(else_expr.value(), ExprValue::Var { name } if name == &format!("bb0_v{}", fields[1][0].index())),
         "else aggregate field should come from the caller rhs"
     );
 }
@@ -4629,21 +5554,59 @@ fn typed_chc_translation_now_models_nested_aggregate_stack_load() {
     // is allocated with fresh-symbolic leaves (a sound over-approximation) and the
     // load returns the tracked nested aggregate — no MemoryAccessWithoutPreciseModel
     // error rule. This is the capability that unblocks `Option<(a,b)>` / `?` matches.
-    let mut mb = ModuleBuilder::new("test_nested_aggregate_stack_memory_chc");
-    let nested_ty = Ty::Tuple(vec![Ty::Tuple(vec![Ty::U32])]);
-    let ft = mb.add_func_type(vec![], vec![]);
-
-    let mut fb = mb.function("nested_aggregate_stack_memory_chc", ft);
-    let entry = fb.create_block();
-    fb.switch_to_block(entry);
-    fb.set_entry(entry);
-
-    let slot = fb.alloca(nested_ty.clone());
-    let _loaded = fb.load(nested_ty, slot);
-    fb.ret(vec![]);
-    fb.build();
-
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let build = |initialized: bool| {
+        let mut mb = ModuleBuilder::new("test_nested_aggregate_stack_memory_chc");
+        let inner = Ty::Tuple(vec![Ty::U32]);
+        let nested_ty = Ty::Tuple(vec![inner.clone()]);
+        let ft = mb.add_func_type(if initialized { vec![Ty::U32] } else { vec![] }, vec![]);
+        let mut fb = mb.function("nested_aggregate_stack_memory_chc", ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let initial = initialized.then(|| {
+            let x = fb.add_block_param(entry, Ty::U32);
+            let inner = fb.make_aggregate(inner, vec![x]);
+            fb.make_aggregate(nested_ty.clone(), vec![inner])
+        });
+        let slot = fb.alloca(nested_ty.clone());
+        if let Some(initial) = initial {
+            fb.store(nested_ty.clone(), slot, initial);
+        }
+        let _loaded = fb.load(nested_ty, slot);
+        fb.ret(vec![]);
+        fb.build();
+        mb.build().expect("ModuleBuilder::build: test fixture")
+    };
+    let original = build(false);
+    assert_eq!(
+        trust_ir::interpret::Interpreter::with_module(&original)
+            .execute_func(trust_ir::FuncId::new(0), [])
+            .unwrap_err()
+            .code,
+        trust_ir::interpret::InterpretErrorCode::UndefinedBehavior
+    );
+    for check_memory_bounds in [false, true] {
+        let output = trust_ir_to_chc_translation_outputs(
+            &original,
+            &TranslateOptions { check_memory_bounds, ..TranslateOptions::default() },
+        )
+        .remove(0);
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason
+                    == TrustIrChcUnsupportedReason::OperandConsumption)
+        );
+    }
+    let module = build(true);
+    trust_ir::interpret::Interpreter::with_module(&module)
+        .execute_func(
+            trust_ir::FuncId::new(0),
+            [trust_ir::interpret::InterpretValue::int(Ty::U32, 7).unwrap()],
+        )
+        .unwrap();
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -4694,7 +5657,10 @@ fn typed_chc_translation_models_cross_block_alloca_access_as_owned_stack() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -4723,7 +5689,10 @@ fn typed_chc_translation_still_fails_closed_for_unknown_pointer_load() {
     fb.ret(vec![]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -4757,7 +5726,10 @@ fn typed_chc_translation_reports_unsupported_float_cast_reason() {
     fb.ret(vec![cast]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
@@ -4844,7 +5816,7 @@ fn add_with_no_overflow_proof_still_generates_vc() {
     drop(fb);
 
     // Build the module manually to attach proofs to the add instruction.
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // Clear functions and rebuild with proof annotation.
     module.functions.clear();
@@ -4877,7 +5849,7 @@ fn add_with_no_overflow_proof_still_generates_vc() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -4914,7 +5886,7 @@ fn wrapping_add_proof_suppresses_overflow_rule() {
     drop(fb);
 
     // Rebuild the function manually so the add carries a `Wrapping` proof.
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
     let func_ty_id = trust_ir::value::FuncTyId::new(0);
     let mut func = trust_ir::Function::new(
@@ -4940,7 +5912,7 @@ fn wrapping_add_proof_suppresses_overflow_rule() {
         values: vec![trust_ir::value::ValueId::new(2)],
     }));
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
     assert_eq!(outputs.len(), 1);
@@ -4984,7 +5956,10 @@ fn main_translate_models_signed_neg_precisely() {
     fb.ret(vec![neg]);
     fb.build();
 
-    let outputs = trust_ir_to_chc_translation_outputs(&mb.build(), &TranslateOptions::default());
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
     assert!(
@@ -5027,7 +6002,7 @@ fn wrapping_neg_proof_suppresses_overflow_rule() {
     fb.add_block_param(entry, Ty::I64);
     drop(fb);
 
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
     let func_ty_id = trust_ir::value::FuncTyId::new(0);
     let mut func = trust_ir::Function::new(
@@ -5051,7 +6026,7 @@ fn wrapping_neg_proof_suppresses_overflow_rule() {
         values: vec![trust_ir::value::ValueId::new(1)],
     }));
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
     assert_eq!(outputs.len(), 1);
@@ -5083,7 +6058,7 @@ fn assert_generates_assertion_vc() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5117,7 +6092,7 @@ fn sdiv_generates_div_by_zero_vc() {
     fb.ret(vec![result]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5140,7 +6115,7 @@ fn sdiv_with_divnonzero_proof_still_generates_vc() {
     let _fb = mb.function("div_i32_proven", ft);
     // Drop the builder and build manually.
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     module.functions.clear();
     let func_ty_id = trust_ir::value::FuncTyId::new(0);
@@ -5170,7 +6145,7 @@ fn sdiv_with_divnonzero_proof_still_generates_vc() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -5203,7 +6178,7 @@ fn load_without_inbounds_generates_bounds_vc() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5235,7 +6210,7 @@ fn load_with_inbounds_proof_still_generates_bounds_vc() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5251,9 +6226,9 @@ fn load_with_inbounds_proof_still_generates_bounds_vc() {
 }
 
 /// Build a module with an assume + assert pattern.
-/// Expected: assume becomes a constraint, assert becomes a violation.
+/// The earlier assumption makes the later assertion unreachable on false input.
 #[test]
-fn assume_becomes_constraint_assert_becomes_violation() {
+fn earlier_assumption_filters_the_later_assertion() {
     let mut mb = ModuleBuilder::new("test_assume_assert");
     let ft = mb.add_func_type(vec![Ty::Bool], vec![]);
 
@@ -5268,20 +6243,18 @@ fn assume_becomes_constraint_assert_becomes_violation() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
     assert_eq!(vcs.len(), 1);
     let vc = &vcs[0];
 
-    // Should have one constraint (from assume).
-    assert_eq!(vc.constraints.len(), 1, "assume should generate one path constraint");
-
     // Should have one assertion violation.
     let assertion_violations: Vec<_> =
         vc.violations.iter().filter(|v| v.kind == PropertyKind::Assertion).collect();
     assert_eq!(assertion_violations.len(), 1, "assert should generate one assertion violation");
+    assert!(!bmc_violation_is_satisfiable(vc, assertion_violations[0]));
 }
 
 /// Unsupported cast semantics must fail closed instead of producing an unchecked result.
@@ -5300,7 +6273,7 @@ fn cast_semantics_fail_closed() {
     fb.ret(vec![cast]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5338,7 +6311,7 @@ fn acyclic_condbr_no_longer_fails_closed_in_bmc() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5384,7 +6357,7 @@ fn loop_back_edge_semantics_fail_closed_in_bmc() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5418,7 +6391,7 @@ fn options_disable_overflow_checks() {
     fb.ret(vec![sum]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions { check_signed_overflow: false, ..TranslateOptions::default() };
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5451,7 +6424,7 @@ fn sub_and_mul_generate_overflow_vcs() {
     fb.ret(vec![_product]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5494,7 +6467,7 @@ fn multiple_functions_produce_multiple_vcs() {
     fb2.ret(vec![neg]);
     fb2.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5527,7 +6500,7 @@ fn alloca_store_load_roundtrip() {
     fb.ret(vec![loaded]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions {
         check_memory_bounds: false, // Disable bounds checks for this test.
         ..TranslateOptions::default()
@@ -5555,7 +6528,7 @@ fn alloca_load_with_inbounds_still_generates_bounds_vc() {
     // Build manually to attach InBounds proof to the load.
     let _fb = mb.function("load_proven", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     module.functions.clear();
     let func_ty_id = trust_ir::value::FuncTyId::new(0);
@@ -5603,7 +6576,7 @@ fn alloca_load_with_inbounds_still_generates_bounds_vc() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -5626,7 +6599,7 @@ fn dynamic_alloca_count_fails_closed() {
 
     let _fb = mb.function("dynamic_alloca", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     let mut func = trust_ir::Function::new(
@@ -5666,7 +6639,7 @@ fn dynamic_alloca_count_fails_closed() {
         values: vec![trust_ir::value::ValueId::new(3)],
     }));
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
 
@@ -5686,6 +6659,18 @@ fn dynamic_alloca_count_fails_closed() {
 #[test]
 fn heap_alloc_and_global_addr_fail_closed_in_bmc() {
     let mut mb = ModuleBuilder::new("test_heap_global_bmc");
+    mb.add_global(trust_ir::Global {
+        name: "defined_global".into(),
+        ty: Ty::I32,
+        mutable: true,
+        initializer: Some(trust_ir::Constant::Int(0)),
+        linkage: trust_ir::Linkage::Internal,
+        tls: None,
+        align: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
+    });
     let ft = mb.add_func_type(vec![], vec![Ty::Ptr]);
 
     let mut fb = mb.function("heap_global_bmc", ft);
@@ -5697,7 +6682,9 @@ fn heap_alloc_and_global_addr_fail_closed_in_bmc() {
     fb.ret(vec![heap]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_module(&module);
+    let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
 
     assert_eq!(vcs.len(), 1);
     let unsupported_messages = vcs[0]
@@ -5743,7 +6730,7 @@ fn load_from_raw_ptr_generates_bounds_vc() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5768,7 +6755,7 @@ fn return_with_bounded_output_generates_postcondition_vc() {
     // Build manually to attach BoundedOutput proof to the function.
     let _fb = mb.function("bounded_func", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     module.functions.clear();
     let func_ty_id = trust_ir::value::FuncTyId::new(0);
@@ -5790,7 +6777,7 @@ fn return_with_bounded_output_generates_postcondition_vc() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -5821,7 +6808,7 @@ fn return_without_postcondition_no_vc() {
     fb.ret(vec![a]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -5855,7 +6842,7 @@ fn call_to_pure_function_uses_symbolic_return() {
     let _fb2 = mb.function("caller", caller_ft);
     drop(_fb2);
 
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     // Callee: pure_add(a, b) = a + b with Pure annotation.
@@ -5883,7 +6870,7 @@ fn call_to_pure_function_uses_symbolic_return() {
         values: vec![trust_ir::value::ValueId::new(2)],
     }));
     callee_func.blocks.push(callee_block);
-    module.add_function(callee_func);
+    module.try_add_function(callee_func).expect("Module::try_add_function: test fixture");
 
     // Caller: calls pure_add(x, y), asserts result > 0.
     let mut caller_func = trust_ir::Function::new(
@@ -5927,13 +6914,15 @@ fn call_to_pure_function_uses_symbolic_return() {
     // Assert result != 0.
     caller_block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Assert {
         cond: trust_ir::value::ValueId::new(14),
+        kind: trust_ir::inst::AssertKind::Unspecified,
+        site: None,
     }));
 
     caller_block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Return {
         values: vec![trust_ir::value::ValueId::new(12)],
     }));
     caller_func.blocks.push(caller_block);
-    module.add_function(caller_func);
+    module.try_add_function(caller_func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -5978,7 +6967,7 @@ fn call_to_function_with_unchecked_postcondition_does_not_assume_it() {
     let _fb2 = mb.function("caller", caller_ft);
     drop(_fb2);
 
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     // Callee: has BoundedOutput [0, 100] but is NOT pure.
@@ -5996,7 +6985,7 @@ fn call_to_function_with_unchecked_postcondition_does_not_assume_it() {
         values: vec![trust_ir::value::ValueId::new(0)],
     }));
     callee_func.blocks.push(callee_block);
-    module.add_function(callee_func);
+    module.try_add_function(callee_func).expect("Module::try_add_function: test fixture");
 
     // Caller: calls bounded_callee.
     let mut caller_func = trust_ir::Function::new(
@@ -6021,7 +7010,7 @@ fn call_to_function_with_unchecked_postcondition_does_not_assume_it() {
         values: vec![trust_ir::value::ValueId::new(11)],
     }));
     caller_func.blocks.push(caller_block);
-    module.add_function(caller_func);
+    module.try_add_function(caller_func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -6039,14 +7028,14 @@ fn call_to_function_with_unchecked_postcondition_does_not_assume_it() {
 
 /// Call to an unknown function (not in module) creates symbolic return.
 #[test]
-fn call_to_unknown_function_creates_symbolic() {
+fn call_to_unknown_function_refuses_module_without_symbolic_facts() {
     let mut mb = ModuleBuilder::new("test_unknown_call");
     let ft = mb.add_func_type(vec![Ty::I32], vec![Ty::I32]);
 
     // Build manually — reference a callee that doesn't exist.
     let _fb = mb.function("caller", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     let mut func = trust_ir::Function::new(
@@ -6073,23 +7062,9 @@ fn call_to_unknown_function_creates_symbolic() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
-    let options = TranslateOptions::default();
-    let vcs = trust_ir_to_bmc_vc(&module, &options);
-
-    assert_eq!(vcs.len(), 1);
-    let vc = &vcs[0];
-
-    // Should have declarations for the symbolic call result.
-    assert!(vc.decls.len() >= 2, "should have decls for param and symbolic call result");
-
-    let unsupported_violations: Vec<_> =
-        vc.violations.iter().filter(|v| v.kind == PropertyKind::Other).collect();
-    assert!(
-        !unsupported_violations.is_empty(),
-        "unknown direct call should emit an unsupported-semantics violation"
-    );
+    assert_canonical_refusal(&module, "callee function 99 not found");
 }
 
 // ============================================================================
@@ -6112,7 +7087,7 @@ fn atomic_load_generates_bounds_vc() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -6145,7 +7120,7 @@ fn atomic_store_generates_bounds_vc() {
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -6169,7 +7144,7 @@ fn cmpxchg_generates_two_results() {
 
     let _fb = mb.function("cmpxchg_fn", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     let mut func = trust_ir::Function::new(
@@ -6192,6 +7167,7 @@ fn cmpxchg_generates_two_results() {
         desired: trust_ir::value::ValueId::new(2),
         success: trust_ir::Ordering::SeqCst,
         failure: trust_ir::Ordering::SeqCst,
+        weak: false,
     })
     .with_result(trust_ir::value::ValueId::new(3)) // value
     .with_result(trust_ir::value::ValueId::new(4)); // success flag
@@ -6200,12 +7176,14 @@ fn cmpxchg_generates_two_results() {
     // Assert the success flag.
     block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Assert {
         cond: trust_ir::value::ValueId::new(4),
+        kind: trust_ir::inst::AssertKind::Unspecified,
+        site: None,
     }));
 
     block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Return { values: vec![] }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() };
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -6217,6 +7195,320 @@ fn cmpxchg_generates_two_results() {
     let assertion_violations: Vec<_> =
         vc.violations.iter().filter(|v| v.kind == PropertyKind::Assertion).collect();
     assert!(!assertion_violations.is_empty(), "cmpxchg success flag assertion should produce a VC");
+}
+
+/// `entry(x, y)`: store `x` into a fresh cell, compare-exchange the cell from
+/// `x` to `y`, and assert that the exchange succeeded. The cell provably holds
+/// the expected value, so only the instruction's strength decides the assertion.
+/// `weak` sets the trust-ir v48 flag on the one `CmpXchg` node.
+fn cmpxchg_on_a_cell_holding_expected(weak: bool) -> trust_ir::Module {
+    let mut mb = ModuleBuilder::new("test_cmpxchg_strength");
+    let ft = mb.add_func_type(vec![Ty::I32, Ty::I32], vec![]);
+    let mut fb = mb.function("cmpxchg_strength", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let x = fb.add_block_param(entry, Ty::I32);
+    let y = fb.add_block_param(entry, Ty::I32);
+    let cell = fb.alloca(Ty::I32);
+    fb.store(Ty::I32, cell, x);
+    let (_old, exchanged) =
+        fb.cmpxchg(Ty::I32, cell, x, y, trust_ir::Ordering::SeqCst, trust_ir::Ordering::SeqCst);
+    fb.assert(exchanged);
+    fb.ret(vec![]);
+    fb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+
+    let mut flagged = 0;
+    for node in module
+        .functions
+        .iter_mut()
+        .flat_map(|function| function.blocks.iter_mut())
+        .flat_map(|block| block.body.iter_mut())
+    {
+        if let trust_ir::Inst::CmpXchg { weak: flag, .. } = &mut node.inst {
+            *flag = weak;
+            flagged += 1;
+        }
+    }
+    assert_eq!(flagged, 1, "the fixture must carry exactly one CmpXchg");
+    module
+}
+
+/// The single `Assertion` violation of the one translated function.
+fn only_assertion_violation(
+    vc: &trust_mc_core::bmc::BmcVc,
+) -> &trust_mc_core::violation::Violation {
+    let assertions: Vec<_> =
+        vc.violations.iter().filter(|v| v.kind == PropertyKind::Assertion).collect();
+    assert_eq!(assertions.len(), 1, "expected exactly one assertion violation, got {assertions:?}");
+    assertions[0]
+}
+
+/// trust-ir v47 `Drop { ty, ptr }` runs drop glue whose body is not in the node.
+/// Both lanes must refuse it BY NAME: treating it as a no-op would forget every
+/// write and every panic the destructor can perform.
+#[test]
+fn test_drop_glue_fails_closed_by_name_in_both_lanes() {
+    let mut mb = ModuleBuilder::new("test_drop_glue");
+    let dropped = add_dropped_struct(&mut mb);
+    let ft = mb.add_func_type(vec![Ty::Ptr], vec![]);
+    let mut fb = mb.function("drop_glue", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let place = fb.add_block_param(entry, Ty::Ptr);
+    fb.ret(vec![]);
+    fb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let body = &mut module.functions[0].blocks[0].body;
+    let ret = body.pop().expect("the fixture ends in its return");
+    body.push(trust_ir::InstrNode::new(trust_ir::Inst::Drop { ty: dropped, ptr: place }));
+    body.push(ret);
+
+    assert_canonical_module(&module);
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    let drop_rows: Vec<_> = outputs[0]
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.reason == TrustIrChcUnsupportedReason::DropGlue)
+        .collect();
+    assert_eq!(drop_rows.len(), 1, "CHC must name the drop, got {:?}", outputs[0].diagnostics);
+    assert_eq!(drop_rows[0].family, SemanticsFamily::Calls);
+    assert!(
+        outputs[0].vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "CHC must fail closed on drop glue with a reachable error rule"
+    );
+
+    let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
+    assert_eq!(vcs.len(), 1);
+    assert!(
+        vcs[0].violations.iter().any(|violation| {
+            violation.kind == PropertyKind::Other
+                && violation
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("drop-glue semantics"))
+        }),
+        "BMC must fail closed on drop glue by name, got {:?}",
+        vcs[0].violations
+    );
+}
+
+/// The trust-ir instructions added between wire v53 and v56 that neither lane
+/// models: the no-unwind boundary calls (v53) and the unwinding twins of
+/// `Assert` (v54 `AssertInvoke`), `Drop` (v55 `DropInvoke`) and `CallIndirect`
+/// (v56 `InvokeIndirect`).
+#[derive(Clone, Copy, Debug)]
+enum UnmodeledUnwindSurface {
+    CallCannotUnwind,
+    CallIndirectCannotUnwind,
+    AssertInvoke,
+    DropInvoke,
+    InvokeIndirect,
+}
+
+/// `unwind_surface(p: Ptr, c: Bool)` whose entry block holds `surface`: a
+/// non-terminating call before the entry's `ret`, or a terminator whose normal
+/// edge returns and whose unwind edge enters a cleanup landing pad that resumes.
+fn unmodeled_unwind_surface_module(surface: UnmodeledUnwindSurface) -> trust_ir::Module {
+    use trust_ir::{AssertKind, CallingConv, Inst, InstrNode, PanicLocation, PanicSite};
+
+    let mut mb = ModuleBuilder::new("test_unmodeled_unwind_surface");
+    let dropped = add_dropped_struct(&mut mb);
+    let ft = mb.add_func_type(vec![Ty::Ptr, Ty::Bool], vec![]);
+    let callee = mb.declare_function("callee", ft);
+    let panic_ft = mb.add_func_type(vec![Ty::Ptr], vec![]);
+    let panic_entry = mb.declare_function("panic_entry", panic_ft);
+    let mut fb = mb.function("unwind_surface", ft);
+    let entry = fb.create_block();
+    let normal = fb.create_block();
+    let pad = fb.create_block();
+    fb.set_entry(entry);
+    fb.switch_to_block(entry);
+    let ptr = fb.add_block_param(entry, Ty::Ptr);
+    let cond = fb.add_block_param(entry, Ty::Bool);
+    let site = PanicSite { entry: panic_entry, location: PanicLocation::Value(ptr) };
+    let call = match surface {
+        UnmodeledUnwindSurface::CallCannotUnwind => {
+            Some(Inst::CallCannotUnwind { callee, args: vec![ptr, cond] })
+        }
+        UnmodeledUnwindSurface::CallIndirectCannotUnwind => Some(Inst::CallIndirectCannotUnwind {
+            callee: ptr,
+            sig: ft,
+            args: vec![ptr, cond],
+            calling_conv: CallingConv::default(),
+        }),
+        UnmodeledUnwindSurface::AssertInvoke => {
+            fb.assert_invoke(cond, AssertKind::Unspecified, site, normal, vec![], pad);
+            None
+        }
+        UnmodeledUnwindSurface::DropInvoke => {
+            fb.drop_invoke(dropped, ptr, normal, vec![], pad);
+            None
+        }
+        UnmodeledUnwindSurface::InvokeIndirect => {
+            fb.invoke_indirect_void(ptr, ft, vec![ptr, cond], normal, vec![], pad);
+            None
+        }
+    };
+    if call.is_some() {
+        fb.ret(vec![]);
+    }
+    if call.is_none() {
+        fb.switch_to_block(normal);
+        fb.ret(vec![]);
+        fb.switch_to_block(pad);
+        let (exn, _selector) = fb.landingpad(true, vec![]);
+        fb.resume(exn);
+    }
+    fb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+    module.target_info = Some(fixture_target());
+    if call.is_some() {
+        module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "unwind_surface")
+            .unwrap()
+            .blocks
+            .retain(|block| block.id == entry);
+    }
+    if let Some(call) = call {
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "unwind_surface")
+            .expect("the fixture defines unwind_surface");
+        let body = &mut function.blocks[0].body;
+        let ret = body.pop().expect("the call fixture's entry ends in its return");
+        body.push(InstrNode::new(call));
+        body.push(ret);
+    }
+    assert_canonical_module(&module);
+    module
+}
+
+/// Every surface must refuse in both lanes. CHC names the instruction;
+/// BMC rejects EH terminators at its earlier unsupported-CFG boundary and
+/// names the two ordinary calls. Neither boundary can decide obligations
+/// through unmodeled dispatch, glue or unwind edges.
+#[test]
+fn test_unwind_surfaces_fail_closed_at_each_lane_boundary() {
+    let cases = [
+        (
+            UnmodeledUnwindSurface::CallCannotUnwind,
+            TrustIrChcUnsupportedReason::NoUnwindCallBoundary,
+            SemanticsFamily::Calls,
+            "direct call with a no-unwind boundary",
+        ),
+        (
+            UnmodeledUnwindSurface::CallIndirectCannotUnwind,
+            TrustIrChcUnsupportedReason::NoUnwindCallBoundary,
+            SemanticsFamily::Calls,
+            "indirect call dispatch with a no-unwind boundary",
+        ),
+        (
+            UnmodeledUnwindSurface::AssertInvoke,
+            TrustIrChcUnsupportedReason::UnwindingCheck,
+            SemanticsFamily::ControlFlow,
+            "path-sensitive control flow (cyclic or structurally unsupported CFG)",
+        ),
+        (
+            UnmodeledUnwindSurface::DropInvoke,
+            TrustIrChcUnsupportedReason::DropGlue,
+            SemanticsFamily::Calls,
+            "path-sensitive control flow (cyclic or structurally unsupported CFG)",
+        ),
+        (
+            UnmodeledUnwindSurface::InvokeIndirect,
+            TrustIrChcUnsupportedReason::IndirectCall,
+            SemanticsFamily::Calls,
+            "path-sensitive control flow (cyclic or structurally unsupported CFG)",
+        ),
+    ];
+    for (surface, reason, family, bmc_name) in cases {
+        let module = unmodeled_unwind_surface_module(surface);
+        let index = module
+            .functions
+            .iter()
+            .position(|function| function.name == "unwind_surface")
+            .expect("the fixture defines unwind_surface");
+        let function = &module.functions[index];
+
+        let output = trust_ir_function_to_chc_translation_output(
+            &module,
+            function.id,
+            &TranslateOptions::default(),
+        )
+        .expect("CHC translates unwind_surface");
+        let rows: Vec<_> =
+            output.diagnostics.iter().filter(|diagnostic| diagnostic.reason == reason).collect();
+        assert_eq!(rows.len(), 1, "{surface:?}: CHC must name it, got {:?}", output.diagnostics);
+        assert_eq!(rows[0].family, family, "{surface:?}");
+        assert_eq!(rows[0].block, function.entry, "{surface:?}");
+        assert!(
+            output.vc.rules.iter().any(|rule| rule.head.name == "error"),
+            "{surface:?}: CHC must fail closed with a reachable error rule"
+        );
+
+        // One VC per module function, in module order.
+        let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
+        let vc = &vcs[index];
+        assert!(
+            vc.violations.iter().any(|violation| {
+                violation.kind == PropertyKind::Other
+                    && violation
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| message.contains(bmc_name))
+            }),
+            "{surface:?}: BMC must name its actual refusal boundary, got {:?}",
+            vc.violations
+        );
+    }
+}
+
+/// `Constant::Uninit` (trust-ir v49) is an unwritten lane, never a value: as a
+/// whole constant it has no bits, so `const_to_expr` must refuse it rather than
+/// invent a placeholder.
+#[test]
+fn test_const_to_expr_refuses_a_whole_uninit_constant() {
+    use trust_ir::constant::Constant;
+    assert!(const_to_expr(&Ty::I32, &Constant::Uninit).is_none());
+    // CONTROL: the aggregate that legitimately carries an unwritten lane keeps
+    // the opaque placeholder every aggregate constant gets.
+    let with_lane = Constant::Aggregate(vec![Constant::Int(0), Constant::Uninit]);
+    assert!(const_to_expr(&Ty::Tuple(vec![Ty::I32, Ty::I32]), &with_lane).is_some());
+}
+
+/// CONTROL: a STRONG compare-exchange on a cell that holds the expected value
+/// always succeeds, so the assertion on its success flag is unreachable.
+#[test]
+fn test_cmpxchg_strong_on_cell_holding_expected_always_succeeds() {
+    let options = TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() };
+    let vcs = trust_ir_to_bmc_vc(&cmpxchg_on_a_cell_holding_expected(false), &options);
+    assert_eq!(vcs.len(), 1);
+    assert!(
+        !bmc_violation_is_satisfiable(&vcs[0], only_assertion_violation(&vcs[0])),
+        "a strong compare-exchange of a cell holding `expected` must succeed"
+    );
+}
+
+/// A WEAK compare-exchange (trust-ir v48) may fail spuriously even when the
+/// comparison holds, so the same assertion is refutable. Modeling the weak
+/// instruction as the strong one would PROVE this assertion, which is false for
+/// `compare_exchange_weak`.
+#[test]
+fn test_cmpxchg_weak_on_cell_holding_expected_may_fail_spuriously() {
+    let options = TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() };
+    let vcs = trust_ir_to_bmc_vc(&cmpxchg_on_a_cell_holding_expected(true), &options);
+    assert_eq!(vcs.len(), 1);
+    assert!(
+        bmc_violation_is_satisfiable(&vcs[0], only_assertion_violation(&vcs[0])),
+        "a weak compare-exchange may fail spuriously; asserting its success must be refutable"
+    );
 }
 
 // ============================================================================
@@ -6247,7 +7539,7 @@ fn gep_with_alloca_produces_declarations() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() };
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -6280,7 +7572,7 @@ fn gep_bounds_check_on_single_alloca() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let options = TranslateOptions::default(); // Bounds checking enabled.
     let vcs = trust_ir_to_bmc_vc(&module, &options);
 
@@ -6317,7 +7609,7 @@ fn gep_bounds_obligation_is_bvuge() {
     fb.ret(vec![val]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
     let bounds: Vec<_> =
         vcs[0].violations.iter().filter(|v| v.kind == PropertyKind::OutOfBounds).collect();
@@ -6341,7 +7633,7 @@ fn full_integration_alloca_store_gep_load_assert_postcond() {
 
     let _fb = mb.function("integration", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     let mut func = trust_ir::Function::new(
@@ -6387,7 +7679,7 @@ fn full_integration_alloca_store_gep_load_assert_postcond() {
     }));
 
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
 
     let options = TranslateOptions::default();
     let vcs = trust_ir_to_bmc_vc(&module, &options);
@@ -6492,7 +7784,7 @@ fn diamond_udiv_module(pin_else: bool) -> trust_ir::Module {
     fb.ret(vec![p]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// (a) A violation inside one leg of a diamond is reported under its exact
@@ -6577,7 +7869,7 @@ fn join_param_module(pin_else: bool) -> trust_ir::Module {
     fb.ret(vec![]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// (c) Values passed through block params across a join compute correctly:
@@ -6682,7 +7974,7 @@ fn switch_module(exclude_default: bool) -> trust_ir::Module {
     fb.ret(vec![]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// (b) A switch with three cases plus default lowers exactly: a property
@@ -6755,7 +8047,7 @@ fn guarded_unreachable_module(pin_then: bool) -> trust_ir::Module {
     fb.unreachable();
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Unreachable-instruction violations are scoped to their block guard: the
@@ -6909,7 +8201,10 @@ fn float_constant_bits_reach_the_bmc_encoding_exactly() {
     fb.ret(vec![ret]);
     fb.build();
 
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(vcs.len(), 1);
     let expected_bits = 1.5f64.to_bits().to_string();
     let pinned = vcs[0].constraints.iter().any(|constraint| {
@@ -6971,7 +8266,10 @@ fn fcmp_eq_of_nan_cannot_be_falsely_proved() {
     fb.assert(cmp);
     fb.ret(vec![]);
     fb.build();
-    let vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
+    let vcs = trust_ir_to_bmc_vc(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
     assert_eq!(vcs.len(), 1);
     assert_float_comparison_fails_closed(&vcs[0], "floating-point comparison");
 }
@@ -6983,8 +8281,8 @@ fn fcmp_eq_of_nan_cannot_be_falsely_proved() {
 /// float gate.
 #[test]
 fn icmp_on_float_type_fails_closed_never_bit_decided() {
-    let vc = translate_single_float_cmp_fn(|fb, lhs, rhs| fb.icmp(ICmpOp::Eq, Ty::F64, lhs, rhs));
-    assert_float_comparison_fails_closed(&vc, "floating-point comparison via ICmp");
+    let module = single_float_cmp_module(|fb, lhs, rhs| fb.icmp(ICmpOp::Eq, Ty::F64, lhs, rhs));
+    assert_canonical_refusal(&module, "icmp requires integer or pointer type, got f64");
 }
 
 /// Translate `assert(cmp(-0.0, +0.0))` for a caller-chosen comparison
@@ -6996,6 +8294,20 @@ fn translate_single_float_cmp_fn(
         trust_ir::value::ValueId,
     ) -> trust_ir::value::ValueId,
 ) -> trust_mc_core::bmc::BmcVc {
+    let module = single_float_cmp_module(build_cmp);
+    assert_canonical_module(&module);
+    let mut vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
+    assert_eq!(vcs.len(), 1);
+    vcs.pop().expect("one VC")
+}
+
+fn single_float_cmp_module(
+    build_cmp: impl FnOnce(
+        &mut trust_ir_build::FunctionBuilder,
+        trust_ir::value::ValueId,
+        trust_ir::value::ValueId,
+    ) -> trust_ir::value::ValueId,
+) -> trust_ir::Module {
     let mut mb = ModuleBuilder::new("test_float_cmp");
     let ft = mb.add_func_type(vec![], vec![]);
     let mut fb = mb.function("float_cmp", ft);
@@ -7008,9 +8320,7 @@ fn translate_single_float_cmp_fn(
     fb.assert(cmp);
     fb.ret(vec![]);
     fb.build();
-    let mut vcs = trust_ir_to_bmc_vc(&mb.build(), &TranslateOptions::default());
-    assert_eq!(vcs.len(), 1);
-    vcs.pop().expect("one VC")
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// The fail-closed contract for a float comparison feeding an assertion:
@@ -7182,7 +8492,7 @@ fn f16_constant_fails_closed_in_both_lanes() {
     let c = fb.fconst(Ty::F16, 1.0);
     fb.ret(vec![c]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let vcs = trust_ir_to_bmc_vc(&module, &TranslateOptions::default());
     assert_eq!(vcs.len(), 1);
@@ -7217,7 +8527,7 @@ fn bounded_output_module(ret_ty: Ty, lo: f64, hi: f64) -> trust_ir::Module {
     let ft = mb.add_func_type(vec![ret_ty.clone()], vec![ret_ty.clone()]);
     let _fb = mb.function("bounded_fn", ft);
     drop(_fb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.functions.clear();
 
     let mut func = trust_ir::Function::new(
@@ -7234,173 +8544,22 @@ fn bounded_output_module(ret_ty: Ty, lo: f64, hi: f64) -> trust_ir::Module {
         values: vec![trust_ir::value::ValueId::new(0)],
     }));
     func.blocks.push(block);
-    module.add_function(func);
+    module.try_add_function(func).expect("Module::try_add_function: test fixture");
     module
 }
 
-/// Count `error`-headed rules in a CHC VC. Every unsupported construct and every
-/// real violation feeds the same nullary `error` relation, which is exactly why
-/// whole-function translation lets one unmodeled construct sink the function.
-fn count_error_rules(vc: &trust_mc_core::chc::ChcVc) -> usize {
-    vc.rules.iter().filter(|rule| rule.head.name == "error").count()
-}
-
-/// Diamond CFG with an unsupported construct on ONE arm:
-///
-///        entry
-///        /   \
-///   A(bad)    B          A holds a relocatable SymbolAddr const (unsupported)
-///        \   /
-///        Join
-///
-/// Returns (module, func, target_the_site_CANNOT_precede, target_it_CAN).
-/// `B` is the first: reachable from entry, but NOT from A. `Join` is the second.
-fn narrowing_fixture_module()
--> (trust_ir::Module, trust_ir::value::FuncId, trust_ir::value::BlockId, trust_ir::value::BlockId) {
-    use trust_ir::value::{BlockId, FuncId, ValueId};
-    let mut module = trust_ir::Module::new("test_chc_narrowing");
-    let ft = module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
-    let (entry, a, b, join) = (BlockId::new(0), BlockId::new(1), BlockId::new(2), BlockId::new(3));
-    let cond = ValueId::new(0);
-    let bad = ValueId::new(1);
-    let mut func = trust_ir::Function::new(FuncId::new(0), "narrowing_fixture", ft, entry);
-
-    let mut e = trust_ir::Block::new(entry);
-    e.body.push(
-        trust_ir::node::InstrNode::new(trust_ir::Inst::Const {
-            ty: Ty::Bool,
-            value: trust_ir::constant::Constant::Int(1),
-        })
-        .with_result(cond),
-    );
-    e.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::CondBr {
-        cond,
-        then_target: a,
-        then_args: vec![],
-        else_target: b,
-        else_args: vec![],
-    }));
-    func.blocks.push(e);
-
-    // A: the unsupported construct, then join.
-    let mut ba = trust_ir::Block::new(a);
-    ba.body.push(
-        trust_ir::node::InstrNode::new(trust_ir::Inst::Const {
-            ty: Ty::Ptr,
-            value: trust_ir::constant::Constant::SymbolAddr {
-                symbol: "static_i32".to_string(),
-                addend: 0,
-            },
-        })
-        .with_result(bad),
-    );
-    ba.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Br { target: join, args: vec![] }));
-    func.blocks.push(ba);
-
-    // B: clean sibling arm. NOT reachable from A.
-    let mut bb = trust_ir::Block::new(b);
-    bb.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Br { target: join, args: vec![] }));
-    func.blocks.push(bb);
-
-    let mut bj = trust_ir::Block::new(join);
-    bj.body.push(trust_ir::node::InstrNode::new(trust_ir::Inst::Return { values: vec![] }));
-    func.blocks.push(bj);
-
-    let id = func.id;
-    module.functions.push(func);
-    (module, id, b, join)
-}
-
 // ---------------------------------------------------------------------------
-// PER-OBLIGATION CHC NARROWING
+// `InsertElement` (array element WRITE) modeling, read back with `ExtractElement`.
 //
-// Whole-function mode routes every unsupported construct's error rule into the
-// single nullary `error` relation, so ONE unmodeled construct anywhere sinks
-// EVERY trust-mc obligation of that function. `narrow_to_target_block` scopes
-// that: a construct provably off every entry ->* site ->* target path cannot
-// influence the states reaching `target`, so its rule is dropped for THAT
-// obligation only.
-//
-// The pair is the point. `narrowing_keeps_rule_when_site_precedes_target` is the
-// FAIL-CLOSED guard: if it ever stops seeing the error rule, the narrowing has
-// begun dropping rules that CAN affect the obligation, which is a false PROVE.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn narrowing_drops_rule_for_unreachable_site() {
-    let (module, func, target_after, _site_only) = narrowing_fixture_module();
-    let mut opts = TranslateOptions::default();
-
-    // Whole-function: the rule is present, so the obligation is sunk.
-    let wide =
-        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
-    let wide_errors = count_error_rules(&wide.vc);
-
-    // Narrowed to a target the unsupported site CANNOT precede.
-    opts.narrow_to_target_block = Some(target_after);
-    let narrow =
-        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
-    let narrow_errors = count_error_rules(&narrow.vc);
-
-    assert!(
-        narrow_errors < wide_errors,
-        "narrowing must drop at least one error rule for a site off every \
-         entry->target path (wide={wide_errors}, narrow={narrow_errors})"
-    );
-}
-
-#[test]
-fn narrowing_keeps_rule_when_site_precedes_target() {
-    // FAIL-CLOSED GUARD. A site that CAN lie on an entry->target path must keep
-    // its rule. If this ever passes with a dropped rule, the narrowing is
-    // masking a construct that can affect the obligation -> false PROVE.
-    let (module, func, _target_after, site_reachable_target) = narrowing_fixture_module();
-    let mut opts = TranslateOptions::default();
-    let wide =
-        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
-    opts.narrow_to_target_block = Some(site_reachable_target);
-    let narrow =
-        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
-    assert_eq!(
-        count_error_rules(&narrow.vc),
-        count_error_rules(&wide.vc),
-        "a site that can precede the target MUST keep its error rule"
-    );
-}
-
-#[test]
-fn narrowing_invalid_target_keeps_unsupported_rule() {
-    let (module, func, _, _) = narrowing_fixture_module();
-    let wide =
-        trust_ir_function_to_chc_translation_output(&module, func, &TranslateOptions::default())
-            .expect("translates");
-
-    let opts = TranslateOptions {
-        narrow_to_target_block: Some(trust_ir::value::BlockId::new(99)),
-        ..TranslateOptions::default()
-    };
-    let narrow =
-        trust_ir_function_to_chc_translation_output(&module, func, &opts).expect("translates");
-
-    assert_eq!(
-        count_error_rules(&narrow.vc),
-        count_error_rules(&wide.vc),
-        "a missing target is Unknown, not proof that the unsupported site is irrelevant"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// `InsertElement` (array/vector element WRITE) modeling.
-//
-// Until this arm existed EVERY `InsertElement` fell into the fail-closed bucket
-// and emitted an UNCONDITIONALLY REACHABLE error rule
-// (`TrustIrChcUnsupportedReason::AggregateUpdate`), which makes every obligation
-// in the enclosing function unprovable by construction — while the READ side
-// (`ExtractElement`) had long been modeled without failing closed. The shape this
-// blocks in practice is the `[core::fmt::rt::Argument; N]` array that every
-// `format!`/`write!` builds: one `InsertElement` at a CONSTANT index per format
-// argument (see `tests/format_args_insert_element_modeling.rs`, which runs on a
-// verbatim `-Ztrust-dump=native-bundle` artifact).
+// Arrays are SMT arrays (`translate_chc::ArrayValue`): a write is `store` and a
+// read is `select`, exact at a constant and at a symbolic index, each access with
+// its own in-bounds obligation. The shape that motivated the write arm is the
+// `[core::fmt::rt::Argument; N]` array that every `format!`/`write!` builds: one
+// `InsertElement` at a CONSTANT index per format argument (see
+// `tests/format_args_insert_element_modeling.rs`, which runs on a verbatim
+// `-Ztrust-dump=native-bundle` artifact). These fixtures read the lane back with
+// `ExtractElement` — the only valid read of an array lane (TrustIR refuses
+// `ExtractField` on an array).
 // ---------------------------------------------------------------------------
 
 /// How many `error`-head rules are UNCONDITIONALLY reachable — every constraint
@@ -7427,14 +8586,198 @@ fn aggregate_update_diagnostics(output: &ChcTranslationOutput) -> usize {
         .count()
 }
 
+/// Keep the original hand-built source as a negative, rather than treating
+/// aggregate Undef or an inspected unwritten scalar as initialized havoc.
+fn assert_legacy_source_ub_is_refused(
+    module: &trust_ir::Module,
+    function: trust_ir::value::FuncId,
+    args: Vec<trust_ir::interpret::InterpretValue>,
+) {
+    // The two constant-index UB fixtures intentionally exercise unchecked IR:
+    // retain their exact static bounds refusals, with no other invalid shape.
+    let validation = trust_ir_build::validate_module(module);
+    assert!(
+        validation.iter().all(|error| matches!(
+            error,
+            trust_ir_build::ValidationError::InvalidVectorElementOp { op, reason, .. }
+                if op == "insert_element" && matches!(reason.as_str(),
+                    "constant lane index 4 is out of range for 4 lanes"
+                    | "constant lane index -1 is out of range for 256 lanes")
+        )),
+        "{validation:?}"
+    );
+    if !validation.is_empty() {
+        assert_canonical_refusal(module, "invalid insert_element");
+    }
+    let error = trust_ir::interpret::Interpreter::with_module(module)
+        .execute_func(function, args)
+        .unwrap_err();
+    assert_eq!(error.code, trust_ir::interpret::InterpretErrorCode::UndefinedBehavior, "{error:?}");
+    for check_memory_bounds in [false, true] {
+        let output = trust_ir_function_to_chc_translation_output(
+            module,
+            function,
+            &TranslateOptions { check_memory_bounds, ..TranslateOptions::default() },
+        )
+        .expect("the original fixture retains an observable refusal");
+        if !validation.is_empty() {
+            assert_chc_canonical_refusal(&output, "invalid insert_element");
+        } else {
+            assert!(
+                output.diagnostics.iter().any(|diagnostic| matches!(
+                    diagnostic.reason,
+                    TrustIrChcUnsupportedReason::OperandConsumption
+                        | TrustIrChcUnsupportedReason::UnsupportedDirectCallSummary
+                )),
+                "{check_memory_bounds}: {:?}",
+                output.diagnostics
+            );
+        }
+        // Guards (including Boolean parameter domains) need not constant-fold.
+        // The maintained solver helper requires actual SAT/UNSAT answers;
+        // `None` means both the condition and its negation are SAT, not unknown.
+        assert!(error_rule_solver_verdicts(&output.vc).iter().any(|result| *result != Some(false)));
+    }
+}
+
+fn legacy_unwritten_pair(ty: Ty) -> trust_ir::interpret::InterpretValue {
+    use trust_ir::interpret::{InterpretValue, InterpretValueKind};
+    InterpretValue {
+        ty,
+        kind: InterpretValueKind::Aggregate(vec![
+            InterpretValue { ty: Ty::U32, kind: InterpretValueKind::Uninit },
+            InterpretValue { ty: Ty::Bool, kind: InterpretValueKind::Uninit },
+        ]),
+    }
+}
+
+/// A NEW positive with scalar entry inputs and explicit complete Pair values.
+/// Preserve the selected function's original body, aggregate types, scalar
+/// parameters, calls and assertions. The returned IDs identify the actual
+/// independent inputs, so field-custody assertions do not accept fresh havoc.
+fn initialized_pair_entry_twin(
+    original: &trust_ir::Module,
+    function: trust_ir::value::FuncId,
+) -> (trust_ir::Module, Vec<[trust_ir::value::ValueId; 2]>) {
+    let mut twin = original.clone();
+    twin.name.push_str("_initialized_unknown_twin");
+    let index = twin.functions.iter().position(|candidate| candidate.id == function).unwrap();
+    let function = &mut twin.functions[index];
+    function.name.push_str("_initialized_unknown_twin");
+    let mut fresh = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .params
+                .iter()
+                .map(|(value, _)| *value)
+                .chain(block.body.iter().flat_map(|node| node.results.iter().copied()))
+        })
+        .map(|value| value.index())
+        .max()
+        .unwrap()
+        + 1;
+    let entry = function.blocks.iter_mut().find(|block| block.id == function.entry).unwrap();
+    let mut parameters = Vec::new();
+    let mut constructors = Vec::new();
+    let mut fields = Vec::new();
+    for (value, ty) in &entry.params {
+        if let Ty::Struct(id) = ty {
+            let definition = twin.structs.iter().find(|definition| definition.id == *id).unwrap();
+            assert_eq!(
+                definition.fields.iter().map(|field| field.ty.clone()).collect::<Vec<_>>(),
+                vec![Ty::U32, Ty::Bool]
+            );
+            let pair_fields =
+                [trust_ir::value::ValueId::new(fresh), trust_ir::value::ValueId::new(fresh + 1)];
+            fresh += 2;
+            parameters.push((pair_fields[0], Ty::U32));
+            parameters.push((pair_fields[1], Ty::Bool));
+            constructors.push(
+                trust_ir::InstrNode::new(trust_ir::Inst::MakeAggregate {
+                    ty: ty.clone(),
+                    variant: None,
+                    fields: pair_fields.to_vec(),
+                })
+                .with_result(*value),
+            );
+            fields.push(pair_fields);
+        } else {
+            parameters.push((*value, ty.clone()));
+        }
+    }
+    assert!(!fields.is_empty());
+    entry.params = parameters;
+    entry.body.splice(0..0, constructors);
+    let mut signature = twin.func_types[function.ty.as_usize()].clone();
+    signature.params = entry.params.iter().map(|(_, ty)| ty.clone()).collect();
+    function.ty = trust_ir::value::FuncTyId::new(u32::try_from(twin.func_types.len()).unwrap());
+    twin.func_types.push(signature);
+    assert!(trust_ir_build::validate_module(&twin).is_empty());
+    (twin, fields)
+}
+
+/// A NEW, hand-built positive twin: replace the sole array Undef with a splat
+/// of an initialized, unconstrained scalar input. Keep the array type and every
+/// subsequent write, read and assertion. No particular initial lane value
+/// supplies the expected result, including after the invalid-index write.
+/// This is not a compiler capture or a reinterpretation of the original Undef.
+fn initialized_array_undef_twin(original: &trust_ir::Module) -> trust_ir::Module {
+    assert_eq!(original.functions.len(), 1);
+    let function = &original.functions[0];
+    let args = original
+        .func_type(function.ty)
+        .unwrap()
+        .params
+        .iter()
+        .map(|ty| trust_ir::interpret::InterpretValue::int(ty.clone(), 0).unwrap())
+        .collect();
+    assert_legacy_source_ub_is_refused(original, function.id, args);
+
+    let mut twin = original.clone();
+    twin.name.push_str("_initialized_unknown_twin");
+    let function = &mut twin.functions[0];
+    function.name.push_str("_initialized_unknown_twin");
+    let fresh = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .params
+                .iter()
+                .map(|(value, _)| *value)
+                .chain(block.body.iter().flat_map(|node| node.results.iter().copied()))
+        })
+        .map(|value| value.index())
+        .max()
+        .unwrap()
+        + 1;
+    let input = trust_ir::value::ValueId::new(fresh);
+    let entry = function.blocks.iter_mut().find(|block| block.id == function.entry).unwrap();
+    entry.params.push((input, Ty::U32));
+    let mut replaced = 0;
+    for node in &mut entry.body {
+        if let trust_ir::Inst::Undef { ty: Ty::Array(element, _) } = &node.inst {
+            assert_eq!(twin.types[element.as_usize()], Ty::U32);
+            let trust_ir::Inst::Undef { ty } = &node.inst else { unreachable!() };
+            node.inst = trust_ir::Inst::ArraySplat { ty: ty.clone(), value: input };
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 1);
+    let mut signature = twin.func_types[function.ty.as_usize()].clone();
+    signature.params.push(Ty::U32);
+    function.ty = trust_ir::value::FuncTyId::new(u32::try_from(twin.func_types.len()).unwrap());
+    twin.func_types.push(signature);
+    assert_eq!(trust_ir_build::validate_module(&twin), trust_ir_build::validate_module(original));
+    twin
+}
+
 /// `[u32; 4]` with lane 2 written to the constant `7`, then read back. The
 /// `assert(lane == 5)` must be REFUTED (`!(7 == 5)` folds to `true`), which is
-/// only possible if the element write is modeled EXACTLY — a havoc leaves the
-/// constraint symbolic and this counts 0.
-///
-/// Pre-fix this failed on `diagnostics == 0`: the `InsertElement` emitted an
-/// `AggregateUpdate` fail-closed rule and the following `ExtractField` an
-/// `AggregateProjection` one.
+/// only possible if the element write AND the read are modeled EXACTLY — a havoc
+/// leaves the constraint symbolic and this counts 0.
 #[test]
 fn insert_element_at_a_constant_index_is_modeled_exactly() {
     let mut mb = ModuleBuilder::new("insert_element_exact");
@@ -7450,14 +8793,15 @@ fn insert_element_at_a_constant_index_is_modeled_exactly() {
     let index = fb.iconst(Ty::I64, 2);
     let seven = fb.iconst(Ty::U32, 7);
     let arr1 = fb.insert_element(arr_ty, arr0, index, seven);
-    let lane = fb.extract_field(Ty::U32, arr1, 2);
+    let lane = fb.extract_element(Ty::U32, arr1, index);
     let five = fb.iconst(Ty::U32, 5);
     let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, five);
     fb.assert(cond);
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    let module = initialized_array_undef_twin(&original);
     let output = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
@@ -7472,10 +8816,10 @@ fn insert_element_at_a_constant_index_is_modeled_exactly() {
         output.diagnostics
     );
     assert_eq!(
-        unconditionally_reachable_error_rules(&output.vc),
-        1,
-        "lane 2 holds exactly 7, so `assert(lane == 5)` must fold to an unconditionally \
-         reachable error rule"
+        error_rule_solver_verdicts(&output.vc),
+        vec![Some(true)],
+        "lane 2 holds exactly 7, so `assert(lane == 5)` must be an unconditionally reachable \
+         error rule — and the in-bounds constant lane carries no bounds rule"
     );
 }
 
@@ -7502,14 +8846,15 @@ fn insert_element_overwrite_does_not_leave_the_old_value_readable() {
     let arr1 = fb.insert_element(arr_ty.clone(), arr0, index, seven);
     let zero = fb.iconst(Ty::U32, 0);
     let arr2 = fb.insert_element(arr_ty, arr1, index, zero);
-    let lane = fb.extract_field(Ty::U32, arr2, 2);
+    let lane = fb.extract_element(Ty::U32, arr2, index);
     let old = fb.iconst(Ty::U32, 7);
     let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, old);
     fb.assert(cond);
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    let module = initialized_array_undef_twin(&original);
     let output = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
@@ -7524,8 +8869,8 @@ fn insert_element_overwrite_does_not_leave_the_old_value_readable() {
         output.diagnostics
     );
     assert_eq!(
-        unconditionally_reachable_error_rules(&output.vc),
-        1,
+        error_rule_solver_verdicts(&output.vc),
+        vec![Some(true)],
         "STALE READ: lane 2 was overwritten with 0, so `assert(lane == 7)` MUST be refuted — \
          proving the pre-overwrite 7 would be a false proof"
     );
@@ -7550,13 +8895,14 @@ fn a_division_by_a_freshly_written_zero_element_is_still_refuted() {
     let index = fb.iconst(Ty::I64, 0);
     let zero = fb.iconst(Ty::U32, 0);
     let arr1 = fb.insert_element(arr_ty, arr0, index, zero);
-    let lane = fb.extract_field(Ty::U32, arr1, 0);
+    let lane = fb.extract_element(Ty::U32, arr1, index);
     let hundred = fb.iconst(Ty::U32, 100);
     let quotient = fb.udiv(Ty::U32, hundred, lane);
     fb.ret(vec![quotient]);
     fb.build();
 
-    let module = mb.build();
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    let module = initialized_array_undef_twin(&original);
     let output = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
@@ -7571,18 +8917,22 @@ fn a_division_by_a_freshly_written_zero_element_is_still_refuted() {
         output.diagnostics
     );
     assert!(
-        unconditionally_reachable_error_rules(&output.vc) >= 1,
+        error_rule_solver_verdicts(&output.vc).contains(&Some(true)),
         "`100 / a[0]` with `a[0] = 0` ALWAYS traps: modeling the element write must not \
          discharge the divide-by-zero obligation"
     );
 }
 
-/// A SYMBOLIC index names an unknown lane. "Copy the aggregate and replace lane
-/// i" is then simply the wrong model — every OTHER lane would stay readable as
-/// its old value while the real write could have landed on any of them — so it
-/// must keep the FAIL-CLOSED path.
+/// A SYMBOLIC index is exact in the SMT-array model: the write is `store` at the
+/// index and a read of the same index is `select` of that `store`, so
+/// `assert(a[i] == 0)` after `a[i] = 0` can never fail — its error rule is dead.
+/// What CAN fail is the access itself when `i` is out of bounds: the write
+/// carries its own in-bounds error rule `!(i <u 4)`, reachable exactly for
+/// `i >= 4`, and the path continues only under `i <u 4` — so the read's own
+/// bounds rule, which asks the same question again, is dead too.
+/// Before arrays were SMT arrays this write failed closed (`AggregateUpdate`).
 #[test]
-fn insert_element_at_a_symbolic_index_still_fails_closed() {
+fn insert_element_at_a_symbolic_index_is_exact_with_its_own_bounds_obligation() {
     let mut mb = ModuleBuilder::new("insert_element_symbolic");
     let u32_ty = mb.add_type(Ty::U32);
     let arr_ty = Ty::Array(u32_ty, 4);
@@ -7595,11 +8945,16 @@ fn insert_element_at_a_symbolic_index_still_fails_closed() {
     let index = fb.add_block_param(entry, Ty::I64);
     let arr0 = fb.undef(arr_ty.clone());
     let zero = fb.iconst(Ty::U32, 0);
-    let _arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+    let arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+    let lane = fb.extract_element(Ty::U32, arr1, index);
+    let also_zero = fb.iconst(Ty::U32, 0);
+    let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, also_zero);
+    fb.assert(cond);
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    let module = initialized_array_undef_twin(&original);
     let output = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
@@ -7607,69 +8962,137 @@ fn insert_element_at_a_symbolic_index_still_fails_closed() {
     )
     .expect("translates");
 
-    assert_eq!(
-        aggregate_update_diagnostics(&output),
-        1,
-        "a symbolic element index has no exact single-lane model and must fail closed"
+    assert!(
+        output.diagnostics.is_empty(),
+        "a symbolic element write and read are exactly expressible: {:?}",
+        output.diagnostics
     );
+    let conditions = error_rule_solver_verdicts(&output.vc);
+    assert_eq!(
+        conditions.iter().filter(|verdict| **verdict == Some(false)).count(),
+        2,
+        "the read-back assertion (`select(store(a, i, 0), i) == 0` in every model) and the \
+         read's own bounds rule (already implied by the write's) are dead"
+    );
+    assert_eq!(
+        conditions.iter().filter(|verdict| verdict.is_none()).count(),
+        1,
+        "the write carries one symbolic in-bounds rule `!(i <u 4)`"
+    );
+    assert!(!conditions.contains(&Some(true)), "nothing is unconditionally reachable");
 }
 
-/// An out-of-bounds CONSTANT element write is TrustIR undefined behaviour (the
-/// interpreter raises `UndefinedBehavior`); there is no defined result to model,
-/// so it must keep the FAIL-CLOSED path rather than silently widening the
-/// aggregate or wrapping the index.
+/// Per `error` rule, decided by the in-process solver over the rule body:
+/// `Some(true)` when it is VALID (reachable in every state of its body relation
+/// — the exact-refutation signal a havoc cannot produce), `Some(false)` when it
+/// is UNSATISFIABLE (dead), `None` when it is neither.
+fn error_rule_solver_verdicts(vc: &trust_mc_core::chc::ChcVc) -> Vec<Option<bool>> {
+    let satisfiable = |constraints: Vec<Expr>| -> bool {
+        let mut program = ay_bindings::AYProgram::new();
+        program.set_logic("QF_ABV");
+        for var in vc.vars() {
+            let _ = program.declare_const(var.name.to_string(), var.sort.clone());
+        }
+        for decl in &vc.decls {
+            if let trust_mc_core::decl::Decl::Const { name, sort } = decl {
+                let _ = program.declare_const(name.clone(), sort.clone());
+            }
+        }
+        for constraint in constraints {
+            program.assert(constraint);
+        }
+        program.check_sat();
+        match ay_bindings::execute_direct::execute(&program)
+            .expect("in-process AY execution should succeed")
+        {
+            ay_bindings::execute_direct::ExecuteResult::Counterexample { .. } => true,
+            ay_bindings::execute_direct::ExecuteResult::Verified => false,
+            other => panic!("unexpected solver outcome: {other:?}"),
+        }
+    };
+    vc.rules
+        .iter()
+        .filter(|rule| rule.head.name.as_str() == "error")
+        .map(|rule| {
+            let body: Vec<Expr> = rule.body.constraints.iter().cloned().collect();
+            if !satisfiable(body.clone()) {
+                return Some(false);
+            }
+            let whole = Expr::and_many(body);
+            if satisfiable(vec![whole.not()]) { None } else { Some(true) }
+        })
+        .collect()
+}
+
+/// A static out-of-bounds write is refused before either public translation.
+/// Its separately initialized in-bounds twin remains modeled without a trap.
 #[test]
-fn insert_element_at_an_out_of_bounds_constant_index_still_fails_closed() {
-    let mut mb = ModuleBuilder::new("insert_element_oob");
-    let u32_ty = mb.add_type(Ty::U32);
-    let arr_ty = Ty::Array(u32_ty, 4);
-    let ft = mb.add_func_type(vec![], vec![]);
+fn insert_element_at_an_out_of_bounds_constant_index_is_an_unconditional_error() {
+    let build = || {
+        let mut mb = ModuleBuilder::new("insert_element_oob");
+        let u32_ty = mb.add_type(Ty::U32);
+        let arr_ty = Ty::Array(u32_ty, 4);
+        let ft = mb.add_func_type(vec![], vec![]);
 
-    let mut fb = mb.function("insert_element_oob", ft);
-    let entry = fb.create_block();
-    fb.switch_to_block(entry);
-    fb.set_entry(entry);
-    let arr0 = fb.undef(arr_ty.clone());
-    let index = fb.iconst(Ty::I64, 4);
-    let zero = fb.iconst(Ty::U32, 0);
-    let _arr1 = fb.insert_element(arr_ty, arr0, index, zero);
-    fb.ret(vec![]);
-    fb.build();
-
-    let module = mb.build();
-    let output = trust_ir_function_to_chc_translation_output(
+        let mut fb = mb.function("insert_element_oob", ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let arr0 = fb.undef(arr_ty.clone());
+        let index = fb.iconst(Ty::I64, 4);
+        let zero = fb.iconst(Ty::U32, 0);
+        let _arr1 = fb.insert_element(arr_ty, arr0, index, zero);
+        fb.ret(vec![]);
+        fb.build();
+        mb.build().expect("ModuleBuilder::build: test fixture")
+    };
+    let original = build();
+    assert_canonical_refusal(&original, "constant lane index 4 is out of range for 4 lanes");
+    let mut module = initialized_array_undef_twin(&original);
+    // A separate valid initialized twin writes the last REAL lane.
+    let mut changed = 0;
+    for node in &mut module.functions[0].blocks[0].body {
+        if let trust_ir::Inst::Const { ty: Ty::I64, value: trust_ir::Constant::Int(index) } =
+            &mut node.inst
+            && *index == 4
+        {
+            *index = 3;
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1);
+    assert_canonical_module(&module);
+    let checked = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
         &TranslateOptions::default(),
     )
     .expect("translates");
-
+    assert_eq!(aggregate_update_diagnostics(&checked), 0, "{:?}", checked.diagnostics);
     assert_eq!(
-        aggregate_update_diagnostics(&output),
-        1,
-        "lane 4 does not exist in `[u32; 4]`; an out-of-bounds write must fail closed"
+        unconditionally_reachable_error_rules(&checked.vc),
+        0,
+        "the valid twin writes lane 3 of `[u32; 4]` without a bounds error"
     );
+
+    let unchecked = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() },
+    )
+    .expect("translates");
+    assert!(unchecked.diagnostics.is_empty(), "{:?}", unchecked.diagnostics);
+    assert_eq!(unconditionally_reachable_error_rules(&unchecked.vc), 0);
 }
 
-/// A NEGATIVE constant element index is TrustIR undefined behaviour exactly like
-/// a too-large one — `interpret.rs :: runtime_index` rejects
-/// `int.signed && int.as_signed() < 0`. It must therefore ALSO fail closed.
-///
-/// The trap this pins: `constant_lane_index` reads the RAW bitvector constant, so
-/// an `I8` constant `-1` reads back as the UNSIGNED `255`, which is IN BOUNDS of a
-/// `[u32; 256]` and so slips past the out-of-bounds guard. The translator would
-/// then model a write that the reference semantics call UB and STATICALLY
-/// DISCHARGE `assert(a[255] == 7)` — a false proof, in the same width/signedness
-/// family as this campaign's earlier constant-reading P0s.
-///
-/// The declared index type is not consulted here: the guard is that the constant's
-/// top bit must be clear, so the signed and unsigned readings provably agree.
+/// A negative static index is canonically invalid, never a wrapped lane. Its
+/// valid initialized twin writes lane 0 without constraining another lane.
 #[test]
-fn insert_element_at_a_negative_constant_index_still_fails_closed() {
+fn insert_element_at_a_negative_constant_index_is_an_error_and_writes_no_lane() {
     let mut mb = ModuleBuilder::new("insert_element_negative");
     let u32_ty = mb.add_type(Ty::U32);
-    // 256 lanes so that the wrapped reading of `-1i8` (255) is IN BOUNDS and the
-    // existing out-of-bounds guard cannot be what rejects it.
+    // 256 lanes so that the wrapped reading of `-1i8` (255) is IN BOUNDS and a
+    // plain length check cannot be what rejects it.
     let arr_ty = Ty::Array(u32_ty, 256);
     let ft = mb.add_func_type(vec![], vec![]);
 
@@ -7681,30 +9104,881 @@ fn insert_element_at_a_negative_constant_index_still_fails_closed() {
     let index = fb.iconst(Ty::I8, -1);
     let seven = fb.iconst(Ty::U32, 7);
     let arr1 = fb.insert_element(arr_ty, arr0, index, seven);
-    let lane = fb.extract_field(Ty::U32, arr1, 255);
+    let lane_255 = fb.iconst(Ty::I64, 255);
+    let lane = fb.extract_element(Ty::U32, arr1, lane_255);
     let same = fb.iconst(Ty::U32, 7);
     let cond = fb.icmp(ICmpOp::Eq, Ty::U32, lane, same);
     fb.assert(cond);
     fb.ret(vec![]);
     fb.build();
 
-    let module = mb.build();
-    let output = trust_ir_function_to_chc_translation_output(
+    let original = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert_canonical_refusal(&original, "constant lane index -1 is out of range for 256 lanes");
+    let mut module = initialized_array_undef_twin(&original);
+    // The valid twin writes lane 0 and reads the distinct lane 255. The
+    // independent initialized input must remain unconstrained by that write.
+    let mut changed = 0;
+    for node in &mut module.functions[0].blocks[0].body {
+        if let trust_ir::Inst::Const { ty: Ty::I8, value: trust_ir::Constant::Int(index) } =
+            &mut node.inst
+            && *index == -1
+        {
+            *index = 0;
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1);
+    assert_canonical_module(&module);
+    let checked = trust_ir_function_to_chc_translation_output(
         &module,
         trust_ir::value::FuncId::new(0),
         &TranslateOptions::default(),
     )
     .expect("translates");
-
+    assert_eq!(aggregate_update_diagnostics(&checked), 0, "{:?}", checked.diagnostics);
     assert_eq!(
-        aggregate_update_diagnostics(&output),
-        1,
-        "`-1i8` is a NEGATIVE lane index (UB), not lane 255: it must fail closed rather than \
-         be modeled as a write to the wrapped lane"
+        error_rule_solver_verdicts(&checked.vc),
+        vec![None],
+        "writing lane 0 must not decide the independent lane 255"
+    );
+
+    let unchecked = trust_ir_function_to_chc_translation_output(
+        &module,
+        trust_ir::value::FuncId::new(0),
+        &TranslateOptions { check_memory_bounds: false, ..TranslateOptions::default() },
+    )
+    .expect("translates");
+    assert_eq!(
+        error_rule_solver_verdicts(&unchecked.vc),
+        vec![None],
+        "the valid write to lane 0 must not decide lane 255; its assertion remains contingent"
+    );
+}
+
+// R129 PIN (stale-read false-proof class): a store carrying
+// `ProofAnnotation::RegionHavocStore` — a bulk write whose target set the
+// producer could not bound — must FAIL CLOSED in the BMC lane. The array
+// memory model would translate it as constraining a single symbolic index,
+// leaving every other index at its pre-write value; a later read of an
+// element the real bulk write overwrote would then return a STALE value.
+// The control (same module, no marker) must translate normally, pinning
+// that the refusal keys on the MARKER, not on the store shape.
+#[test]
+fn region_havoc_store_fails_closed_in_bmc_and_only_when_marked() {
+    let build = |marked: bool| {
+        let mut mb = ModuleBuilder::new("region_havoc_pin");
+        let ft = mb.add_func_type(vec![], vec![]);
+        let fb = mb.function("bulk_write", ft);
+        drop(fb);
+        let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+        module.functions.clear();
+
+        let func_ty_id = trust_ir::value::FuncTyId::new(0);
+        let mut func = trust_ir::Function::new(
+            trust_ir::value::FuncId::new(0),
+            "bulk_write",
+            func_ty_id,
+            trust_ir::value::BlockId::new(0),
+        );
+        let mut block = trust_ir::Block::new(trust_ir::value::BlockId::new(0));
+
+        let slot = trust_ir::value::ValueId::new(0);
+        block.body.push(
+            trust_ir::InstrNode::new(trust_ir::Inst::Alloca {
+                ty: Ty::U8,
+                count: None,
+                align: None,
+            })
+            .with_result(slot),
+        );
+        let value = trust_ir::value::ValueId::new(1);
+        block.body.push(
+            trust_ir::InstrNode::new(trust_ir::Inst::Undef { ty: Ty::U8 })
+                .with_result(value)
+                .with_proof(ProofAnnotation::FreshSymbolicHavoc),
+        );
+        let mut store = trust_ir::InstrNode::new(trust_ir::Inst::Store {
+            ty: Ty::U8,
+            ptr: slot,
+            value,
+            volatile: false,
+            align: None,
+        });
+        if marked {
+            store = store.with_proof(ProofAnnotation::RegionHavocStore);
+        }
+        block.body.push(store);
+        block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Return { values: vec![] }));
+
+        func.blocks.push(block);
+        module.try_add_function(func).expect("Module::try_add_function: test fixture");
+        module
+    };
+
+    let refused = |module: &trust_ir::Module| {
+        let vcs = trust_ir_to_bmc_vc(module, &TranslateOptions::default());
+        assert_eq!(vcs.len(), 1, "expected one BMC VC");
+        vcs[0].violations.iter().any(|violation| {
+            violation.kind == PropertyKind::Other
+                && violation
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("region-havoc store"))
+        })
+    };
+
+    assert!(
+        refused(&build(true)),
+        "a RegionHavocStore-marked store must fail closed in the array memory model"
     );
     assert!(
-        unconditionally_reachable_error_rules(&output.vc) >= 1,
-        "failing closed means the enclosing obligation stays unconditionally reachable; \
-         discharging `assert(a[255] == 7)` off a UB write would be a false proof"
+        !refused(&build(false)),
+        "an unmarked store must keep the ordinary translation — the refusal keys on the marker"
     );
+}
+
+// ============================================================================
+// Return-slot call summaries (Alloca / Store / Load / Assume / Switch / nested
+// Call). This is the lowering `core`'s `Option` combinators are compiled into;
+// before these arms the interpreter met `Alloca` at its catch-all and every
+// caller of `Option::and_then`/`is_some_and`/`map`/`map_or` got an
+// unconditional `UnsupportedDirectCallSummary` may-panic rule.
+// ============================================================================
+
+/// Build the combinator-wrapper shape:
+///
+/// ```text
+///   wrapper(discr, payload):
+///     %slot = Alloca<U32>
+///     [Assume(discr == 0 || discr == 1)]      // present iff `assume_valid_discr`
+///     Switch discr { 0 => none_arm, 1 => some_arm, default => bb_unreachable }
+///     none_arm: Store %slot, 0        ; Br join
+///     some_arm: %r = Call inner(payload)  ; Store %slot, %r ; Br join
+///     join:     %out = Load %slot ; Return %out
+/// ```
+///
+/// `inner(payload)` is `payload - 1` as a checked `SubOverflow` branching to an
+/// `Unreachable` panic block, so the nested callee carries a REAL, guarded panic
+/// obligation (`payload == 0`).
+///
+/// `leak_slot_address` additionally passes `%slot` as an argument to `inner`,
+/// which is the aliasing shape the slot model must refuse.
+fn build_return_slot_wrapper_module(
+    assume_valid_discr: bool,
+    leak_slot_address: bool,
+) -> trust_ir::Module {
+    let mut mb = ModuleBuilder::new("return_slot_wrapper");
+    let inner_ft = if leak_slot_address {
+        mb.add_func_type(vec![Ty::U32, Ty::Ptr], vec![Ty::U32])
+    } else {
+        mb.add_func_type(vec![Ty::U32], vec![Ty::U32])
+    };
+    let wrapper_ft = mb.add_func_type(vec![Ty::I64, Ty::U32], vec![Ty::U32]);
+    let caller_ft = mb.add_func_type(vec![Ty::I64, Ty::U32], vec![]);
+
+    // inner(payload) = payload.checked_sub(1) with the overflow arm unreachable.
+    let mut fb = mb.function("slot_inner", inner_ft);
+    let entry = fb.create_block();
+    let ok = fb.create_block();
+    let panic = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let payload = fb.add_block_param(entry, Ty::U32);
+    if leak_slot_address {
+        fb.add_block_param(entry, Ty::Ptr);
+    }
+    let one = fb.iconst(Ty::U32, 1);
+    let (value, flag) = fb.overflow(OverflowOp::SubOverflow, Ty::U32, payload, one);
+    fb.condbr(flag, panic, vec![], ok, vec![]);
+    fb.switch_to_block(ok);
+    fb.ret(vec![value]);
+    fb.switch_to_block(panic);
+    fb.unreachable();
+    fb.build();
+
+    // wrapper(discr, payload) — the return-slot shape.
+    let mut fb = mb.function("slot_wrapper", wrapper_ft);
+    let entry = fb.create_block();
+    let none_arm = fb.create_block();
+    let some_arm = fb.create_block();
+    let join = fb.create_block();
+    let dead = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let discr = fb.add_block_param(entry, Ty::I64);
+    let payload = fb.add_block_param(entry, Ty::U32);
+    let slot = fb.alloca(Ty::U32);
+    if assume_valid_discr {
+        let zero = fb.iconst(Ty::I64, 0);
+        let one = fb.iconst(Ty::I64, 1);
+        let is_zero = fb.icmp(ICmpOp::Eq, Ty::I64, discr, zero);
+        let is_one = fb.icmp(ICmpOp::Eq, Ty::I64, discr, one);
+        let valid = fb.binop(BinOp::Or, Ty::Bool, is_zero, is_one);
+        fb.assume(valid);
+    }
+    fb.switch(
+        discr,
+        vec![
+            SwitchCase { value: trust_ir::Constant::Int(0), target: none_arm, args: vec![] },
+            SwitchCase { value: trust_ir::Constant::Int(1), target: some_arm, args: vec![] },
+        ],
+        dead,
+        vec![],
+    );
+    fb.switch_to_block(none_arm);
+    let zero_u32 = fb.iconst(Ty::U32, 0);
+    fb.store(Ty::U32, slot, zero_u32);
+    fb.br(join, vec![]);
+    fb.switch_to_block(some_arm);
+    let called = if leak_slot_address {
+        fb.call(trust_ir::value::FuncId::new(0), vec![payload, slot])
+    } else {
+        fb.call(trust_ir::value::FuncId::new(0), vec![payload])
+    };
+    fb.store(Ty::U32, slot, called);
+    fb.br(join, vec![]);
+    fb.switch_to_block(join);
+    let out = fb.load(Ty::U32, slot);
+    fb.ret(vec![out]);
+    fb.switch_to_block(dead);
+    fb.unreachable();
+    fb.build();
+
+    // caller(discr, payload): forwards both unconstrained.
+    let mut fb = mb.function("slot_caller", caller_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let d = fb.add_block_param(entry, Ty::I64);
+    let p = fb.add_block_param(entry, Ty::U32);
+    let _ = fb.call(trust_ir::value::FuncId::new(1), vec![d, p]);
+    fb.ret(vec![]);
+    fb.build();
+
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+fn slot_caller_output(module: &trust_ir::Module) -> ChcTranslationOutput {
+    let outputs = trust_ir_to_chc_translation_outputs(module, &TranslateOptions::default());
+    assert_eq!(outputs.len(), 3, "inner + wrapper + caller");
+    outputs.into_iter().nth(2).expect("caller is the third function")
+}
+
+/// Is ANY of `output`'s `error` rules SATISFIABLE — i.e. does the translation
+/// actually leave a panic REACHABLE?
+///
+/// Existence of an error rule is NOT that question and must never be asserted in
+/// its place: a fold that quietly replaces a real panic condition with `false`
+/// still emits a rule, so an existence assert survives the very mutation it
+/// exists to catch (measured: four of the six tests below were inert until this
+/// helper replaced their existence asserts).
+///
+/// The caller fixtures here are single-entry and their entry relation is
+/// unconstrained, so asserting the rule's own constraints is the reachability
+/// question for them.
+fn some_error_rule_is_satisfiable(output: &ChcTranslationOutput) -> bool {
+    output.vc.rules.iter().filter(|rule| rule.head.name == "error").any(|rule| {
+        let mut program = ay_bindings::AYProgram::new();
+        program.set_logic("QF_BV");
+        for var in output.vc.vars() {
+            let _ = program.declare_const(var.name.to_string(), var.sort.clone());
+        }
+        for decl in &output.vc.decls {
+            if let trust_mc_core::decl::Decl::Const { name, sort } = decl {
+                let _ = program.declare_const(name.clone(), sort.clone());
+            }
+        }
+        for constraint in &rule.body.constraints {
+            program.assert(constraint.clone());
+        }
+        program.check_sat();
+        matches!(
+            ay_bindings::execute_direct::execute(&program),
+            Ok(ay_bindings::execute_direct::ExecuteResult::Counterexample { .. })
+        )
+    })
+}
+
+fn declined_direct_call_summary(output: &ChcTranslationOutput) -> bool {
+    output
+        .diagnostics
+        .iter()
+        .any(|d| d.reason == TrustIrChcUnsupportedReason::UnsupportedDirectCallSummary)
+}
+
+#[test]
+fn return_slot_combinator_wrapper_is_summarized_not_declined() {
+    // THE COMPLETENESS CLAIM. The whole shape — a return-slot `Alloca`, the
+    // enum-validity `Assume`, the discriminant `Switch`, a `Store` per arm, the
+    // join `Load`, and a nested `Call` into the "closure" — must summarize.
+    let caller = slot_caller_output(&build_return_slot_wrapper_module(true, false));
+    assert!(
+        !declined_direct_call_summary(&caller),
+        "the return-slot combinator shape must summarize (no UnsupportedDirectCallSummary), \
+         got {:?}",
+        caller.diagnostics
+    );
+}
+
+#[test]
+fn return_slot_summary_keeps_the_nested_callees_panic_refutable() {
+    // THE SOUNDNESS CLAIM, and the one that separates a summary from a deletion:
+    // `slot_inner` really panics at `payload == 0`, and that obligation must
+    // survive the fold into the caller as a GUARDED error rule — not vanish
+    // with the decline it replaced.
+    let caller = slot_caller_output(&build_return_slot_wrapper_module(true, false));
+    // SATISFIABLE, not merely present. The `Assume` makes the switch default's
+    // `Unreachable` UNSAT, so the ONLY reachable panic left in this fixture is
+    // the nested callee's underflow — drop it and nothing here is satisfiable.
+    assert!(
+        some_error_rule_is_satisfiable(&caller),
+        "the nested callee's checked-sub underflow must reach the caller as a \
+         SATISFIABLE error rule; rules: {:?}",
+        caller
+            .vc
+            .rules
+            .iter()
+            .filter(|r| r.head.name == "error")
+            .map(|r| &r.body.constraints)
+            .collect::<Vec<_>>()
+    );
+    // ...and guarded by the caller's own arguments, never unconditional.
+    assert!(
+        caller.vc.rules.iter().any(|rule| {
+            rule.head.name == "error"
+                && rule.body.relation.as_ref().is_some_and(|rel| rel.name == "bb0")
+                && !rule.body.constraints.is_empty()
+        }),
+        "the folded panic must be GUARDED by the call's arguments, not unconditional"
+    );
+}
+
+#[test]
+fn a_slot_whose_address_escapes_into_a_call_is_refused() {
+    // THE ALIASING GUARD. Hand `slot_inner` the slot's ADDRESS and the model can
+    // no longer claim to see every writer, so the whole summary must decline —
+    // NOT quietly keep reading the id-keyed cell (that read would return the
+    // pre-call value: a fabricated fact, i.e. a false proof).
+    let caller = slot_caller_output(&build_return_slot_wrapper_module(true, true));
+    assert!(
+        declined_direct_call_summary(&caller),
+        "an alloca whose address reaches a call argument must decline the summary"
+    );
+}
+
+#[test]
+fn switch_default_edge_is_explored_rather_than_pruned() {
+    // `exhaustive_enum_unreachable` is never consulted, so the default edge is
+    // ALWAYS explored. With no `Assume` bounding the discriminant, the default
+    // block's `Unreachable` is reachable and the caller must carry a refutable
+    // error rule — the switch must not silently assume its cases are exhaustive.
+    let caller = slot_caller_output(&build_return_slot_wrapper_module(false, false));
+    assert!(
+        !declined_direct_call_summary(&caller),
+        "the shape still summarizes without the Assume, got {:?}",
+        caller.diagnostics
+    );
+    // DIFFERENTIAL, and the direction is what matters. Both modules are the same
+    // wrapper; only the enum-validity `Assume` differs. Dropping it must ADD a
+    // satisfiable error rule — the default edge reaching `Unreachable` with a
+    // discriminant outside {0,1}. A translation that PRUNED the default (by
+    // trusting `exhaustive_enum_unreachable`) emits the same rules either way,
+    // so this comparison is what fails when the flag becomes load-bearing.
+    let assumed = slot_caller_output(&build_return_slot_wrapper_module(true, false));
+    let sat_rules = |o: &ChcTranslationOutput| {
+        o.vc.rules
+            .iter()
+            .filter(|r| r.head.name == "error")
+            .filter(|r| {
+                let mut program = ay_bindings::AYProgram::new();
+                program.set_logic("QF_BV");
+                for var in o.vc.vars() {
+                    let _ = program.declare_const(var.name.to_string(), var.sort.clone());
+                }
+                for constraint in &r.body.constraints {
+                    program.assert(constraint.clone());
+                }
+                program.check_sat();
+                matches!(
+                    ay_bindings::execute_direct::execute(&program),
+                    Ok(ay_bindings::execute_direct::ExecuteResult::Counterexample { .. })
+                )
+            })
+            .count()
+    };
+    let without = sat_rules(&caller);
+    let with = sat_rules(&assumed);
+    assert!(
+        without > with,
+        "an unbounded discriminant must leave the switch default (Unreachable) \
+         REACHABLE: satisfiable error rules without the Assume = {without}, with = {with}"
+    );
+}
+
+#[test]
+fn a_call_chain_deeper_than_the_budget_declines_rather_than_dropping_a_callee() {
+    // TERMINATION + FAIL-CLOSED. A chain longer than
+    // `DIRECT_CALL_SUMMARY_MAX_DEPTH` must DECLINE (the caller keeps its
+    // conservative may-panic rule), never summarize the prefix and drop the tail.
+    let mut mb = ModuleBuilder::new("deep_call_chain");
+    let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+    let void_ft = mb.add_func_type(vec![Ty::U32], vec![]);
+
+    // f0 panics unconditionally; f1..fN each forward to the previous one.
+    let mut fb = mb.function("chain0", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let _ = fb.add_block_param(entry, Ty::U32);
+    fb.unreachable();
+    fb.build();
+
+    let links = DIRECT_CALL_SUMMARY_MAX_DEPTH + 3;
+    for index in 1..=links {
+        let mut fb = mb.function(&format!("chain{index}"), ft);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let n = fb.add_block_param(entry, Ty::U32);
+        let r = fb.call(trust_ir::value::FuncId::new((index - 1) as u32), vec![n]);
+        fb.ret(vec![r]);
+        fb.build();
+    }
+
+    let mut fb = mb.function("chain_caller", void_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let n = fb.add_block_param(entry, Ty::U32);
+    let _ = fb.call(trust_ir::value::FuncId::new(links as u32), vec![n]);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let options =
+        TranslateOptions { collect_call_summary_census: true, ..TranslateOptions::default() };
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &options);
+    let caller = outputs.last().expect("caller output");
+    assert!(
+        declined_direct_call_summary(caller),
+        "a call chain deeper than the depth budget must decline, got {:?}",
+        caller.diagnostics
+    );
+    // Pin the EXIT, not just the fact of declining. Almost anything makes this
+    // fixture decline (`chain0` never returns, so the returns are uncombinable);
+    // only the depth guard makes it decline by meeting a `Call` it refuses to
+    // follow. Without this the test survives removing the budget entirely.
+    let sites: Vec<_> = caller
+        .call_summary_census
+        .iter()
+        .filter_map(|row| match &row.outcome {
+            CallSummaryOutcome::Declined { site, detail } => Some((site.tag, detail.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sites,
+        vec![("unmodeled_instruction", Some("Call".to_owned()))],
+        "the decline must be the DEPTH guard refusing to follow a `Call`"
+    );
+}
+
+#[test]
+fn an_unwritten_slot_consumption_is_refused_not_given_a_default() {
+    // Preserve the original source. A plain load transports poison, and the
+    // comparison consumes it: canonical UB, not an initialized unknown value.
+    let mut mb = ModuleBuilder::new("unwritten_slot");
+    let callee_ft = mb.add_func_type(vec![], vec![Ty::U32]);
+    let caller_ft = mb.add_func_type(vec![], vec![]);
+
+    let mut fb = mb.function("reads_unwritten_slot", callee_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let slot = fb.alloca(Ty::U32);
+    let value = fb.load(Ty::U32, slot);
+    let zero = fb.iconst(Ty::U32, 0);
+    let is_zero = fb.icmp(ICmpOp::Eq, Ty::U32, value, zero);
+    fb.assert(is_zero);
+    fb.ret(vec![value]);
+    fb.build();
+
+    let mut fb = mb.function("caller_of_unwritten", caller_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let _ = fb.call(trust_ir::value::FuncId::new(0), vec![]);
+    fb.ret(vec![]);
+    fb.build();
+
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    for function in [0, 1] {
+        assert_legacy_source_ub_is_refused(&module, trust_ir::value::FuncId::new(function), vec![]);
+    }
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    let caller = outputs.last().expect("caller output");
+    assert!(
+        declined_direct_call_summary(caller),
+        "the original unwritten-slot consumer must retain a summary refusal, got {:?}",
+        caller.diagnostics
+    );
+    assert!(
+        some_error_rule_is_satisfiable(caller),
+        "the original poison inspection must retain a reachable error"
+    );
+}
+
+#[test]
+fn an_initialized_unknown_slot_is_not_given_a_default() {
+    // A separately constructed positive stores a genuine unknown scalar before
+    // the original load/comparison/assertion/return. It is not the old capture.
+    let mut mb = ModuleBuilder::new("initialized_unknown_slot");
+    let callee_ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+    let caller_ft = mb.add_func_type(vec![Ty::U32], vec![]);
+    let mut fb = mb.function("reads_initialized_unknown_slot", callee_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let input = fb.add_block_param(entry, Ty::U32);
+    let slot = fb.alloca(Ty::U32);
+    fb.store(Ty::U32, slot, input);
+    let value = fb.load(Ty::U32, slot);
+    let zero = fb.iconst(Ty::U32, 0);
+    let is_zero = fb.icmp(ICmpOp::Eq, Ty::U32, value, zero);
+    fb.assert(is_zero);
+    fb.ret(vec![value]);
+    fb.build();
+    let mut fb = mb.function("caller_of_initialized_unknown", caller_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let input = fb.add_block_param(entry, Ty::U32);
+    let _ = fb.call(trust_ir::value::FuncId::new(0), vec![input]);
+    fb.ret(vec![]);
+    fb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    let caller = outputs.last().expect("caller output");
+    assert!(!declined_direct_call_summary(caller), "{:?}", caller.diagnostics);
+    assert!(
+        some_error_rule_is_satisfiable(caller),
+        "asserting `initialized_unknown_slot == 0` must stay SATISFIABLE; a default would fabricate a proof"
+    );
+    for value in [0, 1] {
+        let run = trust_ir::interpret::Interpreter::with_module(&module).execute_func(
+            trust_ir::value::FuncId::new(1),
+            [trust_ir::interpret::InterpretValue::int(Ty::U32, value).unwrap()],
+        );
+        if value == 0 {
+            run.unwrap();
+        } else {
+            assert_eq!(run.unwrap_err().code, trust_ir::interpret::InterpretErrorCode::Panic);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// trust-ir v40 `FatPtrKind::ContainerVtable` — the `dyn`-tail container pointer
+// (`*const ArcInner<dyn Any>` inside `Arc<dyn Any>`). Its metadata is an opaque
+// VTABLE WORD, never a length; nothing dispatches through it. Every test below
+// pins that this translator handles or refuses the kind BY NAME rather than
+// folding it into a neighbour.
+// ---------------------------------------------------------------------------
+
+/// A `PtrMetadata` read of a `ContainerVtable` pointer with its honest metadata
+/// type (`Ty::Ptr`, the vtable word) is refused fail-closed as
+/// `PointerMetadata`, exactly as `&dyn Trait` is: the word has no model.
+#[test]
+fn typed_chc_translation_refuses_container_vtable_metadata_by_name() {
+    let mut mb = ModuleBuilder::new("container_vtable_metadata");
+    let fat = Ty::FatPtr(FatPtrKind::ContainerVtable);
+    let ft = mb.add_func_type(vec![fat.clone()], vec![Ty::Ptr]);
+    let mut fb = mb.function("container_vtable_metadata", ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let ptr = fb.add_block_param(entry, fat.clone());
+    let metadata = fb.ptr_metadata(fat, Ty::Ptr, ptr);
+    fb.ret(vec![metadata]);
+    fb.build();
+
+    let outputs = trust_ir_to_chc_translation_outputs(
+        &mb.build().expect("ModuleBuilder::build: test fixture"),
+        &TranslateOptions::default(),
+    );
+    assert_eq!(outputs.len(), 1);
+    let reasons: Vec<_> = outputs[0].diagnostics.iter().map(|d| d.reason).collect();
+    assert_eq!(
+        reasons,
+        vec![TrustIrChcUnsupportedReason::PointerMetadata],
+        "a container-vtable metadata read must be refused as PointerMetadata, nothing else"
+    );
+}
+
+/// A vtable word incorrectly spelled as U64 fails canonical preflight before
+/// length symbols or bounds can exist. Its valid `ContainerLen`
+/// twin, whose metadata IS a length, keeps the length model (unbounded, since the
+/// kind carries no element type), which pins that the split is on metadata
+/// meaning rather than a blanket refusal of container-tail kinds.
+#[test]
+fn typed_chc_container_vtable_metadata_is_never_read_as_a_length() {
+    let vtable = chc_slice_len_plus_one_vc("container_vtable_as_len", |_| {
+        Ty::FatPtr(FatPtrKind::ContainerVtable)
+    });
+    assert_chc_canonical_refusal(&vtable, "metadata must be ptr, got u64");
+    assert!(
+        !chc_vc_has_isize_max_len_bound(&vtable.vc),
+        "no length bound may be pushed on a vtable word: {:?}",
+        vtable.vc.rules
+    );
+
+    let len =
+        chc_slice_len_plus_one_vc("container_len_as_len", |_| Ty::FatPtr(FatPtrKind::ContainerLen));
+    assert!(
+        len.diagnostics.is_empty(),
+        "the ContainerLen twin's metadata IS a length and stays modeled: {:?}",
+        len.diagnostics
+    );
+    assert!(
+        !chc_vc_has_isize_max_len_bound(&len.vc),
+        "ContainerLen carries no element type, so its length stays UNBOUNDED: {:?}",
+        len.vc.rules
+    );
+}
+
+/// An unused ContainerVtable argument can cross a direct-call summary as an
+/// opaque typed token. Returning a constant does not inspect its vtable or
+/// invent a length; metadata inspection remains covered by the refusal above.
+#[test]
+fn call_summary_carries_container_vtable_parameter_without_interpreting_it() {
+    let mut mb = ModuleBuilder::new("container_vtable_census");
+    let fat = Ty::FatPtr(FatPtrKind::ContainerVtable);
+    let callee_ft = mb.add_func_type(vec![fat.clone()], vec![Ty::U32]);
+    let caller_ft = mb.add_func_type(vec![fat.clone()], vec![Ty::U32]);
+
+    let mut fb = mb.function("takes_container_vtable", callee_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let _p = fb.add_block_param(entry, fat.clone());
+    let one = fb.iconst(Ty::U32, 1);
+    fb.ret(vec![one]);
+    fb.build();
+
+    let mut fb = mb.function("calls_with_container_vtable", caller_ft);
+    let entry = fb.create_block();
+    fb.switch_to_block(entry);
+    fb.set_entry(entry);
+    let p = fb.add_block_param(entry, fat.clone());
+    let r = fb.call(trust_ir::value::FuncId::new(0), vec![p]);
+    fb.ret(vec![r]);
+    fb.build();
+
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    let options =
+        TranslateOptions { collect_call_summary_census: true, ..TranslateOptions::default() };
+    let outputs = trust_ir_to_chc_translation_outputs(&module, &options);
+    let caller = outputs.last().expect("caller output");
+    assert!(
+        caller.diagnostics.is_empty(),
+        "an unused opaque container-vtable parameter must not block a constant return: {:?}",
+        caller.diagnostics
+    );
+    assert_eq!(caller.call_summary_census.len(), 1);
+    assert!(matches!(caller.call_summary_census[0].outcome, CallSummaryOutcome::Summarized));
+    assert!(
+        !caller.vc.rules.iter().any(|rule| rule.head.name == "error"),
+        "the constant-returning callee has no error condition"
+    );
+}
+
+/// CHC models a complete tuple exactly; the BMC lane still has no aggregate
+/// value model and must retain its reachable refusal even for an unused result.
+#[test]
+fn make_aggregate_tracks_fields_in_chc_and_retains_bmc_refusal() {
+    let mut builder = ModuleBuilder::new("make_aggregate_refusal");
+    let aggregate_ty = Ty::Tuple(vec![Ty::I64, Ty::I64]);
+    let function_ty = builder.add_func_type(vec![], vec![]);
+    let mut function = builder.function("construct", function_ty);
+    let entry = function.create_block();
+    function.set_entry(entry);
+    function.switch_to_block(entry);
+    let seven = function.iconst(Ty::I64, 7);
+    let nine = function.iconst(Ty::I64, 9);
+    let _result = function.make_aggregate(aggregate_ty, vec![seven, nine]);
+    function.ret(vec![]);
+    function.build();
+    let module = builder.build().expect("ModuleBuilder::build: test fixture");
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+
+    let options = TranslateOptions::default();
+    let bmc = trust_ir_to_bmc_vc(&module, &options);
+    assert_eq!(bmc.len(), 1);
+    assert_eq!(bmc[0].violations.len(), 1);
+    let violation = &bmc[0].violations[0];
+    assert_eq!(violation.kind, PropertyKind::Other);
+    assert!(violation.message.as_deref().unwrap().contains("MakeAggregate construction"));
+    assert_eq!(
+        trust_mc_core::chc_const_prop::eval::try_eval_to_bool(&violation.condition),
+        Some(true),
+    );
+
+    let chc = trust_ir_to_chc_translation_outputs(&module, &options);
+    assert_eq!(chc.len(), 1);
+    assert!(chc[0].diagnostics.is_empty(), "{:?}", chc[0].diagnostics);
+    assert_eq!(unconditionally_reachable_error_rules(&chc[0].vc), 0);
+}
+
+#[test]
+fn unused_runtime_closure_retains_both_lane_refusals() {
+    let (module, host, _, _, result) =
+        crate::translate_chc::liveness_tests::runtime_closure_fixture();
+    let options = TranslateOptions::default();
+    let bmc = trust_ir_to_bmc_vc(&module, &options);
+    assert_eq!(bmc.len(), 2);
+    let violation = &bmc.last().unwrap().violations;
+    assert_eq!(violation.len(), 1, "unused construction must not erase its refusal");
+    assert_eq!(violation[0].kind, PropertyKind::Other);
+    assert!(violation[0].message.as_deref().unwrap().contains("MakeClosure construction"));
+    assert_eq!(
+        trust_mc_core::chc_const_prop::eval::try_eval_to_bool(&violation[0].condition),
+        Some(true),
+    );
+    assert!(bmc_violation_is_satisfiable(bmc.last().unwrap(), &violation[0]));
+
+    for per_block in [false, true] {
+        let output = if per_block {
+            crate::translate_chc::trust_ir_function_to_chc_translation_output_per_block(
+                &module, host, &options,
+            )
+        } else {
+            trust_ir_function_to_chc_translation_output(&module, host, &options)
+        }
+        .unwrap();
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(output.diagnostics[0].family, SemanticsFamily::Closures);
+        assert_eq!(output.diagnostics[0].reason, TrustIrChcUnsupportedReason::ClosureConstruction);
+        assert_eq!(output.diagnostics[0].result_values, vec![result]);
+        // The large-block path retains definitional guard equalities. Decide
+        // their real constraints instead of expecting a literal constant.
+        // This helper's None means both polarities are SAT, never solver-unknown.
+        let verdicts = error_rule_solver_verdicts(&output.vc);
+        assert_eq!(verdicts.len(), 1);
+        assert_ne!(verdicts[0], Some(false), "construction refusal must not be dead");
+        if per_block {
+            assert!(unconditionally_reachable_error_rules(&output.vc) >= 1);
+        }
+    }
+}
+
+#[test]
+fn make_aggregate_retains_refusal_for_untracked_fields() {
+    let mut builder = ModuleBuilder::new("make_aggregate_opaque_field");
+    let opaque = Ty::FatPtr(trust_ir::ty::FatPtrKind::ContainerVtable);
+    let aggregate_ty = Ty::Tuple(vec![opaque.clone()]);
+    let function_ty = builder.add_func_type(vec![opaque.clone()], vec![]);
+    let mut function = builder.function("construct", function_ty);
+    let entry = function.create_block();
+    function.set_entry(entry);
+    function.switch_to_block(entry);
+    let field = function.add_block_param(entry, opaque);
+    let result = function.make_aggregate(aggregate_ty, vec![field]);
+    function.ret(vec![]);
+    function.build();
+    let module = builder.build().expect("ModuleBuilder::build: test fixture");
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+    let chc = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+    assert_eq!(chc.len(), 1);
+    assert_eq!(chc[0].diagnostics.len(), 1);
+    let diagnostic = &chc[0].diagnostics[0];
+    assert_eq!(diagnostic.family, SemanticsFamily::Aggregates);
+    assert_eq!(diagnostic.reason, TrustIrChcUnsupportedReason::AggregateOpaqueValue);
+    assert_eq!(diagnostic.result_values, vec![result]);
+    assert!(unconditionally_reachable_error_rules(&chc[0].vc) >= 1);
+}
+
+#[test]
+fn make_aggregate_preserves_symbolic_field_order_and_duplicates() {
+    for wrong_first_field in [false, true] {
+        let mut mb = ModuleBuilder::new("make_aggregate_symbolic_fields");
+        let aggregate_ty = Ty::Tuple(vec![Ty::I64, Ty::I64, Ty::I64]);
+        let ft = mb.add_func_type(vec![Ty::I64, Ty::I64], vec![]);
+        let mut fb = mb.function("fields", ft);
+        let entry = fb.create_block();
+        fb.set_entry(entry);
+        fb.switch_to_block(entry);
+        let x = fb.add_block_param(entry, Ty::I64);
+        let y = fb.add_block_param(entry, Ty::I64);
+        let aggregate = fb.make_aggregate(aggregate_ty, vec![x, y, x]);
+        for (field, expected) in
+            [if wrong_first_field { y } else { x }, y, x].into_iter().enumerate()
+        {
+            let actual = fb.extract_field(Ty::I64, aggregate, field as u32);
+            let equal = fb.icmp(ICmpOp::Eq, Ty::I64, actual, expected);
+            fb.assert(equal);
+        }
+        fb.ret(vec![]);
+        fb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
+        assert!(trust_ir_build::validate_module(&module).is_empty());
+        let outputs = trust_ir_to_chc_translation_outputs(&module, &TranslateOptions::default());
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].diagnostics.is_empty(), "{:?}", outputs[0].diagnostics);
+        let verdicts = error_rule_solver_verdicts(&outputs[0].vc);
+        assert_eq!(
+            verdicts,
+            vec![if wrong_first_field { None } else { Some(false) }, Some(false), Some(false)]
+        );
+        // `None` here means BOTH the error condition and its negation are
+        // actually SAT (the helper rejects solver-unknown outcomes). Pin the
+        // concrete distinct-input counterexample in the canonical interpreter.
+        let run = trust_ir::interpret::Interpreter::with_module(&module).execute_func(
+            trust_ir::value::FuncId::new(0),
+            [
+                trust_ir::interpret::InterpretValue::int(Ty::I64, 7).unwrap(),
+                trust_ir::interpret::InterpretValue::int(Ty::I64, 9).unwrap(),
+            ],
+        );
+        if wrong_first_field {
+            assert_eq!(run.unwrap_err().code, trust_ir::interpret::InterpretErrorCode::Panic);
+        } else {
+            run.unwrap();
+        }
+    }
+}
+
+#[test]
+fn make_aggregate_cross_block_value_keeps_computed_fields() {
+    let mut mb = ModuleBuilder::new("make_aggregate_cross_block");
+    let pair_ty = Ty::Tuple(vec![Ty::I64, Ty::Bool]);
+    let ft = mb.add_func_type(vec![], vec![Ty::I64]);
+    let mut fb = mb.function("checked_pair", ft);
+    let entry = fb.create_block();
+    let exit = fb.create_block();
+    fb.set_entry(entry);
+    fb.switch_to_block(entry);
+    let seven = fb.iconst(Ty::I64, 7);
+    let flag = fb.bool_const(false);
+    let pair = fb.make_aggregate(pair_ty, vec![seven, flag]);
+    // Deliberately no block argument: carry the immutable SSA definition.
+    fb.br(exit, vec![]);
+    fb.switch_to_block(exit);
+    let result = fb.extract_field(Ty::I64, pair, 0);
+    let flag = fb.extract_field(Ty::Bool, pair, 1);
+    let expected_flag = fb.bool_const(false);
+    let no_overflow = fb.icmp(ICmpOp::Eq, Ty::Bool, flag, expected_flag);
+    fb.assert(no_overflow);
+    fb.ret(vec![result]);
+    fb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+    let outputs =
+        trust_ir_to_chc_translation_outputs_per_block(&module, &TranslateOptions::default());
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+    let fields = head_arg_suffix(output, "bb1", 2);
+    assert_eq!(fields[0], ay_bindings::Expr::bitvec_const(7u64, 64));
+    assert_eq!(fields[1], ay_bindings::Expr::bool_const(false));
 }

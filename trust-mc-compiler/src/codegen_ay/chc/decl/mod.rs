@@ -11,8 +11,8 @@
 // Re-export chc-level items so that leaf modules can keep their `use super::...` imports.
 pub(super) use super::{
     ChcCtx, RefTarget, chc_fresh_name, codegen_ctx, codegen_expr_constant, codegen_expr_heap,
-    codegen_rules_entry, codegen_rules_helpers, declare_pending_var, fragment, names,
-    push_pending_datatype_sort, record_type_sort_fallback,
+    codegen_rules_entry, codegen_rules_helpers, fragment, names, push_pending_datatype_sort,
+    record_type_sort_fallback,
 };
 
 mod codegen_decl;
@@ -40,6 +40,7 @@ pub(in crate::codegen_ay::chc) mod codegen_decl_static;
 pub(in crate::codegen_ay::chc) mod codegen_decl_static_alloc;
 mod codegen_decl_static_callee;
 mod codegen_decl_static_init;
+mod codegen_decl_static_layout;
 mod codegen_decl_static_metadata;
 mod codegen_decl_stub_internal;
 mod codegen_decl_stub_internal_spawn;
@@ -47,6 +48,13 @@ mod codegen_decl_vtable;
 pub(in crate::codegen_ay::chc) mod codegen_types;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt;
 pub(in crate::codegen_ay::chc) mod codegen_types_adt_sort;
+pub(in crate::codegen_ay::chc) mod global_objects;
+pub(in crate::codegen_ay::chc) mod static_path;
+mod static_array_address;
+mod static_array_sources;
+mod static_array_iterator;
+mod static_iterator_invariants;
+pub(in crate::codegen_ay::chc) mod static_iterator_partition;
 
 pub(in crate::codegen_ay) use codegen_decl_liveness::{
     frame_narrowing_enabled, frame_narrowing_flattened_enabled,

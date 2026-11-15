@@ -8,6 +8,8 @@
 //! `codegen_stmt_rvalue_ref.rs` so that both backends use the same contract
 //! for layout-sensitive cross-ADT transmutes.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
 use rustc_public::ty::{AdtDef, AdtKind, GenericArgs, RigidTy, Ty, TyKind};
 
@@ -107,11 +109,15 @@ fn cross_adt_transmute_layout_matches(
 
     src_fields.iter().zip(target_fields.iter()).enumerate().all(
         |(field_idx, (src_field, target_field))| {
-            let src_field_ty = resolve_ty(src_field.ty_with_args(src_args));
-            let target_field_ty = resolve_ty(target_field.ty_with_args(target_args));
+            let (Some(src_field_ty), Some(target_field_ty)) = (
+                super::mono_ty::field_ty(src_field, src_args),
+                super::mono_ty::field_ty(target_field, target_args),
+            ) else {
+                return false;
+            };
             src_offsets.get(field_idx).map(|off| off.bytes())
                 == target_offsets.get(field_idx).map(|off| off.bytes())
-                && src_field_ty == target_field_ty
+                && resolve_ty(src_field_ty) == resolve_ty(target_field_ty)
         },
     )
 }

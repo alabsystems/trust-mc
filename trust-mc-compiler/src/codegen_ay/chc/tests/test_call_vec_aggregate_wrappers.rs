@@ -322,11 +322,18 @@ fn test_resolve_slice_arg_length_rejects_wrapper_datatype_without_vec_fields() {
         chc_ctx.ref_resolution.slice_to_vec_local.insert(slice_local, wrapper_local);
         chc_ctx.ref_resolution.iter_to_collection_local.remove(&slice_local);
 
+        // The wrapper is never read as a Vec. Since round 2 of the walker
+        // fail-closed review's repair, the slice's own pointer metadata (the
+        // resolver `PtrMetadata` uses) answers first, and it is the `left`
+        // field's length, the true length of `&wrapper.left`; before, no
+        // strategy answered.
         let len_expr = chc_ctx.resolve_slice_arg_length(&call_args, 1, &HashSet::new());
+        let text = len_expr.as_ref().map(ToString::to_string);
         assert!(
-            len_expr.is_none(),
-            "wrapper datatype without Vec fields should not be treated as a Vec length source; expr={:?}",
-            len_expr.as_ref().map(ToString::to_string)
+            text.as_deref().is_none_or(|t| t.contains("fld_len (fld_left ")
+                && !t.contains("fld_right")
+                && !t.contains("flag")),
+            "wrapper datatype without Vec fields should not be treated as a Vec length source; expr={text:?}"
         );
     });
 }

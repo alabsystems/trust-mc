@@ -12,6 +12,9 @@
 //! functions; the shared core (`ty_signedness_shallow`, `is_pointer_wrapper_adt`)
 //! lives in `codegen_ay::shared` (Part of #2944).
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
 use rustc_public::abi::IntegerType;
 use rustc_public::mir::{BinOp, LocalDecl, Operand, ProjectionElem, Rvalue};
@@ -137,6 +140,10 @@ impl<'tcx, 'body> ExprSignedness for ChcCtx<'tcx, 'body> {
                 None
             }
             Operand::Constant(_) => operand.ty(self.body.locals()).ok().and_then(ty_signedness),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {
+                operand.ty(self.body.locals()).ok().and_then(ty_signedness)
+            }
         }
     }
 
@@ -174,12 +181,16 @@ impl<'tcx, 'body> ExprSignedness for ChcCtx<'tcx, 'body> {
             Operand::Constant(_) => {
                 operand.ty(self.body.locals()).ok().and_then(ty_signedness_for_cast)
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {
+                operand.ty(self.body.locals()).ok().and_then(ty_signedness_for_cast)
+            }
         }
     }
 
     fn rvalue_signedness(&self, rvalue: &Rvalue) -> Option<bool> {
         match rvalue {
-            Rvalue::Use(operand) => self.operand_signedness(operand),
+            Rvalue::Use(operand, ..) => self.operand_signedness(operand),
             Rvalue::BinaryOp(op, lhs, rhs) | Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
                 // For shift operations, only the value operand's (LHS) signedness
                 // matters; the shift amount may have a different type in MIR.
@@ -268,7 +279,9 @@ pub(in crate::codegen_ay::chc) fn ty_signedness(ty: rustc_public::ty::Ty) -> Opt
                         return Some(false); // ZST — no data to compare
                     }
                     if fields.len() == 1 {
-                        if let Some(inner) = ty_signedness(fields[0].ty_with_args(args)) {
+                        if let Some(inner) =
+                            mono_ty::field_ty(&fields[0], args).and_then(ty_signedness)
+                        {
                             return Some(inner);
                         }
                     }

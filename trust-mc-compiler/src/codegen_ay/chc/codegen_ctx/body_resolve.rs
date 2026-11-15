@@ -6,14 +6,24 @@
 //!
 //! Extracted from `codegen_ctx/mod.rs` per #3254 packet 1.
 
-use rustc_middle::ty::{EarlyBinder, TypeVisitableExt, TypingEnv};
-use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgKind, GenericArgs, RigidTy, Ty, TyConst, TyConstKind, TyKind};
+use tracing::debug;
 
 use super::ChcCtx;
 use crate::codegen_ay::chc::decl::codegen_types::CodegenTypes;
+use crate::codegen_ay::shared::mono_ty;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// A body-local type at the current instance's arguments.
+    ///
+    /// Rule A's body binder is `shared::mono_ty::body_ty`: rustc's full
+    /// monomorphization (nested generics, associated types, async opaque
+    /// futures revealed to their coroutine), with the `try_` normalizer and an
+    /// arguments-fit check, so it refuses instead of panicking (#3705 was the
+    /// panic of the old guard's gap). During migration (design
+    /// trust-mc-reds-final §3.3, phase A2 moves the callers to `Option`) a
+    /// refusal falls back to the shallow substitution below, which is what
+    /// this function did before for a type the full path did not take.
     pub(in crate::codegen_ay::chc) fn resolve_body_ty(
         &self,
         ty: rustc_public::ty::Ty,
@@ -21,25 +31,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(instance) = self.current_instance else {
             return ty;
         };
-        let internal_ty = rustc_internal::internal(self.tcx, ty);
-        // When the instance has generic args, use rustc's full monomorphization
-        // to resolve body-local types (handles nested generics, associated types,
-        // and normalizations that manual substitution misses). When args are
-        // empty (non-generic harness), only do this for types without residual
-        // params. That preserves the #3705 panic fix while still revealing
-        // args-empty async opaque futures to their hidden coroutine type.
-        if !instance.args().0.is_empty() || !internal_ty.has_param() {
-            let internal_instance = rustc_internal::internal(self.tcx, instance);
-            let resolved_ty = rustc_internal::stable(
-                internal_instance.instantiate_mir_and_normalize_erasing_regions(
-                    self.tcx,
-                    TypingEnv::fully_monomorphized(),
-                    EarlyBinder::bind(internal_ty),
-                ),
-            );
-            if resolved_ty != ty {
-                return resolved_ty;
-            }
+        match mono_ty::body_ty(instance, ty) {
+            Some(resolved) if resolved != ty => return resolved,
+            Some(_) => {}
+            None => debug!(?ty, "resolve_body_ty: body_ty refused; shallow substitution"),
         }
         Self::resolve_body_ty_with_args(ty, &instance.args())
     }

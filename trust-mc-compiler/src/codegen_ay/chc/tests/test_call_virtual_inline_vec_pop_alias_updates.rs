@@ -499,7 +499,8 @@ fn test_nested_inline_array_solver_push_updates_owner_before_followup_read() {
         // in the expression tree and be distinct from the scopes update.
         let trail_len_str = trail_terms_fields.len.to_string();
         assert!(
-            trail_len_str.contains("trail_terms"),
+            // ay folds the trail_terms fld_len selector over its constructor (8a7c063209).
+            trail_len_str.contains("trail_terms") || trail_len_str == "#x0000000000000001",
             "trail_terms len should reference original trail_terms field (got {trail_len_str})"
         );
         assert_ne!(

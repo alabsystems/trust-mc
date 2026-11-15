@@ -273,13 +273,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 };
                 let zero = Expr::bitvec_const(0u128, width);
                 let div_zero = y.clone().eq(zero);
-                // Kani's SIMD lane check text is "division by zero" (the
-                // corpus expected files demand it); the bare label default
-                // renders the SCALAR text "attempt to divide by zero", so
-                // carry the message explicitly.
+                // A zero lane divisor is UB of the unsafe intrinsic (core
+                // `intrinsics::simd::simd_div`/`simd_rem` `# Safety`), never a
+                // Rust panic, so it must not reuse the scalar MIR-Assert label
+                // `div_by_zero_check`: that label's `division-by-zero` class is a
+                // panic class, which would let a `#[kani::should_panic]` harness
+                // count this UB as its expected panic. Kani adds no check here;
+                // CBMC's division-by-zero check fires, and Kani's should_panic
+                // accepts only class `assertion`. The text is CBMC's, which the
+                // corpus pins (intrinsics/simd-{div,rem}-div-zero); the bare
+                // label default would not render it, so carry it explicitly.
                 self.record_violation_guarded_with_message(
                     div_zero.clone(),
-                    "div_by_zero_check",
+                    "simd_div_by_zero_check",
                     Some("division by zero".to_string()),
                 );
                 let mut no_ub = div_zero.not();
@@ -305,8 +311,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
-        // Integer simd_add / simd_sub / simd_mul are UB on lane overflow.
-        // Kani checks each lane with assert-assume semantics ("attempt to
+        // Integer simd_add / simd_sub / simd_mul WRAP on lane overflow
+        // (core::intrinsics::simd docs: never UB, never a panic), but Kani
+        // checks each lane with assert-assume semantics ("attempt to
         // compute simd_add which would overflow"); a missing check here
         // emitted NO obligation at all, so a harness whose whole point is
         // that overflow reported VACUOUS no-checks (corpus:

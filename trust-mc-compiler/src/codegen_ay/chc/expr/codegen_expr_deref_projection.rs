@@ -319,12 +319,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             ))
                         )
                     {
-                        let checks = self.provenance_deref_bound_checks(
+                        let mut checks = self.provenance_deref_bound_checks(
                             deref_loc.as_expr(),
                             pointee_ty,
                             local_idx,
+                            Some(0),
                         );
-                        self.heap_state.pending_checks.extend(checks);
+                        // A pointer a wrapping step may have moved out of a heap
+                        // allocation (heap/stack_address.rs).
+                        if checks.is_empty() {
+                            checks = self.wrapping_deref_checks(
+                                deref_loc.as_expr(),
+                                pointee_ty,
+                                local_idx,
+                                modified_locals,
+                            );
+                        }
+                        self.push_pending_checks_dedup(checks);
                     }
 
                     // Part of #1161: Look ahead for Field projections after Deref.
@@ -334,6 +345,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         deref_loc.clone(),
                         pointee_ty,
                         remaining_projs,
+                        modified_locals,
                     ) {
                         DerefFieldOffsetResult::Loaded(expr) => {
                             current_expr = expr;
@@ -415,6 +427,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         field_ty: Some(*field_ty),
                     }];
                     let field_root = current_expr.clone();
+                    // A union field first: the type-blind selectors misread a
+                    // flat union's bits (`union_bv_field_coerce`).
+                    if active_variant.is_none()
+                        && let Some(value) =
+                            self.union_bv_field_coerce(&field_root, current_ty, *field_ty)
+                    {
+                        current_expr = value;
+                        current_ty = *field_ty;
+                        proj_idx += 1;
+                        continue;
+                    }
                     current_expr = match Self::apply_field_selections(current_expr, &selections) {
                         Some(expr) => expr,
                         None => {
@@ -424,7 +447,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             // union arm, so `(*static_ref).field` reads work for
                             // union statics pinned by the zero-fill lane.
                             if let Some(coerced) =
-                                Self::union_bv_field_coerce(&field_root, current_ty, *field_ty)
+                                self.union_bv_field_coerce(&field_root, current_ty, *field_ty)
                             {
                                 coerced
                             } else {

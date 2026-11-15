@@ -11,6 +11,8 @@
 //! Part of #2306: include!() to proper module migration.
 
 use crate::codegen_ay::stubs::StubKind;
+use rustc_public::mir::Operand;
+use rustc_public::ty::{RigidTy, TyKind};
 
 use super::ChcCtx;
 use super::chc_call_context::{ChcCallContext, DispatchCallContext};
@@ -41,6 +43,10 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
             dcx.stmt_constraints,
             dcx.modified_locals,
         );
+        // A collection model reached through a `&mut` reference naming one of
+        // several collections fails closed (see the method).
+        self.fail_close_path_dependent_collection_receiver(args);
+
         // === Pre-routes: type-based or custom detectors that bypass the stub registry ===
         // Design rule (Part of #2408 T5): these use type-based detection (BigInt,
         // BigRational, HashMap) or custom path patterns (alloc, iterators) that
@@ -396,7 +402,7 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
                     stmt_constraints,
                     modified_locals,
                 };
-                self.codegen_call_iterator_adapter(&cx);
+                self.codegen_call_iterator_adapter(&cx, Some(func));
             } else {
                 self.record_diverging_call_drop(
                     func,
@@ -455,6 +461,31 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
             return true;
         }
 
+        // SliceRepeat — `<[T]>::repeat`, the buffer `str::repeat` builds. Exact
+        // for a constant count over a resolved source, else a recorded havoc.
+        if matches!(stub, StubKind::SliceRepeat) {
+            if let Some(target) = target {
+                let cx = ChcCallContext {
+                    stub,
+                    args,
+                    destination,
+                    target: *target,
+                    from_app,
+                    stmt_constraints,
+                    modified_locals,
+                };
+                self.codegen_call_slice_repeat(&cx);
+            } else {
+                self.record_diverging_call_drop(
+                    func,
+                    Some(bb_idx),
+                    "collections::slice_repeat",
+                    Some(stub),
+                );
+            }
+            return true;
+        }
+
         // HashSet iterator stubs — route through projection-aware handler (Part of #3057).
         // Without this, HashSetIntoIter/Iter/IterNext fall through to codegen_call_hashset
         // via is_hashset predicate, which uses apply_collection_result — that handler lacks
@@ -494,6 +525,14 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
         // to get CTREX because only the first next() call reached the adapter.
         if stub.is_iterator_adapter() {
             if let Some(target) = target {
+                self.pending_iter_sum_model = (stub == StubKind::IterSum)
+                    .then(|| {
+                        crate::codegen_ay::reduce_loop_rule::iter_sum_call_model(
+                            func,
+                            self.body.locals(),
+                        )
+                    })
+                    .flatten();
                 let cx = ChcCallContext {
                     stub,
                     args,
@@ -503,7 +542,7 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
                     stmt_constraints,
                     modified_locals,
                 };
-                self.codegen_call_iterator_adapter(&cx);
+                self.codegen_call_iterator_adapter(&cx, Some(func));
             } else {
                 self.record_diverging_call_drop(
                     func,
@@ -551,5 +590,49 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
         }
 
         false
+    }
+}
+
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// A collection method called through a reference that names one of
+    /// several collections (`let r = if c { &mut v1 } else { &mut v2 };
+    /// r.push(7)`). The collection models keep length, capacity and presence
+    /// side state per LOCAL and resolve the receiver to one local, or to the
+    /// reference itself: the push updated the reference's own length and
+    /// neither `v1`'s nor `v2`'s, so `v1.len() == 0` verified clean where Kani
+    /// fails and the true `v1.len() + v2.len() == 1` was certified a Genuine
+    /// failure, and a `len()` through a shared `if c { &v1 } else { &v2 }`
+    /// read one of them on both paths (walker fail-closed repair round 5,
+    /// `cond_ref_collection_push_dual.rs`). Such a call records a fail-closed
+    /// reason: no proof stands on it and no counterexample is certified.
+    /// Repeated identical borrows (an unrolled loop's `&mut v` per copy) name
+    /// one collection and are exempt (`unanimous_borrowed_local`).
+    fn fail_close_path_dependent_collection_receiver(&mut self, args: &[Operand]) {
+        let Some(Operand::Copy(place) | Operand::Move(place)) = args.first() else {
+            return;
+        };
+        if !place.projection.is_empty() {
+            return;
+        }
+        let Ok(TyKind::RigidTy(RigidTy::Ref(_, pointee, _))) =
+            place.ty(self.body.locals()).map(|ty| ty.kind())
+        else {
+            return;
+        };
+        if !crate::codegen_ay::chc::stmt::ty_holds_collection(pointee, 0)
+            || !self.pointer_value_is_path_dependent(place.local)
+        {
+            return;
+        }
+        if super::codegen_call_iterator_adapter::unanimous_borrowed_local(self.body, place.local)
+            .is_some()
+        {
+            return;
+        }
+        tracing::debug!(
+            receiver = place.local,
+            "collection method through a reference naming several collections — fail closed"
+        );
+        self.record_sound_fallback_reason("collection_receiver_reference_path_dependent");
     }
 }

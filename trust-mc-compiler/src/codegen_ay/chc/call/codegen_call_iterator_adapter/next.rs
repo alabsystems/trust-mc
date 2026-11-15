@@ -56,7 +56,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Part of #4112: constrain FlattenNext payload to concrete chars
                     // from MIR string array when flat_map operates on string literals.
                     if matches!(stub, StubKind::FlattenNext) {
-                        if let Some(constraint) = self.try_constrain_flatten_next_payload(&payload)
+                        if let Some(constraint) = self.try_constrain_flatten_next_payload(&payload, iter_local)
                         {
                             adapter_extra_constraints.push(constraint);
                         }
@@ -76,7 +76,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         if matches!(stub, StubKind::FlattenNext) {
                             if let Some(payload) = &raw_payload {
                                 if let Some(constraint) =
-                                    self.try_constrain_flatten_next_payload(payload)
+                                    self.try_constrain_flatten_next_payload(payload, iter_local)
                                 {
                                     adapter_extra_constraints.push(constraint);
                                 }
@@ -314,6 +314,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         if let Some((iter_expr, iter_local)) =
             self.iterator_receiver_expr_and_local(args, modified_locals)
+            && let iter_local = self.range_receiver_local(&iter_expr, iter_local)
             && let Some((advanced_iter, has_remaining, current_item)) =
                 self.advance_range_iterator_expr(&iter_expr, iter_local, modified_locals)
         {

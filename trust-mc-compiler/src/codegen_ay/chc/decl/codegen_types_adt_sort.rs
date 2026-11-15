@@ -7,16 +7,18 @@
 //! Contains:
 //! - `translate_into_iter_sort`: IntoIter variant dispatch (Vec, Array, HashMap, HashSet)
 //! - `translate_adt_sort`: generic ADT field-by-field sort construction
-//! - `resolve_generic_ty`: Param type resolution from generic args
 //! - `adt_sort_name`: unique SMT sort name for generic ADT
 //! - `is_opaque_alloc_infra`: allocator/fmt infrastructure detection
 //!
 //! Extracted from include!() to proper module via extension trait pattern.
 //! Part of #2306: include!() to proper module migration.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_public::CrateDef;
-use rustc_public::ty::{AdtDef, AdtKind, GenericArgKind, GenericArgs, RigidTy, TyKind};
+use rustc_public::ty::{AdtDef, AdtKind, GenericArgs, RigidTy, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::field_roles;
@@ -34,10 +36,6 @@ pub(in crate::codegen_ay::chc) trait CodegenTypesAdtSort<'tcx, 'body> {
     fn translate_into_iter_sort(def: AdtDef, args: &GenericArgs) -> Option<Sort>;
     #[must_use]
     fn translate_adt_sort(def: AdtDef, args: GenericArgs) -> Option<Sort>;
-    fn resolve_generic_ty(
-        ty: rustc_public::ty::Ty,
-        args: &GenericArgs,
-    ) -> Option<rustc_public::ty::Ty>;
     fn adt_sort_name(def: AdtDef, args: &GenericArgs) -> String;
     fn is_opaque_alloc_infra(def: AdtDef) -> bool;
     fn is_hashbrown_internal(def: AdtDef) -> bool;
@@ -181,8 +179,8 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 let some_variant = &variants[some_idx];
 
                 if let Some(field) = some_variant.fields().first() {
-                    // Part of #4114: Use ty_with_args for associated type projection resolution.
-                    let concrete_ty = field.ty_with_args(&args);
+                    // Part of #4114 and Rule A (`shared::mono_ty::field_ty`).
+                    let concrete_ty = mono_ty::field_ty(field, &args)?;
                     {
                         // Keep refs to unsized fat-pointer pointees (&str, &[T])
                         // intact: their payload is the BV128 fat-pointer value,
@@ -196,8 +194,12 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                             // `Option_bv64` instead of `Option_hashbrown_raw_Bucket_K_V`,
                             // avoiding a duplicate datatype whose `value` accessor triggers
                             // Z3 PDR's "Uninterpreted 'value'" error.
-                            let option_name = if matches!(payload_ty.kind(), TyKind::RigidTy(RigidTy::Adt(inner_def, _)) if Self::is_hashbrown_internal(inner_def))
-                            {
+                            let shared_name = matches!(
+                                payload_ty.kind(),
+                                TyKind::RigidTy(RigidTy::Adt(inner_def, _))
+                                    if Self::is_hashbrown_internal(inner_def)
+                            );
+                            let option_name = if shared_name {
                                 names::option_sort_name(&names::sort_short_name(&payload_sort))
                             } else {
                                 Self::option_like_sort_name(def, &args, payload_ty)
@@ -205,18 +207,26 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                             // §4 item 7 records NO role for this arm, on
                             // purpose. `extract_pointer_expr` reads the FIRST
                             // constructor, which for an Option-like enum is the
-                            // empty `None_*` one, so the payload role has no
-                            // reader — and this is also the arm that MINTS the
+                            // empty `None_*` one (or, for a payload-first enum,
+                            // the payload one, whose field carries no role, so
+                            // it declines all the same), so the payload role has
+                            // no reader — and this is also the arm that MINTS the
                             // collision the table is built to survive
                             // (`Option<*mut u8>` and `Option<usize>` both name
                             // their sort `Option_bv64`), so recording it would
                             // poison an entry nobody consults. Record it here
                             // when a consumer for it appears, and re-run the
                             // dual wall then.
-                            return Some(enum_sort(
-                                &option_name,
-                                names::option_constructors(&option_name, payload_sort),
-                            ));
+                            //
+                            // The constructors are in variant order
+                            // (`option_like_constructors`), except under a name
+                            // shared with `Option`.
+                            let constructors = if shared_name {
+                                names::option_constructors(&option_name, payload_sort)
+                            } else {
+                                Self::option_like_constructors(def, &option_name, payload_sort)
+                            };
+                            return Some(enum_sort(&option_name, constructors));
                         }
                     }
                 }
@@ -247,26 +257,24 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
             let mut fields = Vec::with_capacity(variant.fields().len());
 
             for field in variant.fields() {
-                // Part of #4114: Use ty_with_args to resolve associated type
-                // projections (e.g., <Chars as IntoIterator>::IntoIter → Chars).
-                // field.ty() returns the raw definition type which may contain
-                // unresolved projections; resolve_generic_ty only handles Param.
-                let concrete_ty = field.ty_with_args(&args);
+                // Part of #4114 and Rule A (`shared::mono_ty::field_ty`): the
+                // field's type at the ADT's own arguments, associated-type
+                // projections normalized (<Chars as IntoIterator>::IntoIter →
+                // Chars). A field whose type does not instantiate refuses the
+                // sort instead of panicking.
+                let concrete_ty = mono_ty::field_ty(&field, &args)?;
                 let field_ty = concrete_ty;
                 // Part of #3883: References/raw pointers to dyn Trait are fat pointers
                 // (data ptr + vtable ptr). translate_ty maps all Ref/RawPtr to
                 // ptr_sort() (BV64), but dyn coercion produces Dyn_Trait{BV64, BV64}.
                 // Use the fat pointer sort so collect_leaf_sorts flattens to 2 slots,
                 // matching the actual coerced value and enabling reconstruction.
-                // resolve_generic_ty only resolves top-level Param types,
-                // not params nested inside Ref/RawPtr. For `&'a T` where
-                // T = dyn Trait, the pointee is still Param. Resolve it here.
+                // `concrete_ty` is already instantiated, so `&'a T` with
+                // T = dyn Trait reads as `&dyn Trait` here.
                 let is_dyn_fat_ptr = match concrete_ty.kind() {
                     TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
                     | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => {
-                        let resolved_pointee =
-                            Self::resolve_generic_ty(pointee, &args).unwrap_or(pointee);
-                        matches!(resolved_pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)))
+                        matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)))
                     }
                     _ => false,
                 };
@@ -275,15 +283,11 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                     struct_sort(dyn_name, [("fld_ptr", ptr_sort()), ("fld_vtable", ptr_sort())])
                 } else {
                     Self::translate_ty(concrete_ty).or_else(|| {
-                        // Part of #3596: Handle parameterized array fields like [T; N]
-                        // where T is a generic param. resolve_generic_ty only resolves
-                        // top-level Param types but not params nested inside Array types.
-                        // For #[repr(simd)] structs (e.g., CustomSimd<T, N>([T; N])),
-                        // the field type [T; N] has an unresolved elem param that
-                        // translate_ty cannot process, causing BV32 fallback.
+                        // Part of #3596: an array field (`[T; N]` of a
+                        // `#[repr(simd)]` struct) whose length translate_ty cannot
+                        // evaluate: its element sort, at any length.
                         if let TyKind::RigidTy(RigidTy::Array(elem_ty, _)) = field_ty.kind() {
-                            let resolved_elem = Self::resolve_generic_ty(elem_ty, &args)?;
-                            let elem_sort = Self::translate_ty(resolved_elem)?;
+                            let elem_sort = Self::translate_ty(elem_ty)?;
                             let elem_sort = flatten_dt_array_element(elem_sort);
                             Some(Sort::array(ptr_sort(), elem_sort))
                         } else {
@@ -315,8 +319,8 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 let v_name = variant.name();
                 let mut fields = Vec::with_capacity(variant.fields().len());
                 for (idx, field) in variant.fields().iter().enumerate() {
-                    // Part of #4114: Use ty_with_args for associated type projection resolution.
-                    let concrete_ty = field.ty_with_args(&args);
+                    // Part of #4114 and Rule A (`shared::mono_ty::field_ty`).
+                    let concrete_ty = mono_ty::field_ty(field, &args)?;
                     // Apply deref_ref_ty for &[T; N] fields so that general enum
                     // paths (Result<&[T; N], E>) use Array sort, matching the
                     // Option-like path. Without this, Option uses Array(BV64, BV8)
@@ -328,10 +332,9 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         && deref_ty != concrete_ty;
                     let field_ty = if use_deref { deref_ty } else { concrete_ty };
                     let sort = Self::translate_ty(field_ty).or_else(|| {
-                        // Part of #3596: same parameterized-array fallback as structs.
+                        // Part of #3596: same array fallback as structs.
                         if let TyKind::RigidTy(RigidTy::Array(elem_ty, _)) = field_ty.kind() {
-                            let resolved_elem = Self::resolve_generic_ty(elem_ty, &args)?;
-                            let elem_sort = Self::translate_ty(resolved_elem)?;
+                            let elem_sort = Self::translate_ty(elem_ty)?;
                             let elem_sort = flatten_dt_array_element(elem_sort);
                             Some(Sort::array(ptr_sort(), elem_sort))
                         } else {
@@ -379,27 +382,6 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
 
         None
-    }
-
-    /// Resolves a generic type parameter using the provided generic arguments.
-    fn resolve_generic_ty(
-        ty: rustc_public::ty::Ty,
-        args: &GenericArgs,
-    ) -> Option<rustc_public::ty::Ty> {
-        match ty.kind() {
-            TyKind::Param(param_ty) => {
-                let idx = param_ty.index as usize;
-                if let Some(arg) = args.0.get(idx) {
-                    match arg {
-                        GenericArgKind::Type(resolved_ty) => Some(*resolved_ty),
-                        _ => None, // external enum: GenericArgKind
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => Some(ty), // external enum: TyKind
-        }
     }
 
     /// Build a unique SMT sort name for a generic enum ADT.

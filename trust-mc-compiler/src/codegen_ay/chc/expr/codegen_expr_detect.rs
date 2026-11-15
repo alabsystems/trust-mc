@@ -78,18 +78,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Shared extraction of the resolve-instance-then-check-marker pattern
     /// common to all three detect_kani_* functions.
     fn resolve_kani_marker(&self, func: &Operand) -> Option<(rustc_public::ty::FnDef, String)> {
-        let func_ty = func.ty(self.body.locals()).ok()?;
-        let (fn_def, fn_args) = match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, args)) => (def, args),
-            _ => return None, // external enum: TyKind
-        };
-
-        let instance_opt = Instance::resolve(fn_def, &fn_args).ok();
-        let fn_marker = instance_opt
-            .as_ref()
-            .and_then(|instance| attributes::fn_marker(instance.def))
-            .or_else(|| attributes::fn_marker(fn_def))?;
-
-        Some((fn_def, fn_marker))
+        kani_marker_in(self.body, func)
     }
+}
+
+/// The Kani hook a call's callee is, with the callee operand typed in `body`
+/// (the harness's or an inlined callee's).
+pub(in crate::codegen_ay::chc) fn kani_hook_in(
+    body: &rustc_public::mir::Body,
+    func: &Operand,
+) -> Option<KaniHook> {
+    let (_, marker) = kani_marker_in(body, func)?;
+    match try_get_kani_function(&marker)? {
+        KaniFunction::Hook(hook) => Some(hook),
+        _ => None,
+    }
+}
+
+/// Resolve a function operand, typed in `body`, to its FnDef and Kani marker.
+fn kani_marker_in(
+    body: &rustc_public::mir::Body,
+    func: &Operand,
+) -> Option<(rustc_public::ty::FnDef, String)> {
+    let func_ty = func.ty(body.locals()).ok()?;
+    let (fn_def, fn_args) = match func_ty.kind() {
+        TyKind::RigidTy(RigidTy::FnDef(def, args)) => (def, args),
+        _ => return None, // external enum: TyKind
+    };
+
+    let instance_opt = Instance::resolve(fn_def, &fn_args).ok();
+    let fn_marker = instance_opt
+        .as_ref()
+        .and_then(|instance| attributes::fn_marker(instance.def))
+        .or_else(|| attributes::fn_marker(fn_def))?;
+
+    Some((fn_def, fn_marker))
 }

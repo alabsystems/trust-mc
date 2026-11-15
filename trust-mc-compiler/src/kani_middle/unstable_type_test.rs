@@ -12,7 +12,6 @@ use rustc_public::{CompilerError, CrateDef, run_with_tcx};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tempfile::TempDir;
 
@@ -91,21 +90,28 @@ where
     let helper_out_dir = temp_dir.path().join("helper_out");
     fs::create_dir_all(&helper_out_dir).expect("create helper output dir");
 
-    // Compile the helper with the same explicitly selected compiler as this
-    // test binary.  Falling through to an unrelated `rustc` on PATH can
-    // produce an rlib with a different metadata version and make this test
-    // observe E0514 instead of the unstable-type diagnostic under test.
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let helper_status = Command::new(rustc)
-        .arg(&helper_src_path)
-        .arg("--crate-type=lib")
-        .arg(format!("--crate-name={helper_name}"))
-        .arg("--out-dir")
-        .arg(&helper_out_dir)
-        .arg("--edition=2024")
-        .status()
-        .expect("compile helper crate");
-    assert!(helper_status.success(), "helper crate compilation failed");
+    // Compile the helper IN PROCESS, with the compiler this test binary links
+    // (design trust-mc-reds-final §7.1, E2: the engine's test oracles spawn no
+    // tool by bare name). A `rustc` found on PATH may be another compiler (an
+    // rlib with a different metadata version reads as E0514 instead of the
+    // unstable-type diagnostic under test), or a launcher that refuses the
+    // name outright; the running `librustc_driver` is exactly the compiler
+    // the harness crate below is checked with.
+    struct EmitHelperRlib;
+    impl rustc_driver::Callbacks for EmitHelperRlib {}
+    let helper_args = vec![
+        "rustc".to_string(),
+        helper_src_path.to_string_lossy().into_owned(),
+        "--crate-type=lib".to_string(),
+        format!("--crate-name={helper_name}"),
+        "--out-dir".to_string(),
+        helper_out_dir.to_string_lossy().into_owned(),
+        "--edition=2024".to_string(),
+    ];
+    let helper_compiled = rustc_driver::catch_fatal_errors(|| {
+        rustc_driver::run_compiler(&helper_args, &mut EmitHelperRlib)
+    });
+    assert!(helper_compiled.is_ok(), "helper crate compilation failed");
 
     let helper_rlib = fs::read_dir(&helper_out_dir)
         .expect("read helper output dir")

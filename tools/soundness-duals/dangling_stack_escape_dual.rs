@@ -6,16 +6,18 @@
 //
 //   escape_reborrow_read   - MUST FAIL: reborrow into dead callee storage.
 //   escape_reborrow_via_fn - MUST FAIL: same, across a call boundary.
-//   escape_println_unsafe  - TOLERATED
+//   escape_println_unsafe  - MUST FAIL: `&*p` into dead storage, read only by format-args.
 //   escape_value_load      - MUST FAIL: caught today; this is the REGRESSION guard.
 //
-// `escape_println_unsafe` is STILL KNOWN BROKEN (the deref is consumed by
-// format-args, which reaches the pointee through a lane this check does not
-// see). Change its annotation to `MUST FAIL` the moment that path is covered — that turns this file into the gate that keeps them fixed. Do not
-// write the words MUST FAIL on those lines before then: `harness_oracle` tests
-// for MUST FAIL BEFORE it tests for TOLERATED, so a line carrying both scores
-// the harness as an unfixed bug and the wall reports a P0 (learned the hard
-// way — this exact file did it).
+// The format-args harness was the last one CHC proved clean: its only load of
+// the pointee happens inside `<i32 as Display>::fmt`, behind `_print`, which
+// CHC models as a no-op. It is now caught where the program first goes wrong —
+// the `&(*p)` that builds the reference into dead storage
+// (`emit_ref_into_dead_storage_check`, ref_address.rs). Never put TOLERATED
+// and MUST FAIL on one harness line: `harness_oracle` tests for MUST FAIL
+// BEFORE it tests for TOLERATED, so such a line scores the harness as an
+// unfixed bug and the wall reports a P0 (learned the hard way — this exact
+// file did it).
 //
 // WHY THIS FILE EXISTS
 //
@@ -79,7 +81,8 @@ fn escape_reborrow_via_fn() {
     assert!(v == 2);
 }
 
-/// MISSED: the deref is consumed by format-args, which takes `&*p`.
+/// CAUGHT: the deref is consumed by format-args, which takes `&*p`; the
+/// reference creation is the checked site (CHC used to prove this clean).
 #[kani::proof]
 fn escape_println_unsafe() {
     let p = dies();

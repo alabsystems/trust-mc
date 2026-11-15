@@ -6,6 +6,7 @@
 //!
 //! Converted from include!() to proper module per #2595.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 use std::collections::HashSet;
@@ -194,9 +195,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let present_expr = present.unwrap_or_else(|| {
             // Part of #3447: Record that HashMap iterator present array is
             // unconstrained (tracked present not available — membership unknown).
-            self.record_sound_fallback_reason("hashmap_iter_present_unknown");
+            let booked = self.record_sound_fallback_reason("hashmap_iter_present_unknown");
             let sym_name = super::chc_fresh_name("hashmap_iter_present");
-            super::declare_pending_var(sym_name, Sort::array(key_sort.clone(), bool_sort()))
+            Havoc::booked(booked, sym_name, Sort::array(key_sort.clone(), bool_sort()))
         });
 
         // Build iterator sort name based on key/value sorts.

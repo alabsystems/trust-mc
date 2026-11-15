@@ -190,6 +190,38 @@ fn test_collect_constructor_guards_recurses_through_bv2int() {
     }
 }
 
+/// The last constructor of an enum flatten's tester chain lives in an ELSE
+/// branch: `ite(is_None(o), #b0, value(o))`. `value(o)` is evaluated only when
+/// `o` is not `None`, so asserting `((_ is Some) o)` as a block fact prunes the
+/// `None` path (`prusti/Fibonacci_sequence.rs` went VACUOUS on exactly this).
+/// A selector on the same container OUTSIDE the ite still gets its guard.
+#[test]
+fn test_collect_constructor_guards_skips_selector_in_tester_else_branch() {
+    let option_sort = enum_sort(
+        "Option_bv32_else",
+        vec![("None", vec![]), ("Some", vec![("value", Sort::bitvec(32))])],
+    );
+    let option_var = Expr::var("option_var", option_sort);
+    let payload = option_var.clone().field_select("Option_bv32_else", "value", Sort::bitvec(32));
+    let encoded = Expr::ite(
+        option_var.clone().is_constructor("Option_bv32_else", "None"),
+        Expr::bitvec_const(0u64, 32),
+        payload.clone(),
+    );
+    let out = Expr::var("encoded_out", Sort::bitvec(32));
+
+    let guards = super::super::collect_constructor_guards(&[out.clone().eq(encoded.clone())]);
+    assert!(
+        guards.is_empty(),
+        "a selector the tester's else branch already guards must not become a block fact: \
+         {guards:?}"
+    );
+
+    // Control: the same selector read unconditionally keeps its guard.
+    let guards = super::super::collect_constructor_guards(&[out.eq(payload)]);
+    assert_eq!(guards.len(), 1, "an unguarded selector still gets its constructor guard");
+}
+
 // ─── Constructor-guard walker: skip guard on known DT constants (#3896) ──
 
 #[test]
@@ -327,11 +359,12 @@ fn test_untranslatable_mir_assert_fallback_emits_error_and_successor_rules() {
             let new_rules = &chc_ctx.vc.rules[before_len..];
             assert_eq!(
                 new_rules.len(),
-                2,
+                // BSEM-18: check rule + error_p bridge + successor.
+                3,
                 "non-deterministic choice emits error rule + successor transition"
             );
             assert!(
-                new_rules.iter().any(|rule| rule.head.name == "error"),
+                new_rules.iter().any(is_error_check_rule),
                 "fallback must emit error rule to prevent false proofs"
             );
             assert!(
@@ -407,17 +440,17 @@ fn test_switchint_fallback_emits_error_and_selector_guarded_successors() {
             let new_rules = &chc_ctx.vc.rules[before_len..];
             assert_eq!(
                 new_rules.len(),
-                4,
-                "fallback must emit 1 error rule + 3 guarded successor rules"
+                5,
+                "fallback must emit 1 error rule, its BSEM-18 error_p bridge, and 3 guarded successor rules"
             );
             assert_eq!(
-                new_rules.iter().filter(|rule| rule.head.name == "error").count(),
+                new_rules.iter().filter(|rule| is_error_check_rule(rule)).count(),
                 1,
                 "fallback must emit exactly one conservative error rule"
             );
 
             let successor_rules: Vec<_> =
-                new_rules.iter().filter(|rule| rule.head.name != "error").collect();
+                new_rules.iter().filter(|rule| !is_error_head(rule.head.name.as_str())).collect();
             assert_eq!(
                 successor_rules.len(),
                 3,
@@ -1257,7 +1290,7 @@ fn error_rule_negates_guard(
     rule: &trust_mc_core::chc::Rule,
     guard_pred: impl Fn(&Expr) -> bool,
 ) -> bool {
-    rule.head.name == "error"
+    is_error_check_rule(rule)
         && rule.body.constraints.iter().any(|constraint| {
             constraint_tree_contains(constraint, &|expr| match expr.value() {
                 ExprValue::Not(inner) => guard_pred(inner),
@@ -1475,7 +1508,7 @@ fn test_box_ptr_level_drop_call_emits_error_and_obj_valid_store() {
                 vc.relations.iter().any(|r| r.name == "error"),
                 "Ptr-level Box VC must declare error relation"
             );
-            let error_rule_count = vc.rules.iter().filter(|rule| rule.head.name == "error").count();
+            let error_rule_count = vc.rules.iter().filter(|rule| is_error_check_rule(rule)).count();
             assert!(
                 error_rule_count >= 1,
                 "Drop(Box) must emit at least one error-headed safety rule, got {}",
@@ -2084,7 +2117,7 @@ fn test_box_drop_reg_level_includes_dealloc_safety_checks() {
                 ChcConfig { track_level: crate::args::ChcTrackLevel::Ptr, ..ChcConfig::default() },
             );
 
-            let ptr_error_rules = vc_ptr.rules.iter().filter(|r| r.head.name == "error").count();
+            let ptr_error_rules = vc_ptr.rules.iter().filter(|r| is_error_check_rule(r)).count();
             assert!(
                 ptr_error_rules >= 1,
                 "Ptr level must emit error-headed safety rules for Box drop, got {}",
@@ -2118,7 +2151,7 @@ fn test_box_drop_reg_level_includes_dealloc_safety_checks() {
             let reg_dealloc_error_rules = vc_reg
                 .rules
                 .iter()
-                .filter(|r| r.head.name == "error" && rule_contains_var(r, "obj_valid"))
+                .filter(|r| is_error_check_rule(r) && rule_contains_var(r, "obj_valid"))
                 .count();
             assert!(
                 reg_dealloc_error_rules >= 1,
@@ -2130,7 +2163,7 @@ fn test_box_drop_reg_level_includes_dealloc_safety_checks() {
             let ptr_dealloc_error_rules = vc_ptr
                 .rules
                 .iter()
-                .filter(|r| r.head.name == "error" && rule_contains_var(r, "obj_valid"))
+                .filter(|r| is_error_check_rule(r) && rule_contains_var(r, "obj_valid"))
                 .count();
             assert!(
                 ptr_dealloc_error_rules >= 1,
@@ -2145,10 +2178,10 @@ fn test_box_drop_reg_level_includes_dealloc_safety_checks() {
 // InlineAsm fail-closed (Part of #2756)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Tests that `TerminatorKind::InlineAsm` in the CHC pipeline:
-/// 1. Emits a conservative error rule (fail-closed, no vacuous PROOF)
+/// Tests that a nop `TerminatorKind::InlineAsm` (`asm!("nop")`) in the CHC pipeline:
+/// 1. Emits no conservative error rule from its block (lowered as a goto, ae0cbd325)
 /// 2. Preserves reachability to successor blocks via goto rule
-/// 3. Records a sound fallback (increments sound_fallback_count, Part of #3099)
+/// 3. Records no fallback (it modifies no locals)
 ///
 /// The test source uses `core::arch::asm!("nop")` to produce a MIR InlineAsm
 /// terminator.  If MIR does not contain InlineAsm (future compiler change),
@@ -2185,10 +2218,26 @@ fn test_inline_asm_emits_error_rule_and_preserves_successor_reachability() {
             let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_inline_asm", ChcConfig::default());
             let (vc, _) = chc_ctx.translate();
 
-            // 1. Must have at least one error rule (fail-closed for InlineAsm).
+            // 1. `asm!("nop")` has no effect, so it is lowered as a plain goto
+            //    (is_nop_inline_asm_template, ae0cbd325): the InlineAsm block emits no
+            //    fail-closed error rule. The probe's `x + 1` overflow check is an error rule
+            //    from the successor block, so only rules leaving the InlineAsm block count.
+            //    The fail-closed arm is covered by
+            //    test_inline_asm_fallback_records_fallback_and_emits_error.
+            let asm_rel: Vec<String> = body
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, bb)| {
+                    matches!(bb.terminator.kind, rustc_public::mir::TerminatorKind::InlineAsm { .. })
+                })
+                .map(|(idx, _)| format!("probe_inline_asm__bb{idx}"))
+                .collect();
             assert!(
-                vc.rules.iter().any(|r| r.head.name == "error"),
-                "InlineAsm block must emit at least one conservative error rule (fail-closed)"
+                !vc.rules.iter().filter(|r| is_error_check_rule(r)).any(|r| {
+                    r.body.relation.as_ref().is_some_and(|rel| asm_rel.iter().any(|a| rel.name.as_str() == a))
+                }),
+                "a nop InlineAsm must not emit a conservative error rule from its block {asm_rel:?}"
             );
 
             // 2. Successor blocks after InlineAsm must be reachable.
@@ -2224,8 +2273,8 @@ fn test_inline_asm_emits_error_rule_and_preserves_successor_reachability() {
             let fallback_counts = get_chc_fallback_counts();
             let count = fallback_counts.get("probe_inline_asm").copied().unwrap_or(0);
             assert_eq!(
-                count, 1,
-                "InlineAsm must increment unsound fallback_count (stale locals in goto rule); \
+                count, 0,
+                "a nop InlineAsm modifies no locals and must not record a fallback; \
                  got {count} for probe_inline_asm in map: {fallback_counts:?}"
             );
         },
@@ -2288,18 +2337,20 @@ fn test_inline_asm_fallback_records_fallback_and_emits_error() {
             let new_rules = &chc_ctx.vc.rules[before_rules..];
             assert_eq!(
                 new_rules.len(),
-                2,
+                // BSEM-18: check rule + error_p bridge + successor.
+                3,
                 "InlineAsm handler must emit error rule + successor goto rule"
             );
             assert!(
-                new_rules.iter().any(|r| r.head.name == "error"),
+                new_rules.iter().any(is_error_check_rule),
                 "InlineAsm handler must emit conservative error rule"
             );
             assert!(
                 new_rules.iter().any(|r| r.head.name == target_rel),
                 "InlineAsm handler must preserve successor reachability"
             );
-            for rule in new_rules {
+            // The error_p bridge has its own empty body; check the emitted rules.
+            for rule in new_rules.iter().filter(|r| is_error_check_rule(r) || r.head.name == target_rel) {
                 match &rule.body.constraints {
                     trust_mc_core::constraints::Constraints::Shared { base, .. } => {
                         assert!(
@@ -2360,12 +2411,12 @@ fn test_box_drop_reg_level_solver_produces_proof() {
             let reg_dealloc_rules = vc_reg
                 .rules
                 .iter()
-                .filter(|r| r.head.name == "error" && rule_contains_var(r, "obj_valid"))
+                .filter(|r| is_error_check_rule(r) && rule_contains_var(r, "obj_valid"))
                 .count();
             let ptr_dealloc_rules = vc_ptr
                 .rules
                 .iter()
-                .filter(|r| r.head.name == "error" && rule_contains_var(r, "obj_valid"))
+                .filter(|r| is_error_check_rule(r) && rule_contains_var(r, "obj_valid"))
                 .count();
             assert!(
                 reg_dealloc_rules >= 1,

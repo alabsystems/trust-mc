@@ -20,6 +20,7 @@
 //!
 //! Part of #3702.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -30,7 +31,7 @@ use super::super::codegen_call_atomic::resolve_ptr_target_local;
 use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_rules::CodegenRules;
 use super::super::codegen_types::CodegenTypes;
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 use crate::kani_middle::abi::LayoutOf;
 
 /// Try to encode `write_bytes(dst, val, count)` when it fully overwrites a
@@ -568,7 +569,12 @@ fn fresh_expr_for_local(ctx: &mut ChcCtx<'_, '_>, referent_local: usize) -> Opti
         let referent_ty = ctx.body.locals().get(referent_local)?.ty;
         ChcCtx::translate_ty(referent_ty)?
     };
-    Some(declare_pending_var(chc_fresh_name("__write_bytes_full"), sort))
+    Some(Havoc::mint(
+        ctx,
+        sound_havoc::UNTRACKED_CALL_RESULT,
+        chc_fresh_name("__write_bytes_full"),
+        sort,
+    ))
 }
 
 fn referent_byte_width(
@@ -688,6 +694,8 @@ fn operand_pointee_ty(operand: &Operand, ctx: &ChcCtx<'_, '_>) -> Option<rustc_p
             ctx.body.locals().get(place.local).map(|l| l.ty)?
         }
         Operand::Constant(c) => c.ty(),
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => rustc_public::ty::Ty::bool_ty(),
     };
     match ty.kind() {
         TyKind::RigidTy(RigidTy::RawPtr(pointee_ty, _)) => Some(pointee_ty),

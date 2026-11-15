@@ -7,13 +7,13 @@
 
 use super::remap::remap_block;
 use super::*;
-use crate::kani_middle::reachability::is_prefix_abstracted;
+use crate::kani_middle::std_abstraction::StdAbstraction;
 use crate::rustc_public_bridge::IndexedVal;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    BasicBlock, BinOp, Operand, Place, ProjectionElem, Rvalue, Statement, StatementKind,
-    Terminator, TerminatorKind, UnwindAction,
+    BasicBlock, BinOp, Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+    UnwindAction,
 };
 use rustc_public::rustc_internal;
 use rustc_public::ty::Span;
@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use trust_mc_codegen_stubs::{StubKind, StubRegistry};
 
 mod handler_boundaries_tests;
+mod storage_lifetime_tests;
 mod variadic_tests;
 
 fn dummy_span() -> Span {
@@ -211,12 +212,12 @@ fn apply_codegen_inline_pass_with_config(
     config: InlineConfig,
 ) -> Body {
     let mut pass = FunctionInlinePass::new(config);
+    let std_abstraction = StdAbstraction::resolve(tcx);
     let (_, body) = pass.transform_with_body_provider(tcx, body, instance, |callee_instance| {
         if !callee_instance.has_body() {
             return None;
         }
-        let callee_name = callee_instance.name();
-        if is_prefix_abstracted(&callee_name) {
+        if std_abstraction.abstracts_public_instance(tcx, callee_instance) {
             return None;
         }
         callee_instance.body()
@@ -228,7 +229,7 @@ fn apply_codegen_inline_pass_with_config(
 fn test_remap_block_empty_no_mapping() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb + 10, Some(99));
@@ -241,7 +242,7 @@ fn test_remap_block_empty_no_mapping() {
 fn test_remap_block_return_without_call_target_becomes_unreachable() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb, None);
@@ -252,7 +253,10 @@ fn test_remap_block_return_without_call_target_becomes_unreachable() {
 fn test_remap_block_goto_remaps_target() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator { kind: TerminatorKind::Goto { target: 3 }, span: dummy_span() },
+        terminator: crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: 3 },
+            dummy_span(),
+        ),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb + 100, None);
@@ -262,8 +266,11 @@ fn test_remap_block_goto_remaps_target() {
 #[test]
 fn test_remap_block_storage_live_remaps_local() {
     let block = BasicBlock {
-        statements: vec![Statement { kind: StatementKind::StorageLive(5), span: dummy_span() }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::StorageLive(5),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(5, 42)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -274,8 +281,11 @@ fn test_remap_block_storage_live_remaps_local() {
 #[test]
 fn test_remap_block_storage_dead_remaps_local() {
     let block = BasicBlock {
-        statements: vec![Statement { kind: StatementKind::StorageDead(3), span: dummy_span() }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::StorageDead(3),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(3, 77)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -285,15 +295,19 @@ fn test_remap_block_storage_dead_remaps_local() {
 #[test]
 fn test_remap_block_assign_remaps_both_place_and_operand() {
     let block = BasicBlock {
-        statements: vec![Statement {
-            kind: StatementKind::Assign(mk_place(1), Rvalue::Use(Operand::Copy(mk_place(2)))),
-            span: dummy_span(),
-        }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
+                mk_place(1),
+                rvalue_use!(Rvalue::Use(Operand::Copy(mk_place(2)))),
+            ),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(1, 10), (2, 20)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
-    let StatementKind::Assign(place, Rvalue::Use(Operand::Copy(src))) = &result.statements[0].kind
+    let StatementKind::Assign(place, Rvalue::Use(Operand::Copy(src), ..)) =
+        &result.statements[0].kind
     else {
         unreachable!("expected Assign(Place, Use(Copy(Place)))");
     };
@@ -304,8 +318,11 @@ fn test_remap_block_assign_remaps_both_place_and_operand() {
 #[test]
 fn test_remap_block_unmapped_locals_pass_through() {
     let block = BasicBlock {
-        statements: vec![Statement { kind: StatementKind::StorageLive(99), span: dummy_span() }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::StorageLive(99),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(1, 10)]); // 99 not in map
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -315,8 +332,8 @@ fn test_remap_block_unmapped_locals_pass_through() {
 #[test]
 fn test_remap_block_nop_passes_through() {
     let block = BasicBlock {
-        statements: vec![Statement { kind: StatementKind::Nop, span: dummy_span() }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(StatementKind::Nop, dummy_span())],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -327,14 +344,10 @@ fn test_remap_block_nop_passes_through() {
 fn test_remap_block_drop_remaps_place_and_target() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator {
-            kind: TerminatorKind::Drop {
-                place: mk_place(4),
-                target: 7,
-                unwind: UnwindAction::Continue,
-            },
-            span: dummy_span(),
-        },
+        terminator: crate::rustc_compat::mir_terminator(
+            TerminatorKind::Drop { place: mk_place(4), target: 7, unwind: UnwindAction::Continue },
+            dummy_span(),
+        ),
     };
     let local_map = mk_local_map(&[(4, 40)]);
     let result = remap_block(&block, &local_map, &|bb| bb + 100, None);
@@ -349,8 +362,8 @@ fn test_remap_block_drop_remaps_place_and_target() {
 #[test]
 fn test_remap_block_binary_op_remaps_operands() {
     let block = BasicBlock {
-        statements: vec![Statement {
-            kind: StatementKind::Assign(
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 mk_place(0),
                 Rvalue::BinaryOp(
                     BinOp::Add,
@@ -358,9 +371,9 @@ fn test_remap_block_binary_op_remaps_operands() {
                     Operand::Move(mk_place(2)),
                 ),
             ),
-            span: dummy_span(),
-        }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(0, 100), (1, 101), (2, 102)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -381,14 +394,14 @@ fn test_remap_block_binary_op_remaps_operands() {
 #[test]
 fn test_remap_block_projection_index_remapped() {
     let block = BasicBlock {
-        statements: vec![Statement {
-            kind: StatementKind::Assign(
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 Place { local: 0, projection: vec![ProjectionElem::Index(5)] },
-                Rvalue::Use(Operand::Copy(mk_place(1))),
+                rvalue_use!(Rvalue::Use(Operand::Copy(mk_place(1)))),
             ),
-            span: dummy_span(),
-        }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(0, 10), (5, 50), (1, 11)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -405,14 +418,14 @@ fn test_remap_block_projection_index_remapped() {
 fn test_remap_block_unwind_cleanup_remapped() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator {
-            kind: TerminatorKind::Drop {
+        terminator: crate::rustc_compat::mir_terminator(
+            TerminatorKind::Drop {
                 place: mk_place(0),
                 target: 1,
                 unwind: UnwindAction::Cleanup(5),
             },
-            span: dummy_span(),
-        },
+            dummy_span(),
+        ),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb + 10, None);
@@ -427,14 +440,10 @@ fn test_remap_block_unwind_cleanup_remapped() {
 fn test_remap_block_unwind_continue_unchanged() {
     let block = BasicBlock {
         statements: vec![],
-        terminator: Terminator {
-            kind: TerminatorKind::Drop {
-                place: mk_place(0),
-                target: 1,
-                unwind: UnwindAction::Continue,
-            },
-            span: dummy_span(),
-        },
+        terminator: crate::rustc_compat::mir_terminator(
+            TerminatorKind::Drop { place: mk_place(0), target: 1, unwind: UnwindAction::Continue },
+            dummy_span(),
+        ),
     };
     let local_map = mk_local_map(&[]);
     let result = remap_block(&block, &local_map, &|bb| bb + 10, None);
@@ -448,11 +457,11 @@ fn test_remap_block_unwind_continue_unchanged() {
 #[test]
 fn test_remap_block_discriminant_remaps_place() {
     let block = BasicBlock {
-        statements: vec![Statement {
-            kind: StatementKind::Assign(mk_place(0), Rvalue::Discriminant(mk_place(3))),
-            span: dummy_span(),
-        }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(mk_place(0), Rvalue::Discriminant(mk_place(3))),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(0, 10), (3, 30)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -471,11 +480,11 @@ fn test_remap_block_discriminant_remaps_place() {
 #[test]
 fn test_remap_block_copy_for_deref_remaps_place() {
     let block = BasicBlock {
-        statements: vec![Statement {
-            kind: StatementKind::Assign(mk_place(0), Rvalue::CopyForDeref(mk_place(7))),
-            span: dummy_span(),
-        }],
-        terminator: Terminator { kind: TerminatorKind::Return, span: dummy_span() },
+        statements: vec![crate::rustc_compat::mir_statement(
+            StatementKind::Assign(mk_place(0), Rvalue::CopyForDeref(mk_place(7))),
+            dummy_span(),
+        )],
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
     };
     let local_map = mk_local_map(&[(0, 10), (7, 70)]);
     let result = remap_block(&block, &local_map, &|bb| bb, Some(0));
@@ -500,14 +509,26 @@ fn test_inline_config_default() {
 
 #[test]
 fn test_inline_config_custom() {
-    let config = InlineConfig { max_depth: 5, enabled: false, preserve_block_on: true };
+    let config = InlineConfig {
+        max_depth: 5,
+        enabled: false,
+        preserve_block_on: true,
+        preserve_array_comparisons: true,
+        ..InlineConfig::default()
+    };
     assert_eq!(config.max_depth, 5);
     assert!(!config.enabled);
 }
 
 #[test]
 fn test_function_inline_pass_new() {
-    let config = InlineConfig { max_depth: 20, enabled: true, preserve_block_on: true };
+    let config = InlineConfig {
+        max_depth: 20,
+        enabled: true,
+        preserve_block_on: true,
+        preserve_array_comparisons: true,
+        ..InlineConfig::default()
+    };
     let pass = FunctionInlinePass::new(config);
     assert_eq!(pass.config.max_depth, 20);
     assert!(pass.config.enabled);
@@ -1035,7 +1056,11 @@ fn test_inline_pass_inlines_block_on_when_boundary_not_preserved() {
         let instance = find_instance_by_suffix(tcx, "probe_manual_block_on");
         let body = instance.body().expect("probe_manual_block_on should have a body");
 
-        let config = InlineConfig { preserve_block_on: false, ..InlineConfig::default() };
+        let config = InlineConfig {
+            preserve_block_on: false,
+            preserve_array_comparisons: false,
+            ..InlineConfig::default()
+        };
         let inlined = apply_codegen_inline_pass_with_config(tcx, instance, body, config);
         let inlined_calls = collect_call_names(&inlined);
         assert!(
@@ -1045,15 +1070,14 @@ fn test_inline_pass_inlines_block_on_when_boundary_not_preserved() {
         );
         // The busy-poll loop now belongs to the caller's CFG: a back-edge
         // (a Goto/SwitchInt target at or before its own block) survives inlining.
-        let has_back_edge = inlined.blocks.iter().enumerate().any(|(bb, block)| {
-            match &block.terminator.kind {
+        let has_back_edge =
+            inlined.blocks.iter().enumerate().any(|(bb, block)| match &block.terminator.kind {
                 TerminatorKind::Goto { target } => *target <= bb,
                 TerminatorKind::SwitchInt { targets, .. } => {
                     targets.all_targets().iter().any(|t| *t <= bb)
                 }
                 _ => false,
-            }
-        });
+            });
         assert!(has_back_edge, "the inlined poll loop should leave a back-edge in the caller");
     });
 }

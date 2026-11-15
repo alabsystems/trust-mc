@@ -66,7 +66,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             {
                                 Some(p.local)
                             }
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                                 if p.projection.is_empty() =>
                             {
                                 Some(p.local)

@@ -26,9 +26,11 @@ pub(super) fn statement_allows_elided_pin_box_local(
             }
         },
         StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => true,
-        StatementKind::FakeRead(_, place)
-        | StatementKind::Retag(_, place)
-        | StatementKind::PlaceMention(place) => !place_mentions_local(place, local_idx),
+        StatementKind::FakeRead(_, place) | StatementKind::PlaceMention(place) => {
+            !place_mentions_local(place, local_idx)
+        }
+        #[cfg(not(trust_toolchain))]
+        StatementKind::Retag(_, place) => !place_mentions_local(place, local_idx),
         StatementKind::AscribeUserType { place, .. } => !place_mentions_local(place, local_idx),
         StatementKind::Coverage(_) | StatementKind::ConstEvalCounter => true,
     }
@@ -60,11 +62,12 @@ pub(super) fn terminator_allows_ref_local_unmentioned(
 
 pub(super) fn rvalue_mentions_local(rvalue: &Rvalue, local_idx: usize) -> bool {
     match rvalue {
-        Rvalue::Use(op)
+        Rvalue::Use(op, ..)
         | Rvalue::Repeat(op, _)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::UnaryOp(_, op)
-        | Rvalue::ShallowInitBox(op, _) => operand_mentions_local(op, local_idx),
+        | Rvalue::UnaryOp(_, op) => operand_mentions_local(op, local_idx),
+        #[cfg(not(trust_toolchain))]
+        Rvalue::ShallowInitBox(op, _) => operand_mentions_local(op, local_idx),
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
             operand_mentions_local(lhs, local_idx) || operand_mentions_local(rhs, local_idx)
         }
@@ -73,10 +76,16 @@ pub(super) fn rvalue_mentions_local(rvalue: &Rvalue, local_idx: usize) -> bool {
         | Rvalue::Len(place)
         | Rvalue::Discriminant(place)
         | Rvalue::CopyForDeref(place) => place_mentions_local(place, local_idx),
+        // Trust: `Reborrow` bitwise-copies `place`, so it mentions the place's
+        // locals exactly as a `Copy(place)` operand would.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(_, _, place) => place_mentions_local(place, local_idx),
         Rvalue::Aggregate(_, operands) => {
             operands.iter().any(|operand| operand_mentions_local(operand, local_idx))
         }
-        Rvalue::NullaryOp(_) | Rvalue::ThreadLocalRef(_) => false,
+        Rvalue::ThreadLocalRef(_) => false,
+        #[cfg(not(trust_toolchain))]
+        Rvalue::NullaryOp(_) => false,
     }
 }
 
@@ -84,6 +93,8 @@ pub(super) fn operand_mentions_local(operand: &Operand, local_idx: usize) -> boo
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place_mentions_local(place, local_idx),
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 

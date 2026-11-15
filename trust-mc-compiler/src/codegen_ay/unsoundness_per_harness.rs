@@ -27,6 +27,7 @@ use super::{
     get_unconstrained_assignment_count, get_unsupported_construct_fallback_count,
     get_vec_field_fallback_count, store_coercion::get_bmc_store_coercion_fallback_count,
 };
+use super::diagnostics::get_unstubbed_abstraction_count;
 
 /// Snapshot of all crate-level unsoundness counters at a point in time.
 ///
@@ -61,6 +62,9 @@ pub(in crate::codegen_ay) struct CounterSnapshot {
     pub(in crate::codegen_ay) stub_approximation: usize,
     /// Part of #3779: float rounding assertion weakened to finiteness tautology.
     pub(in crate::codegen_ay) rounding_assertion_bypass: usize,
+    /// D1 (2026-09-14): reachability abstracted a stdlib function away with no
+    /// stub and no handler, leaving its result unconstrained.
+    pub(in crate::codegen_ay) unstubbed_abstraction: usize,
 }
 
 /// Per-harness accumulated counts for all crate-level categories.
@@ -93,6 +97,8 @@ pub(super) struct PerHarnessAccumulator {
     pub(super) stub_approximation: BTreeMap<String, usize>,
     /// Part of #3779: rounding assertion bypass per-harness accumulator.
     pub(super) rounding_assertion_bypass: BTreeMap<String, usize>,
+    /// D1 (2026-09-14): unstubbed-abstraction per-harness accumulator.
+    pub(super) unstubbed_abstraction: BTreeMap<String, usize>,
     /// HARNESS-keyed offset-provenance-unresolved, absorbed from the
     /// per-FUNCTION map at each harness's codegen boundary. See
     /// [`absorb_fn_keyed_for_harness`] for why this exists.
@@ -173,6 +179,7 @@ thread_local! {
             rounding_assertion_bypass: BTreeMap::new(),
             offset_provenance_unresolved: BTreeMap::new(),
             kani_mem_overapprox: BTreeMap::new(),
+            unstubbed_abstraction: BTreeMap::new(),
         }) };
 }
 
@@ -200,6 +207,7 @@ pub(in crate::codegen_ay) fn snapshot_counters() -> CounterSnapshot {
         aggregate_encoding_gap: get_aggregate_encoding_gap_count(),
         stub_approximation: get_stub_approximation_count(),
         rounding_assertion_bypass: get_rounding_assertion_bypass_count(),
+        unstubbed_abstraction: get_unstubbed_abstraction_count(),
     }
 }
 
@@ -242,6 +250,15 @@ pub(in crate::codegen_ay) fn record_harness_deltas(
             harness_name,
             before.abstracted_fallback,
             after.abstracted_fallback,
+        );
+        // D1: `collect_reachable_items` runs INSIDE `codegen_items`, which the
+        // caller brackets with one snapshot pair per harness, so this delta is
+        // this harness's own abstractions and cannot leak onto a sibling.
+        insert_delta(
+            &mut acc.unstubbed_abstraction,
+            harness_name,
+            before.unstubbed_abstraction,
+            after.unstubbed_abstraction,
         );
         insert_delta(
             &mut acc.assume_dropped_transition,

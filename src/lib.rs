@@ -124,9 +124,8 @@ pub(crate) fn prepend_search_path(
 /// `trust-mc-driver` child, so there is nothing to restore. The lock serializes
 /// both mutation entrypoints; both callers run during single-threaded startup,
 /// before any concurrent environment readers exist. This is the crate's one
-/// item-level `env_mutation` allow; `unknown_lints` keeps the stock-rustc build
-/// green (the lint is defined only by the Trust toolchain).
-#[allow(unknown_lints, env_mutation)]
+/// item-level `env_mutation` allow (a Trust toolchain lint).
+#[allow(env_mutation)]
 pub(crate) fn set_process_env_var(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

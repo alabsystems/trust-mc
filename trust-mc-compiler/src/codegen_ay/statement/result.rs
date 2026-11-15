@@ -16,7 +16,7 @@
 
 use super::StatementCodegen;
 use crate::codegen_ay::names;
-use ay_bindings::Sort;
+use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{BasicBlockIdx, Operand, Place};
 use tracing::{debug, warn};
 
@@ -60,7 +60,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         let result_base = self.get_result_base_from_ref(&args[0])?;
-        let discrim_name = crate::codegen_ay::names::discrim_name(result_base.as_ref());
+        let predicate_expr =
+            self.result_variant_predicate(result_base.as_ref(), ctor, ok_discriminant_zero)?;
+        self.bind_ssa_result(destination, predicate_expr);
+        target
+    }
+
+    /// `is_<ctor>(result)` for the Result value bound at `result_base`, in
+    /// whichever representation it has: flattened (`.0` discriminant, 0 = Ok)
+    /// or native datatype (`is_constructor`). `None` when neither is bound —
+    /// callers that need the predicate for an OBLIGATION treat that as "no
+    /// check emitted" and say so in the log, exactly as `Option::unwrap` does.
+    fn result_variant_predicate(
+        &mut self,
+        result_base: &str,
+        ctor: &str,
+        ok_discriminant_zero: bool,
+    ) -> Option<Expr> {
+        let discrim_name = crate::codegen_ay::names::discrim_name(result_base);
 
         // Part of #2267: static lowercase — ctor is always "Ok" or "Err".
         let ctor_lower = Self::ctor_lowercase(ctor);
@@ -72,7 +89,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             } else {
                 discrim_expr.clone().eq(zero).not()
             }
-        } else if let Some(result_expr) = self.env_lookup(result_base.as_ref()) {
+        } else if let Some(result_expr) = self.env_lookup(result_base) {
             let sort = result_expr.sort();
             let Some(dt_name) = sort.datatype_name() else {
                 warn!("Result::{}: {} is not a datatype, sort={:?}", ctor_lower, result_base, sort);
@@ -93,8 +110,38 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         };
 
-        self.bind_ssa_result(destination, predicate_expr);
-        target
+        Some(predicate_expr)
+    }
+
+    /// The panic obligation of `Result::unwrap`/`expect` (`panics_on` = "Err")
+    /// and `Result::unwrap_err`/`expect_err` (`panics_on` = "Ok").
+    ///
+    /// SOUNDNESS: the inline pass keeps these calls as `Call` terminators
+    /// whenever their stub is selected, so the library body's `unwrap_failed`
+    /// path never reaches codegen and the panic has to be emitted HERE — the
+    /// Option::unwrap stub has carried the same note since #695. Before this,
+    /// `codegen_result_unwrap` extracted the Ok payload with no check at all
+    /// ("verification typically uses assume(is_ok()) first"), which is a false
+    /// PROOF the moment the stub fires on an `Err` that nobody assumed away.
+    /// The check is guarded by the current path condition; when the value
+    /// exposes no discriminant the omission is logged, as for Option.
+    fn record_result_unwrap_panic(&mut self, result_base: &str, panics_on: &str) {
+        let ok_discriminant_zero = panics_on == "Ok";
+        match self.result_variant_predicate(result_base, panics_on, ok_discriminant_zero) {
+            Some(is_panicking_variant) => {
+                debug!(
+                    "Result unwrap-family: recording panic-on-{} check for {}",
+                    panics_on, result_base
+                );
+                self.record_violation_guarded(is_panicking_variant, "panic");
+            }
+            None => {
+                debug!(
+                    "Result unwrap-family: no discriminant for {} - panic-on-{} check not emitted",
+                    result_base, panics_on
+                );
+            }
+        }
     }
 
     /// Codegen `Result::unwrap_or(self, default) -> T`.
@@ -189,8 +236,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// - Flattened representation: value in field `.1` (discriminant 0 = Ok)
     /// - Native SMT datatype: use field_select with "value"/"ok" selector
     ///
-    /// Note: unwrap on Err is UB/panic in Rust - we just extract the Ok value
-    /// since verification typically uses assume(is_ok()) first.
+    /// `unwrap` on `Err` panics: the `is_err` panic obligation is recorded
+    /// before the payload is extracted (see `record_result_unwrap_panic`).
     ///
     /// Part of #1836: Recover harnesses calling unwrap on Result values.
     ///
@@ -210,6 +257,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             .get_result_base_direct(&args[0])
             .or_else(|| self.get_result_base_from_ref(&args[0]))?;
 
+        // `unwrap`/`expect` panic on `Err` (see `record_result_unwrap_panic`).
+        self.record_result_unwrap_panic(result_base.as_ref(), "Err");
+
         let result_sort = self.infer_sort_from_place(destination)?;
 
         // Try flattened representation first: value in field .1
@@ -221,13 +271,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Resolve field name; field_select now consumes self, clone needed.
             let sort = result_expr.sort();
             let dt_name = sort.datatype_name()?;
-            let field_name = if sort.datatype_has_field("value") {
-                "value"
-            } else if sort.datatype_has_field("ok") {
-                "ok"
-            } else {
+            let Some(field_name) = Self::result_payload_field_name(sort, "Ok") else {
                 warn!(
-                    "Result::unwrap: datatype '{}' missing value/ok field for {}",
+                    "Result::unwrap: datatype '{}' has no Ok payload field for {}",
                     dt_name, result_base
                 );
                 return None;
@@ -236,7 +282,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 "AY codegen: Result::unwrap using native datatype '{}' field '{}'",
                 dt_name, field_name
             );
-            result_expr.clone().field_select(dt_name, field_name, result_sort)
+            result_expr.clone().field_select(dt_name, &field_name, result_sort)
         } else {
             warn!(
                 "Result::unwrap: could not find value ({}.1) or Result value ({})",
@@ -275,6 +321,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             .get_result_base_direct(&args[0])
             .or_else(|| self.get_result_base_from_ref(&args[0]))?;
 
+        // `unwrap_err`/`expect_err` panic on `Ok` (see `record_result_unwrap_panic`).
+        self.record_result_unwrap_panic(result_base.as_ref(), "Ok");
+
         let result_sort = self.infer_sort_from_place(destination)?;
 
         // Try flattened representation first: for same-sort Result<T, T>,
@@ -290,14 +339,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // For datatype-backed Result, select the Err payload field.
             let sort = result_expr.sort();
             let dt_name = sort.datatype_name()?;
-            let field_name = if sort.datatype_has_field("err") {
-                "err"
-            } else if sort.datatype_has_field("value") {
-                // Same-sort Result uses shared "value" field for both variants
-                "value"
-            } else {
+            let Some(field_name) = Self::result_payload_field_name(sort, "Err") else {
                 warn!(
-                    "Result::unwrap_err: datatype '{}' missing err/value field for {}",
+                    "Result::unwrap_err: datatype '{}' has no Err payload field for {}",
                     dt_name, result_base
                 );
                 return None;
@@ -306,7 +350,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 "AY codegen: Result::unwrap_err using native datatype '{}' field '{}'",
                 dt_name, field_name
             );
-            result_expr.clone().field_select(dt_name, field_name, result_sort)
+            result_expr.clone().field_select(dt_name, &field_name, result_sort)
         } else {
             warn!(
                 "Result::unwrap_err: could not find value ({}.1) or Result value ({})",
@@ -318,6 +362,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.bind_ssa_result(destination, value_expr);
 
         target
+    }
+
+    /// The payload selector of the `Ok`/`Err` variant of a Result datatype.
+    ///
+    /// The canonical Result sort names it "value"/"ok" (Ok) and "err" (Err),
+    /// with a same-sort `Result<T, T>` sharing "value"; the general enum-sort
+    /// path (sort_inference_adt.rs) names it positionally (`Ok_field_0` /
+    /// `Err_field_0`). The hardcoded names missed the latter, so
+    /// `Err(3u8).expect_err(..)` on `Result_u8_u8` declined the payload and
+    /// fell through to an unsupported "Call terminator". Prefer the canonical
+    /// names for the representations that carry them, then the variant
+    /// constructor's ACTUAL first-field selector — the payload is `fields[0]`
+    /// in every representation.
+    pub(super) fn result_payload_field_name(sort: &Sort, bare_name: &str) -> Option<String> {
+        let canonical: &[&str] = match bare_name {
+            "Ok" => &["value", "ok"],
+            "Err" => &["err", "value"],
+            _ => return None, // non-enum: &str
+        };
+        if let Some(name) = canonical.iter().find(|name| sort.datatype_has_field(name)) {
+            return Some((*name).to_owned());
+        }
+        let dt_name = sort.datatype_name()?;
+        let ctor = Self::find_result_constructor(sort, bare_name, dt_name)?;
+        let dt = sort.datatype_sort()?;
+        dt.constructors
+            .iter()
+            .find(|c| c.name == ctor)
+            .and_then(|c| c.fields.first())
+            .map(|f| f.name.clone())
     }
 
     /// Find the actual constructor name for a Result variant in a datatype sort.

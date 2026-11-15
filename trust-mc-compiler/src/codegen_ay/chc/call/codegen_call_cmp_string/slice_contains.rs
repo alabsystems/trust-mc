@@ -53,12 +53,42 @@ pub(in crate::codegen_ay::chc) fn try_codegen_slice_contains(
     dcx: &DispatchCallContext<'_>,
     target: BasicBlockIdx,
 ) -> bool {
+    // Reading the needle through its reference can stage checks; a declined
+    // model hands the call to the general path, which stages its own, so the
+    // needle's are dropped with it.
+    let staged = ctx.heap_state.pending_checks.len();
+    let handled = try_codegen_slice_contains_inner(ctx, dcx, target);
+    if !handled {
+        ctx.heap_state.pending_checks.truncate(staged);
+    }
+    handled
+}
+
+fn try_codegen_slice_contains_inner(
+    ctx: &mut ChcCtx<'_, '_>,
+    dcx: &DispatchCallContext<'_>,
+    target: BasicBlockIdx,
+) -> bool {
     debug!(bb_idx = dcx.bb_idx, args = dcx.args.len(), "slice_contains: entry");
     if dcx.args.len() < 2 {
         return false;
     }
 
     let dest_local: usize = dcx.destination.local;
+
+    // An element whose `==` is not its encoding's (a float, a reference, a
+    // hand-written `PartialEq`) is compared by Rust's `==`, or the call falls
+    // through (`codegen_call_cmp_semantic.rs`): `[0.0f32].contains(&-0.0)`
+    // failed certified, `[f32::NAN].contains(&f32::NAN)` verified clean.
+    use crate::codegen_ay::shared::compare_loops;
+    let elem_ty = dcx.args[0]
+        .ty(ctx.body.locals())
+        .ok()
+        .and_then(|ty| compare_loops::compared_elem_ty(ctx.resolve_body_ty(ty)));
+    let Some(elem_ty) = elem_ty else {
+        return false;
+    };
+    let exact_elem = !compare_loops::eq_is_encoding_eq(elem_ty);
 
     // Resolve the target element value. `contains(&self, x: &T) -> bool` takes
     // args[1] as `&T`. We need the T value, not the pointer. Dereference through
@@ -124,6 +154,15 @@ pub(in crate::codegen_ay::chc) fn try_codegen_slice_contains(
     for i in 0..concrete_len {
         let idx = Expr::bitvec_const(i as u64, index_width);
         let elem = data_array.clone().select(idx);
+        if exact_elem {
+            match compare_loops::rust_value_eq(elem_ty, &elem, &target_expr) {
+                Some(eq) => {
+                    disjuncts.push(eq);
+                    continue;
+                }
+                None => return false,
+            }
+        }
         // Coerce element sort to match target sort if needed.
         let eq = if elem.sort() == &target_sort {
             elem.eq(target_expr.clone())
@@ -214,6 +253,8 @@ fn resolve_target_value(ctx: &mut ChcCtx<'_, '_>, dcx: &DispatchCallContext<'_>)
             }
         }
         MirOperand::Constant(_) => None,
+        #[cfg(trust_toolchain)]
+        MirOperand::RuntimeChecks(_) => None,
     };
 
     // Step 2: Dereference through ref_targets to find the T value.
@@ -224,8 +265,12 @@ fn resolve_target_value(ctx: &mut ChcCtx<'_, '_>, dcx: &DispatchCallContext<'_>)
     }
 
     // Step 2b: Scan MIR for the Ref assignment to the local.
-    // If _13 = &_M or _13 = &_N[_day], trace to the referent.
-    if let Some(ref_local) = ref_local {
+    // If _13 = &_M or _13 = &_N[_day], trace to the referent. Only for a local
+    // with ONE whole definition: the scan takes the first `Ref` it meets, and a
+    // reference joined from two (`if b { &m } else { &n }`) has one per arm.
+    if let Some(ref_local) = ref_local
+        && !ctx.local_has_multiple_whole_definitions(ref_local)
+    {
         if let Some(expr) = scan_mir_for_ref_value(ctx, ref_local, modified_locals) {
             debug!(ref_local, sort = ?expr.sort(), "slice_contains: resolved via MIR ref scan");
             return Some(expr);
@@ -248,12 +293,58 @@ fn resolve_target_value(ctx: &mut ChcCtx<'_, '_>, dcx: &DispatchCallContext<'_>)
         debug!(sort = ?expr.sort(), "slice_contains: resolve_ref_or_const_referent skipped (likely pointer)");
     }
 
-    // Step 4: Fallback — translate operand directly.
-    if let Some(expr) = ctx.translate_operand_with_modified(arg, modified_locals) {
-        return Some(expr);
+    // Step 4: read the referent through the reference, as `*x` would. The
+    // operand itself is the POINTER: the old fallback handed it to the
+    // element-wise comparison, which truncated the address to the element width,
+    // so `a.contains(r)` compared the low byte of `r`'s address with each
+    // element — `slice_contains_refjoin_safe` (review_r05_slice_range_contains.rs)
+    // FAILED certified Genuine. A reference the deref lanes cannot read leaves
+    // the call to the general path instead.
+    if let Some(ref_local) = ref_local
+        && ctx.body.locals().get(ref_local).is_some_and(|decl| {
+            matches!(
+                decl.ty.kind(),
+                rustc_public::ty::TyKind::RigidTy(
+                    rustc_public::ty::RigidTy::Ref(..) | rustc_public::ty::RigidTy::RawPtr(..)
+                )
+            )
+        })
+    {
+        // A reference chosen on a path (`if b { &m } else { &n }`) has no single
+        // referent for the value lanes, and the deref cascade fails closed on
+        // it; typed memory holds every borrowed local's image, so the needle is
+        // read there at the reference's own address — exact on every path.
+        if ctx.pointer_value_is_path_dependent(ref_local)
+            && let Some(pointee_ty) = ctx.body.locals().get(ref_local).and_then(|decl| {
+                match decl.ty.kind() {
+                    rustc_public::ty::TyKind::RigidTy(
+                        rustc_public::ty::RigidTy::Ref(_, pointee, _)
+                        | rustc_public::ty::RigidTy::RawPtr(pointee, _),
+                    ) => Some(pointee),
+                    _ => None,
+                }
+            })
+            && ctx.track_level >= crate::args::ChcTrackLevel::Mem
+            && let Some(addr) = ctx.translate_operand_with_modified(arg, modified_locals)
+            && addr.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH)
+        {
+            let value = ctx
+                .load_from_memory(crate::codegen_ay::provenance::Loc::of_address(addr), pointee_ty)
+                .map(crate::codegen_ay::provenance::Val::into_expr);
+            debug!(ref_local, resolved = value.is_some(), "slice_contains: path-merged needle read from memory");
+            return value;
+        }
+        let deref = rustc_public::mir::Place {
+            local: ref_local,
+            projection: vec![rustc_public::mir::ProjectionElem::Deref],
+        };
+        let value = ctx.translate_place_with_deref(&deref, modified_locals);
+        debug!(ref_local, resolved = value.is_some(), "slice_contains: needle read through the reference");
+        return value;
     }
 
-    None
+    // A needle that is not a reference local (a constant operand): translate it.
+    ctx.translate_operand_with_modified(arg, modified_locals)
 }
 
 /// Scan MIR for the `Ref` or `Index` assignment to `target_local` and resolve

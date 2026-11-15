@@ -178,6 +178,14 @@ impl MirVisitor for InstrumentationVisitor<'_, '_> {
             Rvalue::AddressOf(..) | Rvalue::Ref(..) => {
                 // These operations are always legitimate for us.
             }
+            // A reborrow reads the bytes of `place`: codegen lowers it to `Operand::Copy(place)`.
+            // Visit it as that copy. `super_rvalue` would pass a mutating place context for a
+            // `Mut` reborrow, which set-instruments the source instead of checking it.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(target, _, place) => {
+                self.visit_ty(target, location);
+                self.visit_operand(&Operand::Copy(place.clone()), location);
+            }
             _ => self.super_rvalue(rvalue, location), // external enum: Rvalue
         }
     }

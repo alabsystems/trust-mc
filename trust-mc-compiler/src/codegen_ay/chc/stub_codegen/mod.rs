@@ -16,9 +16,8 @@ pub(super) use super::{
     AllocCallResult, ChcCtx, CollectionCallResult, StubTranslateArgs, UNDEF_COUNTER,
     UnknownProjectionPolicy, chc_call_context, chc_fresh_name, codegen_call_coerce,
     codegen_call_vtable_intrinsic, codegen_ctx, codegen_decl_flatten, codegen_expr_heap,
-    codegen_expr_signedness, codegen_rules, codegen_types, collect_field_projections,
-    declare_pending_var, pointer_step, push_pending_datatype_sort, record_type_sort_fallback,
-    ty_signedness,
+    codegen_expr_signedness, codegen_rules, codegen_types, collect_field_projections, pointer_step,
+    push_pending_datatype_sort, record_type_sort_fallback, ty_signedness,
 };
 
 // --- Modules accessed from outside stub_codegen ---

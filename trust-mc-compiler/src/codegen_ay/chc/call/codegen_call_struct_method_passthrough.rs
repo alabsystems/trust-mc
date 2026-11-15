@@ -9,14 +9,25 @@
 //! this dispatcher treats the method as a conservative identity on all struct fields:
 //! all state vars and collection auxiliaries are copied from receiver to destination.
 //!
-//! This is an over-approximation: mutations the method makes to collection fields
-//! are lost, potentially causing false CTREX. But it is sound — it never produces
-//! false PROOF. The solver has freedom to find proofs that only depend on the
-//! unchanged fields (e.g., scalar field propagation through clone-mutate-return
-//! patterns where assertions check keys not affected by the mutation).
+//! This is NOT an over-approximation, and it fails closed. It constrains the
+//! result to EQUAL the receiver, so every mutation the method makes is lost
+//! (an under-approximation of its return value), and it drops every check in
+//! the method's body. A 2026-09-27 audit of the callers that take over a call
+//! whose inline walk failed (fix/chc-walker-fail-closed, item c) measured
+//! both: `assert!(self.x != 100)` in the method and `s.x == r.x` for a method
+//! that returns `x + 1` verified SUCCESSFUL clean where Kani fails
+//! (tools/soundness-duals/walker_caller_fallback_dual.rs). The claim here used
+//! to be "sound — it never produces false PROOF". It now records
+//! [`STRUCT_METHOD_PASSTHROUGH`] (not blessed), so a proof resting on it is
+//! demoted and a counterexample is never certified; the scalar-field
+//! propagation it was written for survives only as an uncertified result.
 //!
 //! Part of #3348: scalar field propagation through method return chains.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -33,6 +44,10 @@ use super::codegen_decl_flatten;
 use super::codegen_rules::CodegenRules;
 use super::codegen_types::CodegenTypes;
 use crate::codegen_ay::types::{bool_sort, int_sort, ptr_sort};
+
+/// Fail-closed record of the passthrough (see the module docs).
+pub(in crate::codegen_ay::chc) const STRUCT_METHOD_PASSTHROUGH: &str =
+    "struct_method_passthrough_unmodelled";
 
 /// Extension trait for struct method passthrough dispatch on `ChcCtx`.
 pub(in crate::codegen_ay::chc) trait CallDispatchStructMethodPassthrough {
@@ -91,8 +106,9 @@ impl<'tcx, 'body> CallDispatchStructMethodPassthrough for ChcCtx<'tcx, 'body> {
             return false;
         }
         let fields = variants[0].fields();
-        let has_collection =
-            fields.iter().any(|f| Self::type_is_hashmap(&f.ty_with_args(&adt_args)));
+        let has_collection = fields
+            .iter()
+            .any(|f| mono_ty::field_ty(f, &adt_args).is_some_and(|t| Self::type_is_hashmap(&t)));
         if !has_collection {
             return false;
         }
@@ -115,7 +131,7 @@ impl<'tcx, 'body> CallDispatchStructMethodPassthrough for ChcCtx<'tcx, 'body> {
             Ok(inst) => inst,
             Err(_) => return false,
         };
-        if instance.body().is_none() {
+        if instance.callee_body().is_none() {
             return false;
         }
 
@@ -169,12 +185,15 @@ impl<'tcx, 'body> CallDispatchStructMethodPassthrough for ChcCtx<'tcx, 'body> {
             dcx.stmt_constraints,
             extra_constraints,
         );
+        // The result is the receiver and the body's checks are gone: never a
+        // proof, never a certificate (module docs).
+        self.record_sound_fallback_reason(STRUCT_METHOD_PASSTHROUGH);
 
         debug!(
             actual_source,
             dest_local,
             callee = %callee_name,
-            "CHC: struct method passthrough — conservative clone (#3348)"
+            "CHC: struct method passthrough — conservative clone (#3348), fail closed"
         );
         true
     }

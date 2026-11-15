@@ -9,30 +9,33 @@ use super::{StubKind, StubRegistry};
 impl StubRegistry {
     #[inline]
     pub(super) fn contains_any(path: &str, patterns: &[&str]) -> bool {
-        patterns.iter().any(|pattern| path.contains(pattern))
+        patterns.iter().any(|&pattern| path.contains(pattern))
     }
 
     #[inline]
     pub(super) fn contains_all(path: &str, patterns: &[&str]) -> bool {
-        patterns.iter().all(|pattern| path.contains(pattern))
+        patterns.iter().all(|&pattern| path.contains(pattern))
     }
 
     #[inline]
     pub(super) fn ends_with_any(path: &str, suffixes: &[&str]) -> bool {
-        suffixes.iter().any(|suffix| path.ends_with(suffix))
+        suffixes.iter().any(|&suffix| path.ends_with(suffix))
     }
 
     /// Extract method name from a path suffix (#1434).
     /// Handles `>::method` and `::method` patterns, strips turbofish (#3189).
     pub(super) fn extract_method_name(path: &str) -> Option<&str> {
-        let raw = if let Some(idx) = path.rfind(">::") {
-            &path[idx + 3..]
-        } else if let Some(idx) = path.rfind("::") {
-            &path[idx + 2..]
+        let raw = if let Some((_, suffix)) = path.rsplit_once(">::") {
+            suffix
+        } else if let Some((_, suffix)) = path.rsplit_once("::") {
+            suffix
         } else {
             return None;
         };
-        Some(raw.split("::<").next().unwrap_or(raw))
+        Some(match raw.split_once("::<") {
+            Some((method, _)) => method,
+            None => raw,
+        })
     }
 
     /// Suffix-based HashMap/BTreeMap stub lookup (Part of #788, #772).
@@ -166,6 +169,11 @@ impl StubRegistry {
     const VEC_METHOD_TABLE: &[(&str, StubKind)] = &[
         ("new", StubKind::VecNew),
         ("default", StubKind::VecNew),
+        // Vec::new_in(alloc): the model carries no allocator, so this is
+        // Vec::new — the same treatment `with_capacity_in` already gets.
+        // Without the entry the call survives the inline pass and only the
+        // BMC mini-inliner (RawVec::new_in stub underneath) rescues it.
+        ("new_in", StubKind::VecNew),
         ("with_capacity", StubKind::VecWithCapacity),
         ("with_capacity_in", StubKind::VecWithCapacityIn),
         ("push", StubKind::VecPush),
@@ -454,6 +462,14 @@ impl StubRegistry {
             "next" if path.contains("SplitWhitespace") => Some(StubKind::SplitWhitespaceNext),
             // String::into_boxed_str(self) -> Box<str> (#3646)
             "into_boxed_str" if path.contains("String") => Some(StubKind::StringIntoBoxedStr),
+            // String::from_utf8(Vec<u8>) -> Result<String, FromUtf8Error>. The inline
+            // pass keeps every `String::` call as a Call terminator, so without this
+            // arm the BMC mini-inliner descends into `run_utf8_validation` and
+            // demotes the harness. `extract_method_name` is exact, so this does
+            // NOT catch from_utf8_lossy / from_utf8_unchecked (separate arms above).
+            "from_utf8" if path.contains("String") => Some(StubKind::StringFromUtf8),
+            // String::into_bytes(self) -> Vec<u8>: layout identity.
+            "into_bytes" if path.contains("String") => Some(StubKind::StringIntoBytes),
             _ => {
                 // non-enum: &str (method name)
                 tracing::warn!(method, path, "unhandled String method in stub lookup");
@@ -560,13 +576,22 @@ impl StubRegistry {
     ///
     /// For CHC, pre-inlined ManuallyDrop helper calls are modeled as
     /// unconstrained allocation-path extras to avoid falling through dispatch.
+    ///
+    /// `Deref::deref` / `DerefMut::deref_mut` are NOT stubs: they return
+    /// `&self.value` of a transparent wrapper, the argument's own address,
+    /// and the CHC call spine models them as that identity
+    /// (`try_dispatch_array_iter_identity_call`). The `GlobalAllocImpl` stub
+    /// they used to take left the returned reference unconstrained and booked
+    /// nothing, so a read through it (`ManuallyDrop<Vec<T>>::capacity()`) was
+    /// an arbitrary value a counterexample could depend on and still be
+    /// certified Genuine: `cap * 2` over a capacity of 3 failed "attempt to
+    /// multiply with overflow" on a program Kani proves (walker fail-closed
+    /// review 6, finding 8).
     pub(super) fn lookup_manuallydrop_suffix(path: &str) -> Option<StubKind> {
         let method = Self::extract_method_name(path)?;
         match method {
             "new" => Some(StubKind::GlobalAllocImpl),
-            // Deref::deref and DerefMut::deref_mut — transparent wrapper, identity in verification.
-            // deref_mut appears in Vec::IntoIter paths (ManuallyDrop<Vec<T>>). Part of #2967.
-            "deref" | "deref_mut" if path.contains("Deref") => Some(StubKind::GlobalAllocImpl),
+            "deref" | "deref_mut" if path.contains("Deref") => None,
             _ => {
                 // non-enum: &str (method name)
                 tracing::debug!(method, path, "unhandled ManuallyDrop method in stub lookup");

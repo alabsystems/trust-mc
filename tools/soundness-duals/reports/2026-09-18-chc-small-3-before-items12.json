@@ -1,0 +1,790 @@
+{
+  "provenance": {
+    "ay": {
+      "build_commit": "45cc58c698f98554608b4b5ff8ae30013550b9bf",
+      "cargo_toml_pin": "45cc58c698f98554608b4b5ff8ae30013550b9bf",
+      "path": "~/.cache/trust-mc-ay-cli-45cc58c69/release/ay",
+      "pin_match": true,
+      "version": "ay 0.27.0+build.10299.45cc58c698f98554608b4b5ff8ae30013550b9bf@2026-09-18T20:58:07Z"
+    },
+    "bundle": {
+      "checkout_at_run": {
+        "dirty": false,
+        "dirty_tracked_paths": 0,
+        "head": "9afbd3cd9e430dca6651112154805d357a9b288d",
+        "note": "checkout HEAD at gate time; not evidence of the bundle's build commit",
+        "path": "~/tmc-fix/chc-small-3/baseline/trust-mc",
+        "untracked_paths": 0
+      },
+      "compiler_sha256": "d6e5ae30be63bfe467ec5bd6b7b8504febd26764472262843fea839abf1d6885",
+      "dir": "~/tmc-fix/chc-small-3/baseline/trust-mc/target/trust-mc",
+      "driver_mtime_utc": "2026-09-18T21:41:57+00:00",
+      "driver_sha256": "59680f40e6b1d9b4509b3e5942d293cfbe84ead6185e5e4f77a007f21211887c",
+      "driver_version": "trust-mc 0.6.0"
+    },
+    "config": {
+      "env": {
+        "PATH_first": "~/.cache/trust-mc-ay-cli-45cc58c69/release",
+        "RUSTFLAGS": "-Awarnings",
+        "TRUST_MC_SYSROOT": "~/tmc-fix/chc-small-3/baseline/trust-mc/target/trust-mc"
+      },
+      "harness_timeout_s": 15,
+      "inherited_env": {},
+      "jobs": 2,
+      "kinds": [],
+      "lanes": [
+        "chc",
+        "bmc"
+      ],
+      "only": [
+        "float_to_int_in_range",
+        "cover_probe_starved"
+      ],
+      "strict": false,
+      "wall_timeout_rule": "180 + harnesses * (2 * 15 + 30) seconds per file"
+    },
+    "finished_at_utc": "2026-09-18T21:47:56+00:00",
+    "host": {
+      "cpu_count": 20,
+      "load_average_end": [
+        26.02,
+        28.97,
+        30.48
+      ],
+      "load_average_start": [
+        27.21,
+        30.55,
+        31.14
+      ],
+      "platform": "Linux-6.17.0-1026-nvidia-aarch64-with-glibc2.39",
+      "python": "3.12.3"
+    },
+    "manifest": {
+      "changed_during_run": false,
+      "path": "tools/soundness-duals/manifest.toml",
+      "sha256": "2bbed09fe5a1e2e7bf2be2978f3a331ae642bc24c3a978aa58fae76b234ea5ec"
+    },
+    "runtime_seconds": 126.2,
+    "started_at_utc": "2026-09-18T21:45:49+00:00",
+    "trust_mc": {
+      "dirty": false,
+      "dirty_tracked_paths": 0,
+      "head": "9afbd3cd9e430dca6651112154805d357a9b288d",
+      "path": "~/tmc-fix/chc-small-3/baseline/trust-mc",
+      "untracked_paths": 0
+    },
+    "trust_mc_changed_during_run": false
+  },
+  "rows": [
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "unknown",
+      "covers": [
+        {
+          "class": "match",
+          "description": "easy cover after expensive assert",
+          "detail": "cover-undetermined",
+          "status": "UNDETERMINED",
+          "truth": "SATISFIED"
+        }
+      ],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "cover_after_expensive_assert",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 0,
+      "class": "false-failure",
+      "covers": [
+        {
+          "class": "error",
+          "description": "easy cover after expensive assert",
+          "detail": "cover-not-reported",
+          "status": null,
+          "truth": "SATISFIED"
+        }
+      ],
+      "ctrex_category": null,
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "cover_after_expensive_assert",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "UNKNOWN_REASON:DriverTimeout",
+        "UNKNOWN"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 7,
+      "class": "unknown",
+      "covers": [
+        {
+          "class": "match",
+          "description": "factor a 62-bit semiprime",
+          "detail": "cover-undetermined",
+          "status": "UNDETERMINED",
+          "truth": "SATISFIED"
+        }
+      ],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "expensive_cover_probe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:UndecidedModel"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver undecided \u2014 try --ay-chc for unbounded proofs)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [
+        {
+          "class": "error",
+          "description": "factor a 62-bit semiprime",
+          "detail": "cover-not-reported",
+          "status": null,
+          "truth": "SATISFIED"
+        }
+      ],
+      "ctrex_category": "Unknown",
+      "detail": "failed-on-safe",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: ay-chc inconclusive"
+        ]
+      ],
+      "harness": "expensive_cover_probe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CHC-ROW:unknown",
+        "CHC-ROW:unknown",
+        "UNKNOWN",
+        "UNKNOWN-CATEGORY",
+        "EXTERNAL_AY_FALLBACK:attempted:unproved",
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:Timeout"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [
+        {
+          "class": "match",
+          "description": "violable only by factoring the first semiprime",
+          "detail": "check-failure",
+          "status": "FAILURE",
+          "truth": "FAILURE"
+        },
+        {
+          "class": "match",
+          "description": "violable only by factoring the second semiprime",
+          "detail": "check-failure",
+          "status": "FAILURE",
+          "truth": "FAILURE"
+        }
+      ],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "\"cheap violable assertion\""
+        ],
+        [
+          "assertion",
+          "\"violable only by factoring the first semiprime\""
+        ],
+        [
+          "assertion",
+          "\"violable only by factoring the second semiprime\""
+        ]
+      ],
+      "harness": "starved_violation_requery",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [
+        {
+          "class": "unknown",
+          "description": "violable only by factoring the first semiprime",
+          "detail": "check-not-reported-inconclusive",
+          "status": null,
+          "truth": "FAILURE"
+        },
+        {
+          "class": "unknown",
+          "description": "violable only by factoring the second semiprime",
+          "detail": "check-not-reported-inconclusive",
+          "status": null,
+          "truth": "FAILURE"
+        }
+      ],
+      "checks": 0,
+      "class": "error",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "harness-not-run",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "starved_violation_requery",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [],
+      "needs_review": null,
+      "output_tail": [
+        "SUMMARY:",
+        " ** 1 of 1 failed",
+        "Failed Checks: CHC verification: ay-chc inconclusive",
+        "",
+        "VERIFICATION:- FAILED",
+        "Verification Time: 46.325558s",
+        "",
+        "Checking harness cover_after_expensive_assert...",
+        "[trust_mc] driver wall-clock watchdog fired after 125s during verification: a harness overran its deadline and the watchdog headroom (hang suspected) \u2014 emitting UNKNOWN and exiting",
+        "[AY:UNKNOWN_REASON:DriverTimeout]",
+        "[AY:UNKNOWN] driver wall-clock timeout after 125s",
+        "VERIFICATION:- FAILED"
+      ],
+      "path": "negative/cover_probe_starved.rs",
+      "property": "assertion",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": null,
+      "verdict_line": null
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [
+        {
+          "class": "match",
+          "description": "contradictory cover",
+          "detail": "cover-unsatisfiable",
+          "status": "UNSATISFIABLE",
+          "truth": "UNSATISFIABLE"
+        }
+      ],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "unsatisfiable_cover_control",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 8,
+      "class": "match",
+      "covers": [
+        {
+          "class": "match",
+          "description": "contradictory cover",
+          "detail": "cover-undetermined",
+          "status": "UNDETERMINED",
+          "truth": "UNSATISFIABLE"
+        }
+      ],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "unsatisfiable_cover_control",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "PROOF",
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/cover_probe_starved.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: kani::float::float_to_int_in_range::<f64, i128>(f)"
+        ]
+      ],
+      "harness": "huge_f64_i128_claim_must_fail",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: kani::float::float_to_int_in_range::<f64, i128>(f)"
+        ]
+      ],
+      "harness": "huge_f64_i128_claim_must_fail",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "huge_f64_i128_not_in_range_safe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "huge_f64_i128_not_in_range_safe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "PROOF",
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "fixed on m3/soundness-fixes-1 by casts 186aa7ce0: bmc now match (SUCCESSFUL), bundle a6f1075d0, gate run 2026-09-12 (report tools/soundness-duals/reports/2026-09-12-soundness-fixes-1-gate-run.json); was: kani-surface/lib-float-to-int-in-range, kani-surface/z-float-lib, tests/kani; measured red on the first gate run 2026-09-11 (bundle 07b812dd1)",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "in_range_local_operand_safe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 2,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "fixed on m3/soundness-fixes-1 by casts 186aa7ce0: bmc now match (SUCCESSFUL), bundle a6f1075d0, gate run 2026-09-12 (report tools/soundness-duals/reports/2026-09-12-soundness-fixes-1-gate-run.json); was: kani-surface/lib-float-to-int-in-range, kani-surface/z-float-lib, tests/kani; measured red on the first gate run 2026-09-11 (bundle 07b812dd1)",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "in_range_local_operand_safe",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "PROOF",
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: fits_in_u16"
+        ]
+      ],
+      "harness": "out_of_range_claim_must_fail",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "assertion",
+          "assertion failed: fits_in_u16"
+        ]
+      ],
+      "harness": "out_of_range_claim_must_fail",
+      "kind": "negative",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "negative/float_to_int_in_range.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    }
+  ],
+  "runs": [
+    {
+      "command": [
+        "trust-mc-driver",
+        "negative/cover_probe_starved.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=15s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "negative/cover_probe_starved.rs",
+      "seconds": 39.8,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 420
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "negative/cover_probe_starved.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=15s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "negative/cover_probe_starved.rs",
+      "seconds": 125.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 420
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "negative/float_to_int_in_range.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=15s",
+        "-Z",
+        "float-lib"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "negative/float_to_int_in_range.rs",
+      "seconds": 0.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 420
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "negative/float_to_int_in_range.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=15s",
+        "--ay-chc",
+        "-Z",
+        "float-lib"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "negative/float_to_int_in_range.rs",
+      "seconds": 0.1,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 420
+    }
+  ],
+  "schema": "trust-mc.soundness-dual-gate-report/v2",
+  "summary": {
+    "decided_rows": 13,
+    "false_certificate_rows": [],
+    "gate": "fail",
+    "gate_reasons": [
+      "gating-rows"
+    ],
+    "gating_rows": [
+      {
+        "class": "error",
+        "detail": "harness-not-run",
+        "evidence": null,
+        "harness": "starved_violation_requery",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "chc",
+        "path": "negative/cover_probe_starved.rs"
+      }
+    ],
+    "known_red_class_changed": [],
+    "known_red_now_green": [],
+    "needs_review": [],
+    "per_lane": {
+      "bmc": {
+        "error": 0,
+        "false-certificate": 0,
+        "false-failure": 0,
+        "match": 6,
+        "missed-bug": 0,
+        "property_mismatch": 0,
+        "total": 8,
+        "unclassified": 0,
+        "unknown": 2
+      },
+      "chc": {
+        "error": 1,
+        "false-certificate": 0,
+        "false-failure": 2,
+        "match": 5,
+        "missed-bug": 0,
+        "property_mismatch": 0,
+        "total": 8,
+        "unclassified": 0,
+        "unknown": 0
+      }
+    },
+    "soundness_rows": []
+  }
+}

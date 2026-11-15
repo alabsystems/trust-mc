@@ -12,6 +12,8 @@
 
 use super::common::*;
 use crate::codegen_ay::chc::memory_type_key_tables;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 const TYPE_KEY_SOURCE: &str = r#"
     #![allow(dead_code)]
@@ -921,4 +923,59 @@ fn test_sort_from_type_key_dynamic_is_not_flat_bitvec() {
 fn test_sort_from_type_key_closure_non_capturing_is_bool() {
     let sort = ChcCtx::sort_from_type_key("ty_RigidTy_Closure_DefId_123");
     assert_eq!(sort, Sort::bool(), "non-capturing closure fallback should be Bool");
+}
+
+const POINTER_KEY_COLLAPSE_SOURCE: &str = r#"
+    #![allow(dead_code)]
+    use core::mem::ManuallyDrop;
+    use core::ptr::NonNull;
+
+    pub fn probe_pointer_key_collapse(
+        a: Box<u8>,
+        b: NonNull<u8>,
+        c: *const u8,
+        d: *mut u8,
+        e: ManuallyDrop<Box<u8>>,
+        f: Box<i128>,
+        g: NonNull<i128>,
+        h: *const i128,
+    ) {
+        let _ = (a, b, c, d, e, f, g, h);
+    }
+"#;
+
+/// Rule C (design trust-mc-reds-final §4.3): a pointer's cell is keyed by its
+/// representation, so `Box<T>`, `NonNull<T>`, Box's native pointer carrier
+/// (`Unique<T>` or `BoxRaw<T>` on the held compiler),
+/// `*const T`, `*mut T` and `ManuallyDrop<Box<T>>` are one key. This is the
+/// evidence the pointer-wrapper alias mirror (which copied every `ptr_T`
+/// store into `NonNull_T` and `Unique_T` arrays) was deleted on: no type
+/// produces those keys, so no load reads the copies.
+#[test]
+fn test_type_key_for_ty_pointer_wrappers_share_the_raw_pointer_key() {
+    with_test_ay_ctx_for_source(POINTER_KEY_COLLAPSE_SOURCE, |ctx| {
+        let sig = fn_sig_by_suffix(ctx.tcx, "probe_pointer_key_collapse");
+        let args = sig.inputs();
+        let carrier_of = |boxed: rustc_public::ty::Ty| match boxed.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, gargs)) => {
+                assert!(def.is_box(), "the actual owned-box definition");
+                crate::codegen_ay::shared::mono_ty::field_ty(&def.variants()[0].fields()[0], &gargs)
+                    .expect("Box's field 0")
+            }
+            other => panic!("not a Box: {other:?}"),
+        };
+        for (group, label) in [(&[0usize, 1, 2, 3, 4][..], "u8"), (&[5, 6, 7][..], "i128")] {
+            let raw = ChcCtx::type_key_for_ty(args[group[2]]);
+            assert_eq!(raw.as_ref(), format!("ptr_{label}"), "*const {label}");
+            for &i in group {
+                assert_eq!(ChcCtx::type_key_for_ty(args[i]), raw, "argument {i} ({label})");
+            }
+            let carrier = carrier_of(args[group[0]]);
+            assert!(
+                ChcCtx::value_is_address(carrier),
+                "Box's actual carrier must retain address representation: {carrier:?}"
+            );
+            assert_eq!(ChcCtx::type_key_for_ty(carrier), raw, "native carrier<{label}>");
+        }
+    });
 }

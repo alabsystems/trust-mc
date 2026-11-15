@@ -1,0 +1,2299 @@
+{
+  "schema_version": 7,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          39,
+          170,
+          6,
+          155,
+          80,
+          212,
+          138,
+          9,
+          221,
+          84,
+          144,
+          92,
+          138,
+          246,
+          52,
+          75,
+          90,
+          166,
+          206,
+          153,
+          71,
+          115,
+          134,
+          232,
+          76,
+          223,
+          181,
+          163,
+          27,
+          99,
+          44,
+          215
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.9.0",
+    "source_language": "Rust",
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        39,
+        170,
+        6,
+        155,
+        80,
+        212,
+        138,
+        9,
+        221,
+        84,
+        144,
+        92,
+        138,
+        246,
+        52,
+        75,
+        90,
+        166,
+        206,
+        153,
+        71,
+        115,
+        134,
+        232,
+        76,
+        223,
+        181,
+        163,
+        27,
+        99,
+        44,
+        215
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.9.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 7,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      137,
+      104,
+      51,
+      116,
+      207,
+      150,
+      161,
+      76,
+      201,
+      184,
+      203,
+      99,
+      22,
+      63,
+      37,
+      28,
+      5,
+      70,
+      60,
+      255,
+      160,
+      160,
+      131,
+      203,
+      96,
+      191,
+      94,
+      67,
+      241,
+      139,
+      166,
+      194
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "recursive_requires",
+        "symbol": "recursive_requires",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            80,
+            16,
+            200,
+            36,
+            139,
+            139,
+            212,
+            0,
+            173,
+            11,
+            72,
+            206,
+            55,
+            136,
+            163,
+            251,
+            63,
+            81,
+            124,
+            123,
+            81,
+            195,
+            186,
+            126,
+            145,
+            80,
+            202,
+            185,
+            132,
+            213,
+            243,
+            212
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "obligation:rr__recursive_requires:precondition:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 18,
+          "col": 13
+        },
+        "assertion_id": 2858340475,
+        "cause": "Precondition",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 1,
+        "public_obligation_id": "vc:rr__recursive_requires:termination:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 21,
+          "col": 27
+        },
+        "assertion_id": 3889472773,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 2,
+        "public_obligation_id": "vc:rr__recursive_requires:precondition:1",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 21,
+          "col": 8
+        },
+        "assertion_id": 2826425264,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 3,
+        "public_obligation_id": "vc:rr__recursive_requires:arithmetic_safety:2",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 21,
+          "col": 27
+        },
+        "assertion_id": 1525958991,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 4,
+        "public_obligation_id": "vc:rr__recursive_requires:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 17,
+          "col": 0
+        },
+        "assertion_id": 1857412791,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 5,
+        "public_obligation_id": "vc:rr__recursive_requires:assertion:panic-freedom:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 17,
+          "col": 0
+        },
+        "assertion_id": 227893368,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "rr::recursive_requires",
+    "functions": [
+      {
+        "id": 0,
+        "name": "recursive_requires",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "U32"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Alloca": {
+                    "ty": "Unit",
+                    "count": null,
+                    "align": null
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ugt",
+                    "ty": "U32",
+                    "lhs": 0,
+                    "rhs": 6
+                  }
+                },
+                "results": [
+                  7
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 7
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  8
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Uge",
+                    "ty": "U32",
+                    "lhs": 0,
+                    "rhs": 8
+                  }
+                },
+                "results": [
+                  9
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 4294967295
+                    }
+                  }
+                },
+                "results": [
+                  10
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U32",
+                    "lhs": 0,
+                    "rhs": 10
+                  }
+                },
+                "results": [
+                  11
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  12
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "ty": "Bool",
+                    "cond": 9,
+                    "then_val": 11,
+                    "else_val": 12
+                  }
+                },
+                "results": [
+                  13
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 13
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  15
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ugt",
+                    "ty": "U32",
+                    "lhs": 0,
+                    "rhs": 15
+                  }
+                },
+                "results": [
+                  14
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  16
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 14,
+                    "rhs": 16
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 17,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  18
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Overflow": {
+                    "op": "SubOverflow",
+                    "ty": "U32",
+                    "lhs": 0,
+                    "rhs": 18
+                  }
+                },
+                "results": [
+                  19,
+                  20
+                ],
+                "proofs": [
+                  "NoOverflow"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    }
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    },
+                    "aggregate": 21,
+                    "field": 0,
+                    "value": 19
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Tuple": [
+                        "U32",
+                        "Bool"
+                      ]
+                    },
+                    "aggregate": 22,
+                    "field": 1,
+                    "value": 20
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ExtractField": {
+                    "ty": "Bool",
+                    "aggregate": 23,
+                    "field": 1
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 24,
+                    "rhs": 25
+                  }
+                },
+                "results": [
+                  26
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 26
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoOverflow"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 3,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Return": {
+                    "values": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "ExtractField": {
+                    "ty": "U32",
+                    "aggregate": 23,
+                    "field": 0
+                  }
+                },
+                "results": [
+                  27
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Call": {
+                    "callee": 0,
+                    "args": [
+                      27
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 2,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      }
+    ],
+    "structs": [],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          "U32"
+        ],
+        "returns": [],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "Precondition",
+        "status": "Pending",
+        "description": "prove requires contract (public verifier obligation obligation:rr__recursive_requires:precondition:0)",
+        "formula": {
+          "schema": "trust.trust_ir.obligation-source.v1",
+          "payload": "{\"source_id\":\"trust-contract:rr::recursive_requires:requires:0\",\"assertion_id\":\"trust-assertion:trust-contract:rr::recursive_requires:requires:0\",\"native_assertion_id\":2858340475,\"span\":{\"file\":\"tests/ui/trust/native_recursive_requires_fresh_context.rs\",\"line_start\":18,\"col_start\":13,\"line_end\":18,\"col_end\":18},\"public_obligation_id\":\"obligation:rr__recursive_requires:precondition:0\"}",
+          "smtlib": null
+        },
+        "function": 0,
+        "source": {
+          "source_id": "trust-contract:rr::recursive_requires:requires:0",
+          "assertion_id": "trust-assertion:trust-contract:rr::recursive_requires:requires:0",
+          "range": {
+            "file": 0,
+            "start_line": 18,
+            "start_col": 13,
+            "end_line": 18,
+            "end_col": 18
+          },
+          "public": {
+            "obligation_id": "obligation:rr__recursive_requires:precondition:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                78,
+                38,
+                140,
+                31,
+                6,
+                194,
+                49,
+                213,
+                174,
+                113,
+                185,
+                183,
+                115,
+                152,
+                231,
+                142,
+                63,
+                218,
+                140,
+                81,
+                123,
+                7,
+                193,
+                242,
+                66,
+                220,
+                239,
+                215,
+                155,
+                222,
+                2,
+                124
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "non-termination: recursion measure `n` may not decrease (public verifier obligation vc:rr__recursive_requires:termination:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.1#s1_0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"lt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_3.1#s1_0\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+          "smtlib": "(and (and (>= n 1) (<= n 4294967295)) (and (> n 1) (not |_3.1#s1_0|) (> n 0) (and (>= n 0) (<= n 4294967295)) (and (>= n 0) (or (>= (- n 1) n) (< n 0)))))",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "contract:trust-mc-typed-chc-public:9d9ed65e582547c2ed67db6bf53ece7b361edb8394eace250d2270430e50c7bc",
+          "assertion_id": "trust-assertion:contract:trust-mc-typed-chc-public:9d9ed65e582547c2ed67db6bf53ece7b361edb8394eace250d2270430e50c7bc",
+          "range": {
+            "file": 0,
+            "start_line": 21,
+            "start_col": 27,
+            "end_line": 21,
+            "end_col": 27
+          },
+          "public": {
+            "obligation_id": "vc:rr__recursive_requires:termination:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                219,
+                180,
+                174,
+                133,
+                238,
+                116,
+                69,
+                137,
+                149,
+                236,
+                216,
+                70,
+                56,
+                233,
+                135,
+                41,
+                12,
+                175,
+                71,
+                9,
+                40,
+                181,
+                48,
+                11,
+                198,
+                82,
+                50,
+                65,
+                216,
+                151,
+                105,
+                219
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "precondition of `rr::recursive_requires` (public verifier obligation vc:rr__recursive_requires:precondition:1)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0#s1_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.1#s1_0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0#s1_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_2\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.0#s1_0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.1#s1_0\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+          "smtlib": "(and (> n 0) (and (>= n 0) (<= n 4294967295)) (= _2 (> n 1)) (and (<= 0 (- n 1)) (<= (- n 1) 4294967295)) (= |_3.0#s1_0| (- n 1)) (and (<= 0 n) (<= n 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (= _2 (> n 1)) (> n 1) (not |_3.1#s1_0|) (= _2 (> n 1)) (and (<= 0 (- n 1)) (<= (- n 1) 4294967295)) (= _3.0 (- n 1)) (and (<= 0 n) (<= n 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (not (> |_3.0#s1_0| 0)))",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "contract:trust-mc-typed-chc-public:1b1c8078d53a977d8ab981e70a9faa561477d87d11901b5912e4d615a9615e1c",
+          "assertion_id": "trust-assertion:contract:trust-mc-typed-chc-public:1b1c8078d53a977d8ab981e70a9faa561477d87d11901b5912e4d615a9615e1c",
+          "range": {
+            "file": 0,
+            "start_line": 21,
+            "start_col": 8,
+            "end_line": 21,
+            "end_col": 8
+          },
+          "public": {
+            "obligation_id": "vc:rr__recursive_requires:precondition:1",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                121,
+                34,
+                203,
+                114,
+                167,
+                149,
+                202,
+                108,
+                159,
+                223,
+                5,
+                159,
+                120,
+                221,
+                50,
+                47,
+                52,
+                114,
+                71,
+                41,
+                70,
+                187,
+                154,
+                147,
+                212,
+                193,
+                187,
+                229,
+                252,
+                45,
+                237,
+                230
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "arithmetic overflow (Sub) (public verifier obligation vc:rr__recursive_requires:arithmetic_safety:2)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"width\":64}}}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_2\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":{\"bit_vec\":{\"width\":64}},\"origin\":{\"origin\":\"inferred\"}}]}",
+          "smtlib": "(and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (= _2 (bvult (_ bv1 64) n)) (and (bvult (_ bv1 64) n) (bvult (_ bv0 64) n) (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (= _2 (bvult (_ bv1 64) n)) (and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (bvule (_ bv0 64) (_ bv1 64)) (bvule (_ bv1 64) (_ bv4294967295 64))) (bvult n (_ bv1 64))))))))",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "contract:trust-mc-typed-chc-public:1f64c21f5495477ba4b1e9c3e34ad0f0ef780972d1fc2dcfe7ca19e1ac41bce3",
+          "assertion_id": "trust-assertion:contract:trust-mc-typed-chc-public:1f64c21f5495477ba4b1e9c3e34ad0f0ef780972d1fc2dcfe7ca19e1ac41bce3",
+          "range": {
+            "file": 0,
+            "start_line": 21,
+            "start_col": 27,
+            "end_line": 21,
+            "end_col": 27
+          },
+          "public": {
+            "obligation_id": "vc:rr__recursive_requires:arithmetic_safety:2",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                143,
+                186,
+                59,
+                245,
+                57,
+                205,
+                224,
+                114,
+                158,
+                0,
+                4,
+                134,
+                100,
+                151,
+                141,
+                147,
+                174,
+                22,
+                70,
+                124,
+                91,
+                140,
+                241,
+                17,
+                64,
+                47,
+                164,
+                73,
+                180,
+                215,
+                20,
+                230
+              ]
+            }
+          }
+        },
+        "site": {
+          "function": 0,
+          "block": 1,
+          "inst_index": 8
+        }
+      },
+      {
+        "id": 4,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:rr__recursive_requires:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:rr__recursive_requires:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:rr__recursive_requires:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 17,
+            "start_col": 0,
+            "end_line": 23,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:rr__recursive_requires:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                230,
+                181,
+                127,
+                44,
+                189,
+                125,
+                66,
+                147,
+                74,
+                192,
+                106,
+                253,
+                61,
+                90,
+                58,
+                40,
+                227,
+                55,
+                167,
+                65,
+                222,
+                89,
+                205,
+                226,
+                56,
+                37,
+                103,
+                211,
+                221,
+                168,
+                125,
+                87
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "panic freedom: no assertion, `unreachable!`, or panic is reachable (public verifier obligation vc:rr__recursive_requires:assertion:panic-freedom:0)",
+        "formula": {
+          "schema": "trust.trust_ir.obligation-source.v1",
+          "payload": "{\"source_id\":\"vc:rr__recursive_requires:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:rr__recursive_requires:assertion:panic-freedom:0\",\"native_assertion_id\":227893368,\"span\":{\"file\":\"tests/ui/trust/native_recursive_requires_fresh_context.rs\",\"line_start\":17,\"col_start\":0,\"line_end\":23,\"col_end\":1},\"public_obligation_id\":\"vc:rr__recursive_requires:assertion:panic-freedom:0\"}",
+          "smtlib": null
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:rr__recursive_requires:assertion:panic-freedom:0",
+          "assertion_id": "trust-assertion:vc:rr__recursive_requires:assertion:panic-freedom:0",
+          "range": {
+            "file": 0,
+            "start_line": 17,
+            "start_col": 0,
+            "end_line": 23,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:rr__recursive_requires:assertion:panic-freedom:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                96,
+                192,
+                153,
+                20,
+                10,
+                177,
+                1,
+                19,
+                197,
+                147,
+                157,
+                67,
+                121,
+                175,
+                189,
+                206,
+                216,
+                90,
+                207,
+                209,
+                137,
+                107,
+                210,
+                173,
+                4,
+                195,
+                227,
+                247,
+                98,
+                52,
+                148,
+                243
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "NativeC"
+    },
+    "files": [
+      "tests/ui/trust/native_recursive_requires_fresh_context.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            39,
+            170,
+            6,
+            155,
+            80,
+            212,
+            138,
+            9,
+            221,
+            84,
+            144,
+            92,
+            138,
+            246,
+            52,
+            75,
+            90,
+            166,
+            206,
+            153,
+            71,
+            115,
+            134,
+            232,
+            76,
+            223,
+            181,
+            163,
+            27,
+            99,
+            44,
+            215
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            137,
+            104,
+            51,
+            116,
+            207,
+            150,
+            161,
+            76,
+            201,
+            184,
+            203,
+            99,
+            22,
+            63,
+            37,
+            28,
+            5,
+            70,
+            60,
+            255,
+            160,
+            160,
+            131,
+            203,
+            96,
+            191,
+            94,
+            67,
+            241,
+            139,
+            166,
+            194
+          ]
+        },
+        "obligations": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              69,
+              57,
+              229,
+              54,
+              1,
+              1,
+              130,
+              24,
+              49,
+              250,
+              40,
+              211,
+              184,
+              86,
+              158,
+              186,
+              243,
+              201,
+              207,
+              3,
+              101,
+              205,
+              58,
+              4,
+              56,
+              149,
+              177,
+              120,
+              216,
+              145,
+              136,
+              182
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                40,
+                103,
+                17,
+                238,
+                209,
+                248,
+                143,
+                1,
+                168,
+                94,
+                243,
+                132,
+                117,
+                89,
+                229,
+                134,
+                64,
+                164,
+                228,
+                114,
+                28,
+                56,
+                226,
+                204,
+                54,
+                191,
+                134,
+                236,
+                136,
+                26,
+                25,
+                54
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.trust_ir.obligation-source.v1",
+                  "payload": "{\"source_id\":\"trust-contract:rr::recursive_requires:requires:0\",\"assertion_id\":\"trust-assertion:trust-contract:rr::recursive_requires:requires:0\",\"native_assertion_id\":2858340475,\"span\":{\"file\":\"tests/ui/trust/native_recursive_requires_fresh_context.rs\",\"line_start\":18,\"col_start\":13,\"line_end\":18,\"col_end\":18},\"public_obligation_id\":\"obligation:rr__recursive_requires:precondition:0\"}",
+                  "smtlib": null
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    253,
+                    77,
+                    176,
+                    39,
+                    59,
+                    189,
+                    51,
+                    149,
+                    75,
+                    114,
+                    51,
+                    222,
+                    110,
+                    79,
+                    107,
+                    223,
+                    222,
+                    78,
+                    80,
+                    147,
+                    107,
+                    175,
+                    38,
+                    250,
+                    232,
+                    214,
+                    102,
+                    241,
+                    254,
+                    209,
+                    158,
+                    181
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 2858340475,
+                "span": {
+                  "file": 0,
+                  "line": 18,
+                  "col": 13
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 1,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          1
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                195,
+                159,
+                29,
+                68,
+                198,
+                65,
+                146,
+                66,
+                96,
+                230,
+                226,
+                67,
+                113,
+                238,
+                7,
+                140,
+                37,
+                192,
+                24,
+                127,
+                162,
+                171,
+                85,
+                170,
+                34,
+                157,
+                154,
+                35,
+                235,
+                223,
+                126,
+                210
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.1#s1_0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"or\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"lt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_3.1#s1_0\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+                  "smtlib": "(and (and (>= n 1) (<= n 4294967295)) (and (> n 1) (not |_3.1#s1_0|) (> n 0) (and (>= n 0) (<= n 4294967295)) (and (>= n 0) (or (>= (- n 1) n) (< n 0)))))",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    123,
+                    128,
+                    52,
+                    130,
+                    244,
+                    82,
+                    14,
+                    84,
+                    120,
+                    34,
+                    255,
+                    172,
+                    87,
+                    48,
+                    204,
+                    194,
+                    247,
+                    7,
+                    15,
+                    172,
+                    29,
+                    227,
+                    208,
+                    148,
+                    125,
+                    180,
+                    115,
+                    22,
+                    231,
+                    76,
+                    173,
+                    71
+                  ]
+                },
+                "obligation": 1,
+                "assertion_id": 3889472773,
+                "span": {
+                  "file": 0,
+                  "line": 21,
+                  "col": 27
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 2,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          2
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                185,
+                134,
+                198,
+                180,
+                77,
+                181,
+                95,
+                218,
+                245,
+                98,
+                25,
+                247,
+                92,
+                154,
+                246,
+                49,
+                128,
+                22,
+                234,
+                8,
+                152,
+                118,
+                244,
+                215,
+                99,
+                29,
+                127,
+                209,
+                63,
+                243,
+                83,
+                91
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"ge\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0#s1_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.1#s1_0\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"binary\",\"op\":\"sub\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"le\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"1\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"4294967295\"}}}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"unary\",\"op\":\"not\",\"expr\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"gt\",\"lhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"variable\",\"name\":\"_3.0#s1_0\"}},\"rhs\":{\"sort\":\"int\",\"kind\":{\"node\":\"int_literal\",\"value\":\"0\"}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_2\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.0#s1_0\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"_3.1#s1_0\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":\"int\",\"origin\":{\"origin\":\"inferred\"}}]}",
+                  "smtlib": "(and (> n 0) (and (>= n 0) (<= n 4294967295)) (= _2 (> n 1)) (and (<= 0 (- n 1)) (<= (- n 1) 4294967295)) (= |_3.0#s1_0| (- n 1)) (and (<= 0 n) (<= n 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (= _2 (> n 1)) (> n 1) (not |_3.1#s1_0|) (= _2 (> n 1)) (and (<= 0 (- n 1)) (<= (- n 1) 4294967295)) (= _3.0 (- n 1)) (and (<= 0 n) (<= n 4294967295)) (and (<= 0 1) (<= 1 4294967295)) (not (> |_3.0#s1_0| 0)))",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    163,
+                    126,
+                    128,
+                    60,
+                    240,
+                    125,
+                    21,
+                    147,
+                    50,
+                    242,
+                    74,
+                    77,
+                    5,
+                    245,
+                    88,
+                    91,
+                    131,
+                    42,
+                    125,
+                    215,
+                    85,
+                    117,
+                    45,
+                    121,
+                    158,
+                    193,
+                    23,
+                    210,
+                    54,
+                    15,
+                    237,
+                    24
+                  ]
+                },
+                "obligation": 2,
+                "assertion_id": 2826425264,
+                "span": {
+                  "file": 0,
+                  "line": 21,
+                  "col": 8
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 3,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          3
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                236,
+                151,
+                6,
+                242,
+                180,
+                157,
+                51,
+                139,
+                35,
+                115,
+                49,
+                74,
+                173,
+                75,
+                41,
+                7,
+                60,
+                78,
+                72,
+                162,
+                42,
+                49,
+                165,
+                139,
+                210,
+                8,
+                81,
+                139,
+                34,
+                1,
+                253,
+                227
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"eq\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"variable\",\"name\":\"_2\"}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"binary\",\"op\":\"and\",\"lhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"0\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"width\":64}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ule\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"4294967295\",\"width\":64}},\"width\":64}}}}}},\"rhs\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bv_binary\",\"op\":\"ult\",\"lhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"variable\",\"name\":\"n\"}},\"rhs\":{\"sort\":{\"bit_vec\":{\"width\":64}},\"kind\":{\"node\":\"bit_vec_literal\",\"value\":\"1\",\"width\":64}},\"width\":64}}}}}}}}}}}}}},\"root_sort\":\"bool\",\"variables\":[{\"name\":\"_2\",\"sort\":\"bool\",\"origin\":{\"origin\":\"inferred\"}},{\"name\":\"n\",\"sort\":{\"bit_vec\":{\"width\":64}},\"origin\":{\"origin\":\"inferred\"}}]}",
+                  "smtlib": "(and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (= _2 (bvult (_ bv1 64) n)) (and (bvult (_ bv1 64) n) (bvult (_ bv0 64) n) (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (= _2 (bvult (_ bv1 64) n)) (and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (and (bvule (_ bv0 64) n) (bvule n (_ bv4294967295 64))) (and (bvule (_ bv0 64) (_ bv1 64)) (bvule (_ bv1 64) (_ bv4294967295 64))) (bvult n (_ bv1 64))))))))",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    201,
+                    123,
+                    176,
+                    197,
+                    239,
+                    237,
+                    231,
+                    241,
+                    15,
+                    66,
+                    61,
+                    132,
+                    183,
+                    210,
+                    127,
+                    167,
+                    110,
+                    143,
+                    86,
+                    206,
+                    11,
+                    17,
+                    140,
+                    138,
+                    46,
+                    44,
+                    7,
+                    20,
+                    94,
+                    23,
+                    250,
+                    184
+                  ]
+                },
+                "obligation": 3,
+                "assertion_id": 1525958991,
+                "span": {
+                  "file": 0,
+                  "line": 21,
+                  "col": 27
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 4,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          4
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                46,
+                65,
+                78,
+                119,
+                247,
+                25,
+                118,
+                83,
+                138,
+                120,
+                210,
+                115,
+                244,
+                140,
+                50,
+                208,
+                192,
+                2,
+                57,
+                146,
+                213,
+                97,
+                154,
+                178,
+                221,
+                239,
+                89,
+                4,
+                118,
+                105,
+                180,
+                132
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 4,
+                "assertion_id": 1857412791,
+                "span": {
+                  "file": 0,
+                  "line": 17,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 5,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          5
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                204,
+                248,
+                34,
+                43,
+                107,
+                17,
+                123,
+                84,
+                150,
+                255,
+                191,
+                158,
+                175,
+                84,
+                52,
+                128,
+                135,
+                36,
+                208,
+                77,
+                135,
+                109,
+                74,
+                55,
+                227,
+                133,
+                245,
+                101,
+                47,
+                130,
+                229,
+                2
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.trust_ir.obligation-source.v1",
+                  "payload": "{\"source_id\":\"vc:rr__recursive_requires:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:rr__recursive_requires:assertion:panic-freedom:0\",\"native_assertion_id\":227893368,\"span\":{\"file\":\"tests/ui/trust/native_recursive_requires_fresh_context.rs\",\"line_start\":17,\"col_start\":0,\"line_end\":23,\"col_end\":1},\"public_obligation_id\":\"vc:rr__recursive_requires:assertion:panic-freedom:0\"}",
+                  "smtlib": null
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    50,
+                    91,
+                    82,
+                    57,
+                    101,
+                    38,
+                    106,
+                    242,
+                    158,
+                    209,
+                    107,
+                    168,
+                    215,
+                    95,
+                    75,
+                    121,
+                    3,
+                    238,
+                    170,
+                    177,
+                    207,
+                    187,
+                    255,
+                    119,
+                    103,
+                    220,
+                    131,
+                    153,
+                    70,
+                    18,
+                    98,
+                    104
+                  ]
+                },
+                "obligation": 5,
+                "assertion_id": 227893368,
+                "span": {
+                  "file": 0,
+                  "line": 17,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

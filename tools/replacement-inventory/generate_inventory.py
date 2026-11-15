@@ -9,7 +9,8 @@ This is the ay / trust-mc inventory generator. Its disposition source is the
 surveyed public Kani verification corpus
 (``tools/replacement-inventory/public-corpus.json``): one row per
 ``#[kani::proof]`` harness across the real verification suites under
-``tests/``, with each harness's expected disposition read from the test's
+``tests/``, with each harness's expected disposition sourced from the test mode's
+authoritative failure annotation or its
 ``expected`` output file (the convention compiletest's ``Expected`` mode keys
 on: ``run_expected_test`` resolves ``file.with_extension("expected")`` else
 ``<dir>/expected`` and substring-matches the verifier's stdout — see
@@ -105,7 +106,7 @@ CORPUS_TO_EXPECTED = {
 
 # Provenance recorded in the emitted inventory.
 PROVENANCE = (
-    "fresh public corpus over the included Kani verification suites, 2026-06-15"
+    "frozen public corpus, 2026-06-15; source-oracle corrections, 2026-11-14"
 )
 
 # The full inventory lives in the trust-mc suite; the proof subset and the
@@ -652,8 +653,8 @@ def build_non_proof_closure(
                 "expected": row["expected"],
                 "disposition": "expected-fail",
                 "justification": (
-                    "expected non-PROOF verdict carried by the test's `expected` "
-                    f"output file (survey disposition: {row['expected']})"
+                    "expected non-PROOF verdict from the frozen source oracle "
+                    f"(annotation or expected output; survey disposition: {row['expected']})"
                 ),
             }
         )

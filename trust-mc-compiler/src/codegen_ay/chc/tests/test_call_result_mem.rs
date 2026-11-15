@@ -112,6 +112,19 @@ fn collect_nested_stores<'a>(expr: &'a Expr, stores: &mut Vec<(&'a Expr, &'a Exp
     }
 }
 
+/// The stored value folded to a constant, exactly `value` at `width`: the
+/// memory image of a tag is its discriminant VALUE, so an `Err`'s tag byte
+/// must BE 1, not an `ite` with a 1 in one branch (`ite(fld0, 1, 0)` read a
+/// `Result`'s `fld0`, which names `Ok`, as is-`Err`; lostwrite track round 3).
+fn expr_folds_to_bv_const(expr: &Expr, width: u32, value: u128) -> bool {
+    let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(expr);
+    matches!(
+        folded.as_ref().map(|e| e.value()),
+        Some(ExprValue::BitVecConst { value: actual, width: actual_width })
+            if *actual_width == width && *actual == BigInt::from(value)
+    )
+}
+
 fn expr_is_bv_const(expr: &Expr, width: u32, value: u128) -> bool {
     match expr.value() {
         ExprValue::BitVecConst { value: actual, width: actual_width } => {
@@ -177,8 +190,12 @@ fn test_build_call_result_memory_bridge_constraints_mirrors_flattened_result_to_
             "flattened Result bridge should emit at least two mem_u8 stores (tag + payload), got {mem_u8_out}"
         );
         assert!(
-            stores.iter().any(|(_, value)| expr_is_bv_const(value, 8, 1)),
+            stores.iter().any(|(_, value)| expr_folds_to_bv_const(value, 8, 1)),
             "flattened Result bridge should store the Err discriminant byte, got {mem_u8_out}"
+        );
+        assert!(
+            !stores.iter().any(|(_, value)| expr_folds_to_bv_const(value, 8, 0)),
+            "flattened Result bridge must not store an Ok tag byte for Err, got {mem_u8_out}"
         );
         assert!(
             stores.iter().any(|(_, value)| expr_is_bv_const(value, 8, 9)),
@@ -219,8 +236,12 @@ fn test_try_decompose_flattened_enum_field_stores_uses_flattened_env_values() {
             "flattened enum decomposition should emit at least tag + payload stores, got {mem_u8_out}"
         );
         assert!(
-            stores.iter().any(|(_, value)| expr_is_bv_const(value, 8, 1)),
+            stores.iter().any(|(_, value)| expr_folds_to_bv_const(value, 8, 1)),
             "flattened enum decomposition should store the Err discriminant byte, got {mem_u8_out}"
+        );
+        assert!(
+            !stores.iter().any(|(_, value)| expr_folds_to_bv_const(value, 8, 0)),
+            "flattened enum decomposition must not store an Ok tag byte for Err, got {mem_u8_out}"
         );
         assert!(
             stores.iter().any(|(_, value)| expr_is_bv_const(value, 8, 9)),

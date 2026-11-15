@@ -1,0 +1,2883 @@
+{
+  "schema_version": 8,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          155,
+          116,
+          73,
+          155,
+          28,
+          188,
+          73,
+          50,
+          180,
+          0,
+          50,
+          255,
+          48,
+          228,
+          6,
+          38,
+          9,
+          217,
+          209,
+          43,
+          112,
+          188,
+          99,
+          211,
+          8,
+          193,
+          124,
+          49,
+          195,
+          15,
+          216,
+          183
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.12.0",
+    "source_language": "Rust",
+    "source_languages": [
+      "Rust",
+      "TrustIr"
+    ],
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        155,
+        116,
+        73,
+        155,
+        28,
+        188,
+        73,
+        50,
+        180,
+        0,
+        50,
+        255,
+        48,
+        228,
+        6,
+        38,
+        9,
+        217,
+        209,
+        43,
+        112,
+        188,
+        99,
+        211,
+        8,
+        193,
+        124,
+        49,
+        195,
+        15,
+        216,
+        183
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.12.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 8,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      124,
+      74,
+      138,
+      200,
+      163,
+      204,
+      96,
+      191,
+      97,
+      126,
+      221,
+      19,
+      41,
+      227,
+      44,
+      250,
+      255,
+      24,
+      58,
+      93,
+      196,
+      161,
+      228,
+      90,
+      240,
+      98,
+      64,
+      30,
+      215,
+      166,
+      110,
+      70
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "p",
+        "symbol": "p",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            200,
+            100,
+            129,
+            128,
+            205,
+            250,
+            43,
+            140,
+            138,
+            246,
+            146,
+            243,
+            245,
+            161,
+            12,
+            5,
+            179,
+            232,
+            232,
+            178,
+            16,
+            222,
+            9,
+            97,
+            92,
+            1,
+            85,
+            122,
+            201,
+            67,
+            164,
+            10
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:min_arc_drop__p:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 1,
+          "col": 0
+        },
+        "assertion_id": 148393964,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      },
+      {
+        "obligation": 1,
+        "public_obligation_id": "vc:min_arc_drop__p:assertion:panic-freedom:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 1,
+          "col": 0
+        },
+        "assertion_id": 3070148336,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "min_arc_drop::p",
+    "functions": [
+      {
+        "id": 0,
+        "name": "p",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                {
+                  "Struct": 3
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Call": {
+                    "callee": 1,
+                    "args": [
+                      0
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Unit",
+                    "value": "PhantomData"
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 1,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U8",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "U8",
+                    "operand": 4
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      5
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      },
+      {
+        "id": 1,
+        "name": "core::mem::drop::<alloc::sync::Arc<u32>>",
+        "ty": 1,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                {
+                  "Struct": 3
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Unit",
+                    "value": "PhantomData"
+                  }
+                },
+                "results": [
+                  2
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "Unit",
+                    "operand": 2
+                  }
+                },
+                "results": [
+                  3
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": true
+                    }
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 4,
+                    "kind": "Unspecified"
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoPanic"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 1,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Return": {
+                    "values": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      },
+      {
+        "id": 2,
+        "name": "core::mem::alignment::Alignment::new_unchecked::precondition_check",
+        "ty": 2,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "U64"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  15
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Uge",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 15
+                  }
+                },
+                "results": [
+                  16
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 18446744073709551615
+                    }
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 17
+                  }
+                },
+                "results": [
+                  18
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  19
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "ty": "Bool",
+                    "cond": 16,
+                    "then_val": 18,
+                    "else_val": 19
+                  }
+                },
+                "results": [
+                  20
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 20
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": "U32"
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 3,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Unit",
+                    "value": "PhantomData"
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "Unit",
+                    "operand": 22
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    }
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 24
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 198
+                    }
+                  }
+                },
+                "results": [
+                  26
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U64",
+                    "lhs": 25,
+                    "rhs": 26
+                  }
+                },
+                "results": [
+                  27
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 27
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 24
+                  }
+                },
+                "results": [
+                  28
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 28
+                  }
+                },
+                "results": [
+                  29
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrData": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "ptr": 29
+                  }
+                },
+                "results": [
+                  30
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  32
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 0
+                    },
+                    "aggregate": 32,
+                    "field": 0,
+                    "value": 30
+                  }
+                },
+                "results": [
+                  31
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    }
+                  }
+                },
+                "results": [
+                  33
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 33
+                  }
+                },
+                "results": [
+                  34
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 198
+                    }
+                  }
+                },
+                "results": [
+                  35
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U64",
+                    "lhs": 34,
+                    "rhs": 35
+                  }
+                },
+                "results": [
+                  36
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 36
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Cast": {
+                    "op": "Bitcast",
+                    "src_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "dst_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 33
+                  }
+                },
+                "results": [
+                  37
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 37
+                  }
+                },
+                "results": [
+                  38
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  40
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Shl",
+                    "ty": "U64",
+                    "lhs": 38,
+                    "rhs": 40
+                  }
+                },
+                "results": [
+                  39
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  42
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Or",
+                    "ty": "U64",
+                    "lhs": 39,
+                    "rhs": 42
+                  }
+                },
+                "results": [
+                  41
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  43
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 4
+                    }
+                  }
+                },
+                "results": [
+                  44
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 4
+                    },
+                    "aggregate": 44,
+                    "field": 0,
+                    "value": 31
+                  }
+                },
+                "results": [
+                  45
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 4
+                    },
+                    "aggregate": 45,
+                    "field": 1,
+                    "value": 43
+                  }
+                },
+                "results": [
+                  46
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  47
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 47,
+                    "kind": "Unspecified"
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoPanic"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  49
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U32",
+                    "lhs": 21,
+                    "rhs": 49
+                  }
+                },
+                "results": [
+                  48
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  50
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 48,
+                    "rhs": 50
+                  }
+                },
+                "results": [
+                  51
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 51,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      },
+      {
+        "id": 3,
+        "name": "core::alloc::layout::Layout::from_size_alignment_unchecked::precondition_check",
+        "ty": 3,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "U64"
+              ],
+              [
+                1,
+                {
+                  "Struct": 6
+                }
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Uge",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 17
+                  }
+                },
+                "results": [
+                  18
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 18446744073709551615
+                    }
+                  }
+                },
+                "results": [
+                  19
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 19
+                  }
+                },
+                "results": [
+                  20
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "ty": "Bool",
+                    "cond": 18,
+                    "then_val": 20,
+                    "else_val": 21
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 22
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": "U64"
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc",
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "U64",
+                    "operand": 23
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 9223372036854775808
+                    }
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Overflow": {
+                    "op": "SubOverflow",
+                    "ty": "U64",
+                    "lhs": 25,
+                    "rhs": 24
+                  }
+                },
+                "results": [
+                  26,
+                  27
+                ],
+                "proofs": [
+                  "NoOverflow"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  28
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 27,
+                    "rhs": 28
+                  }
+                },
+                "results": [
+                  29
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 29,
+                    "kind": "Unspecified"
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 26
+                  }
+                },
+                "results": [
+                  30
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  31
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "Bool",
+                    "lhs": 30,
+                    "rhs": 31
+                  }
+                },
+                "results": [
+                  32
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 32,
+                    "then_target": 2,
+                    "then_args": [],
+                    "else_target": 1,
+                    "else_args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Unit",
+                    "value": "PhantomData"
+                  }
+                },
+                "results": [
+                  33
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "Unit",
+                    "operand": 33
+                  }
+                },
+                "results": [
+                  34
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    }
+                  }
+                },
+                "results": [
+                  35
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 35
+                  }
+                },
+                "results": [
+                  36
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 259
+                    }
+                  }
+                },
+                "results": [
+                  37
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U64",
+                    "lhs": 36,
+                    "rhs": 37
+                  }
+                },
+                "results": [
+                  38
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 38
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 35
+                  }
+                },
+                "results": [
+                  39
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 39
+                  }
+                },
+                "results": [
+                  40
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrData": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "ptr": 40
+                  }
+                },
+                "results": [
+                  41
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  43
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 0
+                    },
+                    "aggregate": 43,
+                    "field": 0,
+                    "value": 41
+                  }
+                },
+                "results": [
+                  42
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    }
+                  }
+                },
+                "results": [
+                  44
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 44
+                  }
+                },
+                "results": [
+                  45
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 259
+                    }
+                  }
+                },
+                "results": [
+                  46
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Eq",
+                    "ty": "U64",
+                    "lhs": 45,
+                    "rhs": 46
+                  }
+                },
+                "results": [
+                  47
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 47
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Cast": {
+                    "op": "Bitcast",
+                    "src_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "dst_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "operand": 44
+                  }
+                },
+                "results": [
+                  48
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "PtrMetadata": {
+                    "ptr_ty": {
+                      "FatPtr": {
+                        "Slice": 0
+                      }
+                    },
+                    "metadata_ty": "U64",
+                    "ptr": 48
+                  }
+                },
+                "results": [
+                  49
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  51
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Shl",
+                    "ty": "U64",
+                    "lhs": 49,
+                    "rhs": 51
+                  }
+                },
+                "results": [
+                  50
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  53
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "op": "Or",
+                    "ty": "U64",
+                    "lhs": 50,
+                    "rhs": 53
+                  }
+                },
+                "results": [
+                  52
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 0
+                    }
+                  }
+                },
+                "results": [
+                  54
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Struct": 4
+                    }
+                  }
+                },
+                "results": [
+                  55
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 4
+                    },
+                    "aggregate": 55,
+                    "field": 0,
+                    "value": 42
+                  }
+                },
+                "results": [
+                  56
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertField": {
+                    "ty": {
+                      "Struct": 4
+                    },
+                    "aggregate": 56,
+                    "field": 1,
+                    "value": 54
+                  }
+                },
+                "results": [
+                  57
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  58
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 58,
+                    "kind": "Unspecified"
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "NoPanic"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": "Unreachable",
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false,
+          "params": [],
+          "naked": false,
+          "target_features": []
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null,
+        "source_provenance": null,
+        "body_gate": null,
+        "display_path": null,
+        "section": null,
+        "visibility": "Default"
+      }
+    ],
+    "structs": [
+      {
+        "id": 0,
+        "name": "core::ptr::non_null::NonNull",
+        "fields": [
+          {
+            "name": "pointer",
+            "ty": "Ptr",
+            "offset": 0
+          }
+        ],
+        "size": 8,
+        "align": 8,
+        "repr": "Transparent"
+      },
+      {
+        "id": 1,
+        "name": "core::marker::PhantomData",
+        "fields": [],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 2,
+        "name": "alloc::alloc::Global",
+        "fields": [],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 3,
+        "name": "alloc::sync::Arc",
+        "fields": [
+          {
+            "name": "ptr",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          },
+          {
+            "name": "phantom",
+            "ty": {
+              "Struct": 1
+            },
+            "offset": null
+          },
+          {
+            "name": "alloc",
+            "ty": {
+              "Struct": 2
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 4,
+        "name": "core::fmt::Arguments",
+        "fields": [
+          {
+            "name": "template",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          },
+          {
+            "name": "args",
+            "ty": {
+              "Struct": 0
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 5,
+        "name": "core::mem::alignment::AlignmentEnum",
+        "fields": [
+          {
+            "name": "__tag",
+            "ty": "I64",
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      },
+      {
+        "id": 6,
+        "name": "core::mem::alignment::Alignment",
+        "fields": [
+          {
+            "name": "_inner_repr_trick",
+            "ty": {
+              "Struct": 5
+            },
+            "offset": null
+          }
+        ],
+        "size": null,
+        "align": null,
+        "repr": "Rust"
+      }
+    ],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          {
+            "Struct": 3
+          }
+        ],
+        "returns": [
+          "U8"
+        ],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          {
+            "Struct": 3
+          }
+        ],
+        "returns": [],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          "U64"
+        ],
+        "returns": [],
+        "is_vararg": false
+      },
+      {
+        "params": [
+          "U64",
+          {
+            "Struct": 6
+          }
+        ],
+        "returns": [],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:min_arc_drop__p:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:min_arc_drop__p:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:min_arc_drop__p:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 1,
+            "start_col": 0,
+            "end_line": 1,
+            "end_col": 53
+          },
+          "public": {
+            "obligation_id": "vc:min_arc_drop__p:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                234,
+                8,
+                58,
+                23,
+                175,
+                203,
+                50,
+                20,
+                126,
+                156,
+                224,
+                233,
+                20,
+                247,
+                253,
+                95,
+                37,
+                153,
+                74,
+                70,
+                42,
+                121,
+                175,
+                61,
+                36,
+                161,
+                112,
+                141,
+                82,
+                188,
+                17,
+                29
+              ]
+            }
+          }
+        },
+        "site": null
+      },
+      {
+        "id": 1,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "panic freedom: no assertion, `unreachable!`, or panic is reachable (public verifier obligation vc:min_arc_drop__p:assertion:panic-freedom:0)",
+        "formula": {
+          "schema": "trust.trust_ir.obligation-source.v1",
+          "payload": "{\"source_id\":\"vc:min_arc_drop__p:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:min_arc_drop__p:assertion:panic-freedom:0\",\"native_assertion_id\":3070148336,\"span\":{\"file\":\"/tmp/mig101/min-arc_drop.rs\",\"line_start\":1,\"col_start\":0,\"line_end\":1,\"col_end\":53},\"public_obligation_id\":\"vc:min_arc_drop__p:assertion:panic-freedom:0\"}",
+          "smtlib": null,
+          "sort": null
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:min_arc_drop__p:assertion:panic-freedom:0",
+          "assertion_id": "trust-assertion:vc:min_arc_drop__p:assertion:panic-freedom:0",
+          "range": {
+            "file": 0,
+            "start_line": 1,
+            "start_col": 0,
+            "end_line": 1,
+            "end_col": 53
+          },
+          "public": {
+            "obligation_id": "vc:min_arc_drop__p:assertion:panic-freedom:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                116,
+                200,
+                15,
+                160,
+                129,
+                220,
+                254,
+                112,
+                33,
+                221,
+                212,
+                129,
+                160,
+                108,
+                182,
+                148,
+                177,
+                138,
+                113,
+                100,
+                12,
+                4,
+                95,
+                50,
+                118,
+                121,
+                231,
+                21,
+                18,
+                237,
+                112,
+                43
+              ]
+            }
+          }
+        },
+        "site": null
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "Unclassified"
+    },
+    "files": [
+      "/tmp/mig101/min-arc_drop.rs",
+      "library/core/src/mem/mod.rs",
+      "library/core/src/ub_checks.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": [],
+    "predicates": [],
+    "global_asm": [],
+    "imports": [],
+    "tuple_layouts": [],
+    "completeness": null,
+    "drop_glue": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            155,
+            116,
+            73,
+            155,
+            28,
+            188,
+            73,
+            50,
+            180,
+            0,
+            50,
+            255,
+            48,
+            228,
+            6,
+            38,
+            9,
+            217,
+            209,
+            43,
+            112,
+            188,
+            99,
+            211,
+            8,
+            193,
+            124,
+            49,
+            195,
+            15,
+            216,
+            183
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            124,
+            74,
+            138,
+            200,
+            163,
+            204,
+            96,
+            191,
+            97,
+            126,
+            221,
+            19,
+            41,
+            227,
+            44,
+            250,
+            255,
+            24,
+            58,
+            93,
+            196,
+            161,
+            228,
+            90,
+            240,
+            98,
+            64,
+            30,
+            215,
+            166,
+            110,
+            70
+          ]
+        },
+        "obligations": [
+          0,
+          1
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              129,
+              49,
+              79,
+              207,
+              52,
+              239,
+              201,
+              28,
+              254,
+              195,
+              191,
+              213,
+              135,
+              222,
+              220,
+              87,
+              15,
+              192,
+              150,
+              255,
+              91,
+              78,
+              182,
+              163,
+              216,
+              2,
+              104,
+              209,
+              180,
+              46,
+              68,
+              167
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                146,
+                43,
+                61,
+                62,
+                184,
+                168,
+                211,
+                104,
+                66,
+                153,
+                153,
+                201,
+                143,
+                102,
+                66,
+                236,
+                200,
+                197,
+                191,
+                24,
+                44,
+                192,
+                54,
+                214,
+                77,
+                125,
+                69,
+                121,
+                209,
+                58,
+                111,
+                58
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 148393964,
+                "span": {
+                  "file": 0,
+                  "line": 1,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "TrustMc": {
+        "id": 1,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          1
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                212,
+                40,
+                189,
+                244,
+                107,
+                63,
+                73,
+                58,
+                95,
+                254,
+                179,
+                118,
+                80,
+                234,
+                35,
+                44,
+                235,
+                232,
+                87,
+                7,
+                11,
+                46,
+                109,
+                2,
+                155,
+                89,
+                203,
+                233,
+                224,
+                189,
+                163,
+                21
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.trust_ir.obligation-source.v1",
+                  "payload": "{\"source_id\":\"vc:min_arc_drop__p:assertion:panic-freedom:0\",\"assertion_id\":\"trust-assertion:vc:min_arc_drop__p:assertion:panic-freedom:0\",\"native_assertion_id\":3070148336,\"span\":{\"file\":\"/tmp/mig101/min-arc_drop.rs\",\"line_start\":1,\"col_start\":0,\"line_end\":1,\"col_end\":53},\"public_obligation_id\":\"vc:min_arc_drop__p:assertion:panic-freedom:0\"}",
+                  "smtlib": null,
+                  "sort": null
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    61,
+                    7,
+                    144,
+                    61,
+                    17,
+                    177,
+                    182,
+                    160,
+                    8,
+                    240,
+                    254,
+                    44,
+                    102,
+                    48,
+                    226,
+                    145,
+                    245,
+                    120,
+                    4,
+                    202,
+                    170,
+                    246,
+                    81,
+                    216,
+                    148,
+                    29,
+                    33,
+                    194,
+                    140,
+                    178,
+                    2,
+                    158
+                  ]
+                },
+                "obligation": 1,
+                "assertion_id": 3070148336,
+                "span": {
+                  "file": 0,
+                  "line": 1,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

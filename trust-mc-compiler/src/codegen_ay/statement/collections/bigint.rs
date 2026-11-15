@@ -339,6 +339,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         // Issue #739: Fallback creates unconstrained variable - emit warning for visibility
         let var_name = self.ctx.fresh_name("bigint_symbolic");
+        self.ctx.bmc_sound_havoc("bigint_symbolic");
         warn!(
             operand = ?operand,
             var_name = %var_name,

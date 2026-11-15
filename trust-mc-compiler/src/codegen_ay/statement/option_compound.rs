@@ -39,9 +39,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         );
         // args[0] = Option<T> (self)
         // args[1] = closure F where F: FnOnce(T) -> U
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
         if args.len() < 2 {
             warn!("codegen_option_map: expected 2 args, got {}", args.len());
-            return None;
+            self.ctx.unsupported_with_fallback("option_map_arity", "fewer than 2 args");
+            self.codegen_symbolic_result(destination);
+            return target;
         }
 
         // Get destination type for logging
@@ -263,6 +271,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Over-approximate closure result with symbolic value
         let closure_name = self.ctx.fresh_name("opt_unwrap_or_else");
         let closure_result = self.ctx.declare_var(&closure_name, result_sort);
+        self.ctx.bmc_sound_havoc("option_unwrap_or_else_closure");
 
         // Part of #3260: harmonize sorts before ITE to prevent Datatype vs scalar mismatch.
         let (inner_value, closure_result) = if *inner_value.sort() != *closure_result.sort() {

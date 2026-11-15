@@ -513,7 +513,7 @@ fn test_deferred_transitive_resolves_after_dependency() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() == 1
                     && matches!(place.projection[0], ProjectionElem::Deref)
@@ -599,7 +599,7 @@ fn test_worklist_drains_deferred_chain() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() == 1
                     && matches!(place.projection[0], ProjectionElem::Deref)

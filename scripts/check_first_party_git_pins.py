@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
+import importlib.util
+import hashlib
 import re
 import subprocess
 import sys
+from git_authority_environment import git_environment
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -76,7 +79,7 @@ def _tracked_manifests(root: Path) -> list[Path]:
     try:
         raw = subprocess.check_output(
             ["git", "-C", str(root), "ls-files", "-z", "--", "*Cargo.toml"],
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=git_environment(),
         )
     except (OSError, subprocess.CalledProcessError):
         return sorted(root.rglob("Cargo.toml"))
@@ -132,6 +135,49 @@ def _package_repository(package: str) -> str | None:
     return None
 
 
+def _archived_ir_manifest(root: Path, manifest: Path) -> bool:
+    """Use the selected IR's maintained sealed-source boundary, never a glob.
+
+    The historical Cargo files are source evidence rather than live selectors.
+    IR owns their exact immutable seal, bytes and non-adoption policy; using its
+    normal pin rewriter keeps this consumer aligned with the producer policy.
+    """
+    endpoint = ("reports/2026-11-08-source-value-operational/evidence/"
+                "afa-corrected-compact/source/crates/trust-ir-build/Cargo.toml")
+    if manifest.relative_to(root).as_posix() != endpoint:
+        return False
+    helper = root / "scripts/pin_rewrite.py"
+    if not helper.is_file() or helper.is_symlink():
+        raise ValueError("the selected IR archive-boundary owner is unavailable")
+    committed = subprocess.check_output(["git", "-C", str(root), "show", "HEAD:scripts/pin_rewrite.py"], env=git_environment())
+    # A dependency cannot authorize its own exemption by changing the policy.
+    # This exact maintained reader was reviewed with the public ed99 intake;
+    # changing it requires an explicit reviewed consumer update too.
+    expected = "759f60b9d8d4ead39a51576a19933855a8465907d18fe0454d2108bc1151cfb1"
+    if helper.read_bytes() != committed or hashlib.sha256(committed).hexdigest() != expected:
+        raise ValueError("the selected IR archive-boundary owner differs from its reviewed committed source")
+    name = "_trust_mc_selected_ir_pin_boundary"
+    spec = importlib.util.spec_from_file_location(name, helper)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load the selected IR archive-boundary owner")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        tracked = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], env=git_environment()).decode().split("\0")
+        module.validate_archived_pin_boundary(root, [p for p in tracked if p])
+        if not module.is_archived_pin_input(root, endpoint):
+            raise ValueError("the selected IR owner did not authenticate the exact archived endpoint")
+    except Exception as error:
+        # The pinned owner's PinError is a separate exception class. Normalize
+        # every ordinary authentication failure to this audit's refusal API;
+        # never turn a producer exception into an accepted endpoint.
+        raise ValueError(f"IR historical source authentication refused: {error}") from error
+    finally:
+        sys.modules.pop(name, None)
+    return True
+
+
 def audit_repository(root: Path, repository: str) -> PinAudit:
     family = FAMILIES[repository]
     revisions: list[str] = []
@@ -140,6 +186,8 @@ def audit_repository(root: Path, repository: str) -> PinAudit:
 
     for manifest in _tracked_manifests(root):
         relative = manifest.relative_to(root)
+        if repository == "clean" and _archived_ir_manifest(root, manifest):
+            continue
         try:
             document = toml_loads(manifest.read_text(encoding="utf-8"))
         except (OSError, TOMLDecodeError) as error:

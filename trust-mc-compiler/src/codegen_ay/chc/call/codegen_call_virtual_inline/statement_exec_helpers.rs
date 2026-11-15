@@ -7,6 +7,9 @@
 //! Extracted from statement_exec.rs for 500-line file-size compliance.
 //! Part of #4206.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, ExprValue, SortInner};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::{AggregateKind, LocalDecl};
@@ -18,11 +21,11 @@ use tracing::debug;
 use super::super::ChcCtx;
 use super::super::codegen_types::CodegenTypes;
 use super::super::inline_shared::{
-    PlaceResolver, inline_coroutine_discriminant_expr, inline_operand_to_expr, resolve_place,
+    PlaceResolver, checked_inline_variant_constructor, inline_coroutine_discriminant_expr,
+    inline_operand_to_expr, resolve_place,
 };
 use super::super::stubs_option_helpers::{OptionHelpers, option_value_sort};
 use crate::codegen_ay::chc::stmt::codegen_stmt_aggregate_adt::sign_extend_discr_val;
-use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width};
 use crate::rustc_public_bridge::IndexedVal;
 
 pub(super) fn try_inline_unit_enum_discriminant_expr<'tcx, 'body>(
@@ -257,51 +260,11 @@ pub(super) fn try_inline_adt_variant_assign_expr<'tcx, 'body>(
 
     let mut field_values = Vec::with_capacity(operands.len());
     for (i, expr) in operand_exprs.into_iter().enumerate() {
-        let field_sort = &cons.fields[i].sort;
-        let coerced = if *expr.sort() == *field_sort {
-            expr
-        } else if expr.sort().is_bool() && field_sort.is_bitvec() {
-            let width = field_sort.bitvec_width()?;
-            Expr::ite(expr, Expr::bitvec_const(1u64, width), Expr::bitvec_const(0u64, width))
-        } else if expr.sort().is_bitvec() && field_sort.is_bool() {
-            let width = expr.sort().bitvec_width()?;
-            expr.ne(Expr::bitvec_const(0u64, width))
-        } else if expr.sort().is_bitvec() && field_sort.is_bitvec() {
-            if let (Some(src_w), Some(dst_w)) =
-                (expr.sort().bitvec_width(), field_sort.bitvec_width())
-            {
-                if src_w != dst_w {
-                    coerce_bitvec_width(expr, dst_w, SignExtension::ZeroExtend)
-                } else {
-                    expr
-                }
-            } else {
-                expr
-            }
-        } else if expr.sort().is_bool() && field_sort.is_datatype() {
-            // Part of #4090: Bool->Datatype coercion for ZST struct fields
-            // (e.g., CharTryFromError(()) encoded as Datatype with 1 Bool field).
-            // ZST constants translate to Bool(true) but the enum constructor
-            // expects the wrapped Datatype sort.
-            use crate::codegen_ay::types::coerce_bool_to_unit_datatype;
-            if let Some(unit_expr) = coerce_bool_to_unit_datatype(&expr, field_sort) {
-                unit_expr
-            } else {
-                expr
-            }
-        } else if expr.sort().is_bitvec() && field_sort.is_datatype() {
-            // Part of #3984: BV->DT reconstruction for inline aggregate fields.
-            // When a callee-body local was BV-flattened but the DT constructor
-            // expects a struct-sorted field (e.g., NonCopyWrapper from BV32),
-            // reconstruct the struct from the BV bits.
-            use crate::codegen_ay::types::unflatten_bitvec_to_datatype;
-            if let Some(unflattened) = unflatten_bitvec_to_datatype(&expr, field_sort) {
-                unflattened
-            } else {
-                expr
-            }
-        } else {
-            expr
+        // A datatype-involved sort mismatch declines instead of emitting an
+        // ill-sorted constructor that AY's parser rejects (see `ctor_field`).
+        let Some(coerced) = super::super::inline_shared::ctor_field::coerce_inline_ctor_field(expr, &cons.fields[i].sort) else {
+            ctx.record_aggregate_gap("inline_ctor_field_sort_mismatch");
+            return None;
         };
         field_values.push(coerced);
     }
@@ -312,8 +275,9 @@ pub(super) fn try_inline_adt_variant_assign_expr<'tcx, 'body>(
     // caller's state variables or flattened_local_field_count.
     ctx.declare_datatype_sort_if_needed(&sort);
 
-    Some(Expr::datatype_constructor(&dt.name, &cons.name, field_values, sort.clone()))
+    checked_inline_variant_constructor(&dt.name, &cons.name, field_values, sort.clone())
 }
+
 
 pub(super) fn try_inline_bool_tag_set_discriminant_expr(
     ty: rustc_public::ty::Ty,
@@ -394,7 +358,9 @@ fn try_inline_option_like_set_discriminant_expr<'tcx, 'body>(
                 .and_then(|expr| ctx.option_unwrap_value_on_some_path(expr))
                 .filter(|expr| expr.sort() == &payload_sort)
                 .unwrap_or_else(|| {
-                    super::super::declare_pending_var(
+                    Havoc::mint(
+                        ctx,
+                        sound_havoc::UNTRACKED_CALL_RESULT,
                         super::super::chc_fresh_name("__inline_set_discriminant_payload"),
                         payload_sort.clone(),
                     )

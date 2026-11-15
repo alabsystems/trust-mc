@@ -7,7 +7,122 @@
 use super::*;
 use crate::verification_result::ValidationStatus;
 
+/// The `skip-budget-bound` rule (an opt-in policy, not the default).
 #[cfg(feature = "ay-chc-native")]
+#[test]
+fn external_fallback_disposition_skips_budget_bound_and_exhausted() {
+    use super::{ExternalFallbackDisposition as D, external_fallback_disposition};
+    use crate::verification_result::SolverUnknownReason as R;
+    use std::time::Duration;
+    let budget = Some(Duration::from_secs(15));
+    // Not eligible (a rejected false proof, a parse error): never attempted,
+    // whatever the budget.
+    assert_eq!(external_fallback_disposition(false, R::SolverError, budget), D::NotEligible);
+    assert_eq!(external_fallback_disposition(false, R::Timeout, budget), D::NotEligible);
+    // Eligible but budget-bound: a second engine cannot buy the budget back.
+    for reason in [R::Timeout, R::PreSolveDeadline, R::BudgetExhausted] {
+        assert_eq!(
+            external_fallback_disposition(true, reason, budget),
+            D::SkippedBudgetBound,
+            "{reason:?}"
+        );
+    }
+    // Eligible, capability-bound, budget left: attempt with that budget.
+    assert_eq!(
+        external_fallback_disposition(true, R::SolverError, budget),
+        D::Attempt(Duration::from_secs(15))
+    );
+    // Eligible, capability-bound, nothing useful left: skipped, typed.
+    assert_eq!(
+        external_fallback_disposition(true, R::SolverError, None),
+        D::SkippedBudgetExhausted
+    );
+    // Labels are what the marker prints; they must stay distinct.
+    let labels = [
+        D::NotEligible.label(),
+        D::SkippedBudgetBound.label(),
+        D::SkippedBudgetExhausted.label(),
+        D::SkippedDisabled.label(),
+        D::Attempt(Duration::ZERO).label(),
+    ];
+    let unique: std::collections::HashSet<_> = labels.iter().collect();
+    assert_eq!(unique.len(), labels.len());
+}
+
+/// The DEFAULT does not retry a budget-bound UNKNOWN. Measured over the 1280
+/// retained per-unit logs: all 8 proofs this retry ever found came from a
+/// budget-bound `Timeout`, and each is an unattributed `chc.0` success the
+/// scorer files outside parity — so the retry spent 3466.3s and bought no
+/// parity row. `always` restores it; `never` is the other counterfactual.
+/// An unrecognised value must read as the DEFAULT, not as `always`, or a typo
+/// silently restores the phase this measured off.
+#[cfg(feature = "ay-chc-native")]
+#[test]
+fn external_fallback_default_policy_skips_budget_bound_unknowns() {
+    use super::{
+        ExternalFallbackDisposition as D, ExternalFallbackPolicy as P,
+        external_fallback_disposition_with_policy as with_policy,
+        external_fallback_policy_from_value as from_value,
+    };
+    use crate::verification_result::SolverUnknownReason as R;
+    use std::time::Duration;
+    let budget = Some(Duration::from_secs(15));
+
+    // The env mapping, including what an unset or misspelled value takes.
+    assert_eq!(from_value(None), P::SkipBudgetBound);
+    assert_eq!(from_value(Some("")), P::SkipBudgetBound);
+    assert_eq!(from_value(Some("nonsense")), P::SkipBudgetBound);
+    assert_eq!(from_value(Some("skip-budget-bound")), P::SkipBudgetBound);
+    assert_eq!(from_value(Some("always")), P::Always);
+    for off in ["never", "off", "0"] {
+        assert_eq!(from_value(Some(off)), P::Never, "{off}");
+    }
+
+    // The default skips a budget-bound UNKNOWN, and still retries a
+    // capability-bound one that has budget left.
+    let default = from_value(None);
+    for reason in [R::Timeout, R::BudgetExhausted, R::PreSolveDeadline] {
+        assert_eq!(
+            with_policy(default, true, reason, budget),
+            D::SkippedBudgetBound,
+            "{reason:?}"
+        );
+    }
+    assert_eq!(
+        with_policy(default, true, R::SolverError, budget),
+        D::Attempt(Duration::from_secs(15))
+    );
+    // Fail-closed: the skip never invents an attempt without budget, and never
+    // overrides ineligibility.
+    assert_eq!(with_policy(default, false, R::SolverError, budget), D::NotEligible);
+    assert_eq!(with_policy(default, true, R::SolverError, None), D::SkippedBudgetExhausted);
+
+    // `always` restores the old behaviour for every reason; `never` disables.
+    for reason in [R::Timeout, R::BudgetExhausted, R::SolverError] {
+        assert_eq!(with_policy(P::Always, true, reason, budget), D::Attempt(Duration::from_secs(15)));
+        assert_eq!(with_policy(P::Always, true, reason, None), D::SkippedBudgetExhausted);
+        assert_eq!(with_policy(P::Always, false, reason, budget), D::NotEligible);
+        assert_eq!(with_policy(P::Never, true, reason, budget), D::SkippedDisabled);
+    }
+}
+
+#[test]
+fn solver_error_classification_distinguishes_a_refused_spawn_from_a_kill() {
+    use super::{solver_error_is_budget_exhausted, solver_error_is_timeout};
+    let killed =
+        anyhow::anyhow!("ay timed out after 15.0s. Use --tool-timeout to increase the limit.");
+    assert!(solver_error_is_timeout(&killed));
+    assert!(!solver_error_is_budget_exhausted(&killed));
+    let refused = anyhow::anyhow!(
+        "ay {}, timed out after 0.0s. Use --tool-timeout to increase the limit.",
+        crate::session::BUDGET_EXHAUSTED_BEFORE_SPAWN
+    );
+    assert!(solver_error_is_budget_exhausted(&refused));
+    // The refusal keeps the timeout wording for outer consumers, so the
+    // budget check must be consulted first at the call site.
+    assert!(solver_error_is_timeout(&refused));
+}
+
 #[test]
 fn native_chc_external_fallback_gate_accepts_inconclusive_paths() {
     let inconclusive =
@@ -24,6 +139,28 @@ fn native_chc_external_fallback_gate_accepts_inconclusive_paths() {
     let false_proof =
         anyhow::anyhow!("ay-chc false proof detected: BMC cross-check contradicts proof");
     assert!(!native_chc_error_allows_external_proof_fallback(&false_proof));
+}
+
+/// AY ask R1: a lane still alive at the harness deadline is abandoned into the
+/// quarantine and ends the harness. Its wording must NOT open the external `ay`
+/// fallback (that would be another lane beside it), and it files as a
+/// budget-bound `Timeout`, not a solver error.
+#[cfg(feature = "ay-chc-native")]
+#[test]
+fn an_abandoned_lane_never_opens_the_external_fallback() {
+    for lane in ["acyclic-bmc", "bmc-only", "primary-engine-only"] {
+        let abandoned = anyhow::anyhow!(
+            "ay-chc {lane} {}: the cancelled lane was still running 91234 ms after its \
+             cancellation; it is quarantined, and no further lane is started for this harness",
+            chc::LANE_ABANDONED_PHRASE
+        );
+        assert!(!native_chc_error_allows_external_proof_fallback(&abandoned), "{lane}");
+        assert_eq!(
+            crate::verification_provenance::SolverUnknownReason::from_chc_error(&abandoned),
+            crate::verification_provenance::SolverUnknownReason::Timeout,
+            "{lane}"
+        );
+    }
 }
 
 // ==================== Solver-named unknown reasons ====================

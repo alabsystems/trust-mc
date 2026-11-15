@@ -12,7 +12,7 @@ use rustc_public::mir::{BasicBlockIdx, Operand, Place};
 use tracing::{debug, warn};
 
 use super::{IntoOption, SimdLayout};
-use crate::codegen_ay::statement::{Allocation, ConstantKind, StatementCodegen, TyConstKind};
+use crate::codegen_ay::statement::StatementCodegen;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     // -------------------------------------------------------------------------
@@ -162,32 +162,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let Operand::Constant(const_op) = operand else {
             return None;
         };
-        let alloc: &Allocation = match const_op.const_.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_, alloc) => alloc,
-                _ => return None, // external enum: TyConstKind
-            },
-            _ => return None, // external enum: ConstantKind
-        };
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+        let bytes = const_pointer::const_bytes(&const_op.const_)?;
         let elem_bits = layout.elem_width()?;
         let elem_bytes = (elem_bits as usize).div_ceil(8);
         let lanes = layout.lane_count();
-        if elem_bytes == 0 || elem_bytes > 16 || alloc.bytes.len() < lanes.checked_mul(elem_bytes)?
-        {
+        if elem_bytes == 0 || elem_bytes > 16 || bytes.len() < lanes.checked_mul(elem_bytes)? {
             return None;
         }
-        let mut vals = Vec::with_capacity(lanes);
-        for i in 0..lanes {
-            let start = i * elem_bytes;
-            let mut v = 0u128;
-            for (b, byte) in alloc.bytes.get(start..start + elem_bytes)?.iter().enumerate() {
-                let byte = (*byte)?; // uninit byte: decline, use symbolic path
-                v |= (byte as u128) << (b * 8);
-            }
-            vals.push(v);
-        }
-        Some(vals)
+        // Each lane as data under the slot clause; an uninit byte or a
+        // relocation declines (the symbolic path is used).
+        (0..lanes).map(|i| bytes.read_uint_at(i * elem_bytes, elem_bytes)).collect()
     }
 
     /// Build an ITE chain for symbolic index selection.

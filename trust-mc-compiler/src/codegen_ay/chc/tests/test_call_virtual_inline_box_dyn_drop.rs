@@ -154,7 +154,14 @@ fn test_inline_box_dyn_dealloc_ignores_outer_known_alloc_id_collision() {
                 .collect::<Vec<_>>()
                 .join("\n")
                 .to_lowercase();
-            assert!(dealloc_text.contains("obj_valid"), "expected inline dealloc effects");
+            assert!(
+                chc_ctx.diagnostics.place_translation_drop.get() > 0,
+                "a raw numeric pointer without this frame's native typed origin cannot authorize a free"
+            );
+            assert!(
+                !dealloc_text.contains("obj_valid"),
+                "unknown owner must not gain deallocation authority"
+            );
             assert!(
                 !dealloc_text.contains("#x0000dead"),
                 "inline drop must not read caller known_alloc_ids using callee local numbers: \

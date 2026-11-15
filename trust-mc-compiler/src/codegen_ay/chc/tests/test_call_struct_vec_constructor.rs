@@ -19,6 +19,8 @@
 
 use super::super::codegen_call_struct_vec_constructor::vec_constructor_pattern_detected;
 use super::common::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 const SINGLE_VEC_NEWTYPE_SOURCE: &str = r#"
     #![allow(dead_code)]

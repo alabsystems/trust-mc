@@ -8,6 +8,7 @@
 //! Extracted from codegen_call_cmp_string.rs — Part of #2408.
 //! Checked/saturating arithmetic added — Part of #3094.
 
+use trust_mc_core::violation::PropertyKind;
 use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe, ty_to_bv_width};
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, BinOp};
@@ -198,26 +199,75 @@ pub(in crate::codegen_ay::chc) fn codegen_wrapping_arithmetic(
 
         // Part of #3299: unchecked arithmetic has UB on overflow.
         // Emit error rule: from_rel(state) ∧ constraints ∧ ¬no_overflow → error().
+        //
+        // Each obligation carries Kani's property class and message, the ones
+        // the inline walker records for the same BinOp
+        // (`inline_shared/rvalue_ub.rs` `binop_ub_conditions`). They used to be
+        // one MemorySafety "CHC verification: memory safety" check, so a
+        // direct `u8::unchecked_add` overflow failed on the right verdict but
+        // on the wrong check (walker_nested_helper_dual.rs
+        // `bug_unchecked_helper_direct_call`, once its local helper is
+        // MIR-inlined).
         if is_unchecked {
-            let no_overflow = match arith_op {
-                BinOp::Add if is_signed => lhs.clone().bvadd_no_overflow_signed(rhs.clone()),
-                BinOp::Add => lhs.clone().bvadd_no_overflow_unsigned(rhs.clone()),
-                BinOp::Sub if is_signed => lhs.clone().bvsub_no_overflow_signed(rhs.clone()),
-                BinOp::Sub => lhs.clone().bvsub_no_underflow_unsigned(rhs.clone()),
-                BinOp::Mul if is_signed => lhs.clone().bvmul_no_overflow_signed(rhs.clone()),
-                BinOp::Mul => lhs.clone().bvmul_no_overflow_unsigned(rhs.clone()),
+            let mut obligations: Vec<(Expr, PropertyKind, &'static str)> = Vec::new();
+            match arith_op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                    let (no_overflow, message) = match arith_op {
+                        BinOp::Add if is_signed => (
+                            lhs.clone().bvadd_no_overflow_signed(rhs.clone()),
+                            "attempt to compute `unchecked_add` which would overflow",
+                        ),
+                        BinOp::Add => (
+                            lhs.clone().bvadd_no_overflow_unsigned(rhs.clone()),
+                            "attempt to compute `unchecked_add` which would overflow",
+                        ),
+                        BinOp::Sub if is_signed => (
+                            lhs.clone().bvsub_no_overflow_signed(rhs.clone()),
+                            "attempt to compute `unchecked_sub` which would overflow",
+                        ),
+                        BinOp::Sub => (
+                            lhs.clone().bvsub_no_underflow_unsigned(rhs.clone()),
+                            "attempt to compute `unchecked_sub` which would overflow",
+                        ),
+                        BinOp::Mul if is_signed => (
+                            lhs.clone().bvmul_no_overflow_signed(rhs.clone()),
+                            "attempt to compute `unchecked_mul` which would overflow",
+                        ),
+                        _ => (
+                            lhs.clone().bvmul_no_overflow_unsigned(rhs.clone()),
+                            "attempt to compute `unchecked_mul` which would overflow",
+                        ),
+                    };
+                    obligations.push((no_overflow, PropertyKind::ArithmeticOverflow, message));
+                }
                 // Div/Rem UB: division by zero, or signed MIN / -1 overflow.
                 BinOp::Div | BinOp::Rem => {
+                    let is_rem = matches!(arith_op, BinOp::Rem);
                     let zero = Expr::bitvec_const(0u64, target_width);
                     let rhs_nonzero = rhs.clone().eq(zero).not();
+                    obligations.push((
+                        rhs_nonzero,
+                        PropertyKind::DivisionByZero,
+                        if is_rem {
+                            "attempt to calculate the remainder with a divisor of zero"
+                        } else {
+                            "attempt to divide by zero"
+                        },
+                    ));
                     if is_signed {
                         let t_min = Expr::bitvec_const(1u128 << (target_width - 1), target_width);
                         let neg_one =
                             Expr::bitvec_const(!0u128 >> (128 - target_width), target_width);
                         let signed_overflow = lhs.clone().eq(t_min).and(rhs.clone().eq(neg_one));
-                        rhs_nonzero.and(signed_overflow.not())
-                    } else {
-                        rhs_nonzero
+                        obligations.push((
+                            signed_overflow.not(),
+                            PropertyKind::ArithmeticOverflow,
+                            if is_rem {
+                                "attempt to calculate the remainder with overflow"
+                            } else {
+                                "attempt to divide with overflow"
+                            },
+                        ));
                     }
                 }
                 // Shl/Shr UB: shift amount must be in [0, value_width).
@@ -234,26 +284,34 @@ pub(in crate::codegen_ay::chc) fn codegen_wrapping_arithmetic(
                     );
                     let width_const = Expr::bitvec_const(value_width as u64, compare_width);
                     let in_range = rhs_cmp.clone().bvult(width_const);
-                    if rhs_signed {
+                    let in_range = if rhs_signed {
                         let zero = Expr::bitvec_const(0u64, compare_width);
                         in_range.and(rhs_cmp.bvsge(zero))
                     } else {
                         in_range
-                    }
+                    };
+                    obligations.push((
+                        in_range,
+                        PropertyKind::ArithmeticOverflow,
+                        "attempt to shift by excessive shift distance",
+                    ));
                 }
                 _ => {
                     // external enum: BinOp — unknown unchecked op, skip UB check
                     warn!(fn_name = %ctx.fn_name, ?arith_op, "CHC: unknown unchecked arith op for UB check");
-                    Expr::bool_const(true)
                 }
-            };
-            ctx.emit_error_rule_for_condition(
-                from_app,
-                no_overflow.clone(),
-                stmt_constraints,
-                bb_idx,
-            );
-            normal_guards.push(no_overflow);
+            }
+            for (holds, kind, message) in obligations {
+                ctx.emit_error_rule_for_condition_with_kind(
+                    from_app,
+                    holds.clone(),
+                    stmt_constraints,
+                    bb_idx,
+                    kind,
+                    Some(message.to_string()),
+                );
+                normal_guards.push(holds);
+            }
         }
 
         match arith_op {

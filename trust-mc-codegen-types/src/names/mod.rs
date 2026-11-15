@@ -24,18 +24,21 @@ mod sort_short_name;
 mod sort_type_names;
 
 // Re-export everything at the `names` module level to preserve existing import paths.
-pub use adt_names::{adt_sort_name, sanitize_adt_suffix};
+pub use adt_names::{
+    adt_sort_base, adt_sort_is, adt_sort_name, known_adt, sanitize_adt_suffix, sanitize_def_path,
+};
 pub use chc_state_names::{
-    addr_name, alloc_obj_size_name, collection_cap_var_name, collection_len_var_name,
+    MAX_TYPE_KEY_NAME_BYTES, TYPE_KEY_NAME_KEEP_BYTES, addr_name, alloc_obj_size_name,
+    bounded_type_key_segment, collection_cap_var_name, collection_len_var_name,
     collection_present_var_name, mem_array_name, mem_array_name_pair, out_name, pointee_var_name,
     region_array_name, region_array_name_pair, region_key, state_var_addr_name, state_var_name,
     state_var_name_pair, static_var_name, store_coerce_name,
 };
 pub use field_names::{
-    adt_struct_field_name, base_variant_field_name, cons_name, coroutine_direct_fields_name,
-    coroutine_discriminant_field_name, coroutine_field_index, coroutine_field_name,
-    coroutine_variant_field_name, discrim_name, indexed_field_name, len_name, meta_name,
-    payload_name, resolve_ctor_name, tuple_field_name, variant_field_name,
+    adt_struct_field_name, base_variant_field_name, cons_name, constructor_datatype_name,
+    coroutine_direct_fields_name, coroutine_discriminant_field_name, coroutine_field_index,
+    coroutine_field_name, coroutine_variant_field_name, discrim_name, indexed_field_name, len_name,
+    meta_name, payload_name, resolve_ctor_name, tuple_field_name, variant_field_name,
 };
 pub use mir_symbolic_names::{
     alloc_discr_name, discr_sym_name, discriminant_name, local_name, undef_sym_name,
@@ -53,8 +56,13 @@ pub use sort_constructors::{
 pub use sort_constructors::{result_err_constructor_name, result_ok_constructor_name};
 pub use sort_short_name::sort_short_name;
 pub use sort_type_names::{
-    capture_field_name, closure_sort_name, coroutine_sort_name, dyn_sort_name,
-    hashmap_into_iter_sort_name, hashset_into_iter_sort_name, into_iter_sort_name,
-    option_sort_name, polymorphic_iter_sort_name, slice_sort_name, vec_into_iter_sort_name,
-    vec_sort_name,
+    IntoIterSource, LAYOUT_MODEL_SORT, RAWVEC_MODEL_SORT, capture_field_name, closure_sort_name,
+    coroutine_sort_name, dyn_sort_name, hashmap_into_iter_sort_name, hashset_into_iter_sort_name,
+    into_iter_sort_name, into_iter_sort_source, is_alloc_result_sort_name, is_bignum_sort_name,
+    is_closure_sort_name, is_copied_or_cloned_sort_name, is_dyn_sort_name,
+    is_hashmap_into_iter_sort_name, is_hashset_into_iter_sort_name, is_iterator_model_sort_name,
+    is_option_sort_name, is_slice_iter_sort_name, is_slice_sort_name, is_type_id_sort_name,
+    is_vec_family_sort_name, is_vec_into_iter_sort_name, is_vec_sort_name, option_sort_name,
+    polymorphic_iter_sort_name, slice_sort_name, sort_name_mentions_chars,
+    sort_name_mentions_rawvec, sort_name_mentions_slice, vec_into_iter_sort_name, vec_sort_name,
 };

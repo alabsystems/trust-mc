@@ -35,6 +35,12 @@ SHA-256 digest. Source-bound inactive proof rows receive zero credit. Rows UPSTR
 disabled because CBMC could not run them are outside the replacement bar and
 reported as supersession candidates; any row WE disable is local_inactive and
 still blocks the strict proof until it is activated and proved.
+
+--expected-harnesses and --expected-inventory-sha name the FROZEN historical
+PROOF denominator (the whole proof authority). The proof REPORT is checked
+against the BAR instead: the active PROOF rows of the checked source
+disposition, whose count and row digest are derived here and printed on the
+authority line. The two differ by exactly the upstream-inactive rows.
 EOF
 }
 
@@ -93,8 +99,9 @@ require_solver_commit_matches_expected_pin() {
 
 require_live_solver_binary_attestation() {
     local solver_binary_path solver_version solver_commit
-    solver_binary_path="$(command -v ay 2>/dev/null || true)"
-    [[ -n "$solver_binary_path" ]] || die "ay solver binary not found in PATH"
+    # The driver runs $TRUST_MC_AY_BIN in preference to PATH; attest that one.
+    solver_binary_path="${TRUST_MC_AY_BIN:-$(command -v ay 2>/dev/null || true)}"
+    [[ -n "$solver_binary_path" ]] || die "ay solver binary not found in PATH (TRUST_MC_AY_BIN unset)"
 
     if ! solver_version="$("$solver_binary_path" --version 2>&1)"; then
         die "unable to read ay solver binary version from $solver_binary_path"
@@ -157,7 +164,7 @@ PY
 
 require_canonical_public_inventories() {
     local generator canonical_non_proof disposition_generator disposition_report
-    local inactive_proof_rows
+    local local_inactive_rows active_rows active_sha
     generator="$TRUST_MC_DIR/tools/replacement-inventory/generate_inventory.py"
     canonical_non_proof="$TRUST_MC_DIR/tests/trust-mc/non-proof-closure.json"
     disposition_generator="$TRUST_MC_DIR/scripts/replacement_harness_dispositions.py"
@@ -174,12 +181,14 @@ require_canonical_public_inventories() {
         --non-proof-output "$canonical_non_proof"; then
         die "replacement inventories do not match the committed public-corpus authority"
     fi
+    ACTIVE_PROOF_INVENTORY="$(mktemp "${TMPDIR:-/tmp}/trust-mc-active-proof-inventory.XXXXXX")"
     if ! "${AY_PYTHON_BIN:-python3}" "$disposition_generator" \
         --check \
         --inventory "$CLOSURE_INVENTORY" \
         --proof-inventory "$INVENTORY" \
         --non-proof-closure "$canonical_non_proof" \
-        --output "$disposition_report"; then
+        --output "$disposition_report" \
+        --emit-active-proof-inventory "$ACTIVE_PROOF_INVENTORY"; then
         die "replacement source dispositions do not match source or canonical inventories"
     fi
     # The replacement BAR is what the INCUMBENT DOES. A PROOF row upstream Kani
@@ -197,16 +206,61 @@ require_canonical_public_inventories() {
             "$disposition_report" >&2 || true
         die "strict replacement proof is blocked by $local_inactive_rows LOCALLY-disabled PROOF rows; upstream-disabled rows are excluded from the bar, ours are not"
     fi
-    upstream_inactive_rows="$(jq -er '.summary.proof.upstream_inactive' "$disposition_report")"
-    proof_bar="$(jq -er '.summary.proof.bar' "$disposition_report")"
-    printf 'replacement bar: %s PROOF rows (%s upstream-disabled rows excluded as supersession candidates)\n' \
-        "$proof_bar" "$upstream_inactive_rows"
+    UPSTREAM_INACTIVE_ROWS="$(jq -er '.summary.proof.upstream_inactive' "$disposition_report")"
+    PROOF_BAR="$(jq -er '.summary.proof.bar' "$disposition_report")"
+    is_positive_integer "$PROOF_BAR" \
+        || die "source dispositions do not report a usable PROOF bar"
+    # The audit denominator is the BAR, so its inventory must be the ACTIVE
+    # PROOF subset. It is re-derived from the artifact just checked against
+    # source, and its digest must equal the digest that artifact recorded.
+    ACTIVE_PROOF_INVENTORY_SHA="$(jq -er '.summary.proof.active_inventory_row_sha256' "$disposition_report")"
+    is_sha256_hex "$ACTIVE_PROOF_INVENTORY_SHA" \
+        || die "source dispositions do not report an active PROOF row digest"
+    active_sha="$(jq -er '.row_sha256' "$ACTIVE_PROOF_INVENTORY")"
+    [[ "$active_sha" == "$ACTIVE_PROOF_INVENTORY_SHA" ]] \
+        || die "derived active PROOF inventory digest $active_sha does not match the checked plan $ACTIVE_PROOF_INVENTORY_SHA"
+    active_rows="$(jq -er '.denominator' "$ACTIVE_PROOF_INVENTORY")"
+    [[ "$active_rows" == "$PROOF_BAR" ]] \
+        || die "derived active PROOF inventory has $active_rows rows; the bar is $PROOF_BAR"
+    printf 'replacement bar: %s PROOF rows of %s historical (%s upstream-disabled rows excluded as supersession candidates, zero credit)\n' \
+        "$PROOF_BAR" "$EXPECTED_HARNESSES" "$UPSTREAM_INACTIVE_ROWS"
+}
+
+report_bar_field() {
+    jq -er ".replacement_bar | $1" "$REPORT" \
+        || die "proof report has no usable replacement_bar $1; re-run scripts/extract_replacement_proof_report.py"
+}
+
+require_report_replacement_bar() {
+    # The proof report must declare the SAME narrowing this gate just derived,
+    # so a packet extracted against a different plan cannot be audited here.
+    local historical bar upstream local_inactive active_sha named
+    historical="$(report_bar_field '.historical')"
+    bar="$(report_bar_field '.bar')"
+    upstream="$(report_bar_field '.upstream_inactive_zero_credit')"
+    local_inactive="$(report_bar_field '.local_inactive')"
+    active_sha="$(report_bar_field '.active_inventory_row_sha256')"
+    named="$(report_bar_field '.upstream_inactive_rows | length')"
+    [[ "$historical" == "$EXPECTED_HARNESSES" ]] \
+        || die "report replacement_bar.historical $historical does not match expected $EXPECTED_HARNESSES"
+    [[ "$bar" == "$PROOF_BAR" ]] \
+        || die "report replacement_bar.bar $bar does not match the checked bar $PROOF_BAR"
+    [[ "$upstream" == "$UPSTREAM_INACTIVE_ROWS" ]] \
+        || die "report replacement_bar.upstream_inactive_zero_credit $upstream does not match the checked $UPSTREAM_INACTIVE_ROWS"
+    [[ "$named" == "$UPSTREAM_INACTIVE_ROWS" ]] \
+        || die "report names $named upstream-inactive rows; the checked plan has $UPSTREAM_INACTIVE_ROWS"
+    [[ "$local_inactive" == "0" ]] \
+        || die "report replacement_bar.local_inactive is $local_inactive; locally disabled rows stay inside the bar"
+    [[ "$active_sha" == "$ACTIVE_PROOF_INVENTORY_SHA" ]] \
+        || die "report replacement_bar.active_inventory_row_sha256 $active_sha does not match the checked $ACTIVE_PROOF_INVENTORY_SHA"
+    (( bar + upstream == historical )) \
+        || die "report replacement_bar arithmetic is not $historical = $bar + $upstream"
 }
 
 run_replacement_closure_check() {
     local output
     if ! output="$(
-        "$TRUST_MC_CARGO" run --manifest-path "$TRUST_MC_DIR/tools/replacement-audit/Cargo.toml" --locked --quiet \
+        "$TRUST_MC_TARGO" --unverified run --manifest-path "$TRUST_MC_DIR/tools/replacement-audit/Cargo.toml" --locked --quiet \
             --bin replacement-closure-check -- \
             --inventory "$CLOSURE_INVENTORY" \
             --non-proof-closure "$NON_PROOF_CLOSURE" \
@@ -238,6 +292,17 @@ EXPECTED_AY_PIN=""
 EXPECTED_TREE_FINGERPRINT=""
 EXPECTED_HARNESSES=""
 EXPECTED_INVENTORY_SHA=""
+PROOF_BAR=""
+UPSTREAM_INACTIVE_ROWS=""
+ACTIVE_PROOF_INVENTORY=""
+ACTIVE_PROOF_INVENTORY_SHA=""
+
+cleanup() {
+    if [[ -n "${ACTIVE_PROOF_INVENTORY:-}" ]]; then
+        rm -f "$ACTIVE_PROOF_INVENTORY"
+    fi
+}
+trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -318,7 +383,7 @@ case "${AY_REQUIRE_EXPECT:-1}" in
         ;;
 esac
 
-TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
+TRUST_MC_TARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" targo)"
 require_command git
 require_command jq
 require_command python3
@@ -395,19 +460,12 @@ require_live_solver_binary_attestation
 require_report_solver_binary_attestation
 require_report_driver_binary_attestation
 
-ACTUAL_HARNESSES="$(jq -er '.harnesses | length' "$REPORT")"
-is_positive_integer "$ACTUAL_HARNESSES" \
-    || die "report harness count is missing or zero"
-
-if [[ "$ACTUAL_HARNESSES" != "$EXPECTED_HARNESSES" ]]; then
-    die "harness denominator mismatch: report has $ACTUAL_HARNESSES, expected $EXPECTED_HARNESSES"
-fi
-
 require_canonical_public_inventories
 if [[ -n "$NON_PROOF_CLOSURE" ]]; then
     run_replacement_closure_check
 fi
 
+# The frozen historical PROOF authority: unchanged by the narrowing.
 ACTUAL_INVENTORY_HARNESSES="$(jq -er '.denominator' "$INVENTORY")"
 [[ "$ACTUAL_INVENTORY_HARNESSES" == "$EXPECTED_HARNESSES" ]] \
     || die "inventory denominator $ACTUAL_INVENTORY_HARNESSES does not match expected $EXPECTED_HARNESSES"
@@ -416,13 +474,26 @@ ACTUAL_INVENTORY_SHA="$(jq -er '.row_sha256' "$INVENTORY")"
 [[ "$ACTUAL_INVENTORY_SHA" == "$EXPECTED_INVENTORY_SHA" ]] \
     || die "inventory row_sha256 $ACTUAL_INVENTORY_SHA does not match expected $EXPECTED_INVENTORY_SHA"
 
+# The proof report carries the BAR. The excluded rows are not missing evidence:
+# they are accounted in the 818-row report with zero credit, and the extractor
+# refuses to drop one that is absent or credited there.
+ACTUAL_HARNESSES="$(jq -er '.harnesses | length' "$REPORT")"
+is_positive_integer "$ACTUAL_HARNESSES" \
+    || die "report harness count is missing or zero"
+
+if [[ "$ACTUAL_HARNESSES" != "$PROOF_BAR" ]]; then
+    die "harness denominator mismatch: proof report has $ACTUAL_HARNESSES, replacement bar is $PROOF_BAR ($EXPECTED_HARNESSES historical PROOF rows less $UPSTREAM_INACTIVE_ROWS upstream-disabled)"
+fi
+
+require_report_replacement_bar
+
 "${AY_PYTHON_BIN:-python3}" "$TRUST_MC_DIR/scripts/zero_fallback_proof_gate.py" \
     --expected-ay-pin "$EXPECTED_AY_PIN" \
-    --expected-harnesses "$EXPECTED_HARNESSES" \
+    --expected-harnesses "$PROOF_BAR" \
     "$REPORT" \
     || die "zero-fallback proof gate rejected replacement proof report"
 
-AUTHORITY_LINE="ay-replacement-proof: authority report=$REPORT inventory=$INVENTORY commit=$EXPECTED_COMMIT ay_pin=$EXPECTED_AY_PIN tree_fingerprint=$EXPECTED_TREE_FINGERPRINT harnesses=$EXPECTED_HARNESSES inventory_sha=$EXPECTED_INVENTORY_SHA"
+AUTHORITY_LINE="ay-replacement-proof: authority report=$REPORT inventory=$INVENTORY commit=$EXPECTED_COMMIT ay_pin=$EXPECTED_AY_PIN tree_fingerprint=$EXPECTED_TREE_FINGERPRINT harnesses=$EXPECTED_HARNESSES inventory_sha=$EXPECTED_INVENTORY_SHA proof_bar=$PROOF_BAR upstream_inactive=$UPSTREAM_INACTIVE_ROWS active_inventory_sha=$ACTIVE_PROOF_INVENTORY_SHA"
 if [[ -n "$NON_PROOF_CLOSURE" ]]; then
     AUTHORITY_LINE="$AUTHORITY_LINE non_proof_closure=$NON_PROOF_CLOSURE non_proof_closure_sha=$ACTUAL_NON_PROOF_CLOSURE_SHA"
 fi
@@ -432,9 +503,9 @@ AUDIT_ARGS=(
     --expected-commit "$EXPECTED_COMMIT" \
     --expected-ay-pin "$EXPECTED_AY_PIN" \
     --expected-tree-fingerprint "$EXPECTED_TREE_FINGERPRINT" \
-    --expected-harnesses "$EXPECTED_HARNESSES" \
-    --expected-inventory-sha "$EXPECTED_INVENTORY_SHA" \
-    --inventory "$INVENTORY" \
+    --expected-harnesses "$PROOF_BAR" \
+    --expected-inventory-sha "$ACTIVE_PROOF_INVENTORY_SHA" \
+    --inventory "$ACTIVE_PROOF_INVENTORY" \
     --summary-mode kani-compatible \
     "$REPORT"
 )
@@ -447,10 +518,10 @@ if [[ -n "$NON_PROOF_CLOSURE" ]]; then
     )
 fi
 
-"$TRUST_MC_CARGO" run --manifest-path "$TRUST_MC_DIR/tools/replacement-audit/Cargo.toml" --locked --quiet -- \
+"$TRUST_MC_TARGO" --unverified run --manifest-path "$TRUST_MC_DIR/tools/replacement-audit/Cargo.toml" --locked --quiet -- \
     "${AUDIT_ARGS[@]}"
 
-OK_LINE="ay-replacement-proof: OK report=$REPORT inventory=$INVENTORY commit=$EXPECTED_COMMIT ay_pin=$EXPECTED_AY_PIN tree_fingerprint=$EXPECTED_TREE_FINGERPRINT harnesses=$EXPECTED_HARNESSES inventory_sha=$EXPECTED_INVENTORY_SHA"
+OK_LINE="ay-replacement-proof: OK report=$REPORT inventory=$INVENTORY commit=$EXPECTED_COMMIT ay_pin=$EXPECTED_AY_PIN tree_fingerprint=$EXPECTED_TREE_FINGERPRINT harnesses=$EXPECTED_HARNESSES inventory_sha=$EXPECTED_INVENTORY_SHA proof_bar=$PROOF_BAR upstream_inactive=$UPSTREAM_INACTIVE_ROWS active_inventory_sha=$ACTIVE_PROOF_INVENTORY_SHA"
 if [[ -n "$NON_PROOF_CLOSURE" ]]; then
     OK_LINE="$OK_LINE non_proof_closure=$NON_PROOF_CLOSURE non_proof_closure_sha=$ACTUAL_NON_PROOF_CLOSURE_SHA"
 fi

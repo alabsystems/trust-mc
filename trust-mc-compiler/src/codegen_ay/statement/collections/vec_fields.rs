@@ -165,6 +165,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // This fallback handles legacy Vec without fld_data or erased types
         let name = self.ctx.fresh_name("vec_data");
         let array_sort = Sort::array(ptr_sort(), ptr_sort());
+        self.ctx.bmc_sound_havoc("extract_vec_data_fallback");
         self.ctx.declare_var(&name, array_sort)
     }
 }

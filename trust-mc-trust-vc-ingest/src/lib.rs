@@ -337,7 +337,10 @@ impl trust_vcVerificationUnit {
             program.assume(assumption.expr.clone());
         }
 
-        let mut violations = Vec::with_capacity(self.assertions.len());
+        // Grown per assertion rather than preallocated: the capacity hint buys
+        // nothing here, and a bulk allocation sized by the bundle's assertion
+        // count is an allocation with no bound.
+        let mut violations = Vec::new();
         for (idx, assertion) in self.assertions.iter().enumerate() {
             let violation =
                 program.declare_const(format!("ay_violation_trust_vc_assert_{idx}"), Sort::bool());

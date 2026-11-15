@@ -37,6 +37,7 @@ pub(in crate::codegen_ay) fn extract_loop_invariant_formula(
         track_level: chc_track_level,
         step_mode: chc_step_mode,
         wide_mem: WideMemMode::from(ay_wide_mem),
+        straightline_discharge: true,
         ..ChcConfig::default()
     };
     let mut chc_ctx = ChcCtx::new(tcx, &body, harness_name, cfg);

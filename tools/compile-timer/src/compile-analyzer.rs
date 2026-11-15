@@ -15,7 +15,7 @@
 use crate::common::{AggrResult, fraction_of_duration};
 use clap::Parser;
 use serde_json::Deserializer;
-use std::{cmp::max, fs::File, io, path::PathBuf, time::Duration};
+use std::{cmp::max, fs::File, io, path::PathBuf, process::ExitCode, time::Duration};
 mod common;
 
 // Constants for detecting 'significant' regressions
@@ -45,7 +45,7 @@ struct AnalyzerArgs {
     only_markdown: bool,
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args = AnalyzerArgs::parse();
 
     let (pre_file, post_file) = try_read_files(&args).unwrap();
@@ -65,10 +65,14 @@ fn main() {
     sort_results(&mut results);
 
     if args.only_markdown {
-        print_markdown(results.as_slice(), args.suite_name);
+        // Suspected regressions fail the run (exit 1) so CI can gate on it.
+        if print_markdown(results.as_slice(), args.suite_name) {
+            return ExitCode::FAILURE;
+        }
     } else {
         print_to_terminal(results.as_slice());
     }
+    ExitCode::SUCCESS
 }
 
 /// Sort results based on percentage change, with high magnitude regressions first, then low
@@ -79,8 +83,9 @@ fn sort_results(results: &mut [(AggrResult, AggrResult)]) {
     });
 }
 
-/// Print results in a markdown format (for GitHub actions).
-fn print_markdown(results: &[(AggrResult, AggrResult)], suite_name: Option<String>) {
+/// Print results in a markdown format (for GitHub actions). Returns whether any
+/// crate had a suspected regression.
+fn print_markdown(results: &[(AggrResult, AggrResult)], suite_name: Option<String>) -> bool {
     let suite_text = if let Some(suite_name) = suite_name {
         format!(" (`{suite_name}` suite)")
     } else {
@@ -133,13 +138,14 @@ fn print_markdown(results: &[(AggrResult, AggrResult)], suite_name: Option<Strin
 
     if regressions.is_empty() {
         println!("## No suspected regressions[^{footnote_number}]!");
+        false
     } else {
         println!(
             "## Failing because of {} suspected regressions[^{footnote_number}]:",
             regressions.len()
         );
         println!("{}", regressions.join(", "));
-        std::process::exit(1);
+        true
     }
 }
 
@@ -248,4 +254,33 @@ fn try_read_files(c: &AnalyzerArgs) -> io::Result<(File, File)> {
         File::open(c.path_pre.canonicalize()?)?,
         File::open(c.path_post.canonicalize()?)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aggr(krate: &str, avg_ms: u64) -> AggrResult {
+        let stats = format!(
+            r#"{{"avg":{{"secs":0,"nanos":{n}}},"std_dev":{{"secs":0,"nanos":0}},"range":[{{"secs":0,"nanos":{n}}},{{"secs":0,"nanos":{n}}}]}}"#,
+            n = avg_ms * 1_000_000
+        );
+        serde_json::from_str(&format!(
+            r#"{{"krate":"{krate}","krate_trimmed_path":"{krate}","iqr_stats":{stats},"full_stats":{stats}}}"#
+        ))
+        .expect("test AggrResult JSON should deserialize")
+    }
+
+    #[test]
+    fn markdown_reports_whether_a_regression_was_found() {
+        assert!(!print_markdown(&[], None), "no crates: nothing regressed");
+        assert!(
+            !print_markdown(&[(aggr("a", 100), aggr("a", 100))], None),
+            "an unchanged time is not a regression"
+        );
+        assert!(
+            print_markdown(&[(aggr("a", 100), aggr("a", 200))], Some("suite".into())),
+            "doubling a zero-noise time is a suspected regression"
+        );
+    }
 }

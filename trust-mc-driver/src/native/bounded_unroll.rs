@@ -60,6 +60,7 @@
 //! all fail closed.
 
 use ay_chc::{ChcExpr, ChcOp, ChcProblem, ClauseBody, ClauseHead, HornClause};
+use trust_mc_core::chc::is_translation_havoc_var;
 
 /// Escalation ladder of back-edge budgets, cheapest first. Any rung's
 /// `Unsafe` is a real counterexample regardless of the rung (see module
@@ -243,12 +244,23 @@ pub(crate) fn bounded_unroll_chc_for_refutation(
 ///   fixpoint of that rule leaves ANY variable of the clause (constraint or
 ///   head arguments) ungrounded, the value is a translation havoc and a
 ///   model over it need not correspond to a real execution — decline.
+/// - A TRANSLATION HAVOC (a variable whose name carries
+///   `trust_mc_core::chc::TRANSLATION_HAVOC_VAR_PREFIX`, the translator's fresh
+///   unconstrained value) is NEVER grounded, wherever it occurs — the entry fact
+///   included. An equality on it is a constraint the solver satisfies by choosing
+///   it, not a definition: the error clause of `assert(r != 263)` over a havoc
+///   `r` is `(= r 263)`, which the rule above would otherwise read as defining
+///   `r` and so "refute" a program that never produces 263 (measured: a safe loop
+///   calling a summarized element reader, TMC-1 review 2026-09-30). The
+///   structural rules above cannot tell `(= havoc 263)` from a defining
+///   `(= v (+ i 1))`; the name, which the producer stamps and the normalized
+///   input digest binds, can.
 /// - Any expression node this walker does not recognize (`ChcExpr` is
 ///   `#[non_exhaustive]`) declines, and the walk is iterative with an explicit
 ///   node budget so adversarially deep terms fail closed instead of missing
 ///   variables (a missed variable would be silently treated as absent — the
 ///   unsound direction).
-fn problem_is_grounded_for_refutation(problem: &ChcProblem) -> bool {
+pub(crate) fn problem_is_grounded_for_refutation(problem: &ChcProblem) -> bool {
     let mut bodyless = problem.clauses().iter().filter(|clause| clause.body.predicates.is_empty());
     let Some(entry_fact) = bodyless.next() else {
         return false;
@@ -273,13 +285,14 @@ fn problem_is_grounded_for_refutation(problem: &ChcProblem) -> bool {
     }
 
     // Even entry expressions must be fully inventoryable. Free variables are
-    // allowed here, but an unrecognized node must not be able to hide one.
-    if entry_fact
-        .body
-        .constraint
-        .as_ref()
-        .is_some_and(|constraint| collect_expr_vars(constraint).is_none())
-        || entry_args.iter().any(|arg| collect_expr_vars(arg).is_none())
+    // allowed here — they are the function's inputs — but an unrecognized node
+    // must not be able to hide one, and a translation havoc is not an input.
+    let entry_vars_are_inputs = |expr: &ChcExpr| {
+        collect_expr_vars(expr)
+            .is_some_and(|vars| !vars.iter().any(|var| is_translation_havoc_var(&var.name)))
+    };
+    if !entry_fact.body.constraint.as_ref().is_none_or(entry_vars_are_inputs)
+        || !entry_args.iter().all(entry_vars_are_inputs)
     {
         return false;
     }
@@ -291,8 +304,134 @@ fn problem_is_grounded_for_refutation(problem: &ChcProblem) -> bool {
         .all(clause_is_grounded_for_refutation)
 }
 
-/// Node budget for the iterative expression walks below. Far above anything
-/// the native translator emits per clause; hitting it declines (fail-closed).
+/// Whether the derivation `clause_indices` (indices into `problem.clauses()`)
+/// READS a TRANSLATION HAVOC under `model`, the witness's assignment to the
+/// derivation's alpha-renamed variables (`direct_smt_cex::alpha_renamed_clauses`).
+/// `None` when an index is out of range, the renaming declines, or a clause
+/// cannot be inventoried (an unrecognized node): the caller cannot tell, and
+/// must decline.
+///
+/// The consumer's replay of an ACYCLIC direct-SMT witness asks this of the
+/// derivation the witness names: such a witness carries no grounding gate of its
+/// own (the bounded-unroll lane's is `problem_is_grounded_for_refutation`), and a
+/// model that assigns a havoc is a claim about the encoding, not about the program.
+///
+/// A clause reads a havoc when one occurs in a body or head argument, or where a
+/// top-level conjunct of its constraint reads it under the model
+/// (`direct_smt_cex::HavocReads`): every occurrence except
+/// those under an implication whose plain non-havoc Bool antecedent the model
+/// sets `false`, and those in the unselected branch of an `ite` whose plain
+/// non-havoc Bool condition the model fixes. The large-block encoding of an
+/// acyclic function (trust-mc-trust-bmc, `translate_chc_large_block.rs`) puts
+/// every formula of a block under one of that block's Booleans and selects a
+/// block's inputs by `ite`s over its in-edge selectors, so the havocs of a block
+/// or an edge off the witness's path are not read; per-block CHC has neither
+/// shape around a havoc and is judged exactly as before.
+///
+/// Soundness. Let `M` be the witness model, which the replay
+/// (`replay_acyclic_direct_smt_witness`) checks satisfies the derivation. Change
+/// the value of any set of havoc variables in `M`, leaving every other variable
+/// as it is. Arguments contain no havoc, so they are unchanged; a conjunct that
+/// reads no havoc keeps its value, because each occurrence it does not read sits
+/// under a false antecedent (the implication holds whatever its consequent is) or
+/// in an `ite` branch its fixed condition does not select (the `ite`'s value is
+/// the other branch's). The derivation therefore holds for EVERY value of the
+/// havocs it mentions — in particular for the values a real execution gives
+/// them — which is exactly what the havoc-free condition this gate had before
+/// guaranteed, and what makes the counterexample a claim about the program.
+///
+/// Cost: linear in the derivation, each shared node of a clause walked once
+/// (`HavocReads` memoizes per node: under a fixed model, whether a node reads a
+/// havoc does not depend on where it is reached from; the arguments' walk shares
+/// one visited set). No node budget bounds it: a large-block query is a whole
+/// function's clause, and the walk is the size of the consumer's own problem,
+/// not of anything the witness supplies.
+pub(crate) fn derivation_reads_translation_havoc(
+    problem: &ChcProblem,
+    clause_indices: &[u64],
+    model: &serde_json::Value,
+) -> Option<bool> {
+    let clauses = problem.clauses();
+    let renamed = crate::direct_smt_cex::alpha_renamed_variable_names(problem)?;
+    let model = model.as_object()?;
+    let mut argument_nodes: std::collections::HashSet<*const ChcExpr> =
+        std::collections::HashSet::new();
+    for &index in clause_indices {
+        let index = usize::try_from(index).ok()?;
+        let clause = clauses.get(index)?;
+        let names = renamed.get(index)?;
+        let body_args = clause.body.predicates.iter().flat_map(|(_, args)| args.iter());
+        let head_args = match &clause.head {
+            ClauseHead::Predicate(_, args) => args.as_slice(),
+            _ => &[],
+        };
+        for expr in body_args.chain(head_args) {
+            if mentions_translation_havoc(expr, &mut argument_nodes)? {
+                return Some(true);
+            }
+        }
+        let Some(constraint) = &clause.body.constraint else {
+            continue;
+        };
+        let mut reads = crate::direct_smt_cex::HavocReads::new(names, model);
+        let mut pending = vec![constraint];
+        let mut flattened: std::collections::HashSet<*const ChcExpr> =
+            std::collections::HashSet::new();
+        while let Some(expr) = pending.pop() {
+            if let ChcExpr::Op(ChcOp::And, args) = expr {
+                if flattened.insert(std::ptr::from_ref(expr)) {
+                    pending.extend(args.iter().map(AsRef::as_ref));
+                }
+                continue;
+            }
+            if reads.conjunct(expr)? {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Whether `expr` mentions a translation havoc anywhere (an argument is read
+/// whole). Each node is walked once across calls sharing `seen` (a node found
+/// havoc-free stays so). `None` for a shape the walk does not know.
+fn mentions_translation_havoc(
+    expr: &ChcExpr,
+    seen: &mut std::collections::HashSet<*const ChcExpr>,
+) -> Option<bool> {
+    let mut pending = vec![expr];
+    while let Some(node) = pending.pop() {
+        if !seen.insert(std::ptr::from_ref(node)) {
+            continue;
+        }
+        match node {
+            ChcExpr::Var(var) => {
+                if is_translation_havoc_var(&var.name) {
+                    return Some(true);
+                }
+            }
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => pending.extend(args.iter().map(AsRef::as_ref)),
+            ChcExpr::ConstArray(_, value) => pending.push(value.as_ref()),
+            ChcExpr::Bool(_)
+            | ChcExpr::Int(_)
+            | ChcExpr::Real(_, _)
+            | ChcExpr::BitVec(_, _)
+            | ChcExpr::ConstArrayMarker(_)
+            | ChcExpr::IsTesterMarker(_) => {}
+            _ => return None,
+        }
+    }
+    Some(false)
+}
+
+/// Node budget for the bounded-unroll grounding walks below
+/// (`clause_is_grounded_for_refutation`, `collect_expr_vars`): far above anything
+/// the native translator emits per clause of a CYCLIC function, the only
+/// functions this lane unrolls (an acyclic function is one large-block query,
+/// replayed by the direct-SMT lane, whose havoc gate has no budget); hitting it
+/// declines (fail-closed).
 const GROUNDING_NODE_BUDGET: usize = 200_000;
 
 fn clause_is_grounded_for_refutation(clause: &HornClause) -> bool {
@@ -313,7 +452,8 @@ fn clause_is_grounded_for_refutation(clause: &HornClause) -> bool {
     for (_, args) in &clause.body.predicates {
         for arg in args {
             match collect_expr_vars(arg) {
-                Some(vars) => grounded.extend(vars),
+                Some(vars) => grounded
+                    .extend(vars.into_iter().filter(|var| !is_translation_havoc_var(&var.name))),
                 None => return false,
             }
         }
@@ -335,7 +475,8 @@ fn clause_is_grounded_for_refutation(clause: &HornClause) -> bool {
     }
 
     // Fixpoint: a conjunct `(= v e)` (either orientation) grounds `v` once
-    // every variable of `e` is grounded.
+    // every variable of `e` is grounded — unless `v` is a translation havoc,
+    // which no constraint defines.
     loop {
         let mut changed = false;
         for conjunct in &conjuncts {
@@ -343,7 +484,7 @@ fn clause_is_grounded_for_refutation(clause: &HornClause) -> bool {
             let [lhs, rhs] = args.as_slice() else { continue };
             for (var_side, def_side) in [(lhs, rhs), (rhs, lhs)] {
                 let ChcExpr::Var(var) = var_side.as_ref() else { continue };
-                if grounded.contains(var) {
+                if grounded.contains(var) || is_translation_havoc_var(&var.name) {
                     continue;
                 }
                 let Some(def_vars) = collect_expr_vars(def_side) else { return false };
@@ -497,6 +638,201 @@ mod tests {
             Some(ChcExpr::eq(i(), ChcExpr::int(target))),
         )));
         problem
+    }
+
+    /// `bb0(x) ← ⊤` and `error ← bb0(x) ∧ φ`, the shape of a large-block query
+    /// (`entry` here), plus the query clause. Returns the problem and the index
+    /// of the error clause.
+    fn one_query_problem(constraint: ChcExpr) -> (ChcProblem, u64) {
+        let mut problem = ChcProblem::new();
+        let entry = problem.declare_predicate("bb0", vec![ChcSort::Int]);
+        let error = problem.declare_predicate("error", vec![]);
+        let x = ChcExpr::var(ChcVar::new("bb0_v0", ChcSort::Int));
+        problem.add_clause(HornClause::new(
+            ClauseBody::empty(),
+            ClauseHead::Predicate(entry, vec![x.clone()]),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(entry, vec![x])], Some(constraint)),
+            ClauseHead::Predicate(error, vec![]),
+        ));
+        problem.add_clause(HornClause::query(ClauseBody::new(vec![(error, vec![])], None)));
+        (problem, 1)
+    }
+
+    fn bool_var(name: &str) -> ChcExpr {
+        ChcExpr::var(ChcVar::new(name, ChcSort::Bool))
+    }
+
+    fn int_var(name: &str) -> ChcExpr {
+        ChcExpr::var(ChcVar::new(name, ChcSort::Int))
+    }
+
+    /// The witness model binding `values` by their names in the error clause.
+    fn model_of(problem: &ChcProblem, clause: u64, values: &[(&str, bool)]) -> serde_json::Value {
+        let names = crate::direct_smt_cex::alpha_renamed_variable_names(problem)
+            .expect("the fixture renames");
+        let names = &names[clause as usize];
+        let mut model = serde_json::Map::new();
+        for (name, value) in values {
+            let var = ChcVar::new(*name, ChcSort::Bool);
+            let renamed = names.get(&var).expect("the variable occurs in the clause").clone();
+            model.insert(renamed, serde_json::json!({ "kind": "bool", "value": value }));
+        }
+        serde_json::Value::Object(model)
+    }
+
+    #[test]
+    fn a_havoc_under_a_false_block_boolean_is_not_read() {
+        // `(=> r (= havoc 3))` with `r` false: the block is off the path.
+        let havoc = int_var("havoc__f_x_0");
+        let guarded = ChcExpr::implies(bool_var("bb2_lbe_r"), ChcExpr::eq(havoc, ChcExpr::int(3)));
+        let reached = ChcExpr::implies(
+            bool_var("bb1_lbe_e0"),
+            ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0)),
+        );
+        let (problem, clause) =
+            one_query_problem(ChcExpr::and_vec(vec![guarded, reached, bool_var("bb1_lbe_e0")]));
+        let trace = [0, clause, 2];
+        let off = model_of(&problem, clause, &[("bb2_lbe_r", false), ("bb1_lbe_e0", true)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &off), Some(false));
+        // The same block ON the path reads its havoc.
+        let on = model_of(&problem, clause, &[("bb2_lbe_r", true), ("bb1_lbe_e0", true)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &on), Some(true));
+        // A model that does not bind the antecedent proves nothing.
+        let unbound = model_of(&problem, clause, &[("bb1_lbe_e0", true)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &unbound), Some(true));
+        // A binding that is not exactly a Bool `false` is not a false antecedent.
+        let mut odd = off.clone();
+        let names = crate::direct_smt_cex::alpha_renamed_variable_names(&problem).expect("renames");
+        let renamed = names[clause as usize][&ChcVar::new("bb2_lbe_r", ChcSort::Bool)].clone();
+        odd[&renamed] = serde_json::json!({ "kind": "bool", "value": false, "extra": 1 });
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &odd), Some(true));
+    }
+
+    #[test]
+    fn only_a_plain_non_havoc_boolean_antecedent_disables_a_conjunct() {
+        let havoc = || ChcExpr::eq(int_var("havoc__f_x_0"), ChcExpr::int(3));
+        // A havoc antecedent: its value is the solver's choice.
+        let by_havoc = ChcExpr::implies(bool_var("havoc__f_b_1"), havoc());
+        // A compound antecedent, even one that is false under the model.
+        let compound = ChcExpr::implies(ChcExpr::not(bool_var("bb2_lbe_r")), havoc());
+        // A havoc outside any implication.
+        let bare = havoc();
+        // The same implication spelled as a disjunction.
+        let disjunction = ChcExpr::or_vec(vec![ChcExpr::not(bool_var("bb2_lbe_r")), havoc()]);
+        for (conjunct, values) in [
+            (by_havoc, vec![("havoc__f_b_1", false)]),
+            (compound, vec![("bb2_lbe_r", true)]),
+            (bare, vec![]),
+            (disjunction, vec![("bb2_lbe_r", true)]),
+        ] {
+            let (problem, clause) = one_query_problem(ChcExpr::and_vec(vec![
+                conjunct.clone(),
+                ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0)),
+            ]));
+            let model = model_of(&problem, clause, &values);
+            assert_eq!(
+                derivation_reads_translation_havoc(&problem, &[0, clause, 2], &model),
+                Some(true),
+                "{conjunct:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_havoc_in_an_unselected_ite_branch_is_not_read() {
+        // `c = ite(s, havoc, 0)`: the selection of a large-block column.
+        let selection =
+            ChcExpr::ite(bool_var("bb3_lbe_s0"), int_var("havoc__f_x_0"), ChcExpr::int(0));
+        let definition = ChcExpr::eq(int_var("bb4_lbe_c0"), selection);
+        let (problem, clause) = one_query_problem(ChcExpr::and_vec(vec![
+            definition,
+            ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0)),
+        ]));
+        let trace = [0, clause, 2];
+        let unselected = model_of(&problem, clause, &[("bb3_lbe_s0", false)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &unselected), Some(false));
+        let selected = model_of(&problem, clause, &[("bb3_lbe_s0", true)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &selected), Some(true));
+        let unbound = model_of(&problem, clause, &[]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &trace, &unbound), Some(true));
+        // A havoc in the condition is always read.
+        let by_havoc = ChcExpr::eq(
+            int_var("bb4_lbe_c0"),
+            ChcExpr::ite(bool_var("havoc__f_b_1"), ChcExpr::int(1), ChcExpr::int(0)),
+        );
+        let (problem, clause) = one_query_problem(ChcExpr::and_vec(vec![
+            by_havoc,
+            ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0)),
+        ]));
+        let model = model_of(&problem, clause, &[("havoc__f_b_1", false)]);
+        assert_eq!(
+            derivation_reads_translation_havoc(&problem, &[0, clause, 2], &model),
+            Some(true)
+        );
+    }
+
+    /// One shared node, two conjuncts: the first is off the path (its guard is
+    /// false), the second reads the node unguarded. The memo of what a node
+    /// reads must not carry the first conjunct's skip into the second.
+    #[test]
+    fn a_shared_node_is_read_wherever_a_conjunct_reads_it() {
+        let shared = ChcExpr::eq(int_var("havoc__f_x_0"), ChcExpr::int(3));
+        let off = ChcExpr::implies(bool_var("bb2_lbe_r"), shared.clone());
+        let on = ChcExpr::or_vec(vec![bool_var("bb1_lbe_e0"), shared]);
+        let (problem, clause) = one_query_problem(ChcExpr::and_vec(vec![off, on]));
+        let model = model_of(&problem, clause, &[("bb2_lbe_r", false), ("bb1_lbe_e0", true)]);
+        assert_eq!(
+            derivation_reads_translation_havoc(&problem, &[0, clause, 2], &model),
+            Some(true)
+        );
+        // A long derivation of conjuncts that all share one deep subterm is
+        // walked once per node: 2 000 conjuncts over a 2 000-node chain.
+        let mut chain =
+            ChcExpr::ite(bool_var("bb3_lbe_s0"), int_var("havoc__f_y_1"), ChcExpr::int(0));
+        for _ in 0..2_000 {
+            chain = ChcExpr::add(chain, ChcExpr::int(1));
+        }
+        let conjuncts: Vec<ChcExpr> = (0..2_000)
+            .map(|i| ChcExpr::lt(ChcExpr::int(i), chain.clone()))
+            .chain([ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0))])
+            .collect();
+        let (problem, clause) = one_query_problem(ChcExpr::and_vec(conjuncts));
+        let unselected = model_of(&problem, clause, &[("bb3_lbe_s0", false)]);
+        assert_eq!(
+            derivation_reads_translation_havoc(&problem, &[0, clause, 2], &unselected),
+            Some(false)
+        );
+        let selected = model_of(&problem, clause, &[("bb3_lbe_s0", true)]);
+        assert_eq!(
+            derivation_reads_translation_havoc(&problem, &[0, clause, 2], &selected),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_havoc_in_an_argument_is_always_read() {
+        let mut problem = ChcProblem::new();
+        let entry = problem.declare_predicate("bb0", vec![ChcSort::Int]);
+        let error = problem.declare_predicate("error", vec![]);
+        problem.add_clause(HornClause::new(
+            ClauseBody::empty(),
+            ClauseHead::Predicate(entry, vec![int_var("havoc__f_x_0")]),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(
+                vec![(entry, vec![int_var("bb0_v0")])],
+                Some(ChcExpr::implies(
+                    bool_var("bb1_lbe_r"),
+                    ChcExpr::gt(int_var("bb0_v0"), ChcExpr::int(0)),
+                )),
+            ),
+            ClauseHead::Predicate(error, vec![]),
+        ));
+        problem.add_clause(HornClause::query(ClauseBody::new(vec![(error, vec![])], None)));
+        let model = model_of(&problem, 1, &[("bb1_lbe_r", false)]);
+        assert_eq!(derivation_reads_translation_havoc(&problem, &[0, 1, 2], &model), Some(true));
     }
 
     #[test]
@@ -754,6 +1090,90 @@ mod tests {
             bounded_unroll_chc_for_refutation(&problem, 4).is_some(),
             "equality-defined intermediates are grounded, not havoc"
         );
+    }
+
+    /// The TMC-1 review's false refutation, at the CHC level: a safe loop whose
+    /// error clause equates a TRANSLATION HAVOC with a constant — `assert(r !=
+    /// 263)` over a summarized read the caller could not model, `(= r 263)`. Read
+    /// as a definition, the equality "grounds" `r` and the composer refutes a
+    /// program that never produces 263. A havoc is never grounded, so the lane
+    /// declines; the same clause over a variable the program defines (no havoc
+    /// name) is the equality-defined intermediate it always admitted.
+    #[test]
+    fn an_equality_on_a_translation_havoc_never_grounds_it() {
+        let with_read_named = |name: String| {
+            let mut problem = counter_loop_problem(5, 9);
+            let looppred = problem
+                .predicates()
+                .iter()
+                .find(|predicate| predicate.name == "loop")
+                .expect("the fixture's loop predicate")
+                .id;
+            let i = || ChcExpr::var(ChcVar::new("i", ChcSort::Int));
+            let read = ChcExpr::var(ChcVar::new(name, ChcSort::Int));
+            problem.add_clause(HornClause::query(ClauseBody::new(
+                vec![(looppred, vec![i()])],
+                Some(ChcExpr::and_vec(vec![
+                    ChcExpr::lt(i(), ChcExpr::int(5)),
+                    ChcExpr::eq(read, ChcExpr::int(263)),
+                ])),
+            )));
+            problem
+        };
+        let havoc = with_read_named(format!(
+            "{}f_call_element_read_2",
+            trust_mc_core::chc::TRANSLATION_HAVOC_VAR_PREFIX
+        ));
+        assert!(havoc.has_cycles());
+        assert!(!problem_is_grounded_for_refutation(&havoc));
+        assert!(
+            bounded_unroll_chc_for_refutation(&havoc, 4).is_none(),
+            "an equality on a havoc is a constraint, not a definition"
+        );
+        let defined = with_read_named("f_call_element_read_2".to_string());
+        assert!(
+            problem_is_grounded_for_refutation(&defined),
+            "the control: the same equality on a non-havoc name grounds it, which is why \
+             the havoc's name has to carry its identity"
+        );
+    }
+
+    /// A havoc is not a program input even in the entry fact, where free variables
+    /// otherwise stand for the function's inputs: the same entry fact over an
+    /// input is grounded, over a havoc it is not.
+    #[test]
+    fn a_translation_havoc_in_the_entry_fact_is_not_an_input() {
+        let with_entry_value_named = |name: String| {
+            let mut problem = ChcProblem::new();
+            let entry = problem.declare_predicate("entry", vec![ChcSort::Int]);
+            let looppred = problem.declare_predicate("loop", vec![ChcSort::Int]);
+            let value = || ChcExpr::var(ChcVar::new("value", ChcSort::Int));
+            let seed = ChcExpr::var(ChcVar::new(name, ChcSort::Int));
+            problem.add_clause(HornClause::new(
+                ClauseBody::new(vec![], Some(ChcExpr::eq(value(), seed))),
+                ClauseHead::Predicate(entry, vec![value()]),
+            ));
+            problem.add_clause(HornClause::new(
+                ClauseBody::predicates_only(vec![(entry, vec![value()])]),
+                ClauseHead::Predicate(looppred, vec![value()]),
+            ));
+            problem.add_clause(HornClause::new(
+                ClauseBody::predicates_only(vec![(looppred, vec![value()])]),
+                ClauseHead::Predicate(looppred, vec![ChcExpr::add(value(), ChcExpr::int(1))]),
+            ));
+            problem.add_clause(HornClause::query(ClauseBody::new(
+                vec![(looppred, vec![value()])],
+                Some(ChcExpr::gt(value(), ChcExpr::int(2))),
+            )));
+            assert!(problem.has_cycles());
+            problem
+        };
+        assert!(
+            problem_is_grounded_for_refutation(&with_entry_value_named("input".to_string())),
+            "the control: a free entry value is an input"
+        );
+        let havoc = format!("{}seed_0", trust_mc_core::chc::TRANSLATION_HAVOC_VAR_PREFIX);
+        assert!(!problem_is_grounded_for_refutation(&with_entry_value_named(havoc)));
     }
 
     #[test]

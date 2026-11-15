@@ -11,6 +11,7 @@
 //! - Concrete `&str` argument resolution
 //! - `Result<T, E>` Ok/Err constructor helpers used by string parse stubs
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -408,7 +409,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for ctor in &dt.constructors {
             if crate::codegen_ay::names::is_err_constructor(&ctor.name) && ctor.fields.len() == 1 {
                 let err_sort = ctor.fields[0].sort.clone();
-                let err_val = super::super::codegen_ctx::globals::declare_pending_var(
+                let err_val = Havoc::mint_deferred(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     super::super::chc_fresh_name("parse_err"),
                     err_sort,
                 );

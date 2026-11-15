@@ -38,6 +38,29 @@ fn test_label_to_property_kind_div_by_zero_variants() {
     assert_eq!(AYCtx::label_to_property_kind("div_by_zero_check"), PropertyKind::DivisionByZero);
     assert_eq!(AYCtx::label_to_property_kind("mod_by_zero_check"), PropertyKind::DivisionByZero);
     assert_eq!(AYCtx::label_to_property_kind("division_by_zero"), PropertyKind::DivisionByZero);
+    // simd_div/simd_rem zero lane divisor: UB of the intrinsic, not the scalar
+    // MIR-Assert panic kind.
+    assert_eq!(
+        AYCtx::label_to_property_kind("simd_div_by_zero_check"),
+        PropertyKind::UndefinedBehavior
+    );
+    // ...and so is `unchecked_div`/`unchecked_rem` by zero.
+    assert_eq!(
+        AYCtx::label_to_property_kind("unchecked_div_by_zero"),
+        PropertyKind::UndefinedBehavior
+    );
+    // The operator-level Div/Rem checks (statement/rvalue.rs) are the only
+    // checks on a lowered `unchecked_div`/`unchecked_rem`: UB, not the MIR
+    // `Assert` panic kind.
+    for label in
+        ["binop_div_by_zero", "binop_rem_by_zero", "binop_div_overflow", "binop_rem_overflow"]
+    {
+        assert_eq!(
+            AYCtx::label_to_property_kind(label),
+            PropertyKind::UndefinedBehavior,
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -168,6 +191,65 @@ fn test_overflow_checks_filter_arithmetic_overflow_properties() {
     });
 }
 
+/// A lowered `unchecked_div(i32::MIN, -1)` has no MIR `Assert`; its only check
+/// is the operator-level one, so `--no-overflow-checks` must not drop it (Kani
+/// asserts it whatever that flag says).
+#[test]
+fn operator_div_rem_checks_survive_no_overflow_checks() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.overflow_checks = false;
+        for label in
+            ["binop_div_by_zero", "binop_rem_by_zero", "binop_div_overflow", "binop_rem_overflow"]
+        {
+            ctx.record_property_violation(Expr::bool_const(true), label);
+        }
+        assert_eq!(ctx.bmc_vc.violations.len(), 4);
+        assert!(
+            ctx.bmc_vc.violations.iter().all(|v| v.kind == PropertyKind::UndefinedBehavior),
+            "{:?}",
+            ctx.bmc_vc.violations
+        );
+    });
+}
+
+/// SIMD lane checks are assert-assume pairs whose assume half ops.rs adds
+/// unconditionally: `--no-overflow-checks` must not drop the assert half alone,
+/// or every overflowing lane is pruned unchecked (a false proof).
+#[test]
+fn simd_lane_checks_survive_no_overflow_checks() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.overflow_checks = false;
+        ctx.record_property_violation(Expr::bool_const(true), "overflow_check_simd_arith");
+        ctx.record_property_violation(Expr::bool_const(true), "overflow_check_simd_div_rem");
+        assert_eq!(ctx.bmc_vc.violations.len(), 2);
+        assert_eq!(ctx.bmc_vc.violations[0].kind, PropertyKind::Other);
+        assert_eq!(ctx.bmc_vc.violations[1].kind, PropertyKind::UndefinedBehavior);
+    });
+}
+
+/// `unchecked_{add,sub,mul}` overflow is UB that Kani asserts whatever
+/// `--no-overflow-checks` says, and its BMC check has no assume half: the gated
+/// `ArithmeticOverflow` kind would drop the only check of that UB. The safe
+/// operators' `overflow_check_*` stays gated.
+#[test]
+fn unchecked_arith_overflow_survives_no_overflow_checks() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.overflow_checks = false;
+        ctx.record_property_violation(Expr::bool_const(true), "overflow_check_add");
+        for label in ["unchecked_add_overflow", "unchecked_sub_overflow", "unchecked_mul_overflow"]
+        {
+            assert_eq!(
+                AYCtx::label_to_property_kind(label),
+                PropertyKind::UndefinedBehavior,
+                "{label}"
+            );
+            ctx.record_property_violation(Expr::bool_const(true), label);
+        }
+        assert_eq!(ctx.bmc_vc.violations.len(), 3, "only the safe overflow_check_add is gated");
+        assert!(ctx.bmc_vc.violations.iter().all(|v| v.kind == PropertyKind::UndefinedBehavior));
+    });
+}
+
 #[test]
 fn test_record_property_violation_with_location() {
     with_test_ay_ctx(|mut ctx| {
@@ -229,6 +311,48 @@ fn test_finalize_counterexample_multiple_violations_ored() {
     });
 }
 
+/// The legacy finalizer widens a floating-point query's logic as `emit_bmc`
+/// does (`emitter::upgrade_logic_for_floating_point`): the float is a
+/// bit-vector, the FP theory is only inside the violation's term.
+#[test]
+fn test_finalize_counterexample_widens_logic_for_floating_point() {
+    with_test_ay_ctx(|mut ctx| {
+        let x = ctx.declare_var("x", Sort::bitvec(32));
+        let fp = crate::codegen_ay::float_arithmetic::bv_to_ieee_fp(x, 8, 24);
+        let negative = fp.fp_is_negative();
+        ctx.record_property_violation(negative, "kani_assert");
+        ctx.finalize_counterexample_query();
+        let smt = smt_text(&ctx);
+        assert!(smt.contains("(set-logic ALL)"), "FP terms need an FP logic, got:\n{smt}");
+    });
+}
+
+/// A logic the user named (`--ay-logic`) is kept for a floating-point query.
+#[test]
+fn test_finalize_counterexample_keeps_user_logic_for_floating_point() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.logic_override = true;
+        let x = ctx.declare_var("x", Sort::bitvec(32));
+        let fp = crate::codegen_ay::float_arithmetic::bv_to_ieee_fp(x, 8, 24);
+        ctx.record_property_violation(fp.fp_is_negative(), "kani_assert");
+        ctx.finalize_counterexample_query();
+        let smt = smt_text(&ctx);
+        assert!(smt.contains("(set-logic QF_AUFBV)"), "got:\n{smt}");
+    });
+}
+
+/// A query without floating point keeps the configured BMC logic.
+#[test]
+fn test_finalize_counterexample_keeps_logic_without_floating_point() {
+    with_test_ay_ctx(|mut ctx| {
+        let x = ctx.declare_var("x", Sort::bitvec(32));
+        ctx.record_property_violation(x.eq(Expr::bitvec_const(0u32, 32)), "kani_assert");
+        ctx.finalize_counterexample_query();
+        let smt = smt_text(&ctx);
+        assert!(smt.contains("(set-logic QF_AUFBV)"), "got:\n{smt}");
+    });
+}
+
 // =========================================================================
 // record_kani_any_var / add_get_value_for_kani_any
 // =========================================================================
@@ -238,8 +362,8 @@ fn test_record_kani_any_var_tracks_vars() {
     with_test_ay_ctx(|mut ctx| {
         let var1 = ctx.declare_var("x", Sort::bitvec(32));
         let var2 = ctx.declare_var("y", Sort::bitvec(8));
-        ctx.record_kani_any_var(var1);
-        ctx.record_kani_any_var(var2);
+        ctx.record_kani_any_var(var1, None);
+        ctx.record_kani_any_var(var2, None);
         // add_get_value should not panic when there are vars
         ctx.add_get_value_for_kani_any();
         let smt = smt_text(&ctx);
@@ -248,12 +372,12 @@ fn test_record_kani_any_var_tracks_vars() {
 }
 
 #[test]
-fn test_add_get_value_for_kani_any_empty_is_noop() {
+fn test_add_get_value_for_kani_any_empty_has_explicit_count() {
     with_test_ay_ctx(|mut ctx| {
         // No any_vars recorded
         ctx.add_get_value_for_kani_any();
         let smt = smt_text(&ctx);
-        assert!(!smt.contains("get-value"), "no get-value when no any vars exist");
+        assert!(smt.contains("(get-value (ay_playback_count))"), "{smt}");
     });
 }
 
@@ -442,5 +566,63 @@ fn test_emit_bmc_preserves_recorded_kani_assert_name() {
             smt.contains("(declare-const ay_violation_kani_assert_0 Bool)"),
             "expected emit_bmc to preserve recorded violation name, got:\n{smt}"
         );
+    });
+}
+
+/// `unchecked_shl`/`unchecked_shr` past the width is UB that Kani asserts
+/// whatever `--no-overflow-checks` says, and the BMC check has no assume half:
+/// its labels take the ungated UB kind.
+#[test]
+fn unchecked_shift_distance_survives_no_overflow_checks() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.overflow_checks = false;
+        for label in ["unchecked_shift_distance_check", "unchecked_shift_distance_check_negative"] {
+            assert_eq!(
+                AYCtx::label_to_property_kind(label),
+                PropertyKind::UndefinedBehavior,
+                "{label}"
+            );
+            ctx.record_property_violation(Expr::bool_const(true), label);
+        }
+        assert_eq!(ctx.bmc_vc.violations.len(), 2);
+    });
+}
+
+/// `CheckGate::Always` keeps a check whose label's kind a check flag would
+/// drop (a MIR `Assert` enabled at the terminator, a SIMD lane shift), and
+/// still names it by that kind; `CheckGate::ByKind` drops it as before.
+#[test]
+fn check_gate_always_keeps_what_the_flags_would_drop() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.config.overflow_checks = false;
+        ctx.config.memory_safety_checks = false;
+        let labels = [
+            ("overflow_check_div", PropertyKind::ArithmeticOverflow),
+            ("bounds_check", PropertyKind::OutOfBounds),
+            ("shift_distance_check", PropertyKind::ArithmeticOverflow),
+        ];
+        for (label, _) in labels {
+            ctx.record_property_violation_gated(
+                Expr::bool_const(true),
+                label,
+                None,
+                None,
+                None,
+                CheckGate::ByKind,
+            );
+        }
+        assert!(ctx.bmc_vc.violations.is_empty(), "{:?}", ctx.bmc_vc.violations);
+        for (label, _) in labels {
+            ctx.record_property_violation_gated(
+                Expr::bool_const(true),
+                label,
+                None,
+                None,
+                None,
+                CheckGate::Always,
+            );
+        }
+        let kinds: Vec<_> = ctx.bmc_vc.violations.iter().map(|v| v.kind).collect();
+        assert_eq!(kinds, labels.map(|(_, kind)| kind), "kept, and named by the label's kind");
     });
 }

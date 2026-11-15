@@ -13,6 +13,7 @@ use std::collections::HashSet;
 /// Result of translating a collection operation (Part of #788).
 /// Separates collection updates from result values for operations like insert/remove.
 /// Extended with length tracking for #1814 and presence tracking for #3057.
+#[derive(Clone)]
 pub(in crate::codegen_ay::chc) struct CollectionCallResult {
     /// New data-array state (mutating operations only).
     pub(in crate::codegen_ay::chc) map_update: Option<Expr>,

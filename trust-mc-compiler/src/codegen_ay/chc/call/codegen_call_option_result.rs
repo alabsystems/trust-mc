@@ -313,6 +313,13 @@ pub(in crate::codegen_ay::chc) fn propagate_unwrapped_ref_metadata_from_operand(
         {
             place.local
         }
+        rustc_public::mir::Operand::Constant(c) => {
+            // `unwrap(const O)` for a constant `Option<&T>`: the payload is a
+            // constant pointer (`shared::const_pointer`).
+            clear_unwrapped_ref_metadata(ctx, dest_local);
+            ctx.record_const_option_payload_facts(&c.const_, dest_local);
+            return;
+        }
         _ => {
             clear_unwrapped_ref_metadata(ctx, dest_local);
             return;
@@ -338,8 +345,8 @@ pub(in crate::codegen_ay::chc) fn propagate_unwrapped_ref_metadata_from_operand(
         dest_local,
     );
     copy_or_clear_copy(
-        &ctx.ref_resolution.const_ref_promoted_obj_ids.get(&src_local).copied(),
-        &mut ctx.ref_resolution.const_ref_promoted_obj_ids,
+        &ctx.ref_resolution.const_ref_objects.get(&src_local).copied(),
+        &mut ctx.ref_resolution.const_ref_objects,
         dest_local,
     );
     copy_or_clear_expr(
@@ -452,7 +459,7 @@ fn clear_unwrapped_ref_metadata(ctx: &mut ChcCtx<'_, '_>, dest_local: usize) {
     ctx.ref_resolution.call_forwarded_raw_ptrs.remove(&dest_local);
     ctx.ref_resolution.const_ref_values.remove(&dest_local);
     ctx.ref_resolution.const_ref_discriminants.remove(&dest_local);
-    ctx.ref_resolution.const_ref_promoted_obj_ids.remove(&dest_local);
+    ctx.ref_resolution.const_ref_objects.remove(&dest_local);
     ctx.ref_resolution.const_ref_slice_views.remove(&dest_local);
     ctx.ref_resolution.subslice_len.remove(&dest_local);
     ctx.ref_resolution.subslice_offset.remove(&dest_local);

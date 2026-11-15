@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
-//! Uninterpreted-function summaries for CALLS in the CHC lane, encoded as a
-//! frozen congruent table (Part of #4270 / TL18).
+//! Uninterpreted-function summaries for CALLS in the CHC lane, encoded as
+//! FIRST-CLASS `declare-fun` symbols (Part of #4270 / TL18; ay 0.23.0 adoption
+//! step 8).
 //!
 //! # The construct
 //!
@@ -13,54 +14,90 @@
 //! equal results (congruence). SMT-LIB spells that `(declare-fun f (S1..Sn) R)`
 //! with `R != Bool`.
 //!
-//! `ay-chc` cannot parse that. `crates/ay-chc/src/parser/commands.rs` rejects
-//! any `declare-fun` whose return sort is not `Bool` ("Non-predicate function
-//! declaration: '<name>' with return sort <S>. Only Bool-returning functions
-//! (predicates) are supported in ay-chc."), and the error aborts the parse of
-//! the WHOLE problem — one such declaration costs the harness its entire
-//! verification. Nor is there a global-constant escape hatch: `declare-const`
-//! is an alias for `declare-var` there (`commands.rs`: `"declare-var" |
-//! "declare-const"`), and any free symbol resolves to a `ChcVar`, i.e. a
-//! *per-clause* universally quantified variable. Two calls always live in two
-//! different Horn rules, so "reuse the same free variable" gives NO sharing:
-//! it degenerates to independent havocs.
-//!
 //! # The encoding
 //!
-//! The only value that is shared between two Horn rules is a value threaded
-//! through the relation signature. So the UF is a FROZEN state column:
+//! ```text
+//! (declare-fun uf_call_<tag>_<callee> (S1 .. Sn) R)   ; never constrained
+//! d = (uf_call_<tag>_<callee> a1 .. an)
+//! ```
+//!
+//! One symbol, one signature, per MONOMORPHISED callee (the tag key is the
+//! callee's mangled name, so `f::<i32>` and `f::<u32>` are different symbols),
+//! and every semantic input of the callee is an argument of the application —
+//! the purity gate below only admits callees whose entire input is their
+//! by-value scalar parameter list, so "every argument" and "every semantic
+//! input" coincide.
+//!
+//! ## Why this replaced a frozen Array column
+//!
+//! Until ay 0.23.0, `ay-chc` rejected any `declare-fun` whose return sort was
+//! not `Bool`, and the error aborted the parse of the WHOLE problem — one such
+//! declaration cost the harness its entire verification. This module therefore
+//! emulated the UF as a FROZEN STATE COLUMN, exactly as `float_binop_table.rs`
+//! still does for symbolic float arithmetic:
 //!
 //! ```text
 //! call_uf_tbl : Array(BV128 -> BV64)          ; never modified, never constrained
 //! d := extract(w-1, 0, select(call_uf_tbl, tag(32) ++ zext(a1 ++ .. ++ an, 96)))
 //! ```
 //!
-//! This is exactly the mechanism `float_binop_table.rs` already uses for
-//! symbolic float arithmetic, applied to calls. The table is pushed as a
-//! state-var pair and never marked modified, so `build_output_args` passes the
-//! input variable straight through to every successor head: along any single
-//! trace all rules see the SAME table. Two calls with the same tag and the same
-//! argument values therefore select the same entry and get the same value —
-//! congruence — while different traces are free to see different tables.
+//! ay 0.23.0 accepts textual `declare-fun` with scalar `Bool`/`Int`/`Real`/`BV`
+//! arguments and a non-`Bool` scalar return as an ordinary uninterpreted
+//! function with congruence (`ay-chc/src/parser/commands.rs`: "`declare-rel`
+//! and Bool-returning `declare-fun` introduce CHC predicates. Every other
+//! `declare-fun` is an ordinary UF retained in `ChcExpr::FuncApp`; the SMT core
+//! supplies congruence semantics."). The emulation is therefore obsolete, and
+//! it carried three precision ceilings that the real symbol does not:
 //!
-//! Key injectivity (mandatory — a colliding key would ASSERT an equality that
-//! need not hold, which over-constrains and can fabricate a proof):
-//!   * the tag occupies the fixed high 32 bits, so distinct callees never
-//!     collide regardless of their argument widths;
-//!   * tags are handed out sequentially per VC from `ChcCtx::call_uf_tags`,
-//!     keyed on the callee's MANGLED name — monomorphisation-unique, so
-//!     `f::<i32>` and `f::<u32>` never share a tag;
-//!   * within one tag the argument widths are fixed by the monomorphised
-//!     signature, so `zero_extend` of the concatenation is injective.
-//! A call whose arguments do not fit in 96 bits, or whose return does not fit
-//! in 64, is refused (the caller keeps its sound havoc) rather than truncated.
+//!   * a 32-bit callee tag,
+//!   * a 96-bit ceiling on the CONCATENATION of all arguments (a two-`u64`
+//!     callee was refused outright), and
+//!   * a 64-bit ceiling on the value, with narrower returns taking low bits.
+//!
+//! All three are gone. It also cost an Array-sorted column in EVERY Horn
+//! relation of the harness (#4259, the single most expensive thing to add to a
+//! relation signature); a `declare-fun` symbol is global and costs no relation
+//! width at all.
+//!
+//! ## Bool-returning callees: BV1, never a Bool `declare-fun`
+//!
+//! A textual Bool-returning `declare-fun` does NOT mean "uninterpreted
+//! predicate" to ay-chc — it means a HORN RELATION (`parse_declare_predicate`
+//! routes `return_sort == Bool` to `problem.declare_predicate`). Emitting one
+//! for a call summary would hand the solver a relation it is free to SYNTHESISE
+//! an interpretation for, which is a different construct entirely and a
+//! correctness bug. The CHC lane reaches ay as SMT-LIB TEXT
+//! (`emitter::emit_chc_smt2` -> `ChcParser::parse`), so there is no typed
+//! back-channel that could say "ordinary UF, Bool return" instead.
+//!
+//! A `bool`-returning callee is therefore declared with return sort
+//! `(_ BitVec 1)` and applied as `d = ((uf ..) == #b1)`. The BV1 symbol is
+//! uninterpreted and unconstrained, so `d` ranges over both booleans exactly as
+//! a havoc would, and two equal-argument applications are equal — congruence
+//! without a Horn relation.
+//!
+//! ## Symbol/signature stability, and why a mismatch fails closed
+//!
+//! `ay-chc` type-checks an application against the declaration
+//! (`coerce_args_to_sorts`), and a disagreement is a PARSE error that aborts
+//! the whole problem. The symbol table is therefore write-once per VC: the
+//! first application of a key fixes `(arg_sorts, ret_sort)`, and any later
+//! application whose sorts differ is REFUSED — that site keeps its sound havoc
+//! rather than risking the harness. Names are `uf_call_<tag>_<sanitised key>`
+//! with `tag` a per-VC sequential index, so distinct keys can never produce the
+//! same name however the sanitiser folds their characters, and the `uf_call_`
+//! prefix cannot collide with a block relation (`<fn>__bb<N>`), the error
+//! relations, a state var, or a datatype constructor/selector/tester.
 //!
 //! # SOUNDNESS — the gate, not the machinery
 //!
-//! The table itself is never constrained anywhere (not in the entry rule, not
-//! in any transition), so the real function is one interpretation of it and any
-//! property proven over ALL interpretations holds under the real semantics.
-//! That much is free.
+//! The symbol is never constrained anywhere (not in the entry rule, not in any
+//! transition, and no axiom is ever emitted about it), so the real function is
+//! one interpretation of it and any property proven over ALL interpretations
+//! holds under the real semantics. That much is free. ay's congruence closure
+//! is a THEORY fact about the symbol, not evidence that the callee is
+//! deterministic — the deterministic-callee claim comes from the gate below and
+//! from nowhere else.
 //!
 //! What is NOT free is the right to model a callee as a function of its
 //! arguments at all. `codegen_call_foreign.rs` records the counterexample:
@@ -114,21 +151,32 @@
 //!
 //! # Cost control
 //!
-//! An Array-sorted frame column is the most expensive thing to add to a Horn
-//! relation (#4259), so the pre-scan is deliberately strict. The table is
-//! declared only when the harness body applies the SAME symbol at least TWICE —
-//! the only situation congruence can pay for — and, for the call lane, only for
-//! a callee the precise inline lane has already given up on (too big for
-//! `chc_inline_effective_block_limit`, or self-recursive so the MIR
-//! `FunctionInlinePass` skips it). Math intrinsics with an exact BV encoding
-//! (`fabs`, `floor`, `ceil`, `trunc`, `round`, `copysign`, `minnum`, `maxnum`)
-//! are excluded outright: they are already precise.
+//! The pre-scan that used to decide whether the Array column was worth its
+//! relation width is KEPT verbatim, now as the lane's enable flag. It is no
+//! longer paying for a frame column — a `declare-fun` costs no relation width —
+//! but it still buys the only thing congruence can buy, and keeping it makes
+//! this migration behaviour-preserving on the measured corpus rather than a
+//! simultaneous precision AND scheduling change:
+//!
+//!   * the lane is enabled only when the harness body applies the SAME symbol
+//!     at least TWICE (a single application of an unconstrained UF to fixed
+//!     arguments is semantically a fresh havoc, so it buys nothing and only
+//!     hands the solver a congruence-closure term to carry);
+//!   * for the call lane, only for a callee the precise inline lane has already
+//!     given up on (too big for `chc_inline_effective_block_limit`, or
+//!     self-recursive so the MIR `FunctionInlinePass` skips it);
+//!   * math intrinsics with an exact BV encoding (`fabs`, `floor`, `ceil`,
+//!     `trunc`, `round`, `copysign`, `minnum`, `maxnum`) are excluded outright:
+//!     they are already precise.
 //!
 //! MEASURED, and the reason the two-site rule exists: with a one-site rule
 //! `Intrinsics/Math/Arith/powi.rs` went 2/2 -> 0/2 (both harnesses lost to
 //! solver Timeout / SolverError) for a column its single `x.powi(2)` could
-//! never use.
+//! never use. That particular cost is gone with the column, but the rule is
+//! retained deliberately; relaxing it is a separate, separately measured
+//! change.
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
@@ -136,21 +184,29 @@ use rustc_public::mir::{
 };
 use rustc_public::ty::{RigidTy, Ty, TyKind};
 use tracing::debug;
+use trust_mc_core::decl::Decl;
 
 use super::ChcCtx;
 use crate::codegen_ay::shared::count_effective_blocks;
 
-/// Input-side name of the frozen congruent call-summary table.
-pub(in crate::codegen_ay::chc) const CALL_UF_TBL: &str = "call_uf_tbl";
-/// Output-side name (identity-threaded: the table is never marked modified).
-pub(in crate::codegen_ay::chc) const CALL_UF_TBL_OUT: &str = "call_uf_tbl__out";
+/// Prefix of every first-class call-summary UF symbol.
+///
+/// Must not be a prefix any other symbol generator in this encoder can produce:
+/// block relations are `<fn_name>__bb<N>`, error relations `error` /
+/// `error_p<N>`, relation padding `__pad_<rel>_<idx>`, state vars `_<local>` /
+/// `_<local>__out`, and datatype functions `mk_*` / `fld_*` / `is-*`. A
+/// collision would be a hard `ay-chc` parse error ("Cannot declare function
+/// 'x': symbol is already declared as a predicate"), which aborts the WHOLE
+/// problem, so `ChcCtx::call_uf_symbol` additionally checks the VC's declared
+/// relations and variables before committing a name.
+const UF_SYMBOL_PREFIX: &str = "uf_call_";
 
-/// Width of the callee tag in the table key (fixed HIGH bits — see module doc).
-const TAG_WIDTH: u32 = 32;
-/// Width of the zero-extended argument concatenation in the table key.
-const ARG_WIDTH: u32 = 96;
-/// Width of a table VALUE. Narrower returns take the low bits.
-const VALUE_WIDTH: u32 = 64;
+/// How many characters of the (sanitised) tag key are kept in a symbol name.
+///
+/// Readability only — the sequential tag already makes names injective, so
+/// truncation can never merge two callees.
+const UF_SYMBOL_KEY_BUDGET: usize = 72;
+
 /// Bound on the transitive purity walk. A cycle (direct or mutual recursion)
 /// simply exhausts the budget and the callee is refused.
 const MAX_PURITY_DEPTH: usize = 3;
@@ -174,9 +230,52 @@ const PURE_TOTAL_INTRINSICS: &[&str] = &[
     "rotate_right",
 ];
 
-/// Sort of the frozen congruent call-summary table.
-pub(in crate::codegen_ay::chc) fn call_uf_table_sort() -> Sort {
-    Sort::array(Sort::bitvec(TAG_WIDTH + ARG_WIDTH), Sort::bitvec(VALUE_WIDTH))
+/// One first-class UF symbol, minted once per VC per monomorphised callee.
+///
+/// `arg_sorts`/`ret_sort` are the DECLARED signature. `ay-chc` type-checks
+/// every application against them and a disagreement aborts the parse of the
+/// whole problem, so the signature is write-once: a later application whose
+/// sorts differ is refused and keeps its sound havoc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::codegen_ay::chc) struct CallUfSymbol {
+    /// The SMT symbol name (`uf_call_<tag>_<sanitised key>`).
+    pub(in crate::codegen_ay::chc) name: String,
+    /// Declared argument sorts.
+    pub(in crate::codegen_ay::chc) arg_sorts: Vec<Sort>,
+    /// Declared return sort — `BitVec(1)` when the Rust return is `bool`.
+    pub(in crate::codegen_ay::chc) ret_sort: Sort,
+    /// `true` when the Rust return is `bool` and the declaration says BV1.
+    ///
+    /// A Bool-returning `declare-fun` is a HORN RELATION to ay-chc, never an
+    /// ordinary UF; see the module doc.
+    pub(in crate::codegen_ay::chc) bool_result: bool,
+}
+
+/// `true` when a sort may appear in a first-class UF signature here.
+///
+/// `ay-chc` also accepts `Int` and `Real` as scalar UF sorts, but this lane
+/// never emits them: the only mode that produces them is int-lift, and the
+/// whole lane is skipped there (see `collect_call_uf_congruence_lane`). Keeping
+/// the emitted domain to exactly {Bool, BitVec} keeps the declared signature
+/// inside the sorts this encoder round-trips through SMT-LIB text every day.
+fn sort_is_uf_declarable(sort: &Sort) -> bool {
+    sort.is_bool() || sort.is_bitvec()
+}
+
+/// Fold a tag key into the SMT-LIB simple-symbol alphabet.
+///
+/// Lossy on purpose (a mangled name carries `:`, `<`, `>`, `,`, spaces); the
+/// sequential tag in front of it is what makes the full name injective, so a
+/// fold or a truncation here can never merge two callees onto one symbol.
+fn sanitize_uf_key(tag_key: &str) -> String {
+    let mut out = String::with_capacity(UF_SYMBOL_KEY_BUDGET);
+    for ch in tag_key.chars() {
+        if out.len() >= UF_SYMBOL_KEY_BUDGET {
+            break;
+        }
+        out.push(if ch.is_ascii_alphanumeric() { ch } else { '_' });
+    }
+    out
 }
 
 /// `true` when `ty` is a by-value scalar the key can carry losslessly.
@@ -205,16 +304,19 @@ fn operand_is_pure(operand: &Operand, _locals: &[LocalDecl]) -> bool {
         Operand::Constant(konst) => {
             !matches!(konst.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => true,
     }
 }
 
 /// `true` when the rvalue reads only frame-local, pointer-free state.
 fn rvalue_is_pure(rvalue: &Rvalue, locals: &[LocalDecl]) -> bool {
     match rvalue {
-        Rvalue::Use(operand) | Rvalue::Repeat(operand, _) | Rvalue::UnaryOp(_, operand) => {
+        Rvalue::Use(operand, ..) | Rvalue::Repeat(operand, _) | Rvalue::UnaryOp(_, operand) => {
             operand_is_pure(operand, locals)
         }
         // `sizeof`/`alignof`/`offsetof` — compile-time constants.
+        #[cfg(not(trust_toolchain))]
         Rvalue::NullaryOp(_) => true,
         Rvalue::Cast(_, operand, _) => operand_is_pure(operand, locals),
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
@@ -228,10 +330,15 @@ fn rvalue_is_pure(rvalue: &Rvalue, locals: &[LocalDecl]) -> bool {
         // or reads slice metadata.
         Rvalue::Ref(..)
         | Rvalue::AddressOf(..)
-        | Rvalue::ShallowInitBox(..)
         | Rvalue::ThreadLocalRef(_)
         | Rvalue::CopyForDeref(_)
         | Rvalue::Len(_) => false,
+        #[cfg(not(trust_toolchain))]
+        Rvalue::ShallowInitBox(..) => false,
+        // Trust: `Reborrow` re-borrows through a lifetime-carrying ADT (a
+        // pointer in disguise), so it is refused like `Ref`.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(..) => false,
     }
 }
 
@@ -254,9 +361,10 @@ fn body_is_pure(body: &Body, path: &mut Vec<String>) -> bool {
                 }
                 StatementKind::SetDiscriminant { place, .. }
                 | StatementKind::FakeRead(_, place)
-                | StatementKind::Retag(_, place)
                 | StatementKind::PlaceMention(place)
                 | StatementKind::AscribeUserType { place, .. } => !place_has_indirection(place),
+                #[cfg(not(trust_toolchain))]
+                StatementKind::Retag(_, place) => !place_has_indirection(place),
                 StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
                 | StatementKind::Coverage(_)
@@ -309,7 +417,7 @@ fn instance_is_pure(instance: &Instance, path: &mut Vec<String>) -> bool {
     if path.len() > MAX_PURITY_DEPTH {
         return false;
     }
-    let Some(body) = instance.body() else {
+    let Some(body) = instance.callee_body() else {
         // The ONLY bodiless callees accepted are the hand-audited total, pure
         // bit intrinsics. Everything else (foreign items, UB-carrying
         // intrinsics, shims) is refused: purity cannot be established without
@@ -402,50 +510,88 @@ fn callee_is_self_recursive(instance: &Instance, body: &Body) -> bool {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    /// Input-side table variable, iff the pre-scan declared it.
-    ///
-    /// Never returns an undeclared variable: a select over a var missing from
-    /// the relation signature would be a per-rule free variable — sound (it
-    /// degenerates to havoc) but silently NON-congruent, which is exactly the
-    /// bug this encoding exists to avoid.
-    fn call_uf_table_var(&self) -> Option<Expr> {
-        let idx = self.state_var_mgr.state_var_index_by_name(CALL_UF_TBL)?;
-        let (name, sort) = &self.state_var_mgr.state_vars[idx];
-        Some(Expr::var(&**name, sort.clone()))
-    }
-
-    /// Whether the pre-scan declared the table for this harness.
+    /// Whether the pre-scan enabled the congruence lane for this harness.
     ///
     /// Call sites check this BEFORE translating arguments so that a harness
-    /// without the table takes a byte-identical path to the pre-#4270 encoding
+    /// without the lane takes a byte-identical path to the pre-#4270 encoding
     /// — `translate_operand_with_modified` can register pending declarations,
     /// and a measurement control that perturbs the thing it measures is worse
     /// than no control.
-    pub(in crate::codegen_ay::chc) fn call_uf_table_declared(&self) -> bool {
-        self.state_var_mgr.state_var_index_by_name(CALL_UF_TBL).is_some()
+    pub(in crate::codegen_ay::chc) fn call_uf_congruence_enabled(&self) -> bool {
+        self.call_uf_congruence
     }
 
-    /// Stable per-VC tag for a symbol. Two symbols share a tag only if their
-    /// keys are equal, i.e. only if they are the SAME function.
-    fn call_uf_tag(&mut self, key: &str) -> Option<u32> {
-        if let Some(tag) = self.call_uf_tags.get(key) {
-            return Some(*tag);
+    /// Mint (or look up) the first-class UF symbol for `tag_key`.
+    ///
+    /// Write-once per key. The first application fixes the declared signature
+    /// and emits exactly one `(declare-fun ...)` into the VC; a later
+    /// application whose sorts DISAGREE is refused (`None`) so the caller keeps
+    /// its sound havoc, because ay-chc type-checks applications against the
+    /// declaration and a mismatch aborts the parse of the whole problem.
+    ///
+    /// Two symbols share a name only if their keys are equal, i.e. only if they
+    /// are the SAME monomorphised function: the tag is a per-VC sequential
+    /// index over the key map, so the name is injective in the key even though
+    /// the sanitiser that renders the key is not.
+    fn call_uf_symbol(
+        &mut self,
+        tag_key: &str,
+        arg_sorts: &[Sort],
+        ret_sort: &Sort,
+        bool_result: bool,
+    ) -> Option<CallUfSymbol> {
+        if let Some(existing) = self.call_uf_symbols.get(tag_key) {
+            // Same callee, incompatible signature at this site: refuse rather
+            // than emit an application ay-chc will reject.
+            if existing.arg_sorts != arg_sorts
+                || existing.ret_sort != *ret_sort
+                || existing.bool_result != bool_result
+            {
+                debug!(
+                    tag_key,
+                    declared = ?existing,
+                    ?arg_sorts,
+                    ?ret_sort,
+                    "UF summary refused: signature disagrees with the symbol already declared"
+                );
+                return None;
+            }
+            return Some(existing.clone());
         }
-        let next = u32::try_from(self.call_uf_tags.len()).ok()?;
-        // Leave head-room rather than wrap: a wrapped tag would collide.
-        if next == u32::MAX {
+
+        let tag = u32::try_from(self.call_uf_symbols.len()).ok()?;
+        let name = format!("{UF_SYMBOL_PREFIX}{tag}_{}", sanitize_uf_key(tag_key));
+        // Belt-and-braces against the ay-chc "symbol is already declared as a
+        // <kind>" parse abort. The `uf_call_` prefix already rules this out by
+        // construction; the check costs one scan of two small vectors and turns
+        // a whole-harness parse failure into a local fail-closed havoc.
+        if self.vc.relations.iter().any(|rel| &*rel.name == name.as_str())
+            || self.vc.vars().iter().any(|var| &*var.name == name.as_str())
+        {
+            debug!(
+                tag_key,
+                name = name.as_str(),
+                "UF summary refused: minted name collides with a declared symbol"
+            );
             return None;
         }
-        self.call_uf_tags.insert(key.to_string(), next);
-        Some(next)
+
+        let symbol = CallUfSymbol {
+            name: name.clone(),
+            arg_sorts: arg_sorts.to_vec(),
+            ret_sort: ret_sort.clone(),
+            bool_result,
+        };
+        self.vc.add_decl(Decl::function(name, arg_sorts.to_vec(), ret_sort.clone()));
+        self.call_uf_symbols.insert(tag_key.to_string(), symbol.clone());
+        Some(symbol)
     }
 
     /// Build the congruent summary term for `instance(arg_exprs) -> out_sort`.
     ///
-    /// `None` — caller keeps its sound havoc — when the table was not declared,
-    /// when any argument or the result is not a bit-vector, or when the key
-    /// would not fit (never truncated: see the injectivity note in the module
-    /// doc).
+    /// `None` — caller keeps its sound havoc — when the lane is disabled, when
+    /// any argument or the result is not a UF-declarable scalar, or when the
+    /// callee's symbol already carries a different signature.
     pub(in crate::codegen_ay::chc) fn call_uf_summary_term(
         &mut self,
         instance: &Instance,
@@ -472,7 +618,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Without this the encoder cannot prove `sin(x) == sin(x)`: the two sites
     /// received independent havocs. The intrinsic and method spellings of the
     /// same function (`std::intrinsics::sinf32` and `core::f32::math::sin`)
-    /// normalise to the SAME tag, so they are congruent with each other too.
+    /// normalise to the SAME symbol, so they are congruent with each other too.
     pub(in crate::codegen_ay::chc) fn math_uf_summary_term(
         &mut self,
         callee_path: &str,
@@ -483,87 +629,86 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.call_uf_summary_term_keyed(&key, arg_exprs, out_sort)
     }
 
+    /// The shared builder: `(uf_call_<tag>_<key> a1 .. an)`, Bool-wrapped when
+    /// the Rust return is `bool`.
+    ///
+    /// Sound whatever it returns: the symbol carries no axiom anywhere in the
+    /// problem, so every interpretation of it — including the real function —
+    /// is admitted, and `None` simply leaves the caller's havoc alone.
     fn call_uf_summary_term_keyed(
         &mut self,
         tag_key: &str,
         arg_exprs: &[Expr],
         out_sort: &Sort,
     ) -> Option<Expr> {
-        let out_width = out_sort.bitvec_width()?;
-        if out_width == 0 || out_width > VALUE_WIDTH {
+        if !self.call_uf_congruence {
             return None;
         }
-        let mut total_arg_width = 0u32;
-        for arg in arg_exprs {
-            total_arg_width = total_arg_width.checked_add(arg.sort().bitvec_width()?)?;
-        }
-        if total_arg_width > ARG_WIDTH {
+        if !sort_is_uf_declarable(out_sort) {
             return None;
         }
-        let table = self.call_uf_table_var()?;
-        let tag = self.call_uf_tag(tag_key)?;
+        let arg_sorts: Vec<Sort> = arg_exprs.iter().map(|arg| arg.sort().clone()).collect();
+        if !arg_sorts.iter().all(sort_is_uf_declarable) {
+            return None;
+        }
 
-        // tag(32) ++ zext(a1 ++ .. ++ an, 96)
-        let mut payload: Option<Expr> = None;
-        for arg in arg_exprs {
-            payload = Some(match payload {
-                Some(acc) => acc.concat(arg.clone()),
-                None => arg.clone(),
-            });
-        }
-        let payload = match payload {
-            Some(bits) if total_arg_width < ARG_WIDTH => {
-                bits.zero_extend(ARG_WIDTH - total_arg_width)
-            }
-            Some(bits) => bits,
-            // Nullary callee: the tag alone identifies the (single) entry.
-            None => Expr::bitvec_const(0u128, ARG_WIDTH),
-        };
-        let key = Expr::bitvec_const(u128::from(tag), TAG_WIDTH).concat(payload);
-        let value = table.select(key);
-        Some(if out_width == VALUE_WIDTH { value } else { value.extract(out_width - 1, 0) })
+        // A Bool-returning `declare-fun` is a HORN RELATION to ay-chc, not an
+        // ordinary UF (module doc). Declare BV1 and read the bit back instead.
+        let bool_result = out_sort.is_bool();
+        let ret_sort = if bool_result { Sort::bitvec(1) } else { out_sort.clone() };
+
+        let symbol = self.call_uf_symbol(tag_key, &arg_sorts, &ret_sort, bool_result)?;
+        let app = Expr::func_app_with_sort(symbol.name, arg_exprs.to_vec(), symbol.ret_sort);
+        Some(if bool_result { app.eq(Expr::bitvec_const(1u128, 1)) } else { app })
     }
 
-    /// Declare the frozen congruent call-summary table for this body.
+    /// Enable the first-class congruent call-summary lane for this body.
     ///
-    /// Called from `collect_state_vars`. Read-only: never marked modified, so
-    /// successor heads always receive the input variable (identity threading),
-    /// and the entry rule leaves it unconstrained.
-    pub(in crate::codegen_ay::chc) fn collect_call_uf_table_state_vars(&mut self) {
+    /// Called from `collect_state_vars` — i.e. before any rule is encoded, so
+    /// the flag is stable for the whole encoding. Declares NOTHING by itself:
+    /// each callee's `(declare-fun ...)` is minted lazily at its first
+    /// application, so a harness whose calls all fail the purity gate emits no
+    /// new symbol at all.
+    pub(in crate::codegen_ay::chc) fn collect_call_uf_congruence_lane(&mut self) {
         // Measurement control ONLY (same role as
-        // `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE`): with the table undeclared,
-        // `call_uf_table_var` returns `None`, every congruence term degenerates
-        // to `None`, and both lanes fall back to the exact pre-#4270 encoding.
-        // Nothing about soundness depends on it — congruence only ever removes
-        // spurious counterexamples.
+        // `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE`): with the lane disabled, every
+        // congruence term degenerates to `None` and both lanes fall back to the
+        // exact pre-#4270 encoding. Nothing about soundness depends on it —
+        // congruence only ever removes spurious counterexamples. The variable
+        // keeps its historical name so existing measurement scripts still work.
         if std::env::var_os("TRUST_MC_NO_CALL_UF_TABLE").is_some() {
             return;
         }
-        if !self.call_uf_table_needed() {
+        if !self.call_uf_congruence_pays() {
             return;
         }
-        self.push_state_var_pair(CALL_UF_TBL, CALL_UF_TBL_OUT, call_uf_table_sort());
-        debug!("CHC: added congruent call-summary table (read-only, unconstrained)");
+        self.call_uf_congruence = true;
+        debug!("CHC: enabled first-class congruent call-summary UFs (unconstrained symbols)");
     }
 
     /// Pre-scan: does this harness contain a call PAIR that congruence can pay
     /// for?
     ///
     /// Congruence buys exactly one thing — two applications of the same symbol
-    /// to the same argument value collapse to one term — so it is worth a frame
-    /// column ONLY when the body applies the same symbol at least twice. That
-    /// is not a heuristic nicety, it is the cost control: an Array-sorted state
-    /// parameter is the single most expensive thing to add to a Horn relation
-    /// (#4259), and a one-call-site harness would pay it for nothing.
-    /// MEASURED: with a >=1 rule, `Intrinsics/Math/Arith/powi.rs` (one
-    /// `x.powi(2)` per harness, proof `x^2 >= 0` needing only the even-power
-    /// axiom) went 2/2 -> 0/2, both harnesses lost to solver Timeout /
-    /// SolverError. With the >=2 rule it is untouched.
+    /// to the same argument value collapse to one term — so it is worth an
+    /// uninterpreted symbol ONLY when the body applies the same symbol at least
+    /// twice; a lone application of an unconstrained UF to fixed arguments is
+    /// semantically a fresh havoc, so it buys no precision and only hands the
+    /// solver a congruence-closure term to carry.
+    ///
+    /// The rule predates the first-class symbols: it was the cost control for
+    /// the Array-sorted frame column the lane used to add (#4259). MEASURED
+    /// then: with a >=1 rule, `Intrinsics/Math/Arith/powi.rs` (one `x.powi(2)`
+    /// per harness, proof `x^2 >= 0` needing only the even-power axiom) went
+    /// 2/2 -> 0/2, both harnesses lost to solver Timeout / SolverError. With
+    /// the >=2 rule it is untouched. That column is gone, but the rule is
+    /// retained so this migration is a pure encoding change; relaxing it is a
+    /// separate, separately measured decision.
     ///
     /// Conservative in the safe direction: a miss just leaves the pre-existing
     /// encoding in place. Calls that only appear after CHC inlining are not
     /// visible here and are not counted.
-    fn call_uf_table_needed(&self) -> bool {
+    fn call_uf_congruence_pays(&self) -> bool {
         let mut per_symbol: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         for block in &self.body.blocks {
@@ -588,7 +733,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         // Lane 2: PURE MATH INTRINSICS. Cheap path first — a call whose
         // arguments are all MIR constants folds exactly in Tier 1 and never
-        // needs the table.
+        // needs a summary symbol.
         if !args.is_empty() && !args.iter().all(|arg| matches!(arg, Operand::Constant(_))) {
             let path = self.resolve_callee_path(func);
             if let Some(key) = path.as_deref().and_then(math_uf_tag_key) {
@@ -601,13 +746,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
         let instance = resolve_call_instance(func, locals)?;
-        let body = instance.body()?;
+        let body = instance.callee_body()?;
         let effective = count_effective_blocks(&body);
         let too_big_to_inline = effective
             > super::call::inline_budget::chc_inline_effective_block_limit(&body, effective);
         if !too_big_to_inline && !callee_is_self_recursive(&instance, &body) {
-            // The precise inline lane can take it; do not pay a frame column
-            // for a call that never reaches the fallback.
+            // The precise inline lane can take it; do not mint a summary
+            // symbol for a call that never reaches the fallback.
             return None;
         }
         established_pure_scalar_callee(&instance).then(|| format!("fn:{}", instance.mangled_name()))

@@ -181,6 +181,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Some(path) = callee_path
             && let Some(op) = Self::euclid_method(path)
             && dcx.args.len() >= 2
+            && self.euclid_operands_are_integers(dcx)
         {
             div_euclid::codegen_euclid(self, dcx, target, op);
             return true;
@@ -264,7 +265,7 @@ impl<'tcx, 'body> CallCmpString for ChcCtx<'tcx, 'body> {
         let callee_path = dcx.callee_path.clone().or_else(|| self.resolve_callee_path(dcx.func));
         let Some(ref path) = callee_path else { return false };
         let Some(op) = Self::euclid_method(path) else { return false };
-        if dcx.args.len() < 2 {
+        if dcx.args.len() < 2 || !self.euclid_operands_are_integers(dcx) {
             return false;
         }
         let Some(target) = dcx.target else { return false };
@@ -349,6 +350,11 @@ impl<'tcx, 'body> CallCmpString for ChcCtx<'tcx, 'body> {
     fn try_dispatch_call_math_intrinsic(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
         let callee_path = dcx.callee_path.clone().or_else(|| self.resolve_callee_path(dcx.func));
         let Some(ref path) = callee_path else { return false };
+        if (path.ends_with("fabsf16") || path.ends_with("fabsf128"))
+            && try_emit_half_quad_fabs(self, dcx)
+        {
+            return true;
+        }
         let Some(is_f32) = math::detect_math_intrinsic(path) else { return false };
         if dcx.args.is_empty() {
             return false;
@@ -393,6 +399,16 @@ impl<'tcx, 'body> CallCmpString for ChcCtx<'tcx, 'body> {
         if dcx.args.len() < min_args {
             return false;
         }
+        // A compared value holding a reference is compared by referent; the
+        // handler below compares the terms it holds, which are addresses.
+        // `codegen_call_primitive_cmp` fails such a call closed.
+        if super::super::inline_ref_arg_binding::comparison_value_holds_nested_reference(
+            self,
+            &dcx.args[0],
+            self.body.locals(),
+        ) {
+            return false;
+        }
         debug!(
             path,
             method = method.unwrap_or("?"),
@@ -426,6 +442,41 @@ impl<'tcx, 'body> CallCmpString for ChcCtx<'tcx, 'body> {
             .or_else(|| self.resolve_callee_path(dcx.func))
             .or_else(|| self.resolve_fn_def_name(dcx.func));
 
+        // A comparison of a value that holds a reference below its leading
+        // reference levels compares REFERENTS (`(&o, 1u8) == (&c, 1u8)` ends in
+        // `*self.0 == *other.0`). Every lane below compares the terms it holds
+        // for such a value, which are addresses: `!((&o, 1u8) == (&c, 1u8))`
+        // with `o == c` was proved here
+        // (tools/soundness-duals/negative/review_r03_ref_in_aggregate.rs).
+        // The result is left unconstrained — unless the other side is a
+        // constant fieldless variant (`first(&a) == None`), which compares no
+        // referent (`comparison_against_fieldless_variant_constant`).
+        if let Some(path) = callee_path.as_deref()
+            && super::super::inline_ref_arg_binding::is_comparison_callee_path(path)
+            && dcx.args.first().is_some_and(|arg| {
+                super::super::inline_ref_arg_binding::comparison_value_holds_nested_reference(
+                    self,
+                    arg,
+                    self.body.locals(),
+                )
+            })
+            && !super::super::inline_ref_arg_binding::comparison_against_fieldless_variant_constant(
+                self, &dcx.args,
+            )
+        {
+            debug!(path, "cmp: compared value holds a reference; fail-closed fallback");
+            self.record_sound_fallback_reason("cmp_value_holds_reference");
+            super::super::codegen_call_fallback_emit::emit_sound_fallback_goto(
+                self,
+                dcx.from_app,
+                target,
+                dcx.modified_locals,
+                &[dcx.destination.local],
+                dcx.stmt_constraints,
+            );
+            return;
+        }
+
         if self.try_codegen_cmp_string_primary_dispatch(dcx, target, &callee_path)
             || self.try_codegen_cmp_string_arithmetic_dispatch(dcx, target, &callee_path)
             || self.try_codegen_cmp_string_intrinsic_dispatch(dcx, target, &callee_path)
@@ -435,4 +486,49 @@ impl<'tcx, 'body> CallCmpString for ChcCtx<'tcx, 'body> {
 
         self.codegen_tail_dispatch(dcx, &callee_path, target);
     }
+}
+
+/// `fabsf16` / `fabsf128` (Trust core: `fabs::<f16>` / `fabs::<f128>`, which read as those
+/// names): `dest = x` with the sign bit cleared, bit for bit, as IEEE abs and the frozen
+/// nightly's `f16::abs` / `f128::abs` (`from_bits(to_bits() & !(1 << (W - 1)))`) compute it.
+/// Only a real intrinsic is claimed, never a user function that happens to share the name.
+/// Returns `false` (leaving the call to the rest of the chain) when a sort does not fit.
+fn try_emit_half_quad_fabs(ctx: &mut ChcCtx<'_, '_>, dcx: &DispatchCallContext<'_>) -> bool {
+    use super::super::codegen_call_coerce::CallCoerce;
+    use super::super::codegen_rules::CodegenRules;
+
+    let is_intrinsic = dcx.func.ty(ctx.body.locals()).ok().is_some_and(|ty| {
+        matches!(
+            ty.kind(),
+            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(def, _))
+                if def.as_intrinsic().is_some()
+        )
+    });
+    let Some(target) = dcx.target else { return false };
+    if !is_intrinsic || dcx.args.len() != 1 {
+        return false;
+    }
+    let Some(value) = ctx.translate_operand_with_modified(&dcx.args[0], dcx.modified_locals) else {
+        return false;
+    };
+    let Some(width) = value.sort().bitvec_width().filter(|w| *w == 16 || *w == 128) else {
+        return false;
+    };
+    let dest_local = dcx.destination.local;
+    let Some((_, dest_var)) = ctx.resolve_destination(dest_local) else { return false };
+    let sign_cleared =
+        value.bvand(ay_bindings::Expr::bitvec_const(u128::MAX >> (129 - width), width));
+    let Some(eq) = ctx.make_coerced_eq_constraint(
+        &dest_var,
+        sign_cleared,
+        dest_var.sort(),
+        dest_local,
+        "half_quad_fabs",
+    ) else {
+        return false;
+    };
+    let output_args = ctx.build_output_args(dcx.modified_locals, &[dest_local]);
+    ctx.emit_goto_rule_extra(dcx.from_app, *target, &output_args, dcx.stmt_constraints, [eq]);
+    debug!(width, "CHC: fabsf16/fabsf128 as a sign-bit clear");
+    true
 }

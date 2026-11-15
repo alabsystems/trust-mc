@@ -163,6 +163,36 @@ pub(crate) fn cargo_config_args() -> Vec<CargoArg> {
     .to_vec()
 }
 
+/// The Trustc route's [`cargo_config_args`]. The same `--target` and host
+/// configuration, with host units given
+/// [`TRUSTC_HOST_RUSTFLAGS`](crate::session::trustc_route::TRUSTC_HOST_RUSTFLAGS)
+/// in both `host.rustflags` and `host.<host triple>.rustflags`. Cargo reads only the
+/// triple table once any configuration defines one (measured on seal 8571: a
+/// `[host.aarch64-apple-darwin]` table in a cargo configuration file replaced the
+/// command line's `host.rustflags`), and a command-line value merges into a file's
+/// table of the same name, so the route's host posture reaches build scripts and
+/// proc-macros whichever table cargo selects.
+pub(crate) fn trustc_cargo_config_args() -> Vec<CargoArg> {
+    let host = toml_string_array(crate::session::trustc_route::TRUSTC_HOST_RUSTFLAGS);
+    vec![
+        CargoArg::from("--target"),
+        CargoArg::from(env!("TARGET")),
+        CargoArg::from("-Zhost-config"),
+        CargoArg::from("-Ztarget-applies-to-host"),
+        CargoArg::from(format!("--config=host.rustflags={host}")),
+        CargoArg::from(format!("--config=host.{}.rustflags={host}", env!("TARGET"))),
+    ]
+}
+
+/// A TOML array of basic strings. The route's host flags hold no `"` or `\\`.
+pub(super) fn toml_string_array(items: &[&str]) -> String {
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|item| format!("\"{}\"", item.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", quoted.join(","))
+}
+
 /// Print the compiler message following the coloring schema.
 fn print_msg(diagnostic: &Diagnostic, use_rendered: bool) -> Result<()> {
     if use_rendered {

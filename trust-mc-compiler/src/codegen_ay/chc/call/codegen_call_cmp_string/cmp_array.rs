@@ -7,6 +7,9 @@
 //! Part of #3806: handles `[T; N]::partial_cmp`, `ge`, `le`, `lt`, `gt`
 //! where the operands are encoded as SMT Array sorts with BV elements.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -45,7 +48,7 @@ pub(in crate::codegen_ay::chc) fn array_len_from_operand(
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 let variants = def.variants();
                 if variants.len() == 1 && variants[0].fields().len() == 1 {
-                    inner = variants[0].fields()[0].ty_with_args(&args);
+                    inner = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 } else {
                     return None;
                 }
@@ -126,7 +129,7 @@ fn extract_array_len_from_ty(
         TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
             let variants = adt_def.variants();
             if variants.len() == 1 && variants[0].fields().len() == 1 {
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 extract_array_len_from_ty(field_ty, elem_ty)
             } else {
                 None
@@ -331,7 +334,7 @@ pub(in crate::codegen_ay::chc) fn packed_simd_element_width(
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 let variants = def.variants();
                 if variants.len() == 1 && variants[0].fields().len() == 1 {
-                    inner = variants[0].fields()[0].ty_with_args(&args);
+                    inner = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 } else {
                     return None;
                 }

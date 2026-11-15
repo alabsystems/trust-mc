@@ -7,6 +7,7 @@
 use crate::codegen_ay::chc::ChcCtx;
 use crate::codegen_ay::chc::call::chc_call_context::DispatchCallContext;
 use crate::codegen_ay::chc::call::codegen_call_array_solver_shadow::CallDispatchArraySolverShadow;
+use super::super::common::head_arg_for_state_idx;
 use ay_bindings::Expr;
 use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind};
 
@@ -31,8 +32,10 @@ fn assert_promoted_output_slot(
     idx: usize,
 ) {
     let out_name = &chc_ctx.state_var_mgr.output_state_vars[idx].0;
+    let head_arg = head_arg_for_state_idx(chc_ctx, rule, idx)
+        .unwrap_or_else(|| panic!("state slot {idx} is not a column of head {}", rule.head.name));
     assert!(
-        rule.head.args[idx].to_string().contains(out_name.as_ref()),
+        head_arg.to_string().contains(out_name.as_ref()),
         "expected state slot {idx} to use output var {out_name}, head args={:?}",
         rule.head.args
     );
@@ -175,7 +178,7 @@ fn find_constructor_ref_chain_locals(
         body.blocks.iter().flat_map(|block| block.statements.iter()).find_map(|stmt| {
             let StatementKind::Assign(
                 lhs,
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
             ) = &stmt.kind
             else {
                 return None;

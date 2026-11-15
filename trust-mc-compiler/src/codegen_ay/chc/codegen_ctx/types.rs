@@ -8,7 +8,7 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::ProjectionElem;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::args::{ChcStepMode, ChcTrackLevel};
@@ -63,7 +63,8 @@ pub(in crate::codegen_ay) struct ChcConfig {
     /// Emit arithmetic overflow error rules.
     pub overflow_checks: bool,
     /// Emit NaN-generation obligations for float binops (`--nan-check`).
-    /// OFF by default; NaN is defined behaviour in Rust, not UB.
+    /// OFF by default (Kani's default is on; see the driver's `--nan-check`).
+    /// NaN is defined behaviour in Rust, not UB.
     pub nan_checks: bool,
     /// Emit error rules for reachable undefined foreign function calls.
     pub undefined_function_checks: bool,
@@ -86,6 +87,23 @@ pub(in crate::codegen_ay) struct ChcConfig {
     /// the check easier than the contract's meaning — a fail-open. Immutable
     /// non-interior-mut statics and promoted constants stay pinned.
     pub contract_static_havoc: bool,
+    /// Run the syntactic straight-line discharge after translation. It replaces a VC it
+    /// has proven UNSAT with the trivially UNSAT `(=> false error)` system, which is
+    /// equisatisfiable, so it never changes a verdict. Production: always on. The
+    /// engine's unit tests default it OFF so encoding assertions see the translated
+    /// VC; a test that needs the discharged shape (or the solver speed-up) opts in.
+    /// Per translation, so an opt-in cannot leak into concurrently running tests.
+    pub straightline_discharge: bool,
+    /// Lost-checks recovery re-encode (`recover_lost_error_obligations`): the
+    /// translate passes keep every error obligation (see
+    /// `ChcVc::keep_error_obligations`) instead of erasing the last one, and
+    /// the discharge is deferred to emission. Never set on a first encode.
+    pub keep_error_obligations: bool,
+    /// `-Z loop-contracts` is active. The inline walker then books every
+    /// `kani_register_loop_contract` call it meets in a walked body, and every
+    /// havocked callee that reaches one, fail-closed (design 5): a walked body
+    /// is the RAW body, whose contracted loop runs with the invariant unchecked.
+    pub loop_contracts: bool,
 }
 
 impl Default for ChcConfig {
@@ -111,6 +129,9 @@ impl Default for ChcConfig {
             unwinding_assertions: true,
             uninit_checks: false,
             contract_static_havoc: false,
+            straightline_discharge: !cfg!(test),
+            keep_error_obligations: false,
+            loop_contracts: false,
         }
     }
 }
@@ -186,40 +207,40 @@ pub(in crate::codegen_ay::chc) struct ChcCollectionLenState {
     /// Maps local index to length variable name for collection locals.
     /// Example: local 3 (HashMap) -> "hashmap_len_local_3".
     /// Uses `Arc<str>` so `.get().cloned()` is a cheap ref-count bump (Part of #2267).
-    pub(in crate::codegen_ay::chc) len_var_names: HashMap<usize, Arc<str>>,
+    pub(in crate::codegen_ay::chc) len_var_names: BTreeMap<usize, Arc<str>>,
 
     /// Set of length variable names modified in the current block.
     /// Used for output argument selection (similar to modified memory arrays).
-    pub(in crate::codegen_ay::chc) modified_len_vars: HashSet<Arc<str>>,
+    pub(in crate::codegen_ay::chc) modified_len_vars: BTreeSet<Arc<str>>,
 
     /// Maps local index to capacity variable name for Vec locals (#2877).
     /// Example: local 1 (Vec) -> "vec_test_fn_cap_1".
-    pub(in crate::codegen_ay::chc) cap_var_names: HashMap<usize, Arc<str>>,
+    pub(in crate::codegen_ay::chc) cap_var_names: BTreeMap<usize, Arc<str>>,
 
     /// Set of capacity variable names modified in the current block.
-    pub(in crate::codegen_ay::chc) modified_cap_vars: HashSet<Arc<str>>,
+    pub(in crate::codegen_ay::chc) modified_cap_vars: BTreeSet<Arc<str>>,
 
     /// Maps local index to presence-array variable name for HashMap locals (#3057).
     /// Example: local 3 (HashMap) -> "hashmap_test_fn_present_3".
     /// The presence array is `Array(K, Bool)` — tracks key membership.
-    pub(in crate::codegen_ay::chc) present_var_names: HashMap<usize, Arc<str>>,
+    pub(in crate::codegen_ay::chc) present_var_names: BTreeMap<usize, Arc<str>>,
 
     /// Set of presence-array variable names modified in the current block.
-    pub(in crate::codegen_ay::chc) modified_present_vars: HashSet<Arc<str>>,
+    pub(in crate::codegen_ay::chc) modified_present_vars: BTreeSet<Arc<str>>,
 
     /// Task #69: length variables that were EVER constrained by a collection
     /// stub in this function. CUMULATIVE — never cleared at block boundaries.
     /// A current-length bounds guard (slice index) is only meaningful for a
     /// seeded len var: an unseeded one is a free variable, and a guard on it
     /// produces arbitrary counterexamples misclassified as Genuine.
-    pub(in crate::codegen_ay::chc) seeded_len_vars: HashSet<Arc<str>>,
+    pub(in crate::codegen_ay::chc) seeded_len_vars: BTreeSet<Arc<str>>,
 
     /// Task #69: collection locals whose sidecar/state was bypassed by a
     /// non-stub call path (e.g., a `&mut`-receiver method handled by the
     /// fn-inline translator, which mutates the Vec through raw memory and
     /// never syncs the sidecar length). Bounds guards must not trust the
     /// sidecar length of these locals. CUMULATIVE.
-    pub(in crate::codegen_ay::chc) sidecar_untrusted_locals: HashSet<usize>,
+    pub(in crate::codegen_ay::chc) sidecar_untrusted_locals: BTreeSet<usize>,
 }
 
 impl ChcCollectionLenState {

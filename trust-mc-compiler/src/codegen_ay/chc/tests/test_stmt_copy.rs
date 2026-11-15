@@ -429,13 +429,21 @@ fn test_mir_intrinsic_copy_with_offset_no_fallback() {
 
         let chc_ctx =
             ChcCtx::new(ctx.tcx, &body, "probe_intrinsic_copy_with_offset", ChcConfig::default());
-        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
+        let (_, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_eq!(
             diagnostics.fallback_count.get(),
             0,
             "offset intrinsic copy should stay on the precise path without demoted fallback"
         );
+        // Pre-pass VC: `arr` is written and read at constant indices, so `translate()`
+        // scalarizes the copy's store chain into per-lane scalars (7faa74cf9, 948cc5d4e).
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_intrinsic_copy_with_offset",
+            ChcConfig::default(),
+        ));
         let smt = emit_chc(&vc).to_string();
         assert!(
             smt.contains("(store"),

@@ -14,7 +14,9 @@ use rustc_public::mir::ProjectionElem;
 use tracing::debug;
 
 use crate::codegen_ay::names::{self, struct_sort, vec_layout};
-use crate::codegen_ay::types::ptr_sort;
+use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::ptr_repr::PtrRepr;
+use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
 use super::ChcCtx;
 use super::codegen_call_coerce::CallCoerce;
@@ -36,6 +38,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: usize,
         acc: &mut CallAccumulator<'_>,
     ) {
+        // A zero-sized element's capacity is `usize::MAX` (`RawVec::capacity`),
+        // whatever was reserved; the model tracked 0 for `Vec::<()>::new()`,
+        // so `v.capacity() == usize::MAX`, which Kani proves, failed certified
+        // Genuine (walker fail-closed review, round 2 of the repair after the
+        // merge with main, `vec_capacity_growth_dual.rs`).
+        if let Some(coll_local) = collection_local
+            && self.vec_capacity_elem_size(self.body.locals()[coll_local].ty) == Some(0)
+        {
+            if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
+                if let Some(eq) = self.make_coerced_eq_constraint(
+                    &dest_var,
+                    Expr::bitvec_const(u64::MAX, POINTER_WIDTH),
+                    dest_var.sort(),
+                    dest_local,
+                    "codegen_call_vec_core::VecCapacity",
+                ) {
+                    acc.constraints.push(eq);
+                }
+                acc.dests.push(dest_local);
+            }
+            return;
+        }
         // Path A: sidecar cap variable (primary — matches vec_op_len pattern).
         if let Some(coll_local) = collection_local
             && let Some(cap_var_name) = self.collections.len_state.get_cap_var(coll_local).cloned()
@@ -100,11 +124,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         modified_locals: &HashSet<usize>,
         collection_local: Option<usize>,
+        field_projections: &[rustc_public::mir::ProjectionElem],
         dest_local: usize,
         acc: &mut CallAccumulator<'_>,
     ) {
-        let ptr_resolved = collection_local
-            .and_then(|coll_local| self.resolve_vec_ptr_expr(coll_local, modified_locals));
+        // A `vec![e; n]` buffer whose fill is only in the collection's `data`
+        // array (`vec_op_from_elem`): a read through the pointer would load bytes
+        // no rule wrote (`*vec![7u8; n].as_ptr() == 7` FAILED certified Genuine on
+        // main c22e1022e). The pointer itself stays exact.
+        if collection_local.is_some_and(|coll_local| self.vec_local_from_unfilled_elem(coll_local))
+        {
+            self.record_sound_fallback_reason("vec_from_elem_fill_unmaterialized");
+        }
+        // A `Vec` in a field of a struct (`s.v.as_mut_ptr()`): the receiver's
+        // ref target is the struct with the field projection, and only the
+        // struct-embedded resolution selects that field. The whole-local
+        // routes read the STRUCT as if it were the Vec (or loaded a Vec from
+        // memory at the struct's value).
+        let ptr_resolved = collection_local.and_then(|coll_local| {
+            if !field_projections
+                .iter()
+                .any(|p| matches!(p, rustc_public::mir::ProjectionElem::Field(..)))
+            {
+                self.resolve_vec_ptr_expr(coll_local, modified_locals)
+            } else {
+                self.vec_as_slice_struct_embedded(coll_local, field_projections, modified_locals)
+                    .map(|(ptr, _, _, _)| ptr)
+            }
+        });
         if let Some(ptr_expr) = ptr_resolved {
             if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
                 if let Some(eq) = self.make_coerced_eq_constraint(
@@ -119,9 +166,40 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 acc.dests.push(dest_local);
             }
         } else {
-            // Fallback: leave unconstrained (collection_local not resolved).
+            // Fallback: leave unconstrained (collection_local not resolved): a
+            // fresh pointer value, which no certified counterexample may rest on.
+            self.record_sound_fallback_reason("vec_as_ptr_unresolved");
             acc.dests.push(dest_local);
         }
+    }
+
+    /// Whether the Vec `local`, or a local it was moved or copied from whole,
+    /// is a `vec![e; n]` destination whose fill is not in the byte image.
+    fn vec_local_from_unfilled_elem(&self, local: usize) -> bool {
+        use rustc_public::mir::{Operand, Rvalue, StatementKind};
+        let mut work = vec![local];
+        let mut seen = HashSet::new();
+        while let Some(l) = work.pop() {
+            if !seen.insert(l) {
+                continue;
+            }
+            if self.collections.unfilled_from_elem_vecs.contains(&l) {
+                return true;
+            }
+            for block in &self.body.blocks {
+                for stmt in &block.statements {
+                    if let StatementKind::Assign(lhs, rhs) = &stmt.kind
+                        && lhs.local == l
+                        && lhs.projection.is_empty()
+                        && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rhs
+                        && src.projection.is_empty()
+                    {
+                        work.push(src.local);
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn resolve_vec_ptr_expr(
@@ -270,11 +348,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let slice_view = Expr::datatype_constructor(
                         slice_name,
                         ctor_name,
-                        vec![ptr.clone(), len, data],
+                        vec![ptr.clone(), len.clone(), data],
                         slice_sort,
                     );
                     self.ref_resolution.const_ref_slice_views.insert(dest_local, slice_view);
-                    ptr
+                    // Design 4: a wide `&[T]` slot carries the Vec's length in
+                    // its high half. The bare `fld_ptr` was zero-extended into
+                    // it, so a loop-carried or joined slice built from a Vec
+                    // read length 0.
+                    if out_sort.bitvec_width() == Some(2 * POINTER_WIDTH)
+                        && ptr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        && len.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        && let Some(packed) = PtrRepr::from_declared_roles(
+                            Loc::of_address(ptr.clone()),
+                            Val::of_value(len),
+                        )
+                        .into_packed()
+                    {
+                        packed
+                    } else {
+                        ptr
+                    }
                 } else {
                     let elem_sort = data_sort
                         .array_sort()
@@ -484,6 +578,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // (memory-backed), use the type directly.
         let local_ty = self.body.locals().get(coll_local)?.ty;
         let pointee_ty = Self::deref_pointee_ty(local_ty).unwrap_or(local_ty);
+        // Only a `Vec` (or a pointer to one) is a Vec in memory: a struct that
+        // holds one is not, and loading a Vec at the struct's value read a
+        // buffer pointer from an arbitrary cell (`s.v.as_mut_ptr()`, third
+        // review of round 10, `r3_dead5.rs` n02).
+        let is_vec = matches!(self.resolve_body_ty(pointee_ty).kind(),
+            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _))
+                if rustc_public::CrateDef::name(&def).ends_with("vec::Vec"));
+        if !is_vec {
+            return None;
+        }
 
         debug!(
             fn_name = %self.fn_name,

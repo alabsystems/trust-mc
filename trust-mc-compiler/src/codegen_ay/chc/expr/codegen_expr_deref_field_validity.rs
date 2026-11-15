@@ -30,25 +30,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         }
 
-        if let Some(addr) = self.known_stack_addr_expr(local_idx)
+        let stack_owner = if let Some(addr) = self.known_stack_addr_expr(local_idx)
             && let Some((obj_id, _)) = Self::try_extract_constant_addr(&addr)
-            && self.heap_state.local_idx_for_obj_id(obj_id).is_some()
+            && let Some(owner) = self.heap_state.local_idx_for_obj_id(obj_id)
         {
-            debug!(
-                local_idx,
-                obj_id,
-                "CHC: raw pointer deref points at stack local; obj_valid check is trivially true"
-            );
-            return;
-        }
-        if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx)
+            Some(owner)
+        } else if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx)
             && self.body.locals().get(ref_target.local).is_some()
+            && !ref_target
+                .projections
+                .iter()
+                .any(|p| matches!(p, rustc_public::mir::ProjectionElem::Deref))
         {
-            debug!(
-                local_idx,
-                target_local = ref_target.local,
-                "CHC: raw pointer deref targets MIR stack local; obj_valid check is trivially true"
-            );
+            Some(ref_target.local)
+        } else {
+            None
+        };
+        if let Some(owner) = stack_owner {
+            // A zero-sized access touches no allocation, even after StorageDead.
+            let TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) = base_ty.kind() else { return };
+            if self.get_type_size(pointee) == Some(0) {
+                return;
+            }
+            match self.stack_local_is_live(owner) {
+                Some(true) => {}
+                Some(false) => self.heap_state.pending_checks.push(Expr::bool_const(false)),
+                None => {
+                    self.record_sound_fallback_reason("raw_ptr_stack_lifetime_unknown");
+                }
+            }
             return;
         }
 
@@ -99,8 +109,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .map(|addr| addr.into_expr().extract(63, 32))
         };
         if let Some(obj_id) = traced_obj_id.or_else(state_obj_id) {
-            let obj_valid = self.current_obj_valid_array();
-            self.heap_state.pending_checks.push(obj_valid.select(obj_id));
+            let (live, uncertain) = self.same_allocation_live_obj_predicate(obj_id);
+            if uncertain {
+                self.record_sound_fallback_reason("raw_ptr_stack_lifetime_unknown");
+            }
+            self.heap_state.pending_checks.push(live);
             // Part of #3436: track that this block reads heap metadata.
             self.mark_heap_metadata_read();
             debug!(

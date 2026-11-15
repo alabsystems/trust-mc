@@ -174,8 +174,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 break;
                             }
                         }
-                        if let rustc_public::mir::Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) =
-                            rhs
+                        if let rustc_public::mir::Rvalue::Use(
+                            Operand::Copy(p) | Operand::Move(p),
+                            ..,
+                        ) = rhs
                         {
                             if p.projection.is_empty() {
                                 local = p.local;
@@ -281,8 +283,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 break;
                             }
                         }
-                        if let rustc_public::mir::Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) =
-                            rhs
+                        if let rustc_public::mir::Rvalue::Use(
+                            Operand::Copy(p) | Operand::Move(p),
+                            ..,
+                        ) = rhs
                         {
                             if p.projection.is_empty() {
                                 local = p.local;
@@ -387,12 +391,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: usize,
         read_only: bool,
     ) {
+        // An index call needs (slice_or_self, index). With fewer operands the index
+        // lowering has already emitted its sound fallback and there is no index read
+        // to record; `split_chc_slice_index_args` indexes `args[0]` unconditionally.
+        if args.len() < 2 {
+            return;
+        }
         let (slice_arg, index_arg) = self.split_chc_slice_index_args(args);
 
         // Extract slice local from operand.
         let slice_local = match slice_arg {
             Operand::Copy(place) | Operand::Move(place) => place.local,
             Operand::Constant(_) => return,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return,
         };
 
         // Resolve Vec local: first try slice→vec mapping (set by VecAsSlice),

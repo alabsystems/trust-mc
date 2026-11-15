@@ -6,6 +6,9 @@
 //!
 //! Extracted from `codegen_expr_reconstruct.rs` — Part of #4206.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -338,7 +341,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else { return None };
         for variant in def.variants() {
             for field in variant.fields() {
-                let fty = field.ty_with_args(&args);
+                let fty = mono_ty::field_ty(&field, &args)?;
                 if matches!(fty.kind(), TyKind::RigidTy(RigidTy::Array(..))) {
                     return Some(fty.layout().ok()?.shape().size.bytes() as u64);
                 }

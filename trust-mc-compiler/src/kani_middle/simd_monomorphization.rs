@@ -24,6 +24,9 @@
 //! bounds) simply keep their current behavior; this pass never rejects a
 //! program rustc accepts.
 
+#[cfg(all(trust_toolchain, version("1.101")))]
+use rustc_codegen_ssa::diagnostics::InvalidMonomorphization;
+#[cfg(not(all(trust_toolchain, version("1.101"))))]
 use rustc_codegen_ssa::errors::InvalidMonomorphization;
 use rustc_middle::ty::{self, Ty as TyInternal, TyCtxt};
 use rustc_public::mir::mono::MonoItem;
@@ -88,7 +91,7 @@ fn check_body(tcx: TyCtxt, body: &Body) {
         let Ok(ret_ty_stable) = destination.ty(body.locals()) else { continue };
         let ret_ty = rustc_internal::internal(tcx, ret_ty_stable);
         let arg2_ty = internal_operand_ty(tcx, body, args, 2);
-        let span = rustc_internal::internal(tcx, bb.terminator.span);
+        let span = rustc_internal::internal(tcx, mir_span!(bb.terminator));
         check_simd_call(tcx, &name, span, in_ty, ret_ty, arg2_ty);
     }
 }

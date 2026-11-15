@@ -15,8 +15,9 @@
 //! 2. **Consecution:** Invariant is preserved by one loop iteration
 //! 3. **Safety:** Invariant implies the user property at loop exit
 //!
-//! If all 3 checks pass (UNSAT), the VC is replaced with a trivially
-//! safe system (no rules derive error), allowing the driver to report PROOF.
+//! If all 3 checks pass (UNSAT), the VC is replaced with the certified
+//! discharge shape (one `(=> false error)` obligation), allowing the driver to
+//! report PROOF.
 //!
 //! Part of #3258: Alternative to PDR synthesis for detected patterns.
 //! Design: designs/2026-03-06-issue-3258-local-maximum-alternative.md
@@ -47,7 +48,12 @@ pub(in crate::codegen_ay::chc) fn apply_template_check(ctx: &mut ChcCtx<'_, '_>)
     // Try forward accumulator TIC: sum += counter; counter += 1
     if try_forward_accumulator_tic(&result) {
         info!(fn_name = %ctx.fn_name, "TIC: forward accumulator invariant verified");
-        ctx.vc.rules.clear();
+        // Keep the certified-discharge shape, an explicit `(=> false error)`
+        // obligation, not an empty rule set: with registered properties an
+        // empty rule set is the LOST-checks shape the driver fails closed.
+        crate::codegen_ay::chc::straightline_proof::replace_with_unsat_error_obligation(
+            &mut ctx.vc,
+        );
         ctx.vc.trivially_safe_discharged = true;
         return true;
     }
@@ -55,7 +61,12 @@ pub(in crate::codegen_ay::chc) fn apply_template_check(ctx: &mut ChcCtx<'_, '_>)
     // Try countdown accumulator TIC: sum += n; counter -= 1
     if try_countdown_accumulator_tic(&result) {
         info!(fn_name = %ctx.fn_name, "TIC: countdown accumulator invariant verified");
-        ctx.vc.rules.clear();
+        // Keep the certified-discharge shape, an explicit `(=> false error)`
+        // obligation, not an empty rule set: with registered properties an
+        // empty rule set is the LOST-checks shape the driver fails closed.
+        crate::codegen_ay::chc::straightline_proof::replace_with_unsat_error_obligation(
+            &mut ctx.vc,
+        );
         ctx.vc.trivially_safe_discharged = true;
         return true;
     }
@@ -76,6 +87,12 @@ fn ay_check_unsat(smt2: &str, check_name: &str) -> bool {
     };
 
     let mut executor = ay_dpll::Executor::new();
+    // Verdict only — the template check reads `unsat` and nothing else. ay's
+    // bare posture at 10bc4b185 does search-time proof tracking no consumer
+    // here reads, at ~40x the decision time on BV/array VCs (see
+    // `integration_ay_runner::run_ay_smt2`); competition mode sheds exactly
+    // that. A slow `unknown` here would silently refuse a valid template.
+    executor.set_competition_mode(true);
     executor.set_timeout(Some(std::time::Duration::from_secs(10)));
     let outputs = match executor.execute_all(&commands) {
         Ok(outputs) => outputs,

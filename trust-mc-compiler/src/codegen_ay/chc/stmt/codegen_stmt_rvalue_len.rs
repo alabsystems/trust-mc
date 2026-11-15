@@ -10,11 +10,12 @@
 //! - unanimous range-call side metadata
 //! - `try_resolve_len_from_datatype`: extract fld_len from Vec/Slice Datatypes
 
-use std::collections::HashSet;
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
+use std::collections::{HashMap, HashSet};
 
 use ay_bindings::Expr;
 use rustc_public::mir::{
-    CastKind, Operand, Place, PointerCoercion, ProjectionElem, Rvalue, StatementKind,
+    Body, CastKind, Operand, Place, PointerCoercion, ProjectionElem, Rvalue, StatementKind,
     TerminatorKind,
 };
 use rustc_public::ty::{RigidTy, Ty, TyKind};
@@ -23,7 +24,7 @@ use tracing::{debug, warn};
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
 use super::ChcCtx;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_stmt_projection::{UnknownProjectionPolicy, collect_field_projections};
 
 const MAX_SLICE_LEN_PROVENANCE_STEPS: usize = 128;
@@ -306,9 +307,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn fresh_symbolic_len(&mut self, reason: &'static str) -> Expr {
-        self.record_sound_fallback_reason(reason);
+        let booked = self.record_sound_fallback_reason(reason);
         let len_name = chc_fresh_name("__len_nondet");
-        declare_pending_var(len_name, ptr_sort())
+        Havoc::booked(booked, len_name, ptr_sort())
     }
 
     /// Resolve a `Len` place without erasing the distinction between no
@@ -501,7 +502,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .ty(self.body.locals())
                 .ok()
                 .map_or(SliceLenEvidence::Conflict, exact_array_len_from_ty),
-            Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
+            Rvalue::Use(Operand::Copy(source) | Operand::Move(source), ..)
                 if source.projection.is_empty() =>
             {
                 self.slice_len_evidence_for_local(source.local, visiting, steps)
@@ -614,6 +615,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 if let Rvalue::Use(
                     rustc_public::mir::Operand::Copy(src) | rustc_public::mir::Operand::Move(src),
+                    ..,
                 ) = rhs
                 {
                     if src.projection.is_empty() {
@@ -641,6 +643,78 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &self,
         local: usize,
     ) -> bool {
+        self.whole_definition_counts
+            .get_or_init(|| whole_definition_counts(self.body))
+            .get(&local)
+            .is_some_and(|&count| count > 1)
+    }
+
+    /// Whether `local`'s value can differ between the paths reaching a use: it has
+    /// several whole-local producers, or its one producer copies, casts or
+    /// reborrows (`&(*x)`, `&raw (*x)`) a local that does. Every side table that
+    /// names ONE referent for such a local named the producer encoded last, so a
+    /// store `*p = v` through `p = if c { &mut b } else { &mut a }` resolved to a
+    /// single constant object on both paths.
+    pub(in crate::codegen_ay::chc) fn pointer_value_is_path_dependent(&self, local: usize) -> bool {
+        self.path_dependent_pointer_locals
+            .get_or_init(|| {
+                use rustc_public::mir::{Operand, Rvalue};
+                let mut single_source: HashMap<usize, usize> = HashMap::new();
+                for block in &self.body.blocks {
+                    for stmt in &block.statements {
+                        let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                        if !lhs.projection.is_empty() {
+                            continue;
+                        }
+                        let source = match rhs {
+                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+                            | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
+                                if src.projection.is_empty() =>
+                            {
+                                Some(src.local)
+                            }
+                            Rvalue::CopyForDeref(src) if src.projection.is_empty() => {
+                                Some(src.local)
+                            }
+                            Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place)
+                                if matches!(
+                                    place.projection.as_slice(),
+                                    [ProjectionElem::Deref]
+                                ) =>
+                            {
+                                Some(place.local)
+                            }
+                            _ => None,
+                        };
+                        if let Some(source) = source {
+                            single_source.insert(lhs.local, source);
+                        }
+                    }
+                }
+                let mut dependent: HashSet<usize> = (0..self.body.locals().len())
+                    .filter(|local| self.local_has_multiple_whole_definitions(*local))
+                    .collect();
+                loop {
+                    let before = dependent.len();
+                    for (dest, source) in &single_source {
+                        if dependent.contains(source)
+                            && !self.local_has_multiple_whole_definitions(*dest)
+                        {
+                            dependent.insert(*dest);
+                        }
+                    }
+                    if dependent.len() == before {
+                        break;
+                    }
+                }
+                dependent
+            })
+            .contains(&local)
+    }
+
+    /// `true` when `local` has more than one whole-local producer (an unprojected
+    /// assignment or a call destination) anywhere in the body.
+    fn count_whole_definitions_uncached(&self, local: usize) -> bool {
         let stmt_definition_count = self
             .body
             .blocks
@@ -671,6 +745,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         stmt_definition_count + call_definition_count > 1
     }
 
+    /// A tracked dereference store may replace this local's value even when
+    /// its ordinary MIR assignment count is one. The byte-rewrite walk
+    /// distinguishes that referent from the pointer used to write through it.
+    pub(in crate::codegen_ay::chc) fn local_has_tracked_indirect_writes(
+        &self,
+        local: usize,
+    ) -> bool {
+        self.encode.deref_store_target_locals.contains(&local)
+            && self.local_bytes_may_be_rewritten(local)
+    }
+
+    /// Historical metadata is authoritative only while every producer's storage
+    /// is stable across the body. Counting whole assignments alone misses a
+    /// replacement through `&mut local`, including nested aliases and byte writes.
+    /// Otherwise the caller must read the current wide pointer's metadata.
+    /// This cache depends only on immutable MIR, never on block encoding order.
+    pub(in crate::codegen_ay::chc) fn path_insensitive_metadata_is_stable(
+        &self,
+        local: usize,
+    ) -> bool {
+        if let Some(stable) = self.metadata_source_stability.borrow().get(&local) {
+            return *stable;
+        }
+        let stable = !self.local_has_multiple_whole_definitions(local)
+            && !self.local_bytes_may_be_rewritten(local);
+        self.metadata_source_stability.borrow_mut().insert(local, stable);
+        stable
+    }
+
     /// Path-insensitive metadata may cross a local-to-local identity edge only
     /// when both endpoints have a single whole-local producer. Otherwise a
     /// `HashMap<Local, Expr>` can retain one CFG predecessor and revive it under
@@ -682,6 +785,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> bool {
         !self.local_has_multiple_whole_definitions(source_local)
             && !self.local_has_multiple_whole_definitions(dest_local)
+            && !self.local_has_tracked_indirect_writes(source_local)
+            && !self.local_has_tracked_indirect_writes(dest_local)
     }
 
     /// Extract `fld_len` from a Vec/Slice Datatype state variable for `Rvalue::Len`.
@@ -758,4 +863,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             None
         }
     }
+}
+
+/// Per local, the number of whole-local producers in `body`, saturating at 2:
+/// `_l = ...` statements with an empty projection plus `Call` terminators whose
+/// destination is `_l` with an empty projection. Exactly the two counts the old
+/// per-query scan summed (each `take(2)`), so `count > 1` is the same boolean.
+pub(in crate::codegen_ay::chc) fn whole_definition_counts(body: &Body) -> HashMap<usize, u8> {
+    let mut counts: HashMap<usize, u8> = HashMap::new();
+    let mut bump = |local: usize| {
+        let count = counts.entry(local).or_insert(0);
+        *count = count.saturating_add(1).min(2);
+    };
+    for block in &body.blocks {
+        for stmt in &block.statements {
+            if let StatementKind::Assign(lhs, _) = &stmt.kind
+                && lhs.projection.is_empty()
+            {
+                bump(lhs.local);
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
+            && destination.projection.is_empty()
+        {
+            bump(destination.local);
+        }
+    }
+    counts
 }

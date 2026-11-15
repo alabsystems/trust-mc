@@ -213,11 +213,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let arr_var = self.ctx.declare_var(&arr_ssa, new_array.sort().clone());
             // SSA def with ite semantics (#2081)
             self.assert_ssa_def(arr_var.clone(), new_array, arr_base);
-            self.env_update(*arr_base, arr_var);
+            self.env_update(*arr_base, arr_var.clone());
             debug!(
                 "try_codegen_datatype_field_assign: stored updated element into array {}",
                 arr_ssa
             );
+            // The array this wrote may itself be a SLOT of an enclosing place —
+            // `&mut h.a` names `..._field_0`, whose value lives in `h`. Without
+            // the walk the new array stayed under the derived name and every
+            // read of `h.a[i]` re-derived the PRE-STORE array from `h`:
+            // `let p = &mut h.a; p[0].x = 9; assert!(h.a[0].x == 0)` was
+            // VERIFICATION:- SUCCESSFUL with [AY:PROOF_QUALIFIERS:clean]
+            // (pre-existing on origin/main fe89d6a0d; on this branch it stopped
+            // being masked once the repeat array became exact). The non-array
+            // branch below has always done this; the array branch now does too,
+            // and the walk records a fail-closed reason for anything it cannot
+            // place.
+            if is_deref_path {
+                self.try_propagate_deref_write_to_parent_datatype(arr_base, &arr_var, lhs);
+            }
         } else {
             let root_ssa = self.ssa_name_from_base(root_base_name.as_ref(), true);
             let root_var = self.ctx.declare_var(&root_ssa, root_expr.sort().clone());
@@ -248,10 +262,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     "datatype field assign: ref {} -> {} (pointee={})",
                     field_base, pointee_base, pointee_base
                 );
-                self.ref_pointees
-                    .insert(std::sync::Arc::from(field_base), std::sync::Arc::from(pointee_base));
+                self.ref_pointees.insert(
+                    std::sync::Arc::from(field_base.as_str()),
+                    std::sync::Arc::from(pointee_base),
+                );
+                self.rebind_field_through_deref_alias(lhs, &field_base);
             }
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
                 let src_base = self.ssa_base_name(src);
                 if let Some(pointee) = self.ref_pointees.get(src_base.as_str()).cloned() {
                     let field_base = self.ssa_base_name(lhs);
@@ -259,7 +276,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         "datatype field assign: propagating ref {} -> {} (pointee={})",
                         src_base, field_base, pointee
                     );
-                    self.ref_pointees.insert(std::sync::Arc::from(field_base), pointee);
+                    self.ref_pointees
+                        .insert(std::sync::Arc::from(field_base.as_str()), pointee);
+                    self.rebind_field_through_deref_alias(lhs, &field_base);
                 }
             }
             _ => {} // external enum: Rvalue
@@ -433,6 +452,49 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         debug!("datatype field-index store: stored into array field of {base_name}");
         true
+    }
+
+    /// A field store THROUGH a dereference records its pointee binding under the
+    /// DEREF ALIAS name (`{ref}_deref_field_N`), which no read of the storage
+    /// resolves to. `let r = &mut h; (*r).p = &mut y;` wrote
+    /// `ref_pointees[r_deref_field_0] = y` while `h.p`'s own key
+    /// `h_field_0` kept naming `x`, so `*h.p = 9` afterwards wrote `x` and
+    /// `assert!(y == 2)` verified SUCCESSFUL with `[AY:PROOF_QUALIFIERS:clean]`
+    /// (fourth adversarial review of m3/soundness-fixes-2, 2026-09-14, defect
+    /// M3/D4 — the BMC half).
+    ///
+    /// Re-record the same binding under the STORAGE's own name when the
+    /// reference resolves to one. If it does not, every binding under the alias
+    /// root is poisoned and the statement records a fail-closed reason: a kept
+    /// entry names the pre-store referent.
+    fn rebind_field_through_deref_alias(&mut self, lhs: &Place, field_base: &str) {
+        if !matches!(lhs.projection.first(), Some(ProjectionElem::Deref)) {
+            return;
+        }
+        let root_place = Place { local: lhs.local, projection: vec![] };
+        let ptr_base = self.ssa_base_name(&root_place);
+        let alias_root = format!("{ptr_base}_deref");
+        let Some(suffix) = field_base.strip_prefix(alias_root.as_str()) else {
+            return;
+        };
+        let Some(pointee_base) = self.resolved_stack_pointee_base(&ptr_base) else {
+            let now = self.ref_pointees.generation();
+            self.ref_pointees.poison_stale_since(&alias_root, now);
+            self.ctx.unsupported_with_fallback(
+                "pointer_stored_through_deref_rebinds_target",
+                format!("{alias_root}{suffix}: the storage behind the reference is unknown"),
+            );
+            return;
+        };
+        let Some(pointee) = self.ref_pointees.get(field_base).cloned() else {
+            return;
+        };
+        let storage_key = format!("{pointee_base}{suffix}");
+        debug!(
+            "datatype field assign: rebinding {} -> {} (pointee={})",
+            field_base, storage_key, pointee
+        );
+        self.ref_pointees.insert(std::sync::Arc::from(storage_key.as_str()), pointee);
     }
 
     // try_propagate_deref_write_to_parent_datatype, datatype_field_select,

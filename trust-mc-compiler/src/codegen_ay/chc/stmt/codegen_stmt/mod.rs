@@ -31,6 +31,10 @@ use super::{ChcCtx, chc_debug_enabled};
 // Sub-module for SetDiscriminant encoding (Part of #3743).
 mod codegen_stmt_set_discriminant;
 
+// Side-table `subslice_len` entries withheld where their cached length reads a
+// column outside the block's relation frame.
+mod subslice_len_frame;
+
 // Sub-module for arithmetic safety check conditions (shift distance, div-by-zero,
 // signed div overflow), extracted to stay under 500-line limit. Part of #3363.
 // Visibility widened to `chc` so the SIMD div/rem lane checks can reuse the
@@ -73,14 +77,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Part of #3436: Track current block for per-block read tracking.
         self.current_encode_bb = bb_idx;
+        // FC-06 (DFCC freshness): allocations made while this block is encoded
+        // belong to the modifies frame this block is inside, if any.
+        self.heap_state.current_modifies_frame = self.modifies_frame_by_bb.get(&bb_idx).copied();
+        self.heap_state.encode_bb = bb_idx;
+        // A cached subslice length must not read a column this block's frame
+        // does not carry; see `subslice_len_frame`.
+        self.refresh_subslice_len_frame(bb_idx);
 
         // Reset memory array modification tracking for new block (#905)
         self.heap_state.reset_modified_arrays();
         self.heap_state.reset_pending_checks();
+        self.modifies_frame_net_reset_block();
         // Initialize dead-locals set from block-entry dataflow state.
         // Done before clear_block so the dead set can guide env retention (#3474).
         self.liveness.dead_locals =
             self.liveness.dead_locals_at_entry.get(bb_idx).cloned().unwrap_or_default();
+        self.liveness.maybe_dead_locals =
+            self.liveness.maybe_dead_locals_at_entry.get(bb_idx).cloned().unwrap_or_default();
         // Reset per-block encoding state (signedness, expr env, field env, modified indices).
         // Part of #3474: pass dead set so flattened_field_env retains entries for dead locals.
         self.encode.clear_block(&self.liveness.dead_locals);
@@ -105,11 +119,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return (constraints, output_args, HashSet::new(), Vec::new());
         };
         let aggregate_field_sources = self.collect_aggregate_field_sources();
-        for stmt in &bb_data.statements {
+        // Memory this block rewrites or reads under a type it was not written
+        // as (`untyped_view_scan.rs`): decided from the MIR, recorded here so
+        // every encoded block carries its own reasons.
+        self.record_untyped_view_reasons(bb_idx);
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        self.native_init_stores.remove(&bb_idx);
+        for (statement_index, stmt) in bb_data.statements.iter().enumerate() {
+            // Each statement's memory writes form their own heap view groups.
+            self.heap_state.view_ledger.next_statement();
             // Track locals entering/leaving scope for dead-object detection.
             if let StatementKind::StorageLive(local) = &stmt.kind {
                 let local_idx: usize = *local;
                 self.liveness.dead_locals.remove(&local_idx);
+                self.liveness.maybe_dead_locals.remove(&local_idx);
                 debug!(
                     "bb{} StorageLive(_{}) dead_locals={:?}",
                     bb_idx, local_idx, self.liveness.dead_locals
@@ -121,6 +144,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let StatementKind::StorageDead(local) = &stmt.kind {
                 let local_idx: usize = *local;
                 self.liveness.dead_locals.insert(local_idx);
+                self.liveness.maybe_dead_locals.insert(local_idx);
                 debug!(
                     "bb{} StorageDead(_{}) dead_locals={:?}",
                     bb_idx, local_idx, self.liveness.dead_locals
@@ -131,25 +155,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let StatementKind::Intrinsic(intrinsic) = &stmt.kind {
                 match intrinsic {
                     rustc_public::mir::NonDivergingIntrinsic::Assume(op) => {
-                        // Preserve intrinsic assume semantics for MIR that still uses
-                        // StatementKind::Intrinsic(Assume) instead of kani::assume call.
-                        // Part of #2759: track dropped assumes via counter.
+                        // `intrinsics::assume(P)` is UB when P is false, and Kani
+                        // asserts it ("Rust intrinsic assumption failed"). With
+                        // `ub_checks()` false it is the only obligation left for
+                        // `hint::assert_unchecked`, so ASSUMING it pruned the
+                        // violating path and proved the harness
+                        // (tools/soundness-duals/assert_unchecked_intrinsic_dual.rs).
+                        // Kind `Assumption` renders as class `assume`, Kani's
+                        // class for this check: UB, not a panic, so a
+                        // should_panic harness that fails only here fails.
+                        // The condition is checked, not added to the block
+                        // constraints: the check's error rule reads those
+                        // constraints, and P there would make it vacuous. Where P
+                        // can be false the harness fails on the check; where it
+                        // cannot, P is already implied, so nothing is lost.
                         let cond = self.translate_operand_with_modified(op, &modified);
                         let bool_cond = cond.and_then(|c| self.to_bool_expr(c, bb_idx));
                         if let Some(bc) = bool_cond {
-                            constraints.push(bc);
+                            self.heap_state.pending_kinded_checks.push((
+                                bc,
+                                trust_mc_core::violation::PropertyKind::Assumption,
+                                Some("Rust intrinsic assumption failed".to_string()),
+                            ));
                         } else {
-                            // Part of #3099: dropping assume(P) is a sound over-approximation.
                             let dropped = self.diagnostics.assume_dropped_transition.inc_get();
                             warn!(
                                 bb_idx,
                                 dropped_assume_semantics = dropped,
-                                "Intrinsic::Assume guard dropped — sound over-approximation"
+                                "Intrinsic::Assume check untranslatable — failing closed"
                             );
-                            self.record_sound_fallback_reason("assume_guard_dropped");
+                            self.record_sound_fallback_reason("assume_intrinsic_check_dropped");
                         }
                     }
                     rustc_public::mir::NonDivergingIntrinsic::CopyNonOverlapping(copy) => {
+                        // FC-06: the copied bytes land at `dst`; inside a modifies
+                        // frame they must be assignable.
+                        self.modifies_frame_copy_statement_check(copy, &modified);
                         // Part of #2759: track unresolved CopyNonOverlapping via record_fallback.
                         let handled = {
                             let mut acc = StmtAccumulator::new(
@@ -157,9 +198,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 &mut constraints,
                                 &mut last_constraint_for_local,
                             );
-                            self.try_encode_copy_nonoverlapping_intrinsic(
-                                copy, bb_idx, &mut acc, false,
-                            )
+                            self.try_encode_copy_as_typed_store(copy, bb_idx, &mut acc)
+                                || self.try_encode_copy_nonoverlapping_intrinsic(
+                                    copy, bb_idx, &mut acc, false,
+                                )
                         };
                         if !handled {
                             // Part of #3369: Reclassified SOUND_APPROXIMATION → DEMOTED.
@@ -242,6 +284,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // (deref loads, ShallowInitBox, casts, aggregates, refs). Part of #4130.
                 self.propagate_alloc_ids_for_assign(lhs, rhs, local_idx, &rhs_expr);
 
+                // Design 4 D: the write boundary of a slice slot reached through
+                // a projection (`(*p) = s`, `x.f = s`). A value whose high half
+                // is extension padding (a widened thin address, on any `ite`
+                // branch) gets a counted fresh length here. A whole-local
+                // assignment is guarded inside `encode_simple_assignment`, after
+                // its coercion fallbacks.
+                let rhs_expr = match lhs.ty(self.body.locals()) {
+                    Ok(lhs_ty) if !lhs.projection.is_empty() => self.guard_slice_len_slot_write(
+                        lhs_ty,
+                        rhs_expr,
+                        "statement_projection_assign",
+                    ),
+                    _ => rhs_expr,
+                };
+
                 {
                     let mut acc = StmtAccumulator::new(
                         &mut modified,
@@ -255,12 +312,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             lhs, rhs, rhs_expr, local_idx, bb_idx, &mut acc,
                         );
                     } else {
+                        #[cfg(all(trust_toolchain, version("1.101")))]
+                        if self.try_native_initialized_payload_store(
+                            lhs,
+                            rhs,
+                            &rhs_expr,
+                            bb_idx,
+                            statement_index,
+                            &mut acc,
+                        ) {
+                            continue;
+                        }
                         // Projection assignment: _N.field = rhs (#600)
                         // Delegates to codegen_stmt_assign_projection.rs for deref stores,
                         // array stores, flattened tuple fields, and datatype updates.
                         self.encode_projection_assignment(
                             lhs, rhs_expr, local_idx, bb_idx, &mut acc,
                         );
+                        self.sync_collection_side_state_through_deref(lhs, rhs, &mut acc);
                     }
                 }
                 continue;
@@ -276,16 +345,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             // Part of #3743: Explicit no-ops matching BMC backend (D4).
-            if matches!(
-                &stmt.kind,
+            if match &stmt.kind {
                 StatementKind::FakeRead(..)
-                    | StatementKind::PlaceMention(..)
-                    | StatementKind::AscribeUserType { .. }
-                    | StatementKind::Coverage(..)
-                    | StatementKind::Nop
-                    | StatementKind::ConstEvalCounter
-                    | StatementKind::Retag(..)
-            ) {
+                | StatementKind::PlaceMention(..)
+                | StatementKind::AscribeUserType { .. }
+                | StatementKind::Coverage(..)
+                | StatementKind::Nop
+                | StatementKind::ConstEvalCounter => true,
+                #[cfg(not(trust_toolchain))]
+                StatementKind::Retag(..) => true,
+                _ => false,
+            } {
                 continue;
             }
             // Part of #3743: Catch-all for unhandled statement kinds.
@@ -300,6 +370,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Phase 4 (#893): Drain pending memory updates (e.g., heap allocation validity constraints)
         constraints.append(&mut self.heap_state.pending_updates);
+        // Layout facts of this block's pointer-to-integer conversions
+        // (heap/stack_address.rs).
+        constraints.extend(self.take_address_assumptions());
 
         // #1447: Emit accumulated store chain constraints at block end.
         // This produces single constraint per array: arr_out = store(store(arr_in, ...), ...)
@@ -335,6 +408,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Per-field granularity (#3348): pass last_constraint_for_local so flattened
         // locals use OUTPUT vars only for constrained fields (INPUT for others).
         let output_args = self.build_block_output_args(&modified, Some(&last_constraint_for_local));
+
+        // FC-06 frame net: caller-visible writes the statements made without a
+        // precise frame check. Runs on the FINAL output args, so a local the
+        // invariant fix-up reverted to its input var is not treated as written.
+        if self.in_modifies_frame_extent() {
+            let frame_checks = self.modifies_frame_net_statements(&output_args, &constraints);
+            if self.memory_safety_checks {
+                safety_checks.extend(frame_checks);
+            }
+        }
 
         (constraints, output_args, modified, safety_checks)
     }

@@ -7,6 +7,9 @@
 //!
 //! Extracted from `codegen_call_virtual.rs` — Part of #4206.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::rustc_internal;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -96,7 +99,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if variants.is_empty() {
                         return;
                     }
-                    variants[0].fields().iter().map(|field| field.ty_with_args(&args)).collect()
+                    let Some(tys) = variants[0]
+                        .fields()
+                        .iter()
+                        .map(|field| mono_ty::field_ty(field, &args))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return;
+                    };
+                    tys
                 }
                 TyKind::RigidTy(RigidTy::Tuple(elems)) => elems,
                 _ => return,

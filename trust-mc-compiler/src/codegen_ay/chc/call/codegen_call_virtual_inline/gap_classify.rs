@@ -28,7 +28,7 @@ pub(super) fn classify_rvalue_gap(
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
             operand_refs_missing(lhs, local_exprs) || operand_refs_missing(rhs, local_exprs)
         }
-        Rvalue::UnaryOp(_, operand) | Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+        Rvalue::UnaryOp(_, operand) | Rvalue::Use(operand, ..) | Rvalue::Cast(_, operand, _) => {
             operand_refs_missing(operand, local_exprs)
         }
         Rvalue::Aggregate(_, operands) => {
@@ -76,7 +76,7 @@ pub(super) fn classify_rvalue_gap(
             let short_ty = lhs_ty_tag.split('(').next().unwrap_or(&lhs_ty_tag);
             format!("rvalue_gap_BinaryOp_root_{op:?}_{short_ty}")
         }
-        Rvalue::Use(operand) if !has_missing_operand => {
+        Rvalue::Use(operand, ..) if !has_missing_operand => {
             // Root Use failure — the operand is a projected place.
             let detail = match operand {
                 rustc_public::mir::Operand::Copy(place)
@@ -88,6 +88,8 @@ pub(super) fn classify_rvalue_gap(
                     }
                 }
                 rustc_public::mir::Operand::Constant(_) => "const",
+                #[cfg(trust_toolchain)]
+                rustc_public::mir::Operand::RuntimeChecks(_) => "const",
             };
             format!("rvalue_gap_Use_root_{detail}")
         }
@@ -104,6 +106,7 @@ pub(super) fn classify_rvalue_gap(
                 Rvalue::Discriminant(..) => "Discriminant",
                 Rvalue::Len(..) => "Len",
                 Rvalue::Repeat(..) => "Repeat",
+                #[cfg(not(trust_toolchain))]
                 Rvalue::NullaryOp(..) => "NullaryOp",
                 _ => "Other",
             };
@@ -122,5 +125,7 @@ fn operand_refs_missing(
             place.projection.is_empty() && !local_exprs.contains_key(&place.local)
         }
         rustc_public::mir::Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        rustc_public::mir::Operand::RuntimeChecks(_) => false,
     }
 }

@@ -4,8 +4,35 @@
 //
 //! Handler-boundary predicates for the function inline pass.
 
+use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_public::CrateDef;
-use rustc_public::ty::{FloatTy, GenericArgKind, GenericArgs, IntTy, RigidTy, TyKind, UintTy};
+use rustc_public::rustc_internal;
+use rustc_public::ty::{
+    FloatTy, FnDef, GenericArgKind, GenericArgs, IntTy, RigidTy, TyKind, UintTy,
+};
+use std::sync::OnceLock;
+use trust_mc_codegen_stubs::{StubKind, StubRegistry};
+
+/// Preserve the library API, not a user function with a similar module path.
+/// The shared registry includes `same_allocation` and its internal wrapper;
+/// expanding either would bypass the backends' stack-lifetime-aware handler.
+pub(super) fn is_kani_mem_stub_boundary(tcx: TyCtxt<'_>, def: FnDef) -> bool {
+    let owner = def.krate();
+    if owner.is_local || owner.name.as_str() != "kani" {
+        return false;
+    }
+    // The public display name can include the caller's extern-crate path.
+    // Use the defining path, so imports and reexports cannot change ownership.
+    let path = with_no_trimmed_paths!(with_no_visible_paths!(
+        tcx.def_path_str(rustc_internal::internal(tcx, def.def_id()))
+    ));
+    if !path.starts_with("kani::mem::") {
+        return false;
+    }
+    static REGISTRY: OnceLock<StubRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(StubRegistry::new).lookup(&path).is_some_and(StubKind::is_kani_mem)
+}
 
 pub(super) fn is_handler_backed_slice_contains(fn_name: &str) -> bool {
     if !fn_name.ends_with("::contains") {

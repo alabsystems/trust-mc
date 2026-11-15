@@ -208,7 +208,7 @@ fn test_compound_triple_falls_through_to_tuple() {
 }
 
 // =============================================================================
-// resolve_generic_ty edge cases (standalone tests via MIR context)
+// Rule A body binder (`shared::mono_ty::body_ty`), via MIR context
 // =============================================================================
 
 const GENERIC_SOURCE: &str = r#"
@@ -216,9 +216,9 @@ const GENERIC_SOURCE: &str = r#"
 pub fn generic_probe(x: u32) -> u32 { x }
 "#;
 
-/// Test resolve_generic_ty passes non-generic types through unchanged.
+/// A concrete body-local type is its own instantiation under its instance.
 #[test]
-fn test_resolve_generic_ty_passthrough_for_concrete() {
+fn test_body_ty_passthrough_for_concrete() {
     with_test_ay_ctx_for_source(GENERIC_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(&ctx, "generic_probe");
         let body = instance.body().expect("body");
@@ -227,11 +227,8 @@ fn test_resolve_generic_ty_passthrough_for_concrete() {
         let ty = body.locals()[1].ty;
         assert!(matches!(ty.kind(), TyKind::RigidTy(RigidTy::Uint(rustc_public::ty::UintTy::U32))));
 
-        // Empty args — concrete type should pass through resolve_generic_ty
-        let args = rustc_public::ty::GenericArgs(vec![]);
-        let resolved = StatementCodegen::resolve_generic_ty(ty, &args);
-        assert!(resolved.is_some(), "concrete type should pass through");
-        assert_eq!(resolved.unwrap().kind(), ty.kind());
+        let resolved = crate::codegen_ay::shared::mono_ty::body_ty(instance, ty);
+        assert_eq!(resolved.map(|t| t.kind()), Some(ty.kind()));
     });
 }
 

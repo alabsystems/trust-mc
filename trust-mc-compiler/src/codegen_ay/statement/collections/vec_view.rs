@@ -82,6 +82,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return target;
                 }
 
+                // The model keeps the elements in its data array; `fld_ptr` is not
+                // tied to the byte memory a raw pointer reads, nor to a valid
+                // allocation. A read through the pointer over-approximates, so a
+                // counterexample resting on it is not Genuine.
+                self.ctx.bmc_sound_havoc("vec_as_ptr_bytes_unlinked");
                 if let Some((_base, vec)) = self.resolve_collection_base(&args[0]) {
                     // Part of #1632: Use typed Vec datatype names
                     let ptr = self.vec_field_select_declared(&vec, "fld_ptr", ptr_sort());
@@ -89,6 +94,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     let name = self.ctx.fresh_name("vec_ptr");
                     let ptr = self.ctx.declare_var(&name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("vec_as_ptr");
                     self.assign_value_to_place(destination, ptr);
                 }
                 target
@@ -102,6 +108,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return target;
                 }
 
+                // A write through this pointer lands in byte memory, which the
+                // model's element reads never consult: `*v.as_mut_ptr().add(3) = 5`
+                // left `v[3]` at its old value. No proof may rest on those reads.
+                self.ctx.unsupported_with_fallback(
+                    "vec_as_mut_ptr_writes_unlinked",
+                    format!("{destination:?} = Vec::as_mut_ptr"),
+                );
                 if let Some((_base, vec)) = self.resolve_collection_base(&args[0]) {
                     // Part of #1632: Use typed Vec datatype names
                     let ptr = self.vec_field_select_declared(&vec, "fld_ptr", ptr_sort());
@@ -109,6 +122,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     let name = self.ctx.fresh_name("vec_mut_ptr");
                     let ptr = self.ctx.declare_var(&name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("vec_as_mut_ptr");
                     self.assign_value_to_place(destination, ptr);
                 }
                 target
@@ -274,6 +288,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             Some(n) => Expr::bitvec_const(u128::from(n), POINTER_WIDTH),
             None => self.codegen_ptr_metadata(src).unwrap_or_else(|| {
                 let name = self.ctx.fresh_name("iter_slice_len");
+                self.ctx.bmc_sound_havoc("iter_slice_len");
                 self.ctx.declare_var(&name, ptr_sort())
             }),
         };

@@ -96,6 +96,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             debug!("AY codegen: handling fast-math intrinsic: {}", fn_name);
             return self.codegen_fast_math_intrinsic(fn_name, args, destination, target);
         }
+        // f16 / f128 absolute value (nightly `fabsf16` / `fabsf128`; Trust core's `fabs::<f16>` /
+        // `fabs::<f128>` reads as those names). IEEE abs clears the sign bit and nothing else, and
+        // Rust guarantees it bit for bit. The frozen nightly's `f16::abs` / `f128::abs` compute
+        // exactly `from_bits(to_bits() & !(1 << (W - 1)))`; Trust core calls the intrinsic, which
+        // no engine modelled, so the Trustc route failed closed where the nightly decided.
+        if fn_name.ends_with("fabsf16") || fn_name.ends_with("fabsf128") {
+            let value = self.codegen_operand(args.first()?)?;
+            let width = value.sort().bitvec_width().filter(|w| *w == 16 || *w == 128)?;
+            let sign_cleared = u128::MAX >> (129 - width);
+            let result = value.bvand(ay_bindings::Expr::bitvec_const(sign_cleared, width));
+            debug!("AY codegen: {} as a sign-bit clear at width {}", fn_name, width);
+            self.assign_value_to_place(destination, result);
+            return target;
+        }
         // f32 math intrinsics (Part of #1362, #1365)
         if is_f32_math_intrinsic(fn_name) {
             debug!("AY codegen: handling f32 math intrinsic: {}", fn_name);

@@ -9,6 +9,9 @@
 //! Projection chain update and type helpers split to projected_assign_helpers.rs
 //! per #4206.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::{LocalDecl, Operand, Place, ProjectionElem};
@@ -20,7 +23,7 @@ use super::super::ChcCtx;
 use super::super::inline_shared::inline_operand_to_expr;
 use super::projected_assign_helpers::{
     inline_deref_pointee_ty, inline_store_through, load_inline_value_from_memory,
-    mirror_static_state_var_update, record_inline_heap_vtable_forward,
+    note_inline_walk_lane_store, record_inline_heap_vtable_forward,
     record_inline_loaded_value_vtable_forward, update_inline_value_expr,
 };
 use super::walker::InlineWalkCtx;
@@ -183,6 +186,29 @@ pub(in crate::codegen_ay::chc) fn try_inline_memory_store(
     rhs: Expr,
     rhs_vtable: Option<Expr>,
 ) -> bool {
+    if let Some(handled) = ctx.store_native_drop_place(local_exprs, place, locals, &rhs) {
+        return handled;
+    }
+    if ctx.native_drop_memory.is_some() && ctx.native_drop_static_store(local_exprs, place, locals)
+    {
+        return ctx.with_native_drop_store_authority(|ctx| {
+            // The authenticated target is a native primitive scalar. A
+            // propagated logical dyn tag is not metadata for its value and
+            // does not justify an eager read-back for vtable forwarding.
+            try_inline_memory_store_legacy(ctx, locals, local_exprs, place, rhs, None)
+        });
+    }
+    try_inline_memory_store_legacy(ctx, locals, local_exprs, place, rhs, rhs_vtable)
+}
+
+fn try_inline_memory_store_legacy(
+    ctx: &mut ChcCtx<'_, '_>,
+    locals: &[LocalDecl],
+    local_exprs: &HashMap<usize, Expr>,
+    place: &Place,
+    rhs: Expr,
+    rhs_vtable: Option<Expr>,
+) -> bool {
     // Only handle assignments that start with Deref.
     if !matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
         return false;
@@ -223,7 +249,8 @@ pub(in crate::codegen_ay::chc) fn try_inline_memory_store(
         // Part of #3793: Mirror write to static state variable if this address
         // corresponds to a known static. The memory store updates heap arrays,
         // but the outer function reads statics through state variables.
-        mirror_static_state_var_update(ctx, pointer_addr.as_addr_expr(), &rhs);
+        // F3 widened (review finding M2): classified where it is made.
+        note_inline_walk_lane_store(ctx, pointer_addr.as_addr_expr(), &rhs, pointee_ty);
         return true;
     }
 
@@ -245,7 +272,7 @@ pub(in crate::codegen_ay::chc) fn try_inline_memory_store(
         pointee_ty,
         rhs_vtable,
     );
-    mirror_static_state_var_update(ctx, pointer_addr.as_addr_expr(), &updated);
+    note_inline_walk_lane_store(ctx, pointer_addr.as_addr_expr(), &updated, pointee_ty);
     true
 }
 
@@ -302,7 +329,7 @@ pub(in crate::codegen_ay::chc) fn rebuild_inline_coroutine_receiver<'tcx, 'body>
             let variant = variants.first()?;
             let fields = variant.fields();
             let field = fields.first()?;
-            let field_ty = field.ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(field, &args)?;
             let TyKind::RigidTy(RigidTy::Ref(_, inner, _)) = field_ty.kind() else {
                 return None;
             };

@@ -52,11 +52,29 @@ fn has_assert_probe(body: &Body) -> bool {
     })
 }
 
+/// Emit the CHC SMT-LIB2 the production pipeline produces for `fn_suffix`,
+/// straight-line discharge included.
 fn emit_chc_smt_for_fn(source: &str, fn_suffix: &str) -> String {
+    emit_chc_smt_for_fn_with_discharge(source, fn_suffix, true)
+}
+
+fn emit_chc_smt_for_fn_with_discharge(source: &str, fn_suffix: &str, discharge: bool) -> String {
+    emit_chc_smt_for_fn_with_options(source, fn_suffix, discharge, false)
+}
+
+/// [`emit_chc_smt_for_fn_with_discharge`] with `--ay-chc-int-lift` set or not.
+fn emit_chc_smt_for_fn_with_options(
+    source: &str,
+    fn_suffix: &str,
+    discharge: bool,
+    int_lift: bool,
+) -> String {
     let mut maybe_result: Option<String> = None;
     with_test_ay_ctx_for_source(source, |ctx| {
         let mut ctx = ctx;
         ctx.config.use_chc = true;
+        ctx.config.chc_straightline_discharge = discharge;
+        ctx.config.chc_int_lift = int_lift;
         ctx.queries.set_args(crate::args::Arguments::default());
 
         let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
@@ -98,21 +116,11 @@ fn emit_chc_smt_for_fn(source: &str, fn_suffix: &str) -> String {
 /// same verdict on either; this helper merely preserves the richer encoding
 /// for assertion. It NEVER changes a soundness outcome.
 ///
-/// The discharge skip is a process-global flag (codegen runs on a rustc worker
-/// thread, so a thread-local would not reach it). [`DISCHARGE_FLAG_MUTEX`]
-/// serializes these inspection runs so no concurrent test observes the
-/// disabled state.
+/// The switch is the context's own `AYConfig::chc_straightline_discharge`, so a
+/// concurrent test's compilation never sees it.
 fn emit_chc_smt_for_fn_no_discharge(source: &str, fn_suffix: &str) -> String {
-    let _guard = DISCHARGE_FLAG_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let prev = crate::codegen_ay::chc::set_straightline_discharge_disabled(true);
-    let smt = emit_chc_smt_for_fn(source, fn_suffix);
-    crate::codegen_ay::chc::set_straightline_discharge_disabled(prev);
-    smt
+    emit_chc_smt_for_fn_with_discharge(source, fn_suffix, false)
 }
-
-/// Serializes all straight-line-discharge inspection helpers so the
-/// process-global skip flag is never observed by a concurrent test.
-static DISCHARGE_FLAG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Emit CHC SMT-LIB2 at a specific track level (Reg, Ptr, or Mem).
 ///
@@ -661,6 +669,61 @@ fn test_chc_e2e_std_alloc_realloc_grow_full_smt_retains_tail_write() {
     );
 }
 
+/// The straight-line discharge switch belongs to one compilation. A
+/// compilation that turned it off is held open (configured, not yet encoded)
+/// while a second compilation of the same function runs to completion with it
+/// on: the second must still be discharged. With the old process-global skip
+/// flag, which the inspection helper set for the whole of its compilation,
+/// the second compilation encoded undischarged and `realloc_grow_full_proves_unsat`
+/// solved the pre-discharge VC whenever it ran beside
+/// `realloc_grow_full_smt_retains_tail_write`.
+#[test]
+fn test_chc_straightline_discharge_switch_is_per_compilation() {
+    use std::sync::{Arc, Barrier};
+
+    let configured = Arc::new(Barrier::new(2));
+    let finished = Arc::new(Barrier::new(2));
+    let (held_configured, held_finished) = (Arc::clone(&configured), Arc::clone(&finished));
+    let held_open = std::thread::spawn(move || {
+        let mut smt = None;
+        with_test_ay_ctx_for_source(CHC_STD_ALLOC_REALLOC_GROW_FULL_SOURCE, |ctx| {
+            let mut ctx = ctx;
+            ctx.config.use_chc = true;
+            ctx.config.chc_straightline_discharge = false;
+            ctx.queries.set_args(crate::args::Arguments::default());
+            held_configured.wait();
+            held_finished.wait();
+            let instance = find_instance_by_suffix(ctx.tcx, "chc_std_alloc_realloc_grow_full");
+            let body = instance.body().expect("body");
+            let name = instance.name();
+            ctx.set_current_fn(instance);
+            codegen_function_with_body(&mut ctx, instance, body, &name);
+            let chc_vc = ctx.chc_vc.as_ref().expect("CHC VC");
+            smt = Some(crate::codegen_ay::emit_chc(chc_vc).to_string());
+        });
+        smt.expect("CHC SMT of the held-open compilation")
+    });
+
+    configured.wait();
+    let discharged = emit_chc_smt_for_fn(
+        CHC_STD_ALLOC_REALLOC_GROW_FULL_SOURCE,
+        "chc_std_alloc_realloc_grow_full",
+    );
+    finished.wait();
+    let undischarged = held_open.join().expect("held-open compilation");
+
+    assert!(
+        !discharged.contains("#x0000002a"),
+        "a compilation with the discharge on must be discharged while another compilation \
+         holds it off; got the pre-discharge encoding:\n{discharged}"
+    );
+    assert!(
+        undischarged.contains("#x0000002a"),
+        "the compilation that turned the discharge off must keep its pre-discharge encoding:\n\
+         {undischarged}"
+    );
+}
+
 // =========================================================================
 // Track-level regression guards (Part of #2279)
 //
@@ -784,11 +847,21 @@ fn test_chc_e2e_assert_false_finds_sat_at_reg() {
 /// Emit CHC without requiring an assert probe. For tests where the
 /// optimizer may elide asserts but we still need the CHC encoding.
 fn emit_chc_smt_diagnostic(source: &str, fn_suffix: &str, level: ChcTrackLevel) -> String {
+    emit_chc_smt_diagnostic_with_discharge(source, fn_suffix, level, true)
+}
+
+fn emit_chc_smt_diagnostic_with_discharge(
+    source: &str,
+    fn_suffix: &str,
+    level: ChcTrackLevel,
+    discharge: bool,
+) -> String {
     let mut maybe_result: Option<String> = None;
     with_test_ay_ctx_for_source(source, |ctx| {
         let mut ctx = ctx;
         ctx.config.use_chc = true;
         ctx.config.chc_track_level = level;
+        ctx.config.chc_straightline_discharge = discharge;
         ctx.queries.set_args(crate::args::Arguments::default());
 
         let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
@@ -817,11 +890,7 @@ fn emit_chc_smt_diagnostic_no_discharge(
     fn_suffix: &str,
     level: ChcTrackLevel,
 ) -> String {
-    let _guard = DISCHARGE_FLAG_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let prev = crate::codegen_ay::chc::set_straightline_discharge_disabled(true);
-    let smt = emit_chc_smt_diagnostic(source, fn_suffix, level);
-    crate::codegen_ay::chc::set_straightline_discharge_disabled(prev);
-    smt
+    emit_chc_smt_diagnostic_with_discharge(source, fn_suffix, level, false)
 }
 
 const CHC_ENUM_GENERAL_MATCH: &str = r#"#![allow(dead_code)]
@@ -841,6 +910,8 @@ fn probe_enum_general_match(x: u64, y: u64) {
 /// multi-constructor enums use scalar BV state vars (tag + payload fields)
 /// instead of ADT Datatype sorts.
 #[test]
+// Nightly spelling; see the Trust twin below.
+#[cfg(not(trust_toolchain))]
 fn test_chc_enum_general_match_encoding() {
     // Inspect the pre-discharge encoding. The match target is statically
     // `E::Foo(x, y)`, so the bounded straight-line discharge proves the
@@ -868,6 +939,48 @@ fn test_chc_enum_general_match_encoding() {
         // enum E { Foo(u64, u64), Bar } → [Bool tag, BV64 payload0, BV64 payload1]
         assert!(
             smt.contains("_fld0 Bool"),
+            "BV-flattened enum should have Bool tag field (_fld0), got:\n{smt}"
+        );
+        // Discriminant uses ITE on tag: ite(tag_fld0, disc_1, disc_0)
+        assert!(
+            smt.contains("ite"),
+            "BV-flattened enum discriminant should use ITE on tag, got:\n{smt}"
+        );
+    }
+}
+
+/// Trust twin of the test above. Trust's `rustc_public` names a local instance with
+/// its crate (`testcrate_N::...`), so the emitted state symbols are `|`-quoted and
+/// the expected spelling carries the closing `|`. The encoding is unchanged.
+#[test]
+#[cfg(trust_toolchain)]
+fn test_chc_enum_general_match_encoding_trust() {
+    // Inspect the pre-discharge encoding. The match target is statically
+    // `E::Foo(x, y)`, so the bounded straight-line discharge proves the
+    // `a == x` assert and collapses the VC to `(=> false error)`, erasing the
+    // discriminant case-split. The pre-discharge VC is equisatisfiable (still
+    // UNSAT), and it still emits the discriminant ITE on the constructor tag.
+    let smt = emit_chc_smt_diagnostic_no_discharge(
+        CHC_ENUM_GENERAL_MATCH,
+        "probe_enum_general_match",
+        ChcTrackLevel::Reg,
+    );
+    // Detect encoding path: ADT uses `(_ is` constructor tests in rules,
+    // BV-flattened (#3215) uses `_fld0` scalar state vars with BV tag comparisons.
+    // Note: declare-datatype may appear in both paths (sort registration).
+    let uses_adt_constructors =
+        smt.contains("is (as Foo") || smt.contains("is (as Some_E") || smt.contains("(_ is");
+    if uses_adt_constructors {
+        // ADT encoding path: Datatype with constructors.
+        assert!(
+            smt.contains("Some_E") || smt.contains("Foo"),
+            "Expected payload constructor (Some_E or Foo) in CHC, got:\n{smt}"
+        );
+    } else {
+        // BV-flattened encoding path (#3215): scalar state vars for tag + payload.
+        // enum E { Foo(u64, u64), Bar } → [Bool tag, BV64 payload0, BV64 payload1]
+        assert!(
+            smt.contains("_fld0| Bool"),
             "BV-flattened enum should have Bool tag field (_fld0), got:\n{smt}"
         );
         // Discriminant uses ITE on tag: ite(tag_fld0, disc_1, disc_0)
@@ -984,13 +1097,12 @@ fn test_chc_array_deref_chain_diagnostic() {
     // produce. This is verdict-preserving (the discharge only replaces an
     // already-proven-UNSAT system); it lets the test observe the array→scalar
     // reduction the optimization pipeline performs.
-    let _guard = DISCHARGE_FLAG_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let prev_discharge = crate::codegen_ay::chc::set_straightline_discharge_disabled(true);
     let mut maybe_result: Option<String> = None;
     let mut maybe_pre_opt: Option<String> = None;
     with_test_ay_ctx_for_source(CHC_ARRAY_DEREF_CHAIN_SOURCE, |ctx| {
         let mut ctx = ctx;
         ctx.config.use_chc = true;
+        ctx.config.chc_straightline_discharge = false;
         ctx.config.chc_track_level = ChcTrackLevel::Mem;
         ctx.queries.set_args(crate::args::Arguments::default());
 
@@ -1014,7 +1126,6 @@ fn test_chc_array_deref_chain_diagnostic() {
             maybe_result = Some(crate::codegen_ay::emit_chc(chc_vc).to_string());
         }
     });
-    crate::codegen_ay::chc::set_straightline_discharge_disabled(prev_discharge);
     let pre_opt = maybe_pre_opt.expect("expected pre-opt CHC");
     let smt = maybe_result.expect("expected optimized CHC");
 
@@ -1065,4 +1176,594 @@ fn test_chc_array_deref_chain_diagnostic() {
         post_rule_count > 0,
         "expected non-trivial scalarized rules for the deref chain, got {post_rule_count} rules:\n{smt}"
     );
+}
+
+// =========================================================================
+// `Iterator::sum` arithmetic (AY alignment review round 2): the CHC stub
+// reads std's `Sum` impl from the call's Rust types (`iter_sum_summand`).
+// The `(x >> 1) + 1` gives each probe an overflow-checked `Assert` terminator
+// that can never fail, so the sum alone decides the query.
+// =========================================================================
+
+const CHC_ITER_SUM_SOURCE: &str = r#"#![allow(dead_code)]
+use std::num::Saturating;
+
+fn chc_sum_u8_overflow(x: u8) {
+    let s: u8 = [200u8, 100].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s > 0 || y == 0);
+}
+
+fn chc_sum_u8_no_overflow(x: u8) {
+    let s: u8 = [200u8, 50].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s == 250 || y == 0);
+}
+
+fn chc_sum_f32_to_inf(x: u8) {
+    let s: f32 = [f32::MAX, f32::MAX].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s.is_finite() || y == 0);
+}
+
+#[derive(Clone, Copy)]
+struct Weight(u32);
+
+impl<'a> core::iter::Sum<&'a Weight> for u32 {
+    fn sum<I: Iterator<Item = &'a Weight>>(it: I) -> u32 {
+        it.fold(0, |a, w| a.max(w.0))
+    }
+}
+
+fn chc_user_sum_impl(x: u8) {
+    let v = [Weight(3), Weight(4)];
+    let s: u32 = v.iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s == 7 || y == 0);
+}
+
+#[derive(Clone, Copy)]
+struct Small(u8);
+
+impl<'a> core::iter::Sum<&'a Small> for u8 {
+    fn sum<I: Iterator<Item = &'a Small>>(it: I) -> u8 {
+        it.fold(0u8, |a, w| a + w.0)
+    }
+}
+
+fn chc_user_sum_impl_panics(x: u8) {
+    let v = [Small(200), Small(100)];
+    let s: u8 = v.iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+    let _ = s;
+}
+
+fn chc_sum_constant_length_past_default_bound(x: u8) {
+    let s: u8 = [20u8; 12].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s == 240 || y == 0);
+}
+
+fn chc_sum_saturating_unread(x: u8) {
+    let _s: Saturating<u8> = [Saturating(200u8), Saturating(100)].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_sum_saturating_saturates(x: u8) {
+    let s: Saturating<u8> = [Saturating(200u8), Saturating(100)].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s.0 == 255 || y == 0);
+}
+
+fn chc_sum_saturating_is_not_wrapped(x: u8) {
+    let s: Saturating<u8> = [Saturating(200u8), Saturating(100)].iter().sum();
+    let y = (x >> 1) + 1;
+    assert!(s.0 == 44 || y == 0);
+}
+"#;
+
+/// std's integer `Sum` panics on overflow; the stub used to wrap to 44.
+#[test]
+fn test_chc_e2e_iter_sum_u8_overflow_is_reachable() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_u8_overflow", "sat");
+}
+
+#[test]
+fn test_chc_e2e_iter_sum_u8_without_overflow_proves_unsat() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_u8_no_overflow", "unsat");
+}
+
+/// The CHC lane has no FP theory, so a float sum is havocked: the infinite sum
+/// is one of its values. The stub used to add the bit patterns as integers and
+/// proved `s.is_finite()`.
+#[test]
+fn test_chc_e2e_iter_sum_f32_is_not_an_integer_sum() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_f32_to_inf", "sat");
+}
+
+/// A user `impl Sum<&Weight> for u32` taking the max: the stub does not know
+/// it and must not add. It used to `bvadd` the elements (3 + 4 == 7) and prove
+/// an assertion the program (max == 4) fails. Only core's numeric impls reach
+/// the stub now (`reduce_loop_rule::iter_sum_call_is_core_numeric_fold`); this
+/// impl, one `fold`, is inlined and its fold replayed
+/// (`reduce_loop_rule::is_inlined_sum_instance`).
+#[test]
+fn test_chc_e2e_iter_sum_user_impl_is_not_added() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_user_sum_impl", "sat");
+}
+
+/// A user `Sum` impl's body panics: here `200 + 100` overflows inside the
+/// impl (Kani: "attempt to add with overflow"). The only other check holds.
+/// The stub used to havoc the value and emit no error rule, so the query was
+/// `unsat` and the program proved (AY alignment round 8, review round 3,
+/// finding 2). The impl now takes the ordinary call path, where its one
+/// `fold` is inlined and the closure's overflow check replayed per step; a
+/// core impl the stub cannot classify still gets the conservative rule.
+#[test]
+fn test_chc_e2e_iter_sum_unmodeled_impl_may_panic() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_user_sum_impl_panics", "sat");
+}
+
+/// std's `Sum` for `Saturating<u8>` adds with `saturating_add` and cannot
+/// panic. It was `Unknown`, so reaching the call fired the conservative rule
+/// for an unmodelled impl and this program, whose only check holds, could not
+/// be proved (AY alignment round 8, review round 4, finding 1).
+#[test]
+fn test_chc_e2e_iter_sum_saturating_reached_is_not_a_panic() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_saturating_unread", "unsat");
+}
+
+/// `200 + 100` saturates to 255: the replay's step is `ite(carry, MAX, a + b)`.
+#[test]
+fn test_chc_e2e_iter_sum_saturating_saturates() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_saturating_saturates", "unsat");
+}
+
+/// The saturating sum is not the wrapped `44`.
+#[test]
+fn test_chc_e2e_iter_sum_saturating_is_not_wrapped() {
+    assert_chc_solver_result(CHC_ITER_SUM_SOURCE, "chc_sum_saturating_is_not_wrapped", "sat");
+}
+
+/// What a sum can panic on is decided by the impl, never by the destination's
+/// sort. Under `--ay-chc-int-lift` an integer destination may have an `Int`
+/// sort the summand's bit-vector width does not fit, so the value is havocked;
+/// the panic obligation must still be the impl's own: none for `Saturating`,
+/// the conservative "attempt to add with overflow" for std's `u8` sum, and the
+/// "not modelled" rule only for an impl the stub cannot classify. Round 3 let
+/// a sort mismatch reclassify the call `Unknown`, so every such sum got the
+/// "not modelled" rule (AY alignment round 8, review round 4). The rules are
+/// read from the undischarged SMT by the names of their freed flags. A user
+/// impl never reaches the stub (only core's numeric impls do), so it gets
+/// neither the stub's value nor its rule.
+#[test]
+fn test_chc_iter_sum_panic_rule_is_the_impls_at_any_sort() {
+    // The int-lift encodes record place translation drops in a process-global
+    // counter, which `test_range_for_loop_int_lifted_has_zero_translation_drops`
+    // asserts is zero while it holds this lock. The first full suite run with
+    // this test failed that one with 8 drops it had not made (it passes alone).
+    let _counters = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut emitted = Vec::new();
+    for int_lift in [false, true] {
+        for probe in ["chc_sum_saturating_unread", "chc_sum_u8_no_overflow", "chc_user_sum_impl"] {
+            let smt = emit_chc_smt_for_fn_with_options(CHC_ITER_SUM_SOURCE, probe, false, int_lift);
+            emitted.push((int_lift, probe, smt));
+        }
+    }
+    for (int_lift, probe, smt) in &emitted {
+        let unmodeled = smt.contains("iter_sum_impl_unmodeled");
+        assert!(
+            !unmodeled,
+            "{probe} int_lift={int_lift}: a classified impl got the rule. SMT:\n{smt}"
+        );
+        let stubbed = smt.contains("iter_sum_value");
+        match *probe {
+            "chc_user_sum_impl" => assert!(
+                !stubbed,
+                "{probe} int_lift={int_lift}: a user impl reached the sum stub. SMT:\n{smt}"
+            ),
+            _ => assert!(
+                stubbed || !int_lift,
+                "{probe} int_lift={int_lift}: std's impl did not reach the sum stub. SMT:\n{smt}"
+            ),
+        }
+    }
+}
+
+/// `[20u8; 12]` sums to 240: no overflow. Twelve elements are past the
+/// default replay bound of 8, so the replay used to leave four unchecked and
+/// the conservative overflow rule fired. The receiver's static length raises
+/// the bound to 12, the replay covers the sum, and the query is `unsat`
+/// (AY alignment round 8, review round 3, finding 3).
+#[test]
+fn test_chc_e2e_iter_sum_constant_length_is_fully_replayed() {
+    assert_chc_solver_result(
+        CHC_ITER_SUM_SOURCE,
+        "chc_sum_constant_length_past_default_bound",
+        "unsat",
+    );
+}
+
+// -------------------------------------------------------------------------
+// Closures an iterator stub does not run (AY alignment round 8, review round 5)
+// -------------------------------------------------------------------------
+
+const CHC_ITER_CLOSURE_SOURCE: &str = r#"#![allow(dead_code)]
+use std::num::{Saturating, Wrapping};
+
+fn chc_sat_filter_sum_pred_panics(x: u8) {
+    let a = [Saturating(3u8), Saturating(2)];
+    let _s: Saturating<u8> = a
+        .iter()
+        .filter(|v| {
+            assert!(v.0 < 3);
+            true
+        })
+        .sum();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_sat_filter_sum_pure_pred(x: u8) {
+    let a = [Saturating(3u8), Saturating(2)];
+    let _s: Saturating<u8> = a.iter().filter(|v| v.0 > 2).sum();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_wrap_filter_sum_pred_panics(x: u8) {
+    let a = [Wrapping(9u32), Wrapping(2)];
+    let _s: Wrapping<u32> = a
+        .iter()
+        .filter(|v| {
+            assert!(v.0 != 9);
+            true
+        })
+        .sum();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_filter_fold_pred_panics(x: u8) {
+    let a = [3u32, 2];
+    let _s = a
+        .iter()
+        .filter(|v| {
+            assert!(**v < 3);
+            true
+        })
+        .fold(0u32, |acc, v| acc.wrapping_add(*v));
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_filter_next_pred_panics(x: u8) {
+    let a = [3u8, 2];
+    let mut it = a.iter().filter(|v| {
+        assert!(**v < 3);
+        true
+    });
+    let _first = it.next();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_filter_next_pure_pred(x: u8) {
+    let a = [3u8, 2];
+    let mut it = a.iter().filter(|v| **v < 3);
+    let _first = it.next();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_fold_past_max_replay_bound_panics(x: u8) {
+    let mut a = [1u8; 40];
+    a[39] = 9;
+    let _s = a.iter().fold(0u8, |acc, v| {
+        assert!(*v < 5);
+        acc.wrapping_add(*v)
+    });
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_fold_constant_length_past_default_bound(x: u8) {
+    let s = [1u8; 12].iter().fold(0u8, |acc, v| acc.wrapping_add(*v));
+    let y = (x >> 1) + 1;
+    assert!(s == 12 || y == 0);
+}
+
+fn chc_filter_sum(x: u8) {
+    let a = [1u8, 2, 3];
+    let s: u8 = a.iter().filter(|v| **v > 1).sum();
+    let y = (x >> 1) + 1;
+    assert!(s == 5 || y == 0);
+}
+
+fn chc_flat_map_chars(x: u8) {
+    let hi = ["H", "i"];
+    let mut it = hi.iter().flat_map(|s| s.chars());
+    let _first = it.next();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_flat_map_closure_panics(x: u8) {
+    let hi = ["H", "i"];
+    let mut it = hi.iter().flat_map(|s| {
+        assert!(s.len() > 5);
+        s.chars()
+    });
+    let _first = it.next();
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+
+fn chc_try_fold_closure_panics(x: u8) {
+    let a = [3u8, 2];
+    let _s: Option<u8> = a.iter().try_fold(0u8, |acc, v| {
+        assert!(*v < 3);
+        acc.checked_add(*v)
+    });
+    let y = (x >> 1) + 1;
+    assert!(y != 0);
+}
+"#;
+
+/// A `Filter`'s predicate panics on the first element; the sum is std's
+/// `Saturating` sum, which cannot panic itself. The stub never runs the
+/// predicate, and nothing stood in for it, so the program was proved where
+/// Kani fails on the predicate's assert (review round 5, finding 1). The
+/// conservative rule for the unrun closure makes the query `sat`.
+#[test]
+fn test_chc_e2e_filter_sum_predicate_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_sat_filter_sum_pred_panics", "sat");
+}
+
+/// The same with `Wrapping<u32>`.
+#[test]
+fn test_chc_e2e_wrapping_filter_sum_predicate_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_wrap_filter_sum_pred_panics", "sat");
+}
+
+/// A predicate that only compares carries no obligation, so no rule is added
+/// and the program is still proved.
+#[test]
+fn test_chc_e2e_filter_sum_pure_predicate_still_proves() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_sat_filter_sum_pure_pred", "unsat");
+}
+
+/// `fold` over the same `Filter`.
+#[test]
+fn test_chc_e2e_filter_fold_predicate_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_filter_fold_pred_panics", "sat");
+}
+
+/// A bare `next()` on the `Filter` (the `FilterNext` stub).
+#[test]
+fn test_chc_e2e_filter_next_predicate_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_filter_next_pred_panics", "sat");
+}
+
+#[test]
+fn test_chc_e2e_filter_next_pure_predicate_still_proves() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_filter_next_pure_pred", "unsat");
+}
+
+/// `try_fold` never applies its closure in this lane (the value is havocked),
+/// so the closure's assert was dropped and the program proved.
+#[test]
+fn test_chc_e2e_try_fold_closure_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_try_fold_closure_panics", "sat");
+}
+
+/// `flat_map(|s| s.chars())`: the closure calls only `str::chars`, which holds
+/// offset sites that cannot fail for a valid `&str`, so the closure carries no
+/// check that can fail and the `FlattenNext` stub adds no rule (the walk
+/// trusts core's total `str`/slice iterator constructors). Without that,
+/// `tests/kani/Iterator/flat_map.rs` lost its proof.
+#[test]
+fn test_chc_e2e_flat_map_chars_still_proves() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_flat_map_chars", "unsat");
+}
+
+/// The same `flat_map` whose closure asserts before `chars()`: the stub does
+/// not run it, so the rule stands for the assert.
+#[test]
+fn test_chc_e2e_flat_map_closure_panic_is_not_dropped() {
+    assert_chc_solver_result(CHC_ITER_CLOSURE_SOURCE, "chc_flat_map_closure_panics", "sat");
+}
+
+/// Forty constant elements: the replay stops at `MAX_REDUCE_BOUND` (32), the
+/// replayed steps' checks fold to true, and the element that fails the
+/// closure's assert (the fortieth) is never replayed. The steps past the
+/// replay now get the conservative rule.
+#[test]
+fn test_chc_e2e_fold_closure_past_the_replay_is_not_dropped() {
+    assert_chc_solver_result(
+        CHC_ITER_CLOSURE_SOURCE,
+        "chc_fold_past_max_replay_bound_panics",
+        "sat",
+    );
+}
+
+/// As for a sum, a constant-length `fold` is replayed whole: twelve elements
+/// were past the default bound of 8, and the value was havocked.
+#[test]
+fn test_chc_e2e_fold_constant_length_is_fully_replayed() {
+    assert_chc_solver_result(
+        CHC_ITER_CLOSURE_SOURCE,
+        "chc_fold_constant_length_past_default_bound",
+        "unsat",
+    );
+}
+
+/// The replay reads `fld_pos`/`fld_len`/`fld_data` wherever the receiver's
+/// sort carries them, and walks into `fld_iter`: for a `Filter` that is the
+/// INNER sequence, so a replay would be the unfiltered sum. Only the
+/// `Filter` construction leaving those fields unbound kept the value sound.
+/// The replay is refused for any receiver that is not a plain sequence
+/// iterator, so no replay step (`iter_reduce_acc`) is emitted here.
+#[test]
+fn test_chc_filter_sum_is_not_replayed_over_the_inner_sequence() {
+    let smt = emit_chc_smt_for_fn(CHC_ITER_CLOSURE_SOURCE, "chc_filter_sum");
+    assert!(!smt.contains("iter_reduce_acc"), "a replay step was emitted. SMT:\n{smt}");
+}
+
+// =========================================================================
+// Float `rem_euclid` / `div_euclid` / `%` in the CHC lane (TRUST-MC-FREM-2)
+// =========================================================================
+
+/// [`emit_chc_smt_for_fn`] plus what the driver reads before it may call a
+/// `sat` `Genuine`: the variables freed by recorded sound approximations, and
+/// for each property whether its reachability depends on them
+/// (`Some(true)` keeps a counterexample `OverApproximation`).
+fn emit_chc_smt_with_approximations(
+    source: &str,
+    fn_suffix: &str,
+) -> (String, Vec<String>, Vec<Option<bool>>) {
+    let mut maybe_result = None;
+    with_test_ay_ctx_for_source(source, |ctx| {
+        let mut ctx = ctx;
+        ctx.config.use_chc = true;
+        ctx.queries.set_args(crate::args::Arguments::default());
+
+        let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
+        let body = instance.body().expect("body");
+        let name = instance.name();
+        ctx.set_current_fn(instance);
+        assert!(has_assert_probe(&body), "{fn_suffix}: expected an overflow Assert terminator");
+
+        codegen_function_with_body(&mut ctx, instance, body, &name);
+        let chc_vc = ctx.chc_vc.as_ref().expect("CHC VC should be populated after CHC codegen");
+        assert!(
+            chc_vc.rules.iter().any(|rule| rule.head.name.starts_with("error")),
+            "{fn_suffix}: expected an error rule; a vacuous query would hide regressions"
+        );
+        let dependence = chc_vc.properties.iter().map(|p| p.approximation_dependent).collect();
+        maybe_result = Some((
+            crate::codegen_ay::emit_chc(chc_vc).to_string(),
+            chc_vc.approximated_vars.clone(),
+            dependence,
+        ));
+    });
+    maybe_result.expect("expected CHC SMT output")
+}
+
+/// Every claim is an overflow check that fails exactly when the claim is
+/// false. The integer `div_euclid` / `rem_euclid` stub (`codegen_euclid`) was
+/// keyed on the method name alone and computed `bvurem` / `bvudiv` over the
+/// floats' IEEE bit patterns: it PROVED the false `x == 5.0 =>
+/// x.rem_euclid(3.0) != 2.0`, and refuted the true claims with a counterexample
+/// that rested on no approximation, so the front door labelled it `Genuine`
+/// (atpkg trust-mc 20065, `--ay-chc`). A float call now takes the ordinary
+/// call path, which in this lane havocs the call's result as a RECORDED sound
+/// approximation (measured: the destination local is a freed variable).
+const CHC_FLOAT_EUCLID_SOURCE: &str = r#"#![allow(dead_code)]
+fn chc_f64_rem_euclid_true(x: f64) {
+    if x == 5.0 {
+        let n: u8 = if x.rem_euclid(3.0) == 2.0 { 0 } else { 255 };
+        let _m = n + 1;
+    }
+}
+fn chc_f64_rem_euclid_not_two_is_false(x: f64) {
+    if x == 5.0 {
+        let n: u8 = if x.rem_euclid(3.0) == 2.0 { 255 } else { 0 };
+        let _m = n + 1;
+    }
+}
+fn chc_f64_div_euclid_true(x: f64) {
+    if x == -5.0 {
+        let n: u8 = if x.div_euclid(3.0) == -2.0 { 0 } else { 255 };
+        let _m = n + 1;
+    }
+}
+fn chc_f64_rem_true(x: f64) {
+    if x == 5.0 {
+        let n: u8 = if x % 3.0 == 2.0 { 0 } else { 255 };
+        let _m = n + 1;
+    }
+}
+"#;
+
+/// The false claim is no longer proved.
+#[test]
+fn test_chc_e2e_f64_rem_euclid_false_claim_is_not_proved() {
+    assert_chc_solver_result(CHC_FLOAT_EUCLID_SOURCE, "chc_f64_rem_euclid_not_two_is_false", "sat");
+}
+
+/// A `sat` on a TRUE float claim must rest on a recorded approximation (the
+/// driver keeps such a counterexample `OverApproximation`), never on an
+/// exact-looking encoding the driver would certify `Genuine`. Returns the
+/// freed variables. (Measured 2026-10-09: each true claim below is `sat`.)
+fn assert_true_float_claim_sat_is_an_over_approximation(fn_suffix: &str) -> Vec<String> {
+    let (smt, approximated_vars, dependence) =
+        emit_chc_smt_with_approximations(CHC_FLOAT_EUCLID_SOURCE, fn_suffix);
+    let result = run_ay_on_smt2(&smt)
+        .unwrap_or_else(|err| panic!("{fn_suffix}: AY execution failed: {err}. SMT:\n{smt}"));
+    if result != "sat" {
+        // No counterexample to classify; a proof of a true claim is sound.
+        return approximated_vars;
+    }
+    assert!(
+        !approximated_vars.is_empty(),
+        "{fn_suffix}: the float result must be a recorded approximation, not an exact-looking \
+         term a counterexample could be certified on"
+    );
+    assert!(
+        !dependence.is_empty() && dependence.iter().all(|dep| *dep == Some(true)),
+        "{fn_suffix}: the check reads the freed result {approximated_vars:?}, so a \
+         counterexample must stay OverApproximation: {dependence:?}"
+    );
+    approximated_vars
+}
+
+#[test]
+fn test_chc_f64_rem_euclid_true_claim_counterexample_is_an_over_approximation() {
+    assert_true_float_claim_sat_is_an_over_approximation("chc_f64_rem_euclid_true");
+}
+
+#[test]
+fn test_chc_f64_div_euclid_true_claim_counterexample_is_an_over_approximation() {
+    assert_true_float_claim_sat_is_an_over_approximation("chc_f64_div_euclid_true");
+}
+
+/// Float `%` itself never reached `fp.rem` in this lane: a symbolic operand
+/// goes to the congruent float table (the constant fold uses host `%`, which
+/// is `fmod`). Pinned so a `sat` here stays an over-approximation, and so a
+/// future exact encoding in this lane is a deliberate change of this test.
+#[test]
+fn test_chc_f64_rem_true_claim_counterexample_rests_on_the_float_table() {
+    let freed = assert_true_float_claim_sat_is_an_over_approximation("chc_f64_rem_true");
+    assert!(
+        freed.iter().any(|var| var == trust_mc_core::chc::FLOAT_BINOP_TABLE_F64),
+        "symbolic f64 `%` must be the recorded f64 float table: {freed:?}"
+    );
+}
+
+/// The CHC twin of `integration_bmc_tests::test_bmc_slice_eq_reads_lengths_not_array_tails`
+/// (same probes: an overflow reachable exactly when the comparison holds).
+///
+/// Before the fix `[1, 2]` against `[1, 2, 0]` at two reference levels came
+/// out EQUAL: the operands reach `SlicePartialEq` loaded through `&&[T]` with
+/// no slice length, and the lane compared the two referent element arrays
+/// with SMT `=`, both decoded over a constant 0 default. The
+/// `*_overflow_if_unequal` probes were `unsat`, i.e. `assert!(a == b)` was
+/// PROVED (`tools/soundness-duals/slice_eq_length_dual.rs`). An array datum is
+/// now compared only below two constant lengths
+/// (`chc::call::codegen_call_slice::slice_eq_from_referent_data`).
+#[test]
+fn test_chc_slice_eq_never_equates_slices_of_different_lengths() {
+    use super::integration_bmc_tests::SLICE_EQ_LENGTH_SOURCE;
+    for (probe, expected) in [
+        ("slice_eq_len_differs_d2_overflow_if_unequal", "sat"),
+        ("slice_eq_u8_len_differs_d2_overflow_if_unequal", "sat"),
+        ("slice_eq_equal_d2_overflow_if_equal", "sat"),
+    ] {
+        assert_chc_solver_result(SLICE_EQ_LENGTH_SOURCE, probe, expected);
+    }
 }

@@ -139,8 +139,26 @@ pub(crate) fn run_ay_direct_with_timeout(
 
     std::thread::spawn(move || {
         let mut executor = ay_dpll::Executor::new();
+        // Verdict only, and the posture the pinned ay CLI uses by default.
+        // This path publishes `proof_qualifiers: Vec::new()` and
+        // `proof_crosscheck: NotRun` — it has never claimed a checked
+        // refutation. ay's bare in-process posture at 10bc4b185 arms the
+        // certified proof cycle (the CLI's `--strict-proofs`), which turned a
+        // 0.27 s `unsat` on a 142-line BMC VC into a 10 s `unknown`, while the
+        // CLI's default plain run — the oracle every counted BMC row is
+        // measured with — is `--no-proof` posture at 0.27 s. Competition mode
+        // is ay's own switch for exactly that posture.
+        executor.set_competition_mode(true);
         executor.set_interrupt(executor_interrupt);
-        executor.set_deadline(Some(solve_deadline));
+        // `solve_deadline` is a std wall instant. It enters ay through ay's
+        // own `From` into `ay_core::time::Instant`, so this call keeps
+        // compiling when ay's clock seam (Trust's determinism plan, P4a) makes
+        // that type a newtype; until then the conversion is the identity.
+        #[expect(
+            clippy::useless_conversion,
+            reason = "identity while ay's Instant re-exports std's; delete once ay's clock seam makes it a newtype"
+        )]
+        executor.set_deadline(Some(solve_deadline.into()));
         let mut check_sat_result: Option<&'static str> = None;
         let mut failed_assert_count: u32 = 0;
         let mut failed_other_count: u32 = 0;

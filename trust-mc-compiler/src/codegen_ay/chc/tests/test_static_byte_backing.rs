@@ -229,3 +229,261 @@ fn test_static_str_as_bytes_final_pipeline_uses_const_backing() {
         );
     });
 }
+const PROJECTED_STATIC_WINDOW_SOURCE: &str = r#"
+    #![allow(dead_code, unused_assignments)]
+    static WORDS: [&str; 2] = ["DECOY", "FOO"];
+    static OTHER: [&str; 2] = ["OTHER", "BAR"];
+    static BYTES: [u8; 5] = *b"xBARy";
+    static WINDOWS: [&str; 1] = [unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(BYTES.as_ptr().add(1), 3))
+    }];
+    static mut LIVE_BYTES: [u8; 3] = *b"LIV";
+    static LIVE_WINDOWS: [&str; 1] = [unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            core::ptr::addr_of!(LIVE_BYTES).cast::<u8>(), 3,
+        ))
+    }];
+    pub fn second_element() -> u8 { WORDS[1].as_bytes()[0] }
+    pub fn interior_window() -> u8 { WINDOWS[0].as_bytes()[0] }
+    pub fn selected_pointer_identity() {
+        let selected = WORDS[1];
+        assert!(selected.as_ptr() == WORDS[1].as_ptr());
+    }
+    pub fn selected_pointer_distinct_bug() {
+        let selected = WORDS[1];
+        assert!(selected.as_ptr() == WORDS[0].as_ptr());
+    }
+    pub fn live_window() -> u8 { LIVE_WINDOWS[0].as_bytes()[0] }
+    pub fn merged_static_source(condition: bool) -> u8 {
+        let source = if condition { &WORDS } else { &OTHER };
+        let copied = source;
+        copied[1].as_bytes()[0]
+    }
+    pub fn copied_entry_source_then_reassign(mut source: &'static [&'static str; 2]) -> u8 {
+        let copied = source;
+        let result = copied[1].as_bytes()[0];
+        source = &WORDS;
+        core::hint::black_box(source);
+        result
+    }
+    pub fn dynamic_index(index: usize) -> u8 { WORDS[index].as_bytes()[0] }
+    pub fn entry_index_then_reassign(mut index: usize) -> u8 {
+        let value = WORDS[index].as_bytes()[0];
+        index = 0;
+        core::hint::black_box(index);
+        value
+    }
+    pub fn replaced_pointer_slot() -> u8 {
+        let mut text = WORDS[1];
+        { let slot = &mut text; *slot = "ZZZ"; }
+        text.as_bytes()[0]
+    }
+"#;
+
+// The decoded bytes are stores over an unconstrained tail. Declare that
+// tail without constraining it: the selected bytes must hold for every tail.
+fn projected_window_query_declarations(expr: &Expr) -> String {
+    let mut variables = std::collections::BTreeMap::new();
+    let mut stack = vec![expr];
+    while let Some(value) = stack.pop() {
+        if let ay_bindings::ExprValue::Var { name } = value.value() {
+            variables.insert(name.clone(), value.sort().clone());
+        }
+        stack.extend(value.value().children());
+    }
+    variables.into_iter().map(|(name, sort)| format!("(declare-const {name} {sort})\n")).collect()
+}
+
+#[test]
+fn test_projected_static_string_windows_precollect_exact_bytes() {
+    with_test_ay_ctx_for_source(PROJECTED_STATIC_WINDOW_SOURCE, |ctx| {
+        for (name, expected) in [("second_element", b"FOO"), ("interior_window", b"BAR")] {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+            let mut chc = ChcCtx::new(ctx.tcx, &body, name, ChcConfig::default());
+            chc.declare_block_relations();
+            let dest = body
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    let TerminatorKind::Call { func, destination, .. } = &block.terminator.kind
+                    else {
+                        return None;
+                    };
+                    chc.resolve_callee_path(func)?
+                        .ends_with("as_bytes")
+                        .then_some(destination.local)
+                })
+                .expect("one str::as_bytes call");
+            let bytes = chc.ref_resolution.const_ref_values.get(&dest).expect(name);
+            let len = chc.ref_resolution.subslice_len.get(&dest).expect(name);
+            assert_eq!(len, &Expr::bitvec_const(expected.len() as u128, 64), "{name}");
+            let index_width = bytes.sort().array_sort().unwrap().index_sort.bitvec_width().unwrap();
+            let same =
+                expected.iter().enumerate().fold(Expr::bool_const(true), |same, (i, byte)| {
+                    same.and(
+                        bytes
+                            .clone()
+                            .select(Expr::bitvec_const(i as u128, index_width))
+                            .eq(Expr::bitvec_const(*byte as u128, 8)),
+                    )
+                });
+            let declarations = projected_window_query_declarations(&same);
+            let query =
+                format!("(set-logic QF_ABV)\n{declarations}(assert (not {same}))\n(check-sat)\n");
+            assert_eq!(
+                run_z3_on_smt2_with_timeout(&query, z3_test_timeout_secs_or(30)).unwrap(),
+                "unsat",
+                "{name}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_projected_static_string_windows_refuse_unstable_inputs() {
+    with_test_ay_ctx_for_source(PROJECTED_STATIC_WINDOW_SOURCE, |ctx| {
+        for name in [
+            "live_window",
+            "dynamic_index",
+            "entry_index_then_reassign",
+            "replaced_pointer_slot",
+            "merged_static_source",
+            "copied_entry_source_then_reassign",
+        ] {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+            let mut chc = ChcCtx::new(ctx.tcx, &body, name, ChcConfig::default());
+            chc.declare_block_relations();
+            let dest = body
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    let TerminatorKind::Call { func, destination, .. } = &block.terminator.kind
+                    else {
+                        return None;
+                    };
+                    chc.resolve_callee_path(func)?
+                        .ends_with("as_bytes")
+                        .then_some(destination.local)
+                })
+                .expect("one str::as_bytes call");
+            assert!(
+                !chc.ref_resolution.const_ref_values.contains_key(&dest),
+                "{name}: no fixed byte fact"
+            );
+            assert!(
+                !chc.ref_resolution.subslice_len.contains_key(&dest),
+                "{name}: no fixed length fact"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_projected_static_pointer_slot_checks_actual_constant_index_bounds() {
+    use rustc_public::mir::{ProjectionElem, Rvalue, StatementKind};
+    use rustc_public::ty::{RigidTy, TyKind};
+    with_test_ay_ctx_for_source(PROJECTED_STATIC_WINDOW_SOURCE, |ctx| {
+        for (offset, min_length, from_end, expected) in [
+            (1, 1, true, true),
+            (0, 3, false, false),
+            (2, 1, false, false),
+            (3, 1, true, false),
+            (0, 1, true, false),
+        ] {
+            let mut body = find_instance_by_suffix(ctx.tcx, "second_element").body().unwrap();
+            let local_tys: Vec<_> = body.locals().iter().map(|local| local.ty).collect();
+            let mut changed = 0;
+            for block in &mut body.blocks {
+                for statement in &mut block.statements {
+                    let StatementKind::Assign(
+                        _,
+                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
+                    ) = &mut statement.kind
+                    else {
+                        continue;
+                    };
+                    let pointee = match local_tys[place.local].kind() {
+                        TyKind::RigidTy(
+                            RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _),
+                        ) => pointee,
+                        _ => continue,
+                    };
+                    if !matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Array(..)))
+                        || place.projection.len() != 2
+                        || !matches!(place.projection[0], ProjectionElem::Deref)
+                        || !matches!(
+                            place.projection[1],
+                            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    place.projection[1] =
+                        ProjectionElem::ConstantIndex { offset, min_length, from_end };
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 1, "the static array's single pointer load");
+            let mut chc = ChcCtx::new(ctx.tcx, &body, "second_element", ChcConfig::default());
+            chc.declare_block_relations();
+            let dest = body
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    let TerminatorKind::Call { func, destination, .. } = &block.terminator.kind
+                    else {
+                        return None;
+                    };
+                    chc.resolve_callee_path(func)?
+                        .ends_with("as_bytes")
+                        .then_some(destination.local)
+                })
+                .expect("one str::as_bytes call");
+            assert_eq!(
+                chc.ref_resolution.const_ref_values.contains_key(&dest),
+                expected,
+                "offset={offset} min_length={min_length} from_end={from_end}"
+            );
+            if expected {
+                assert_eq!(
+                    chc.ref_resolution.subslice_len.get(&dest),
+                    Some(&Expr::bitvec_const(3u128, 64))
+                );
+                let value = chc.ref_resolution.const_ref_values.get(&dest).unwrap();
+                let first = value.clone().select(Expr::bitvec_const(0u128, 64));
+                let declarations = projected_window_query_declarations(&first);
+                let query = format!(
+                    "(set-logic QF_ABV)\n{declarations}(assert (not (= {first} {})))\n(check-sat)\n",
+                    Expr::bitvec_const(b'F' as u128, 8)
+                );
+                assert_eq!(
+                    run_z3_on_smt2_with_timeout(&query, z3_test_timeout_secs_or(30)).unwrap(),
+                    "unsat"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn test_projected_static_string_pointer_identity_is_preserved() {
+    with_test_ay_ctx_for_source(PROJECTED_STATIC_WINDOW_SOURCE, |ctx| {
+        for (name, expected) in
+            [("selected_pointer_identity", "unsat"), ("selected_pointer_distinct_bug", "sat")]
+        {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+            let vc = mir_to_chc(
+                ctx.tcx,
+                &body,
+                name,
+                ChcConfig { track_level: ChcTrackLevel::Mem, ..ChcConfig::default() },
+            );
+            let query = emit_chc(&vc).to_string();
+            assert_eq!(
+                run_z3_on_smt2_with_timeout(&query, z3_test_timeout_secs_or(30)).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    });
+}

@@ -1,0 +1,67 @@
+{
+  "original_source_sha256": "b44e47ecdbe220c97025f89b44e4dfb96e4d2cdca156b93873a53a6c397b2270",
+  "original_runtime_sources": [
+    "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual.rs",
+    "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual.rs",
+    "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual.rs",
+    "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual.rs"
+  ],
+  "original_call_debt": "call_dispatch_fallback=1",
+  "preserved_harnesses": {
+    "nested_compound_none_raw_byte_uses_native_niche_safe": "592b63de8d663f34a58dc85581d49fa202d0e45559ee6ac27ac794291a049bee",
+    "nested_compound_none_raw_byte_is_not_typed_zero_bug": "f3b96c83fe45cbf07201ddd14dba7cac157130565789bf1f25c7d85e72c27932"
+  },
+  "fixture": "tools/soundness-duals/promoted_nested_option_is_none_dual.rs",
+  "initial_fixture_sha256": "8cb2351f5f6d5866185b14ceb56072cedc67627b61599878f6b75a1a1278d572",
+  "original_runtime_artifacts": [
+    {
+      "route": "devcli",
+      "harness": "nested_compound_none_raw_byte_uses_native_niche_safe",
+      "files_sha256": {
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual.rs": "b44e47ecdbe220c97025f89b44e4dfb96e4d2cdca156b93873a53a6c397b2270",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/stdout.txt": "39e8e013e5c660b11018e7a18396c637db2eec7db2a09f6759be0631e5c7ebe7",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/stderr.txt": "57a82bc5354eef689bc983d6a2a7ca759b6a9ebfa8cf05a1e942e79223af77d6",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/summary.json": "e377c12a41e65eeb1764932ef17a93f1fe1e9488bcafb63db8aa8eca17826b32",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/argv.json": "fb059d43b310de157ba845b3d35d5528074c223fe918055796f531b57a9ce427",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual__RNvCslFiAh2jvTaU_26promoted_tuple_option_dual52nested_compound_none_raw_byte_uses_native_niche_safe.symtab.vc.json": "065c2c02b1a7fdc9b85b5c8db03e415858b646acf03631ee431191fa0bf5529f"
+      }
+    },
+    {
+      "route": "devcli",
+      "harness": "nested_compound_none_raw_byte_is_not_typed_zero_bug",
+      "files_sha256": {
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual.rs": "b44e47ecdbe220c97025f89b44e4dfb96e4d2cdca156b93873a53a6c397b2270",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/stdout.txt": "3b0e5fdca21fddb100305e833415d15d6b566924abf9729555f43d9452c6be5f",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/stderr.txt": "a3a669a32e8cb741b13b77a0adcaebdb5706e8791ba63afb2889d57cd4658426",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/summary.json": "3134ee6fbe19bc19753d6be40d33f34e6faaad3a1d8a36b4b85e1fe169c83289",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/argv.json": "bd8aa83fe890544a9510acde152a3a1b06297ce2a04c8ea8910f7586625e6dca",
+        "target/untyped-native-cell-16387/runtime/devcli/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual__RNvCslFiAh2jvTaU_26promoted_tuple_option_dual51nested_compound_none_raw_byte_is_not_typed_zero_bug.symtab.vc.json": "ece15ec670671f25b80e70bd4d6b85c7f56bad6867b651efb57f0fdf67a1d83a"
+      }
+    },
+    {
+      "route": "trustc",
+      "harness": "nested_compound_none_raw_byte_uses_native_niche_safe",
+      "files_sha256": {
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual.rs": "b44e47ecdbe220c97025f89b44e4dfb96e4d2cdca156b93873a53a6c397b2270",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/stdout.txt": "84cf8222829a1b67aa464c411041e2d3ba34689b2efe4630d3f9054f8cd62a99",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/stderr.txt": "82776ae157aa5e41f781c0438cbaf241afff29a1ff0b2825956c9ee3dd117d6d",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/summary.json": "e377c12a41e65eeb1764932ef17a93f1fe1e9488bcafb63db8aa8eca17826b32",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/argv.json": "787bb3520d7440565a86a8f72e756925e88dd75cd3d84a38964e6939c8c72c40",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_uses_native_niche_safe/promoted_tuple_option_dual__RNvCslFiAh2jvTaU_26promoted_tuple_option_dual52nested_compound_none_raw_byte_uses_native_niche_safe.symtab.vc.json": "065c2c02b1a7fdc9b85b5c8db03e415858b646acf03631ee431191fa0bf5529f"
+      }
+    },
+    {
+      "route": "trustc",
+      "harness": "nested_compound_none_raw_byte_is_not_typed_zero_bug",
+      "files_sha256": {
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual.rs": "b44e47ecdbe220c97025f89b44e4dfb96e4d2cdca156b93873a53a6c397b2270",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/stdout.txt": "bf7a36ced99eee3c3964ecc0607acd57276bbcfa14056600f168b19f6e109996",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/stderr.txt": "a48eb154347930bdbaa18ab496f8dec2d17a76721289f685dcf4533242aafee8",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/summary.json": "3134ee6fbe19bc19753d6be40d33f34e6faaad3a1d8a36b4b85e1fe169c83289",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/argv.json": "a6f27652ec4b5252fac47928e5400410ce7ff28b2b04acfd8e945ede90aaff1d",
+        "target/untyped-native-cell-16387/runtime/trustc/nested_compound_none_raw_byte_is_not_typed_zero_bug/promoted_tuple_option_dual__RNvCslFiAh2jvTaU_26promoted_tuple_option_dual51nested_compound_none_raw_byte_is_not_typed_zero_bug.symtab.vc.json": "ece15ec670671f25b80e70bd4d6b85c7f56bad6867b651efb57f0fdf67a1d83a"
+      }
+    }
+  ],
+  "fixture_sha256": "487add4863a7196d86c9e939e6bfd7ecd30b36ad3b7a5b0a5831d5ade0f3a966"
+}

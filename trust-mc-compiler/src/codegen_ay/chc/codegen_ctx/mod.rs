@@ -8,6 +8,10 @@
 // Decomposed into globals/types/mod per #2408.
 
 mod body_resolve;
+mod fresh_vars;
+pub(in crate::codegen_ay::chc) use fresh_vars::{
+    Booked, ExactVar, Havoc, SoundHavocReason, sound_havoc,
+};
 pub(in crate::codegen_ay) mod diagnostics;
 mod diagnostics_global;
 mod diagnostics_per_fn;
@@ -24,20 +28,21 @@ pub(in crate::codegen_ay::chc) use types_collection_result::{
 // Re-export globals for sibling modules in chc/
 pub(in crate::codegen_ay::chc) use globals::{
     CHC_DEBUG_FLAG, PENDING_FRESH_VAR_DECLS, UNDEF_COUNTER, chc_debug_enabled, chc_fresh_name,
-    declare_pending_var, push_pending_datatype_sort, record_aggregate_encoding_gap_for_fn,
-    record_aggregate_gap_reason_for_fn, record_drop_fallback_reason_for_fn,
-    record_fp_bitvector_encoding_for_fn, record_kani_mem_overapprox_for_fn,
-    record_offset_provenance_unresolved_for_fn, record_ptr_metadata_unconstrained_for_fn,
-    record_signedness_fallback_for_fn, record_sound_havoc_drop_for_fn,
-    record_static_init_incomplete_for_fn, record_store_dropped_for_fn,
-    record_stub_approximation_for_fn, record_translation_drop_for_fn,
+    push_pending_datatype_sort, record_aggregate_encoding_gap_for_fn,
+    record_aggregate_gap_reason_for_fn, record_assert_untranslatable_for_fn,
+    record_drop_fallback_reason_for_fn, record_fp_bitvector_encoding_for_fn,
+    record_kani_mem_overapprox_for_fn, record_offset_provenance_unresolved_for_fn,
+    record_ptr_metadata_unconstrained_for_fn, record_signedness_fallback_for_fn,
+    record_sound_havoc_drop_for_fn, record_static_init_incomplete_for_fn,
+    record_store_dropped_for_fn, record_stub_approximation_for_fn, record_translation_drop_for_fn,
     record_translation_drop_site_reason_for_fn, record_type_sort_fallback,
     record_type_sort_fallback_for_fn, record_unhandled_call_for_fn, set_chc_fallback_count_for_fn,
 };
 // Re-export test-only globals: chc-only at chc scope, cross-module at codegen_ay scope
 #[cfg(test)]
 pub(in crate::codegen_ay::chc) use globals::get_chc_fallback_counts;
-pub(in crate::codegen_ay::chc) use globals::push_pending_var_decl;
+pub(in crate::codegen_ay) use globals::record_bmc_offset_provenance_unresolved_for_fn;
+pub(in crate::codegen_ay) use globals::record_bmc_sound_havoc_for_fn;
 #[cfg(test)]
 pub(in crate::codegen_ay) use globals::{
     clear_chc_fallback_counts, get_chc_unhandled_call_count, set_chc_fallback_count_for_test,
@@ -47,7 +52,8 @@ pub(in crate::codegen_ay) use globals::{
     get_aggregate_encoding_gap_count, get_fp_bitvector_encoding_count,
     get_inferable_predicate_count, get_ptr_metadata_unconstrained_count,
     get_rounding_assertion_bypass_count, get_static_init_incomplete_count,
-    get_stub_approximation_count, take_chc_diverging_call_drop_count, take_chc_fallback_counts,
+    get_stub_approximation_count, take_assert_untranslatable_by_fn,
+    take_chc_diverging_call_drop_count, take_chc_fallback_counts,
     take_chc_offset_provenance_unresolved_count, take_chc_unhandled_call_count,
     take_drop_fallback_reasons_by_fn, take_error_blocked_fmt_count,
     take_fp_bitvector_encoding_by_fn, take_fp_bitvector_encoding_count,
@@ -132,6 +138,15 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         | "raw_ptr_deref_unresolved_fail_closed"
         | "rvalue_deref_load_unresolved"
         | "assume_guard_dropped"
+        // heap/stack_address.rs: a relational comparison of two raw pointers
+        // that may be in different allocations, where one allocation has no
+        // tracked base address, compares two FRESH declare-vars. A declare-var
+        // is universally quantified over its rule, so every order (and
+        // equality) of the two addresses is admitted: a superset of the real
+        // outcomes, monotone, never a false proof. Tagging a dependent
+        // counterexample OverApproximation is right: the fresh pair does not
+        // keep two comparisons of the same pointers consistent.
+        | "cross_alloc_ptr_order_untracked"
         | "constraint_invariant_fixup"
         // #4225 unsize-coercion alias store dropped on elem-sort mismatch
         // (unsize_dyn.rs): a DROPPED store only widens behavior — reads of the
@@ -145,9 +160,9 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // terminal fallback for the full written audit): the clone destination
         // state var reaches the head as a fresh, unconstrained `__out` havoc
         // (universally quantified — monotone). The only accompanying
-        // constraints are the sidecar pins dst_len := src_len (exact real
-        // clone semantics) and dst_cap := src_cap (the uniform VecClone stub
-        // semantics shared with the fully-modeled paths); no stale-input
+        // constraints are the sidecar pins dst_len := src_len and
+        // dst_cap := src_len (exact real clone semantics, shared with the
+        // fully-modeled paths); no stale-input
         // constraint touches the havocked var, and dest adapter_source_data is
         // invalidated at dispatch. ∀-sound; blessing keeps parity untouched
         // with attribution visible.
@@ -172,6 +187,87 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // excluded from the proof qualifier (proofs stay clean) while still
         // tagging a dependent counterexample OverApproximation.
         | "nested_call_overapprox"
+        // Untyped-view net 2 (stmt/codegen_stmt_store/untyped_view_scan.rs):
+        // a raw read of a static's memory under a view the entry rule never
+        // seeds and the static store lanes never write (`*(addr_of!(G) as
+        // *const u8).add(2)` for `G: [u16; 2]`). The encoding is unchanged:
+        // the read selects a typed-memory cell no rule constrains, a
+        // universally quantified value of which the real byte is one
+        // interpretation, so no proof over it is a false proof. What the free
+        // value never is, is evidence: the reason is recorded unaccounted, so
+        // a counterexample in the harness is not certified Genuine.
+        | "static_memory_read_unseeded_view"
+        | "array_byte_view_unmodeled"
+        // A bounds check against a `Vec::with_capacity` buffer's recorded size
+        // when the `Vec` may grow past it (call/codegen_call_vec_ops/
+        // constructors.rs `taint_vec_capacity_size`): the size is `ite(t, 0,
+        // bytes)` for a fresh `t` recorded as the freed variable. `t` may be
+        // false, so the recorded bound still binds every proof exactly as
+        // before, and a violation of it stays reachable; a counterexample that
+        // rests on it reads `t` and is not certified (a grown `Vec`'s buffer is
+        // larger than the record).
+        | "vec_capacity_size_uncertified"
+        // The memory image of a niche-encoded flattened enum's tag
+        // (call/codegen_call_result_mem.rs `flattened_enum_tag_image`): where
+        // the untagged variant is active, the tag bytes are its payload's, and
+        // a payload with no byte image leaves them a fresh value, universally
+        // quantified, of which the real bytes are one interpretation. A proof
+        // over it is a proof; it is recorded with the fresh value's identity,
+        // so a counterexample that reads those bytes is not certified Genuine.
+        | "enum_tag_image_payload_unknown"
+        // The heap view ledger (heap/heap_view_ledger.rs): a read of a heap
+        // object under a type key no store of those bytes wrote (`*(p as
+        // *const u32)` over a `Box<[u16; 2]>` the program only ever wrote as
+        // `u16`). The read selects a typed-memory cell no rule constrains, of
+        // which the real bytes are one interpretation, so a proof over it is a
+        // proof. It is recorded with the arrays it selected from as the freed
+        // identities, so no counterexample that reads them is certified
+        // Genuine on its strength (review of fix/chc-lost-writes, lostwrite
+        // round 1, finding 3), while one that rests on another check of the
+        // same access (its bounds, its initialization) still is (lostwrite
+        // track round 1, finding 4: recorded unaccounted, it cost
+        // `uninit/vec-read-uninit` its certificate). A read where some store
+        // of the bytes wrote its key and another did not may be STALE, not
+        // free, and fails closed (`heap_view_read_stale`).
+        | "heap_view_read_unwritten"
+        // Integer-to-pointer invalidation (expr/codegen_expr_heap.rs
+        // `invalidate_int_to_ptr_object`): the lane invalidates `obj_valid` of
+        // the object its result names, since the model keeps no set of exposed
+        // allocations. That only ADDS violations (every later access of the
+        // object fails memory safety), so a proof under it is a proof. What a
+        // failure resting on it is not, is evidence when the object was live
+        // (Kani keeps the pointer's bits and proves the round trip): the reason
+        // is recorded unaccounted, so no counterexample in the harness is
+        // certified Genuine (review of fix/chc-lost-writes round 3, finding 1;
+        // the BMC lane's `pointer_with_exposed_provenance`).
+        | "int_to_ptr_obj_invalidated"
+        // Cell store register havoc (call/codegen_call_cell_register.rs,
+        // R5): a `Cell` store the lane models exactly (the value lands at the
+        // referent's own memory-mirror address) whose register mirror cannot
+        // be rebound exactly (an array element, an enum payload, an unmapped
+        // offset, a choice between known locals). The register of EVERY local
+        // the address can name is left unbound in the rule head -- a fresh,
+        // universally quantified value of which the stored value is one
+        // interpretation -- and the block's earlier bindings of those slots
+        // are rewritten onto the pre-call value first, so nothing pins the
+        // havoced slot. Monotone: a proof over it is a proof. The havoced
+        // slots are recorded as freed variables, so a counterexample that
+        // reads one stays OverApproximation and one independent of them can
+        // be certified. RefCell stores (whose lane is not exact) and stores
+        // with an unidentified referent record their own fail-closed reasons.
+        | "cell_store_register_havoc"
+        // Design 3 fn-pointer dispatch (call/fn_ptr_targets.rs
+        // `fn_ptr_obligation_default`): the "invalid function pointer"
+        // obligation of a set the harness universe completed becomes
+        // `ptr ∈ ids ∨ t` for a FRESH boolean `t` recorded as this event's
+        // freed variable. `t` occurs in that error rule alone and can always
+        // be false, so the error is reachable exactly when `ptr ∉ ids` is: no
+        // behaviour is added or removed and no proof changes. What it buys is
+        // that the violated obligation reads a freed variable, so
+        // `recertify_overapprox_ctrex` never certifies it Genuine (the pointer
+        // came from memory, where a type-punned read is unconstrained), while
+        // a violation of any other check stays certifiable.
+        | "fn_ptr_obligation_value_uncertified"
         // P4-4 audit (emit_math_axiom_goto_extra): PURE math intrinsic
         // (sin/cos/sqrt/exp/powf even-power) — the destination is the call's
         // only effect; it reaches the head as fresh havoc constrained only by
@@ -181,17 +277,22 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // strict over-approximation. ∀-sound. Duals: dual_p4_float_nan.rs
         // (sine value not pinned; powf lower bound refutable) stay FAILED.
         //
-        // #4270 / TL18 UPDATE: the destination is now bound to a select over
-        // the frozen `call_uf_tbl` (call_uf_table.rs) instead of a bare fresh
-        // variable. This does NOT weaken the audit. The table is never
-        // constrained anywhere, so for a FIXED key the ∀-quantified table
-        // still ranges over every value of the sort — the destination remains
-        // universally quantified and no behaviour is removed. What the select
-        // adds is CONGRUENCE: two sites with the same intrinsic and the same
-        // argument value now get the same result, which is what the real
-        // function does (`sin(x) == sin(x)` was previously unprovable because
-        // the two sites drew independent havocs). Arguments that differ stay
-        // independent — `sin(x) == sin(y)` is still refutable.
+        // #4270 / TL18 UPDATE: the destination is now bound to an application
+        // of a first-class uninterpreted `declare-fun` symbol
+        // (call_uf_table.rs) instead of a bare fresh variable. This does NOT
+        // weaken the audit. No axiom about that symbol is emitted anywhere in
+        // the problem, so its interpretation ranges over every function of the
+        // declared signature — for FIXED arguments the application still ranges
+        // over every value of the sort, the destination remains universally
+        // quantified, and no behaviour is removed. What the application adds is
+        // CONGRUENCE: two sites with the same intrinsic and the same argument
+        // value now get the same result, which is what the real function does
+        // (`sin(x) == sin(x)` was previously unprovable because the two sites
+        // drew independent havocs). Arguments that differ stay independent —
+        // `sin(x) == sin(y)` is still refutable. (Before ay 0.23.0 the same
+        // congruence was emulated by a frozen `call_uf_tbl` Array column
+        // threaded through every relation; the audit above held for the same
+        // reason, and the column is gone.)
         // Bounded-inline SwitchInt branch fallback (switchint.rs
         // `switchint_branch_fallback`): the branch result is a FRESH,
         // universally-quantified variable of the callee's return sort — a
@@ -207,21 +308,374 @@ pub(in crate::codegen_ay::chc) fn fallback_soundness(reason: &str) -> FallbackSo
         // reported as a genuine failed assertion.
         | "switchint_branch_overapprox"
         | "math_axiom_range_overapprox"
+        // Parity-1 second review (float_binop_table.rs `float_binop_chc_term`): a
+        // symbolic float Add/Sub/Mul/Div/Rem is a select from a table no rule
+        // constrains — a universally quantified value of which the IEEE 754
+        // result is one interpretation, so no proof over it is a false proof
+        // (the module's original soundness argument, unchanged). What the
+        // table never was is EVIDENCE: the solver may pick `tbl[Add, -0, +0]`
+        // = -0 where every FPU gives +0, and before this record that pick was
+        // certified `[AY:CTREX_CAT:Genuine]` (`(m + 0.0).is_sign_positive()`
+        // with `m` either zero, both routes). SoundHavoc is exactly the lane
+        // for it: excluded from the proof qualifier, demotes a dependent
+        // counterexample to OverApproximation. Recorded once per symbolic
+        // select, including the refined ones — a refinement decides its
+        // guarded cases and leaves the rest free, and the classifier cannot
+        // tell from the count which case a counterexample took.
+        | "float_binop_table_overapprox"
+        // Kani "not currently supported" check (codegen_call_fallback_emit.rs
+        // `emit_kani_unsupported_check`): the call site emits a path-gated
+        // `error_p{N}` carrying Kani's own message and NO successor edge —
+        // Kani's `assert(false); assume(false)`. It removes no behaviour a proof
+        // could rest on: the only executions left without a successor are the
+        // ones that reach that error head, so a PROOF requires the call to be
+        // unreachable, and then its successor is unreachable too. Recorded
+        // UNIDENTIFIED on purpose: an unaccounted reason keeps the
+        // approximation-identity evidence incomplete, so
+        // `recertify_overapprox_ctrex` can never certify the unsupported check
+        // as a Genuine bug — the CHC twin of the BMC lane's
+        // `unsupported_foreign_function` taint (dual_77_dependent.rs).
+        | "kani_unsupported_construct_check"
+        // `kani::float::float_to_int_in_range` whose operand did not translate
+        // to a float bitvector (codegen_call_kani.rs): the destination is left
+        // out of the rule's constraints and reaches the head as a fresh `__out`
+        // havoc, so every rule holds for BOTH boolean answers -- monotone, a
+        // proof over it is a proof of the real program. A counterexample may
+        // read the wrong answer, which is exactly what this lane tags
+        // (OverApproximation) instead of certifying it Genuine.
+        | "float_to_int_in_range_nondet"
+        // A promoted constant reference whose target object is registered (its
+        // address resolves, `pointer_scalar_expr`) but whose contents did not
+        // decode (`collect.rs` `try_collect_single_const_ref`): the object's
+        // memory cells and `obj_size` are free. Free cells admit every value
+        // the real constant has, so a proof over them is a proof; a
+        // counterexample may rest on a value or size the constant never has
+        // (T1 review, 2026-09-24: a free `obj_size` certified Genuine), so it
+        // is recorded UNIDENTIFIED and never certified.
+        | "const_ref_contents_unmodeled"
+        // D2 (`decl::global_objects`): a FIXED object a constant pointer
+        // reaches that is too large to seed cell by cell, or whose read at a
+        // type was noted only after the entry rule was emitted (an inlined
+        // callee's constant). Its cells are free: free cells admit every value
+        // the constant really has, so a proof over them is a proof; a
+        // counterexample may rest on a value the object never holds, so it is
+        // recorded and never certified — the same audit as
+        // `const_ref_contents_unmodeled`, one object wide instead of one window.
+        | "const_object_unseeded"
+        // D7(b) (`decl::static_path`): a store whose address const-folds into
+        // a static the harness keeps a state variable for, but whose bytes no
+        // static place path names. The static's state variable is left
+        // unbound in the rule head — a fresh, universally quantified value of
+        // which the stored one is an instance — and the block's earlier binding
+        // of it is dropped first, so nothing pins the havoced slot. Monotone: a
+        // proof over it is a proof; a counterexample that reads it is tagged,
+        // never certified.
+        | "static_store_unrouted"
+        // FC-06 frame check on a `&mut T` (or interior-mutable `&T`) argument of a
+        // call that MAY write it (modifies_frame.rs::modifies_frame_call_check):
+        // an error rule whose violation over-approximates the call's writes. It
+        // adds error paths only, and a write the call makes through that
+        // reference stays inside the checked `size_of::<T>()` bytes, so a proof
+        // over it is a proof; a counterexample is tagged, never certified.
+        | "modifies_frame_call_arg_overapprox"
+        // Option payload coercion (`coerce_option_payload_expr`,
+        // codegen_stmt_aggregate_adt_option.rs): a payload whose sort cannot be
+        // coerced to the Option datatype's payload sort becomes a fresh
+        // declare-var of that sort, which nothing constrains. It admits the real
+        // payload, so a proof over it is a proof; a counterexample that reads it
+        // is demoted. The site used to record only `aggregate_encoding_gap`,
+        // which no verdict reads. RECEIPT: kani/ThreadLocalRef/main.rs
+        // `test_bool` (`thread_local! { static COND: bool = true }`, Kani
+        // SUCCESSFUL): the `Option<&bool>` behind `LocalKey::with` arrives as a
+        // pointer where the datatype holds a Bool, and "assertion failed: b" was
+        // certified Genuine once 7427e34c5 removed an unrelated translation drop
+        // from the same harness.
+        | "adt_option_payload_sort_mismatch"
+        // translate.rs `account_unbound_heap_metadata_outputs`: a transition rule
+        // whose head carries an `obj_valid` / `obj_size` output that nothing in
+        // its body mentions. The lane is universally quantified there -- a
+        // superset of the one real value, monotone, so a proof over it is a
+        // proof. A counterexample may rest on a validity or size no allocation
+        // has, so it is tagged and never certified (the site that left the
+        // lane unbound recorded nothing; see `box_then_null_deref` in
+        // tools/soundness-duals/heap_metadata_lane_dual.rs).
+        | "heap_metadata_output_unbound"
+        // heap/stack_address.rs `far_step_unknown`: a wrapping pointer step
+        // from a FAR pointer whose full offset is unknown
+        // (`step_wrapping_address_from`) keeps the pointer's object and its
+        // exact low 48 offset bits, and takes "far again or back in range" from
+        // a fresh 1-bit declare-var. The real outcome is one of its two values,
+        // so every behavior of the real step is admitted: monotone, a proof over
+        // it is a proof. The var is the freed identity, so only a
+        // counterexample that reads it is left uncertified.
+        | "wrapping_step_far_unknown"
+        // heap/stack_address.rs `apply_far_observation_cuts`: a fail-closed far
+        // pointer observation splits each rule of its block into the rule cut to
+        // the paths where no observation is fail-closed and a copy whose extra
+        // guard (the observation's condition AND a fresh 1-bit declare-var equal
+        // to 1) reaches a dedicated error property. The copy only ADDS error
+        // edges and the cut removes exactly the paths the copy reports, so no
+        // behavior escapes both: a proof needs the copy unreachable, i.e. no far
+        // pointer observed. The declare-var is the freed identity, so the copy's
+        // property is never certified while every other property reads nothing
+        // of it.
+        | "far_pointer_observation"
+        // The `Iterator::sum` stub (codegen_call_iterator_adapter/reduce.rs
+        // `reduce_havoc`, AY alignment review round 2): the value of a sum the
+        // stub cannot compute -- a float sum (the lane has no FP theory), a
+        // `Sum` impl it does not know, elements past the replay bound or a
+        // sequence the replay cannot address -- is a FRESH, universally
+        // quantified declare-var of the destination sort, of which the real
+        // value is one interpretation: a proof over it is a proof. It is
+        // recorded IDENTIFIED, so a counterexample that reads it is demoted and
+        // one independent of it can be certified. RECEIPT (all Kani
+        // SUCCESSFUL): `[1u32; 12].iter().sum() == 12`, a symbolic-length
+        // `a[..n]` sum, and `[1.5f32, 2.25].iter().sum() == 3.75` were
+        // counterexamples certified Genuine while the havoc was booked only on
+        // `aggregate_encoding_gap`. (`fold` / `try_fold` values use
+        // `fresh_adapter_symbol`'s `iter_adapter_symbol_overapprox`.)
+        | "iter_sum_value_overapprox"
+        // The same stub's conservative overflow rule: `unchecked ∧ t` for a
+        // FRESH boolean `t` that occurs in that error rule alone and can always
+        // be true, so the rule is reachable exactly when an element the replay
+        // did not check is added. It only ADDS error paths (fail-closed for a
+        // proof); `t` makes the violated check read a freed variable, so a
+        // counterexample through it is never certified Genuine -- the same
+        // device as `fn_ptr_obligation_value_uncertified`.
+        | "iter_sum_overflow_unchecked"
+        // The same device for a `Sum` impl the stub does not model
+        // (`SumSummand::Unknown`: a core impl the classification does not
+        // know, since a user impl, `Duration` and `Option<T>` take the ordinary
+        // call path; never std's `Saturating`, which cannot panic and is
+        // replayed exactly, AY alignment round 8, review round 4): an error rule whose violation is
+        // a FRESH boolean `t` alone, so the rule is reachable whenever the call
+        // is. It stands for every panic of the unencoded body, adds error paths
+        // only, and a counterexample through it reads `t`, so it is never
+        // certified.
+        | "iter_sum_impl_unmodeled"
+        // The same device for the closures a call runs and its stub does not
+        // encode (AY alignment round 8, review round 5, finding 1;
+        // `iter_closure_obligation`): a `Filter`'s predicate or a `Map`'s
+        // function under a `next()`, `sum`, `fold` or `collect` stub. Only a
+        // closure the obligation-free walk cannot certify gets the rule, whose
+        // violation is the fresh boolean alone. (A `fold`'s own closure states
+        // its checks per replayed step, and an uncertified reach check where a
+        // step is not replayed: reduce.rs `unreplayed_step_check`.)
+        | "iter_adapter_closure_unmodeled"
+        // The same device for Kani's "NaN on addition" inside a float sum under
+        // `--nan-check` (the lane has no FP theory to compute the partial sums
+        // the check reads): `has_remaining ∧ t`.
+        | "iter_sum_nan_unchecked"
+        // Rule E (design trust-mc-reds-final §4.4;
+        // stmt/codegen_stmt_aggregate_discr.rs `translate_discriminant`): the
+        // discriminant of an enum read through a `Deref` whose referent did not
+        // translate is a fresh `declare-var` constrained to the disjunction of
+        // `discriminant_for_variant(v)` over EVERY variant (sign-extended to
+        // the pointer width, the encoder's value convention;
+        // `enum_discriminant_value_set`). A valid enum's discriminant is one of
+        // those values, so the symbol ranges over a superset of the real one:
+        // monotone, a proof over it is a proof. Two reads of the same place get
+        // independent symbols, which only adds behaviours. The symbol's name is
+        // recorded as the approximation's identity, so a counterexample that
+        // reads it is OverApproximation unless recertified. The same fallback
+        // reached on a place with NO `Deref` (where the place itself should
+        // have translated) also books `discr_unresolved_direct_place`, which is
+        // NOT listed here: fail-closed. Held by
+        // chc/tests/test_rule_e_discriminant.rs.
+        | "discr_unresolved_referent"
         // #4270 / TL18 audit (see call_uf_table.rs for the full written gate):
-        // an ESTABLISHED-pure scalar callee summarised by the frozen congruent
-        // table. `established_pure_scalar_callee` reads the callee's MIR body
-        // (not its signature shape) and admits it only when the body has no
-        // Deref, no reference/raw-pointer constant, no pointer-creating rvalue,
-        // no memory intrinsic, no panicking terminator (no `Assert`, so an
-        // overflow check is never swallowed) and no nested call outside the
-        // same gate or the total/pure bit intrinsics. Such a callee's ONLY
-        // observable effect is its return value, which reaches the head as
-        // `select` over a table that is never constrained anywhere -- the real
-        // function is one interpretation of it, so the term is universally
-        // quantified exactly like a fresh havoc, only congruent. No memory
-        // side effect exists to be identity-retained. ∀-sound; a callee that
-        // can panic, read a static or take a pointer FAILS the gate and keeps
-        // the fail-closed `call_dispatch_fallback_prebuilt` havoc.
+        // an ESTABLISHED-pure scalar callee summarised by a first-class
+        // uninterpreted function. `established_pure_scalar_callee` reads the
+        // callee's MIR body (not its signature shape) and admits it only when
+        // the body has no Deref, no reference/raw-pointer constant, no
+        // pointer-creating rvalue, no memory intrinsic, no panicking terminator
+        // (no `Assert`, so an overflow check is never swallowed) and no nested
+        // call outside the same gate or the total/pure bit intrinsics. Such a
+        // callee's ONLY observable effect is its return value, which reaches
+        // the head as an application of a `declare-fun` symbol that carries no
+        // axiom anywhere in the problem -- the real function is one
+        // interpretation of it, so the term is universally quantified exactly
+        // like a fresh havoc, only congruent. AY's congruence closure is a
+        // theory fact about the symbol, NOT a purity proof: the right to model
+        // the callee as a function of its arguments comes from the gate and
+        // from nowhere else. No memory side effect exists to be
+        // identity-retained. ∀-sound; a callee that can panic, read a static or
+        // take a pointer FAILS the gate and keeps the fail-closed
+        // `call_dispatch_fallback_prebuilt` havoc.
+        //
+        // Uncertified reach checks of the inline walker
+        // (call/codegen_call_virtual_inline/uncertified_check.rs): an
+        // obligation the walk reaches but cannot state is recorded as the
+        // side-channel check `t`, a FRESH boolean read by that error rule
+        // alone and recorded as this event's freed variable. The walker adds
+        // its path condition as for any check, and `t` can be false, so the
+        // error is reachable exactly when the obligation's site is: a proof
+        // requires the site unreachable, and then the obligation it stands
+        // for is unreachable too. Nothing is havocked and no behaviour is
+        // removed, so a proof over it is a proof. What the record buys is that
+        // the violated check reads a freed variable, so it is never certified
+        // Genuine (the program does not fail there; the walker could not say
+        // whether it does). Measured on the duals and the 737 parity units in
+        // docs/chc-hole-fix-designs-2026-09-24.md, "Walker fail-closed".
+        | "walker_untranslatable_assert_uncertified"
+        // The same record for a diverging call the walker does not model
+        // (a user `-> !` function): the check `t` above, and the path's
+        // result value, a fresh declare-var on a continuation the program
+        // never takes (the call does not return), so every value is
+        // admitted and a counterexample reading it is never certified.
+        | "walker_diverging_call_uncertified"
+        // The same record for a SwitchInt arm the walker could not finish
+        // whose abandoned region can carry an obligation (switchint.rs
+        // `switchint_branch_fallback`): `t` under the arm's path condition
+        // and guard, so the error is reachable exactly when the arm is, and
+        // every obligation the region holds lies on paths through the arm.
+        | "walker_bailed_arm_obligation_uncertified"
+        // The same record for an iterator reduction step the statement path
+        // does not replay (`codegen_call_iterator_adapter/reduce.rs`: a
+        // `fold` / `sum` step past the replay bound, a `fold` closure the
+        // walker could not walk, a `try_fold` closure never walked): `t`
+        // under the condition that such a step runs, so the error is
+        // reachable exactly when an unchecked step's obligation can be.
+        | "iter_reduce_step_uncertified"
+        // Kani's unwinding assertion on an iterator reduction's std loop
+        // under a declared unwind bound, where the model cannot state it
+        // exactly (`reduce.rs`, `push_reduce_unwinding_check`): `t` under
+        // the condition that the loop can run past the bound.
+        | "iter_reduce_unwind_uncertified"
+        // A modelled call whose callee may loop, under a declared unwind
+        // bound (`codegen_call.rs`, `model_call_unwinding_check`): the reach
+        // check `t` wherever the call is reached, standing for Kani's
+        // unwinding assertion on the loop the model does not replay.
+        | "model_call_loop_unwind_uncertified"
+        // `Vec::extend` from a source whose length the model cannot resolve
+        // (`codegen_call_vec_ops_len.rs`, `vec_op_extend_from_slice`): the new
+        // length is a fresh value no smaller than the old, freed by this
+        // record.
+        | "vec_extend_source_len_unresolved"
+        // `Vec::extend` from a range whose count is symbolic or past the
+        // unroll bound (`codegen_call_vec_ops_extend_range.rs`,
+        // `range_extended_data`): the Vec's `data` is a fresh array, freed by
+        // this record. Its `len` and `cap` fields are written exactly.
+        | "vec_extend_range_elements_unmodelled"
+        // The same for `Vec::extend_from_slice` / `extend` from a slice whose
+        // length is known and whose values are not (`codegen_call_vec_ops_len.rs`).
+        | "vec_extend_slice_elements_unmodelled"
+        // A Vec's grown capacity where the model does not know `RawVec`'s
+        // growth: the element's size, which fixes the minimum non-zero
+        // capacity, is unknown, or the call grows in steps the model does
+        // not replay (`splice`) (`codegen_call_vec_ops/shared.rs`,
+        // `vec_reserved_cap`, `vec_fresh_grown_cap`): a fresh value of at
+        // least the required capacity, freed by this record.
+        | "vec_grown_capacity_unmodelled"
+        // A collected Vec's capacity where the collect may reuse the source
+        // Vec's buffer (a chain over `vec::IntoIter`,
+        // `codegen_call_iterator_adapter/collect.rs`, `collected_vec_cap`): a
+        // fresh value of at least the length, freed by this record.
+        | "vec_collected_capacity_unmodelled"
+        // The Vec `split_off` returns (`codegen_call_vec_ops_mutate.rs`,
+        // `vec_op_split_off`): its `data` is a fresh array, freed by this
+        // record; its length, capacity and the split Vec's length are written
+        // exactly.
+        | "vec_split_off_elements_unmodelled"
+        // A closure `retain`, `dedup_by(_key)` or `sort_by(_key)` runs on the
+        // elements, which the Vec models never walk, where it can carry an
+        // obligation (`codegen_call_vec.rs`): `t` wherever the call is reached.
+        | "vec_closure_step_uncertified"
+        // An iterator adapter's fresh value (`fresh_adapter_symbol`,
+        // codegen_call_iterator_adapter/helpers.rs): a `fold` / `sum` result,
+        // a `next` payload, a filter's keep bit, where the model has no exact
+        // term. A fresh `declare-var`, universally quantified over its rule,
+        // so it admits the real value and a proof over it is a proof. It used
+        // to record only `aggregate_encoding_gap`, which no verdict reads, so a
+        // counterexample built on it was certified Genuine: `[1, 2, 3,
+        // 4].iter().filter(|x| **x > 100).fold(0u8, wrapping_add) == 0` and
+        // `[Wrapping(200u8), ..].iter().fold(Wrapping(0), |a, b| a + b)`, both
+        // proved by Kani (walker fail-closed review 6 round 3). Recorded with
+        // the symbol as the freed variable: a counterexample that reads it is
+        // OverApproximation, one independent of it can still be certified.
+        | "iter_adapter_symbol_overapprox"
+        // The char `kani_str_chars_nth` returns where the string's bytes may
+        // hold a multi-byte char (codegen_call_string_nth.rs,
+        // `try_build_str_nth_result_expr`): a fresh `declare-var` of the
+        // `Option<char>` sort, which admits the real decoding, recorded with
+        // itself as the freed variable.
+        | "str_chars_nth_multibyte_overapprox"
+        //
+        // call/codegen_call_vec_ops_views.rs `vec_op_as_ptr`: a `Vec`'s buffer
+        // pointer the encoder cannot resolve (a `Vec` in a struct field it
+        // cannot select, an untracked receiver) is a FRESH pointer value: every
+        // address is admitted, so a read through it is a superset of the real
+        // reads and a proof stands, while a counterexample that rests on it is
+        // not certified. It used to be left free with no reason recorded, so a
+        // read through `s.v.as_mut_ptr()` certified a false counterexample
+        // (third review of round 10 of fix/chc-false-certificates,
+        // `r3_dead5.rs` `n02_safe_struct_vec_moved_out_copy_src`).
+        | "vec_as_ptr_unresolved"
+        //
+        // Rule E (fresh_vars.rs, design trust-mc-reds-final §4.4, decision
+        // REDS-REST): the reasons a `Havoc::mint` site books. Each one stands
+        // for a VALUE the encoding does not compute, replaced by a fresh
+        // `declare-var` of the slot's sort. A declare-var is universally
+        // quantified over its rule, so the rule holds for every value the real
+        // one could be: monotone, it adds behaviours and removes none, and a
+        // proof over it is a proof. No check, write or deallocation rides on
+        // the value: a site that drops one of those books a lost obligation
+        // (Rule D) or a fail-closed reason instead, and a site whose fresh value
+        // is pinned, semantically nondeterministic or unobserved is an
+        // `ExactVar` and books nothing. What the havoc is not, is evidence: the
+        // value is booked with its identity, so a counterexample that reads it
+        // is OverApproximation unless `recertify_overapprox_ctrex` certifies
+        // it. The classes are in docs/DECISION_QUEUE.md (REDS-REST); a
+        // reason's sites share its argument:
+        // - untracked_collection_state: a collection stub's length, data,
+        //   keys, iterator state or predicate result (Vec::from_iter's length,
+        //   retain's length within [0, old len], a HashMap iterator's keys,
+        //   `str::starts_with` with no content model);
+        // - untracked_pointer_value: an address the model does not pin (a Vec
+        //   buffer's base, `Vec::new`'s dangling pointer, a drop's `self`, an
+        //   allocator `Ok` payload, an `Option<&mut T>` reference);
+        // - untracked_vtable_metadata: size, align, type id or vtable id for a
+        //   vtable id no registered type has, or a dyn drop's vtable;
+        // - untracked_coroutine_state: a coroutine resume's state, payload,
+        //   fields or discriminant the walk does not compute;
+        // - untracked_sort_mismatch_value: a value whose sort disagrees with
+        //   its slot's (a store, an aggregate field, an array element, a
+        //   SwitchInt arm's value), replaced by a value of the slot's sort;
+        // - untracked_discriminant: a discriminant ranging over the variants'
+        //   discriminant VALUES or a superset (an allocation Result's, a
+        //   coroutine's within 256, an enum whose sort is not a datatype);
+        // - untracked_call_result: an intrinsic's or library call's result the
+        //   model does not compute (memset/write_bytes fills, catch_unwind's
+        //   outcome and payload, a non-ASCII `next_code_point`, a formatting
+        //   call, `unwrap_unchecked`'s None payload, a datatype field of an
+        //   ite branch that is not its constructor term);
+        // - untracked_constant_bytes: a constant's bytes or length the encoding
+        //   does not read out (a long `&str`'s contents, unreadable fat-pointer
+        //   metadata);
+        // - untracked_walker_value: a value the inline walker hands back
+        //   without computing it (a pointee written through memory only, a
+        //   drop placeholder);
+        // - untracked_bignum_value: a BigInt/BigRational value the LIA model
+        //   does not compute;
+        // - memory_cell_unwritten_under_key (Rule C's backstop,
+        //   heap/memory_cell_backstop.rs): a constant-address read of a cell
+        //   under a type key that no store, and no entry initialization, wrote
+        //   at that address, while another key was written there. The typed
+        //   array's initial state is unconstrained (the entry rule constrains
+        //   only static and promoted-constant cells, which count as writes), so
+        //   the read ranges over every value, the real one included.
+        // Held by `test_rule_e_constructors::every_sound_havoc_reason_is_audited`.
+        | "untracked_collection_state"
+        | "untracked_pointer_value"
+        | "untracked_vtable_metadata"
+        | "untracked_coroutine_state"
+        | "untracked_sort_mismatch_value"
+        | "untracked_discriminant"
+        | "untracked_call_result"
+        | "untracked_constant_bytes"
+        | "untracked_walker_value"
+        | "untracked_bignum_value"
+        | "memory_cell_unwritten_under_key"
         => FallbackSoundness::SoundHavoc,
         // NOT blessed: "call_uf_congruent_summary". The UF-summary lane replaces
         // an unconditional fail-closed `return None` in `fallback_dispatch.rs`,
@@ -252,8 +706,90 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// The MIR body being translated.
     pub(in crate::codegen_ay::chc) body: &'body Body,
 
+    /// Trust: whether this context has recorded the fail-close reason
+    /// `rvalue_reborrow_unsupported` (see `chc::trust_reborrow`). A helper
+    /// context whose reasons never reach a harness verdict reads it to decline.
+    #[cfg(trust_toolchain)]
+    pub(in crate::codegen_ay::chc) reborrow_unsupported_recorded: bool,
+
     /// The CHC verification condition being built.
     pub(in crate::codegen_ay::chc) vc: ChcVc,
+
+    /// Freed-var identities of sound approximations recorded through `&self`
+    /// (`record_sound_fallback_reason_identified_deferred`), moved into `vc`
+    /// before finalization.
+    pub(in crate::codegen_ay::chc) deferred_approximation_identities:
+        std::cell::RefCell<Vec<String>>,
+
+    /// Fail-closed far pointer observations of the block under construction
+    /// (`heap/stack_address.rs`, `record_far_observation`), applied by
+    /// `apply_far_observation_cuts` when its rules are emitted.
+    pub(in crate::codegen_ay::chc) pending_far_observations:
+        std::cell::RefCell<Vec<(ay_bindings::Expr, &'static str, bool)>>,
+
+    /// Error relations of fail-closed far pointer observations, marked
+    /// approximation-dependent after the dependence analysis
+    /// (`mark_far_observation_properties_dependent`).
+    pub(in crate::codegen_ay::chc) far_observation_relations: std::cell::RefCell<Vec<String>>,
+
+    /// Whether the translation in progress is one of rustc's null or alignment
+    /// check casts, which observe no far pointer (`is_rustc_check_cast_dest`).
+    pub(in crate::codegen_ay::chc) far_observation_suppressed: std::cell::Cell<bool>,
+
+    /// Destinations of rustc's check casts (`is_rustc_check_cast_dest`).
+    pub(in crate::codegen_ay::chc) far_check_cast_dests: std::cell::OnceCell<HashSet<usize>>,
+
+    /// Whether a block's (or fragment's) rule generation is collecting far
+    /// pointer observations (`begin_far_observation_range`).
+    pub(in crate::codegen_ay::chc) far_observation_range_active: std::cell::Cell<bool>,
+
+    /// Whether this body may build a far pointer (`far_pointers_possible`).
+    pub(in crate::codegen_ay::chc) far_pointers_possible_cache: std::cell::Cell<Option<bool>>,
+
+    /// A far pointer appeared after an observation was translated without
+    /// fail-closed conditions (`note_far_producer`); the harness fails closed.
+    pub(in crate::codegen_ay::chc) far_prescan_missed: std::cell::Cell<bool>,
+
+    /// An observation was translated while no far pointer was possible yet
+    /// (`note_observation_without_far_pointers`).
+    pub(in crate::codegen_ay::chc) far_observation_skipped: std::cell::Cell<bool>,
+
+    /// This translation asked for a retry with far pointers possible from the
+    /// start (`book_far_pointer_prescan`); its per-function diagnostics are
+    /// not recorded, the retry's are.
+    pub(in crate::codegen_ay::chc) far_retry_requested: bool,
+
+    /// The full 64-bit offset of each far constant this body built, `None` when
+    /// two far constants with one identity had different offsets.
+    pub(in crate::codegen_ay::chc) far_literal_t64: std::cell::RefCell<HashMap<u64, Option<u64>>>,
+
+    /// Pointer terms `int_to_ptr_value` built, whose observation is exact
+    /// (`may_be_far_observed`).
+    pub(in crate::codegen_ay::chc) far_from_integer: std::cell::RefCell<Vec<ay_bindings::Expr>>,
+
+    /// `var_may_hold_far_pointer` answers, per state variable name.
+    pub(in crate::codegen_ay::chc) far_var_cache: std::cell::RefCell<HashMap<String, bool>>,
+
+    /// `pointer_local_may_be_far` answers, per local.
+    pub(in crate::codegen_ay::chc) far_local_cache:
+        std::cell::RefCell<HashMap<(usize, bool), bool>>,
+
+    /// Locals whose address the body takes (`address_taken_locals`).
+    pub(in crate::codegen_ay::chc) far_address_taken: std::cell::OnceCell<HashSet<usize>>,
+
+    /// Single definitions a wrapping step's accumulated offset follows
+    /// (`wrapping_step_defs`).
+    pub(in crate::codegen_ay::chc) far_wrapping_defs: std::cell::OnceCell<
+        HashMap<usize, crate::codegen_ay::chc::heap::stack_address::WrappingDef>,
+    >,
+
+    /// Layout facts a pointer-to-integer conversion of a possibly UNTRACKED
+    /// object relies on (`heap/stack_address.rs`, `ptr_to_int_value`): no
+    /// tracked stack object has a byte in that object's identity slot. Recorded
+    /// through `&self`, taken into the rule under construction by
+    /// [`ChcCtx::take_address_assumptions`].
+    pub(in crate::codegen_ay::chc) pending_address_assumptions:
+        std::cell::RefCell<Vec<ay_bindings::Expr>>,
 
     /// Map from basic block index to relation name.
     /// Arc<str> values: cloning is O(1) ref-count bump instead of O(n) String copy.
@@ -309,6 +845,12 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) int_lift: bool,
     /// Narrow each block relation's frame to backward-live columns (`ChcConfig`).
     pub(in crate::codegen_ay::chc) frame_narrowing: bool,
+    /// From `ChcConfig::straightline_discharge`.
+    pub(in crate::codegen_ay::chc) straightline_discharge: bool,
+    /// Record this translation's per-function diagnostic maps. False for a speculative
+    /// re-translation whose VC may be discarded (frame narrowing): the maps ADD per
+    /// call, so recording it too double-counts the function.
+    pub(in crate::codegen_ay::chc) record_per_fn_diagnostics: bool,
     pub(in crate::codegen_ay::chc) frame_narrowing_flattened: bool,
 
     /// Basic block indices identified as loop headers (back-edge targets).
@@ -374,6 +916,9 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// and encode real verdicts for mem-init model calls (MEMUB-24/25/27).
     pub(in crate::codegen_ay::chc) uninit_checks: bool,
 
+    /// `-Z loop-contracts` is active (see `ChcConfig::loop_contracts`).
+    pub(in crate::codegen_ay::chc) loop_contracts: bool,
+
     /// P2-S1: contract CHECK harness — havoc mutable statics and the
     /// interior-mutable (UnsafeCell-covered) parts of immutable statics
     /// instead of pinning them to initializers (Kani `--enforce-contract`
@@ -386,6 +931,19 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
 
     /// Emit arithmetic overflow error rules.
     pub(in crate::codegen_ay::chc) overflow_checks: bool,
+
+    /// The model of the `Iterator::sum` call the iterator-adapter dispatch is
+    /// about to encode (`reduce_loop_rule::iter_sum_model`), set by the
+    /// dispatch from the call's operand and taken by the `IterSum` arm.
+    pub(in crate::codegen_ay::chc) pending_iter_sum_model:
+        Option<crate::codegen_ay::reduce_loop_rule::SumModel>,
+
+    /// Set by a call dispatcher that replays the callee's body through the
+    /// walker (fn-inline, closure, virtual, fn-pointer, `catch_unwind`), whose
+    /// loop replay states Kani's unwinding assertions itself; cleared before
+    /// each call terminator's dispatch (`codegen_call.rs`,
+    /// `model_call_unwinding_check`).
+    pub(in crate::codegen_ay::chc) call_replays_body: bool,
 
     /// Emit NaN-generation obligations for float binops (`--nan-check`).
     pub(in crate::codegen_ay::chc) nan_checks: bool,
@@ -414,6 +972,12 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// resets per harness codegen.
     pub(in crate::codegen_ay::chc) switchint_walk_nodes_spent: usize,
 
+    /// Cumulative inline work over the whole harness, including failed
+    /// speculative attempts and dyn-drop candidates. This is deliberately
+    /// outside heap/ref-resolution snapshots: rollback cannot refund work.
+    pub(in crate::codegen_ay::chc) inline_work_budget:
+        crate::codegen_ay::chc::call::inline_work_budget::InlineWorkBudget,
+
     /// P2 S3 Stage A (honesty-only): depth of the currently-walking
     /// `kani_register_contract` closure inline, incremented/decremented as a
     /// scope guard around `translate_closure_inline_result` in the two
@@ -424,6 +988,71 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// resulting counterexample/proof is fabricated — the drop site books a
     /// demoting `record_fallback()` instead of continuing silently.
     pub(in crate::codegen_ay::chc) register_contract_walk_depth: usize,
+
+    /// Phase 0 of the dyn-walker write/read design
+    /// (`docs/chc-hole-fix-designs-2026-09-24.md` section 2): the heap write
+    /// mark taken at the OUTERMOST active inline walk (or host front door that
+    /// walks several bodies). `None` outside every walk. A read through a deref
+    /// inside the walk after any write since this mark fails closed
+    /// (`inline_walk_guard.rs`).
+    pub(in crate::codegen_ay::chc) inline_walk_write_mark:
+        Option<crate::codegen_ay::chc::heap_state::HeapWriteMark>,
+    pub(in crate::codegen_ay::chc) native_drop_memory:
+        Option<super::call::native_drop_memory::NativeDropMemory>,
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    pub(in crate::codegen_ay::chc) native_init_stores:
+        HashMap<usize, super::call::native_init_handoff::NativeInitStore>,
+    /// Closed host custody facts, not proof that the payload is initialized.
+    /// Capture at the real allocation before later free clears live aliases.
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    pub(in crate::codegen_ay::chc) native_init_authorized_locals: HashSet<usize>,
+    pub(in crate::codegen_ay::chc) inline_walk_param_native_drop_seeds:
+        Option<Vec<(usize, super::call::native_drop_memory::NativeDropAddress)>>,
+    /// One entry per active inline walk frame (innermost last): the
+    /// reference-typed locals of that body whose term is, or may be, an
+    /// ADDRESS rather than the referent value the walker's transparent
+    /// `Deref` reads it as (`inline_walk_guard.rs`, F2). Monotone per frame.
+    pub(in crate::codegen_ay::chc) inline_walk_frames:
+        Vec<crate::codegen_ay::chc::call::inline_walk_guard::InlineWalkFrame>,
+    /// Address-bound parameter locals the binder of the NEXT walk established
+    /// (dyn door, nested walks, fn_inline unreported bindings). Taken by the
+    /// walk entry.
+    pub(in crate::codegen_ay::chc) inline_walk_param_address_seeds: Option<Vec<usize>>,
+    /// Reference parameters whose binders explicitly resolved referent values.
+    pub(in crate::codegen_ay::chc) inline_walk_param_referent_seeds: Option<Vec<usize>>,
+    /// Typed host owners of reference parameters in the NEXT inline frame.
+    pub(in crate::codegen_ay::chc) inline_walk_param_mut_owner_seeds:
+        Option<Vec<(usize, super::call::inline_mut_ref_owner::InlineMutRefOwner)>>,
+    /// RustCall tuple fields forwarded into the NEXT inline frame.
+    pub(in crate::codegen_ay::chc) inline_walk_param_rustcall_mut_owner_seeds:
+        Option<Vec<(usize, Vec<Option<super::call::inline_mut_ref_owner::InlineMutRefArg>>)>>,
+    pub(in crate::codegen_ay::chc) inline_walk_param_readonly_ref_seeds:
+        Option<Vec<(usize, super::call::inline_readonly_ref::ReadonlyRefValue)>>,
+    /// Typed native dyn coercion origins bound in the NEXT inline frame.
+    pub(in crate::codegen_ay::chc) inline_walk_param_native_dyn_seeds:
+        Option<Vec<(usize, super::call::native_dyn_origin::NativeDynOrigin)>>,
+    /// Positive native dyn origin returned from a completed inline frame.
+    pub(in crate::codegen_ay::chc) inline_walk_returned_native_dyn:
+        Option<super::call::native_dyn_origin::NativeDynOrigin>,
+    /// Set when a popped walk frame's return local was address-bound, so the
+    /// nested call site can tag its destination.
+    pub(in crate::codegen_ay::chc) inline_walk_returned_address: bool,
+    /// The length an array VALUE has as a slice: an inline walk carries
+    /// `&[T; N]` as the array's own term (value semantics), so its unsize to
+    /// `&[T]` keeps no metadata half. The cast records `N` against the term
+    /// here, and the walker's `PtrMetadata` of that term reads it back
+    /// (`inline_shared/rvalue_ptr.rs`). `None` marks a term recorded with two
+    /// different lengths: it answers nothing.
+    pub(in crate::codegen_ay::chc) inline_array_value_slice_lens:
+        HashMap<ay_bindings::Expr, Option<u64>>,
+    /// Set when a popped walk frame's return local was address-carrying (an
+    /// aggregate that may hold an address in a field), so the nested call
+    /// site can mark its destination (F2 residual).
+    pub(in crate::codegen_ay::chc) inline_walk_returned_carrying: bool,
+    /// Whether the last inline `&place` / `&raw place` took the ADDRESS lane
+    /// of `inline_ref_place_to_expr` (read back by the walker's statement
+    /// executor to tag the destination).
+    pub(in crate::codegen_ay::chc) last_inline_ref_was_address: bool,
 
     /// Emit failing guard on recursive unwind exhaustion (Part of #3929).
     /// Currently used only for configuration threading; fail-closed guard
@@ -483,6 +1112,11 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) provenance_walk_memo:
         std::cell::RefCell<HashMap<(usize, usize), Option<usize>>>,
 
+    /// Per-block reasons of the untyped-view nets
+    /// (`stmt/codegen_stmt_store/untyped_view_scan.rs`), built once per body.
+    pub(in crate::codegen_ay::chc) untyped_view_scan:
+        std::cell::OnceCell<HashMap<usize, Vec<&'static str>>>,
+
     /// Known allocation IDs: maps local_idx → heap alloc obj_id (Part of #3273).
     /// Populated by `codegen_call_alloc` when `translate_rust_alloc` returns a
     /// concrete obj_id. Used by `translate_rust_realloc` to resolve symbolic
@@ -495,6 +1129,11 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// non-unique. Dropping one wrapper must not eagerly invalidate the backing
     /// allocation when the pointee has no assertion-visible drop effects.
     pub(in crate::codegen_ay::chc) rc_arc_shared_alloc_ids: HashSet<u32>,
+
+    /// Strong-count ghost state of the body's counted Rc/Arc allocation sites
+    /// (`rc_strong_count.rs`). Empty unless the pre-scan accounts for every
+    /// handle of a body that clones one.
+    pub(in crate::codegen_ay::chc) rc_strong_counters: super::rc_strong_count::RcStrongCounters,
 
     /// Locals known to hold a concrete stack-local address.
     ///
@@ -530,13 +1169,27 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// the existing uninterpreted function declaration if sorts match.
     pub(in crate::codegen_ay::chc) declared_inferable_fns: HashMap<String, (Vec<Sort>, Sort)>,
 
-    /// Per-VC callee tags for the frozen congruent call-summary table
-    /// (`call_uf_table.rs`): mangled callee name -> tag occupying the fixed
-    /// high 32 bits of the table key. Sequential and monomorphisation-unique,
-    /// so two distinct callees can never select the same table entry (a
-    /// collision would ASSERT an equality that need not hold). `BTreeMap` for
-    /// deterministic tag assignment across runs.
-    pub(in crate::codegen_ay::chc) call_uf_tags: std::collections::BTreeMap<String, u32>,
+    /// Per-VC first-class call-summary UF symbols (`call_uf_table.rs`): tag key
+    /// (`fn:<mangled name>` or `math:<intrinsic suffix>`) -> the one
+    /// `(declare-fun ...)` minted for it.
+    ///
+    /// Keyed on the MONOMORPHISED mangled name, so `f::<i32>` and `f::<u32>`
+    /// are different symbols and can never be equated. Write-once: the first
+    /// application fixes the signature, and a later application whose sorts
+    /// disagree is refused and keeps its sound havoc (ay-chc type-checks
+    /// applications against the declaration, and a mismatch aborts the parse of
+    /// the whole problem). `BTreeMap` for deterministic symbol numbering across
+    /// runs.
+    pub(in crate::codegen_ay::chc) call_uf_symbols:
+        std::collections::BTreeMap<String, super::call_uf_table::CallUfSymbol>,
+
+    /// Whether the congruent call-summary lane is enabled for this harness.
+    ///
+    /// Set once by `collect_call_uf_congruence_lane` during `collect_state_vars`
+    /// — before any rule is encoded — when the pre-scan finds a call PAIR that
+    /// congruence can pay for. False leaves both summary lanes on their
+    /// pre-existing sound havoc.
+    pub(in crate::codegen_ay::chc) call_uf_congruence: bool,
 
     /// Locals known to hold a power of 2: maps local_idx → exponent Expr.
     /// Populated by `codegen_pow` when base == 2 (result = `2^exp`).
@@ -552,6 +1205,11 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// Part of #3436: error-path type array pruning.
     pub(in crate::codegen_ay::chc) current_encode_bb: usize,
 
+    /// `subslice_len` entries withheld while encoding the block named here,
+    /// because their cached length reads a column outside its relation frame.
+    /// See `stmt/codegen_stmt/subslice_len_frame.rs`.
+    pub(in crate::codegen_ay::chc) subslice_len_hidden: Option<(usize, Vec<(usize, Expr)>)>,
+
     /// FC-06: modifies frames (dynamic extents of contract-checked functions)
     /// found by `modifies_frame::prescan_modifies_frames`. Memory stores in
     /// extent blocks are checked against the frame's declared footprint.
@@ -559,6 +1217,19 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
 
     /// FC-06: extent block index → index into `modifies_frames`.
     pub(in crate::codegen_ay::chc) modifies_frame_by_bb: HashMap<usize, usize>,
+
+    /// FC-06 frame net: per-block certification state for writes the precise
+    /// store checks do not see (`modifies_frame_net`).
+    pub(in crate::codegen_ay::chc) modifies_frame_net:
+        super::modifies_frame_net::ModifiesFrameNetState,
+    /// The stores this body makes into statics' memory images, for the
+    /// end-of-translation check that the image sync is sound
+    /// (`decl::static_path::StaticImageWrites`).
+    pub(in crate::codegen_ay::chc) static_image_writes: super::decl::static_path::StaticImageWrites,
+    /// Pointer locals whose value depends on the path taken (multiple producers,
+    /// or a single copy/cast/reborrow of such a local), computed once per body
+    /// (`pointer_value_is_path_dependent`).
+    pub(in crate::codegen_ay::chc) path_dependent_pointer_locals: OnceCell<HashSet<usize>>,
 
     /// FC-29: loop assigns frames (`#[kani::loop_modifies(...)]` regions)
     /// found by `loop_modifies_frame::prescan_loop_modifies_frames`. Register
@@ -592,8 +1263,34 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// Part of #3470: fn pointer identity encoding.
     pub(in crate::codegen_ay::chc) fn_ptr_ids: HashMap<String, Expr>,
 
-    /// Counter for generating unique fn pointer IDs. Part of #3470.
-    pub(in crate::codegen_ay::chc) next_fn_ptr_id: u64,
+    /// Every id `fn_ptr_ids` minted, back to the function it designates
+    /// (design 3, D1: `call/fn_ptr_targets.rs`). A call through a pointer whose
+    /// value is one of these ids runs exactly that function.
+    pub(in crate::codegen_ay::chc) fn_ptr_targets:
+        HashMap<u64, crate::codegen_ay::fn_ptr_identity::FnPtrTarget>,
+
+    /// Host fn-pointer locals whose every definition is a reification or a
+    /// copy of another such local, with the ids they can hold (`None`: not
+    /// closed). Computed on demand (`call/fn_ptr_targets.rs`).
+    pub(in crate::codegen_ay::chc) fn_ptr_local_domains: HashMap<usize, Option<Vec<u64>>>,
+
+    /// Terms the host produced for a closed fn-pointer local, with the ids
+    /// that local can hold (the intersection when several locals produced
+    /// one term). A walked call through a pointer bound to one of these terms
+    /// has a complete candidate set (`call/fn_ptr_targets.rs`).
+    pub(in crate::codegen_ay::chc) fn_ptr_value_domains: HashMap<Expr, Vec<u64>>,
+
+    /// Every dyn coercion the harness can reach, from the reachability
+    /// collector (design 3, D2: `kani_middle/dyn_universe.rs`). `None` when
+    /// the body is encoded outside a per-harness codegen: every dyn candidate
+    /// set is then treated as possibly incomplete.
+    pub(in crate::codegen_ay::chc) dyn_universe:
+        Option<Arc<crate::kani_middle::dyn_universe::DynUniverse>>,
+
+    /// Per trait, the universe's runtime types in candidate order (the third
+    /// phase of `collect_dyn_trait_candidates`), computed once.
+    pub(in crate::codegen_ay::chc) dyn_universe_types_by_trait:
+        std::cell::RefCell<HashMap<rustc_span::def_id::DefId, Vec<rustc_public::ty::Ty>>>,
 
     /// Depth guard for `try_resolve_deref_via_ref_targets` recursion.
     /// Self-referencing ref_targets cause unbounded cycles. Cap at 4 hops
@@ -610,6 +1307,21 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     ///
     /// Part of #3830: Bridges flattened state var data into the inline walker.
     pub(in crate::codegen_ay::chc) inline_self_field_hints: Option<HashMap<(usize, usize), Expr>>,
+    /// The slot values of a by-value flattened argument a walked call bound to
+    /// a self placeholder, keyed by the placeholder's name. A walked body that
+    /// returns the placeholder unchanged returns that argument: the flattened
+    /// destination takes these slots (`build_flattened_destination_field_constraints`).
+    pub(in crate::codegen_ay::chc) inline_placeholder_slots: HashMap<String, Vec<Expr>>,
+
+    /// Side-channel checks of drop bodies the inline WALKER inlined for a
+    /// `Drop` terminator (`inline_drop.rs`, `inline_shared_drop.rs`). Those
+    /// helpers answer only a success guard, so they park the walk's
+    /// `deferred_checks` here and the walker's `Drop` arm takes back exactly the
+    /// entries its own call added (a length mark, so nested drops stack) and
+    /// absorbs them into its state. Before this, a walked drop body's checks
+    /// were discarded.
+    pub(in crate::codegen_ay::chc) inline_drop_deferred_checks:
+        Vec<super::call::inline_body::DeferredInlineCheck>,
 
     /// Scoped synthetic addresses for inline locals that need place semantics.
     ///
@@ -658,11 +1370,26 @@ pub(in crate::codegen_ay) struct ChcCtx<'tcx, 'body> {
     /// membership tests thereafter. Same detection semantics as the old scan;
     /// see `compute_null_tainted_locals`. Part of the null-provenance perf fix.
     pub(in crate::codegen_ay::chc) null_tainted_locals_cache: OnceCell<HashSet<usize>>,
+
+    /// Memoized whole-local producer counts, saturating at 2: for each local,
+    /// how many `_l = ...` statements (empty projection) plus `Call`
+    /// terminators with destination `_l` the body holds. A pure function of
+    /// `body`. `local_has_multiple_whole_definitions` used to rescan the whole
+    /// body per query, and the path-insensitive metadata traces ask it once
+    /// per hop per statement, which made coroutine-heavy bodies quadratic
+    /// (Coroutines/rustc-coroutine-tests/smoke-resume-args.rs). Holds no
+    /// `'body` borrow, so the cell keeps `ChcCtx` covariant.
+    pub(in crate::codegen_ay::chc) whole_definition_counts: OnceCell<HashMap<usize, u8>>,
+
+    /// Body-only stability of locals used by historical metadata traces. Memoize
+    /// the alias/byte-write walk once per queried local, not once per trace hop.
+    pub(in crate::codegen_ay::chc) metadata_source_stability:
+        std::cell::RefCell<HashMap<usize, bool>>,
 }
 
 pub(in crate::codegen_ay::chc) mod clusters;
 mod clusters_ref_resolution;
-pub(in crate::codegen_ay::chc) use clusters_ref_resolution::RefResolution;
+pub(in crate::codegen_ay::chc) use clusters_ref_resolution::{ConstRefObject, RefResolution};
 
 pub(in crate::codegen_ay::chc) struct SpawnSchedulerVtableModel {
     pub(in crate::codegen_ay::chc) poll_vtable_ids: Vec<u64>,
@@ -751,6 +1478,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Self {
         let fn_name_string: Arc<str> = fn_name.into();
         let dead_locals_at_entry = Self::compute_dead_locals_at_block_entry(body);
+        let maybe_dead_locals_at_entry = Self::compute_maybe_dead_locals_at_block_entry(body);
         // Build the whole-body last-assignment map once: reused by every
         // raw-pointer null-deref check and pointer-check suppression query
         // (null-provenance perf fix — was O(body) per raw-ptr deref).
@@ -758,11 +1486,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let step_mode = cfg.step_mode;
         let int_lift = cfg.int_lift;
         let frame_narrowing = cfg.frame_narrowing;
+        let straightline_discharge = cfg.straightline_discharge;
+        // A lost-checks recovery re-encode (`keep_error_obligations`) translates a
+        // function whose first encode already recorded its per-function diagnostic
+        // maps; the maps ADD per call, so the re-encode must not record them again.
+        let record_per_fn_diagnostics = !cfg.keep_error_obligations;
         let frame_narrowing_flattened = cfg.frame_narrowing && cfg.frame_narrowing_flattened;
         let wide_mem = cfg.wide_mem;
         let extra_pointer_checks = cfg.extra_pointer_checks;
         let prove_safety_only = cfg.prove_safety_only;
         let uninit_checks = cfg.uninit_checks;
+        let loop_contracts = cfg.loop_contracts;
         let memory_safety_checks = cfg.memory_safety_checks;
         let overflow_checks = cfg.overflow_checks;
         let nan_checks = cfg.nan_checks;
@@ -839,7 +1573,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Self {
             tcx,
             body,
-            vc: ChcVc::new(),
+            #[cfg(trust_toolchain)]
+            reborrow_unsupported_recorded: false,
+            vc: {
+                let mut vc = ChcVc::new();
+                vc.keep_error_obligations = cfg.keep_error_obligations;
+                vc
+            },
             block_relations: HashMap::with_capacity(num_blocks),
             rel_name_to_bb: HashMap::with_capacity(num_blocks),
             fn_name: fn_name_string,
@@ -849,12 +1589,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             stub_registry: StubRegistry::new(),
             provenance_defs: std::cell::OnceCell::new(),
             provenance_walk_memo: std::cell::RefCell::new(HashMap::new()),
+            untyped_view_scan: std::cell::OnceCell::new(),
+            deferred_approximation_identities: std::cell::RefCell::new(Vec::new()),
+            pending_far_observations: std::cell::RefCell::new(Vec::new()),
+            far_observation_relations: std::cell::RefCell::new(Vec::new()),
+            far_observation_suppressed: std::cell::Cell::new(false),
+            far_check_cast_dests: std::cell::OnceCell::new(),
+            far_observation_range_active: std::cell::Cell::new(false),
+            far_pointers_possible_cache: std::cell::Cell::new(None),
+            far_prescan_missed: std::cell::Cell::new(false),
+            far_observation_skipped: std::cell::Cell::new(false),
+            far_retry_requested: false,
+            far_literal_t64: std::cell::RefCell::new(HashMap::new()),
+            far_from_integer: std::cell::RefCell::new(Vec::new()),
+            far_var_cache: std::cell::RefCell::new(HashMap::new()),
+            far_local_cache: std::cell::RefCell::new(HashMap::new()),
+            far_address_taken: std::cell::OnceCell::new(),
+            far_wrapping_defs: std::cell::OnceCell::new(),
+            pending_address_assumptions: std::cell::RefCell::new(Vec::new()),
             ref_resolution: RefResolution::new(),
             encode: EncodeState::with_capacity(num_locals),
             track_level,
             step_mode,
             int_lift,
             frame_narrowing,
+            straightline_discharge,
+            record_per_fn_diagnostics,
             frame_narrowing_flattened,
             loop_headers: HashSet::new(),
             int_lifted_vars: HashMap::new(),
@@ -862,16 +1622,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             heap_state: ChcHeapState::new(),
             collections: CollectionState::new(),
             wide_mem_manager,
-            liveness: LivenessState::new(dead_locals_at_entry),
+            liveness: LivenessState::new(dead_locals_at_entry, maybe_dead_locals_at_entry),
             needs_mem_promote: false,
             fallback_count: 0,
             diagnostics: ChcDiagnostics::default(),
             extra_pointer_checks,
             prove_safety_only,
             uninit_checks,
+            loop_contracts,
             contract_static_havoc,
             memory_safety_checks,
             overflow_checks,
+            pending_iter_sum_model: None,
+            call_replays_body: false,
             nan_checks,
             undefined_function_checks,
             dyn_vtable_ids: HashMap::new(),
@@ -882,32 +1645,66 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             known_layout_sizes: HashMap::new(),
             known_alloc_ids: HashMap::new(),
             rc_arc_shared_alloc_ids: HashSet::new(),
+            rc_strong_counters: Default::default(),
             known_stack_addr_exprs: HashMap::new(),
             known_pointer_to_alloc: HashMap::new(),
             declared_inferable_fns: HashMap::new(),
-            call_uf_tags: std::collections::BTreeMap::new(),
+            call_uf_symbols: std::collections::BTreeMap::new(),
+            call_uf_congruence: false,
             known_pow2_locals: HashMap::new(),
             current_encode_bb: 0,
+            subslice_len_hidden: None,
             modifies_frames: Vec::new(),
             modifies_frame_by_bb: HashMap::new(),
+            modifies_frame_net: Default::default(),
+            static_image_writes: Default::default(),
             loop_modifies_frames: Vec::new(),
             loop_modifies_frame_by_bb: HashMap::new(),
             suppress_heap_store_checks: false,
             fragment_mid_output_bb: None,
             fn_ptr_ids: HashMap::new(),
-            next_fn_ptr_id: 1,
+            fn_ptr_targets: HashMap::new(),
+            fn_ptr_local_domains: HashMap::new(),
+            fn_ptr_value_domains: HashMap::new(),
+            dyn_universe: crate::kani_middle::dyn_universe::current_harness_universe(),
+            dyn_universe_types_by_trait: std::cell::RefCell::new(HashMap::new()),
             deref_resolve_depth: 0,
             inline_self_field_hints: None,
+            inline_placeholder_slots: HashMap::new(),
+            inline_drop_deferred_checks: Vec::new(),
             inline_local_address_hints: None,
             spawn_scheduler_vtable_model: None,
             spawn_stubbed_type_key_fragments,
             recursive_unwind_depth,
             const_recursion_nodes_spent: 0,
             switchint_walk_nodes_spent: 0,
+            inline_work_budget: Default::default(),
             register_contract_walk_depth: 0,
+            inline_walk_write_mark: None,
+            native_drop_memory: None,
+            #[cfg(all(trust_toolchain, version("1.101")))]
+            native_init_stores: HashMap::new(),
+            #[cfg(all(trust_toolchain, version("1.101")))]
+            native_init_authorized_locals: HashSet::new(),
+            inline_walk_param_native_drop_seeds: None,
+            inline_walk_frames: Vec::new(),
+            inline_walk_param_address_seeds: None,
+            inline_walk_param_referent_seeds: None,
+            inline_walk_param_mut_owner_seeds: None,
+            inline_walk_param_rustcall_mut_owner_seeds: None,
+            inline_walk_param_readonly_ref_seeds: None,
+            inline_walk_param_native_dyn_seeds: None,
+            inline_walk_returned_native_dyn: None,
+            inline_walk_returned_address: false,
+            inline_array_value_slice_lens: HashMap::new(),
+            inline_walk_returned_carrying: false,
+            last_inline_ref_was_address: false,
             unwinding_assertions,
             global_assignment_map,
             null_tainted_locals_cache: OnceCell::new(),
+            whole_definition_counts: OnceCell::new(),
+            metadata_source_stability: std::cell::RefCell::new(HashMap::new()),
+            path_dependent_pointer_locals: OnceCell::new(),
         }
     }
 
@@ -923,13 +1720,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// demoting fallbacks is visible under `TRUST_MC_LOG=trust_mc_compiler=debug`
     /// (the aggregate `chc_fallback=N` marker alone cannot be triaged).
     #[track_caller]
-    pub(in crate::codegen_ay::chc) fn record_fallback(&mut self) {
+    pub(in crate::codegen_ay::chc) fn record_fallback(&mut self) -> Booked {
         self.fallback_count += 1;
         tracing::debug!(
             site = %std::panic::Location::caller(),
             fn_name = %self.fn_name,
             "CHC: demoting chc_fallback recorded"
         );
+        Booked::recorded()
     }
 
     /// Record an aggregate encoding gap with a per-site reason tag (Part of #4050).
@@ -989,15 +1787,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #3794: also records the caller-provided reason in the
     /// translation-drop site map so the six-file cluster rerun can
     /// distinguish which sound-fallback path fires.
+    ///
+    /// Returns the [`Booked`] token a fresh value standing on this booking is
+    /// minted with (`Havoc::booked`, Rule E).
     pub(in crate::codegen_ay::chc) fn record_sound_fallback_reason(
-        &mut self,
+        &self,
         reason: &'static str,
-    ) {
+    ) -> Booked {
         match fallback_soundness(reason) {
             FallbackSoundness::SoundHavoc => self.diagnostics.sound_havoc_drop.inc(),
             FallbackSoundness::FailClose => self.diagnostics.place_translation_drop.inc(),
         }
         record_translation_drop_site_reason_for_fn(&self.fn_name, reason);
+        Booked::recorded()
     }
 
     /// Task #78: like [`record_sound_fallback_reason`], but ALSO records the
@@ -1015,9 +1817,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         reason: &'static str,
         freed_var: Option<&str>,
-    ) {
-        self.record_sound_fallback_reason(reason);
+    ) -> Booked {
+        let booked = self.record_sound_fallback_reason(reason);
         self.vc.record_approximation_identity(freed_var);
+        booked
+    }
+
+    /// [`Self::record_sound_fallback_reason_identified`] for a site reached
+    /// through `&self`.
+    ///
+    /// The float-binop table select (`float_binop_chc_term`) is built inside
+    /// expression translation (`translate_binop`, the NaN-check recomputation,
+    /// SIMD lanes), all of which borrow the context shared. The reason and its
+    /// counter are recorded now, exactly as the plain recorder does; the
+    /// identity is queued and moved into the VC by
+    /// [`Self::flush_deferred_approximation_identities`] before the harness is
+    /// finalized, so each event is accounted exactly once. A context whose
+    /// queue is never flushed stays UNACCOUNTED — the fail-closed direction.
+    pub(in crate::codegen_ay::chc) fn record_sound_fallback_reason_identified_deferred(
+        &self,
+        reason: &'static str,
+        freed_var: impl Into<String>,
+    ) -> Booked {
+        let booked = self.record_sound_fallback_reason(reason);
+        self.deferred_approximation_identities.borrow_mut().push(freed_var.into());
+        booked
+    }
+
+    /// Account every identity queued by
+    /// [`Self::record_sound_fallback_reason_identified_deferred`].
+    pub(in crate::codegen_ay::chc) fn flush_deferred_approximation_identities(&mut self) {
+        for freed_var in self.deferred_approximation_identities.take() {
+            self.vc.record_approximation_identity(Some(&freed_var));
+        }
     }
 
     /// Categorized sound fallback (Part of #3561 Phase 1).
@@ -1248,16 +2080,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// Mark heap metadata arrays as modified and record their state-var indices.
+    /// Mark BOTH heap metadata arrays as modified and record their state-var
+    /// indices. For a site that writes both `obj_valid__out` and `obj_size__out`.
     /// Part of #2552: keep obj_valid/obj_size propagation index-based.
     /// Part of #3436: also tracks per-block metadata access for liveness pruning.
+    ///
+    /// A marked lane's `__out` goes into the rule head, and a head `__out` that
+    /// no constraint of the rule binds is a HAVOC of that lane (a clause
+    /// variable is universally quantified). A site that writes one lane must
+    /// therefore mark only that lane ([`Self::mark_obj_valid_modified`],
+    /// [`Self::mark_obj_size_modified`]): marking both havocked the lane it left
+    /// alone, with no approximation recorded, and a counterexample through that
+    /// havoc was certified Genuine (`box_then_null_deref`: `ptr::null()` after
+    /// `Box::new` refuted the Box's drop-time size check).
     pub(in crate::codegen_ay::chc) fn mark_heap_metadata_modified(&mut self) {
-        self.heap_state.mark_metadata_arrays_modified();
+        self.mark_obj_valid_modified();
+        self.mark_obj_size_modified();
+    }
+
+    /// Mark only `obj_valid` as modified: for a site whose sole metadata write
+    /// is `obj_valid__out = ...` (see [`Self::mark_heap_metadata_modified`]).
+    pub(in crate::codegen_ay::chc) fn mark_obj_valid_modified(&mut self) {
+        self.heap_state.mark_obj_valid_modified();
         self.heap_state.mark_metadata_accessed(self.current_encode_bb);
-        for name in ["obj_valid", "obj_size"] {
-            if let Some(idx) = self.state_var_index_by_name(name) {
-                self.mark_state_var_modified(idx);
-            }
+        if let Some(idx) = self.state_var_index_by_name("obj_valid") {
+            self.mark_state_var_modified(idx);
+        }
+    }
+
+    /// Mark only `obj_size` as modified: for a site whose sole metadata write
+    /// is `obj_size__out = ...` (see [`Self::mark_heap_metadata_modified`]).
+    pub(in crate::codegen_ay::chc) fn mark_obj_size_modified(&mut self) {
+        self.heap_state.mark_obj_size_modified();
+        self.heap_state.mark_metadata_accessed(self.current_encode_bb);
+        if let Some(idx) = self.state_var_index_by_name("obj_size") {
+            self.mark_state_var_modified(idx);
         }
     }
 
@@ -1267,6 +2124,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #3436: per-block metadata liveness tracking.
     pub(in crate::codegen_ay::chc) fn mark_heap_metadata_read(&mut self) {
         self.heap_state.mark_metadata_accessed(self.current_encode_bb);
+    }
+
+    /// The layout assumptions pointer-to-integer conversions recorded since
+    /// the last call (`pending_address_assumptions`), for the rule under
+    /// construction, each once. They read no heap metadata.
+    pub(in crate::codegen_ay::chc) fn take_address_assumptions(
+        &mut self,
+    ) -> Vec<ay_bindings::Expr> {
+        let taken: Vec<ay_bindings::Expr> =
+            self.pending_address_assumptions.borrow_mut().drain(..).collect();
+        let mut facts: Vec<ay_bindings::Expr> = Vec::with_capacity(taken.len());
+        for fact in taken {
+            if !facts.contains(&fact) {
+                facts.push(fact);
+            }
+        }
+        facts
     }
 
     /// Mark a type-indexed heap array as modified and record its state-var index.

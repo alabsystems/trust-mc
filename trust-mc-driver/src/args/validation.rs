@@ -177,6 +177,15 @@ impl ValidateArgs for VerificationArgs {
         self.validate_chc_options()?;
         self.validate_deprecated_obsolete()?;
         self.validate_cbmc_only_flags()?;
+        self.compiler_route.validate()?;
+        if self.compiler_route.is_trustc() && self.no_codegen {
+            return Err(Error::raw(
+                ErrorKind::ArgumentConflict,
+                "Invalid argument: `--no-codegen` is refused on `--compiler-route trustc`: under \
+                 -Z no-codegen the codegen backend's codegen_crate never runs, so neither the \
+                 crate-item checks nor VC generation would run",
+            ));
+        }
 
         // Bespoke validations that don't fit into any of the categories above.
         if let Some(randomize_layout) = self.randomize_layout
@@ -418,6 +427,7 @@ impl VerificationArgs {
             self.ay_chc,
         )?;
         require_chc(self.ay_chc_no_retry, "ay-chc-no-retry", self.ay_chc)?;
+        require_chc(self.ay_chc_deterministic, "ay-chc-deterministic", self.ay_chc)?;
         require_chc(self.ay_chc_bounded_unroll, "ay-chc-bounded-unroll", self.ay_chc)?;
         require_chc(self.export_chc_comp.is_some(), "export-chc-comp", self.ay_chc)?;
         Ok(())

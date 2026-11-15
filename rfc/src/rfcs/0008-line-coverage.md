@@ -164,8 +164,6 @@ We expect many incremental improvements in the coverage area:
  3. Including span information in coverage checks and building region-based coverage reports.
  4. Adding new user-requested coverage formats such as GCOV [#1706](https://github.com/model-checking/kani/issues/1706) or LCOV [#1777](https://github.com/model-checking/kani/issues/1777).
 
-[^coverage-experiments]: We have experimented with different options for injecting coverage checks.
 For example, we have tried injecting one before each basic block, or one before each statement, etc.
 The proposed option (one before each statement AND each terminator) gives us the most accurate results.
 
-[^coverage-api]: In particular, comments in [`CoverageSpan`](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_mir_transform/coverage/spans/struct.CoverageSpan.html) and [`generate_coverage_spans`](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_mir_transform/coverage/spans/struct.CoverageSpans.html#method.generate_coverage_spans) hint that the initial set of spans come from `Statement`s and `Terminators`. [This comment](https://github.com/model-checking/kani/pull/2612#issuecomment-1646312827) goes in detail about the attempt to use the compiler APIs.

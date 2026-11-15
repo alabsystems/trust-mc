@@ -62,7 +62,7 @@
 //! anything but UNSAT. See `slice_sat_never_short_circuits_or_refutes` in
 //! `super::tests`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ay_chc::ChcExpr;
 
@@ -178,6 +178,72 @@ pub(super) fn relevance_slices(conjuncts: &[ChcExpr]) -> Vec<Vec<usize>> {
     candidates.dedup();
     candidates.truncate(MAX_SLICES);
     candidates
+}
+
+/// Whether `slice` is satisfiable by construction, so probing it can never
+/// yield the UNSAT this phase consumes and the caller skips it. Skipping a probe
+/// only declines a proof, never makes one.
+///
+/// The witness is "every Bool variable false, then each defined variable its
+/// definition's value". It satisfies the slice when every conjunct is one of:
+///
+/// 1. an implication `(=> g φ)` whose antecedent `g` is a Bool variable — false,
+///    so the implication holds whatever `φ` is;
+/// 2. a negated Bool variable `(not g)`;
+/// 3. a definition `(= c e)` of a non-Bool variable `c` that occurs neither in
+///    `e` nor in any other conjunct of the slice outside kind 1 — `c` takes
+///    `e`'s value, and nothing else it must satisfy reads `c`.
+///
+/// The large-block query of design step 8e is made of exactly these, except the
+/// disjunction of its error sites and a block's own path constraints; a slice
+/// without those is satisfiable.
+pub(super) fn trivially_satisfiable(slice: &[usize], conjuncts: &[ChcExpr]) -> bool {
+    let bool_var =
+        |expr: &ChcExpr| matches!(expr, ChcExpr::Var(var) if var.sort == ay_chc::ChcSort::Bool);
+    let guarded = |expr: &ChcExpr| {
+        matches!(expr, ChcExpr::Op(ay_chc::ChcOp::Implies, args)
+            if args.first().is_some_and(|antecedent| bool_var(antecedent)))
+    };
+    // Each variable's occurrences among the slice's conjuncts outside kind 1,
+    // counted once per conjunct: one pass over the slice, each conjunct's
+    // variables collected once (linear in the slice, whatever its number of
+    // definitions).
+    let mut definitions: Vec<ay_chc::ChcVar> = Vec::new();
+    let mut occurrences: BTreeMap<ay_chc::ChcVar, usize> = BTreeMap::new();
+    for &index in slice {
+        let Some(conjunct) = conjuncts.get(index) else {
+            return false;
+        };
+        if guarded(conjunct) {
+            continue;
+        }
+        match conjunct {
+            // Kind 2 mentions only a Bool variable, which no definition defines.
+            ChcExpr::Op(ay_chc::ChcOp::Not, args)
+                if args.len() == 1 && bool_var(args[0].as_ref()) => {}
+            ChcExpr::Op(ay_chc::ChcOp::Eq, args) if args.len() == 2 => {
+                let ChcExpr::Var(defined) = args[0].as_ref() else {
+                    return false;
+                };
+                if defined.sort == ay_chc::ChcSort::Bool {
+                    return false;
+                }
+                let read = args[1].vars();
+                if read.iter().any(|var| var == defined) {
+                    return false;
+                }
+                *occurrences.entry(defined.clone()).or_insert(0) += 1;
+                for var in read {
+                    *occurrences.entry(var).or_insert(0) += 1;
+                }
+                definitions.push(defined.clone());
+            }
+            _ => return false,
+        }
+    }
+    // A defined variable may occur in no other conjunct but a guarded one: its
+    // own definition is its only occurrence.
+    definitions.iter().all(|defined| occurrences.get(defined) == Some(&1))
 }
 
 /// Accept `slice` as a candidate iff it is non-empty and a STRICT subset of the
@@ -415,5 +481,46 @@ mod tests {
             slices.iter().all(|s| s.len() < conjuncts.len()),
             "no slice may equal the full body"
         );
+    }
+
+    fn bvar(name: &str) -> ChcExpr {
+        ChcExpr::var(ChcVar::new(name, ChcSort::Bool))
+    }
+
+    /// The witness `trivially_satisfiable` relies on — every Bool variable false,
+    /// each defined variable its definition's value — satisfies exactly the
+    /// slices it accepts, and anything that could force a contradiction is
+    /// probed.
+    #[test]
+    fn only_slices_satisfied_by_all_guards_false_are_skipped() {
+        let guarded = ChcExpr::implies(bvar("g"), ChcExpr::gt(ivar("x"), ivar("x")));
+        let negated = ChcExpr::not(bvar("s"));
+        let defined = ChcExpr::eq(ivar("c"), ChcExpr::ite(bvar("s"), ivar("y"), ChcExpr::int(0)));
+        let reads_c = ChcExpr::implies(bvar("h"), ChcExpr::lt(ivar("c"), ChcExpr::int(0)));
+        let conjuncts = vec![guarded, negated, defined.clone(), reads_c];
+        assert!(trivially_satisfiable(&[0, 1, 2, 3], &conjuncts));
+        // A bare Bool variable, a disjunction, an atom: each may force something.
+        for forcing in [
+            bvar("f"),
+            ChcExpr::or_vec(vec![bvar("f"), bvar("g")]),
+            ChcExpr::gt(ivar("x"), ChcExpr::int(0)),
+        ] {
+            let mut with = conjuncts.clone();
+            with.push(forcing.clone());
+            assert!(!trivially_satisfiable(&[0, 1, 2, 3, 4], &with), "{forcing:?}");
+        }
+        // A defined variable read outside a guarded conjunct is not free.
+        let mut with = conjuncts.clone();
+        with.push(ChcExpr::eq(ivar("d"), ChcExpr::add(ivar("c"), ChcExpr::int(1))));
+        assert!(!trivially_satisfiable(&[0, 1, 2, 3, 4], &with));
+        // A variable defined twice, or in terms of itself, is not free.
+        let mut with = conjuncts.clone();
+        with.push(ChcExpr::eq(ivar("c"), ChcExpr::int(5)));
+        assert!(!trivially_satisfiable(&[0, 1, 2, 3, 4], &with));
+        let selfish = vec![ChcExpr::eq(ivar("c"), ChcExpr::add(ivar("c"), ChcExpr::int(1)))];
+        assert!(!trivially_satisfiable(&[0], &selfish));
+        // A Bool definition is not free: "every Bool variable false" fixes it.
+        let bool_def = vec![ChcExpr::eq(bvar("b"), ChcExpr::Bool(true))];
+        assert!(!trivially_satisfiable(&[0], &bool_def));
     }
 }

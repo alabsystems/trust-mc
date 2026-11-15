@@ -286,7 +286,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let ptr = self.coerce_to_ptr_width(ptr);
         let size = self.coerce_to_ptr_width(size);
         let align = self.coerce_to_ptr_width(align);
-        self.ctx.heap_dealloc(ptr, size, align);
+        // The Box cast's event-time lane receives exact SSA definitions, not
+        // a reconstructed layout or the last value under a base-name suffix.
+        let ptr = self.box_pointer_value(&ptr).unwrap_or(ptr);
+        self.ctx.heap_dealloc_on_path(ptr, size, align, self.store_path_condition());
 
         debug!("codegen_rust_dealloc: deallocated");
         target
@@ -307,9 +310,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
-        if args.len() < 4 {
+        // `std::alloc::realloc(ptr, layout, new_size)` carries the old size and
+        // alignment in its Layout; `__rust_realloc` passes them as usizes.
+        let layout_form = args.len() == 3 && self.operand_is_layout(&args[1]);
+        if args.len() < 4 && !layout_form {
             debug!(
-                "codegen_rust_realloc: need 4 args (ptr, old_size, align, new_size), got {}",
+                "codegen_rust_realloc: need (ptr, old_size, align, new_size) or (ptr, layout, new_size), got {}",
                 args.len()
             );
             return None;
@@ -323,17 +329,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             debug!("codegen_rust_realloc: failed to codegen old_ptr — fail-closed (#2497)");
             return None;
         };
-        let old_size = self.codegen_operand(&args[1]).unwrap_or_else(|| {
-            let name = self.ctx.fresh_name("realloc_old_size");
-            warn!("codegen_rust_realloc: old_size codegen failed, using symbolic (#2455)");
-            Expr::var(name, ptr_sort())
-        });
-        let align = self.codegen_operand(&args[2]).unwrap_or_else(|| {
-            let name = self.ctx.fresh_name("realloc_align");
-            warn!("codegen_rust_realloc: align codegen failed, using symbolic (#3723)");
-            Expr::var(name, ptr_sort())
-        });
-        let new_size = self.codegen_operand(&args[3]).unwrap_or_else(|| {
+        let (old_size, align, new_size_idx) = if layout_form {
+            let (size, align) = self.extract_dealloc_layout_args(&args[1]);
+            (size, align, 2)
+        } else {
+            let old_size = self.codegen_operand(&args[1]).unwrap_or_else(|| {
+                let name = self.ctx.fresh_name("realloc_old_size");
+                warn!("codegen_rust_realloc: old_size codegen failed, using symbolic (#2455)");
+                Expr::var(name, ptr_sort())
+            });
+            let align = self.codegen_operand(&args[2]).unwrap_or_else(|| {
+                let name = self.ctx.fresh_name("realloc_align");
+                warn!("codegen_rust_realloc: align codegen failed, using symbolic (#3723)");
+                Expr::var(name, ptr_sort())
+            });
+            (old_size, align, 3)
+        };
+        let new_size = self.codegen_operand(&args[new_size_idx]).unwrap_or_else(|| {
             let name = self.ctx.fresh_name("realloc_new_size");
             warn!("codegen_rust_realloc: new_size codegen failed, using symbolic (#2455)");
             Expr::var(name, ptr_sort())
@@ -423,7 +435,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         use ay_bindings::SortInner;
 
         if let SortInner::Datatype(dt) = expr.sort().inner()
-            && dt.name == "Layout"
+            && dt.name == crate::codegen_ay::names::LAYOUT_MODEL_SORT
         {
             // Part of #3007: When the Layout is a concrete constructor application,
             // extract arguments directly to preserve concrete values for

@@ -9,6 +9,7 @@
 pub(crate) mod autoharness_args;
 pub(crate) mod cargo;
 pub(crate) mod common;
+pub(crate) mod compiler_route;
 mod harnesses_validation;
 pub(crate) mod list_args;
 pub(crate) mod playback_args;

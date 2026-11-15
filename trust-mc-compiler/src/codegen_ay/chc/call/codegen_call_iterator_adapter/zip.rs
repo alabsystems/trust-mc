@@ -30,11 +30,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // The Zip adapter sort is typically BV64 (opaque), so we only propagate
         // remaining_len via adapter_remaining_len for downstream IterMap/IterCollect.
         let len_a = self.iterator_receiver_expr_and_local(args, modified_locals).and_then(
-            |(iter_expr, iter_local)| {
-                self.try_extract_iterator_remaining_len(&iter_expr).or_else(|| {
-                    iter_local
-                        .and_then(|il| self.collections.adapter_remaining_len.get(&il).cloned())
-                })
+            |(iter_expr, _)| {
+                let ty = args.first()?.ty(self.body.locals()).ok()?;
+                self.typed_iterator_remaining_len(&iter_expr, ty)
             },
         );
         let len_b = args.get(1).and_then(|arg| {
@@ -42,29 +40,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .get_collection_arg(arg, modified_locals)
                 .or_else(|| self.resolve_ref_operand(arg, modified_locals))
                 .or_else(|| self.translate_operand_with_modified(arg, modified_locals))?;
-            self.try_extract_iterator_remaining_len(&expr).or_else(|| {
-                if let Operand::Copy(place) | Operand::Move(place) = arg {
-                    let ref_local: usize = place.local;
-                    let resolved = self
-                        .ref_resolution
-                        .ref_targets
-                        .get(&ref_local)
-                        .map_or(ref_local, |rt| rt.local);
-                    self.collections.adapter_remaining_len.get(&resolved).cloned()
-                } else {
-                    None
-                }
-            })
+            self.typed_iterator_remaining_len(&expr, arg.ty(self.body.locals()).ok()?)
         });
         let zip_remaining = match (len_a, len_b) {
             (Some(a), Some(b)) => {
                 // min(a, b) = ite(a <=u b, a, b)
                 Some(Expr::ite(a.clone().bvule(b.clone()), a, b))
             }
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+            // One known length is only an upper bound on a zip's length.
+            _ => None,
         };
+        self.collections.adapter_remaining_len.remove(&dest_local);
         if let Some(rl) = zip_remaining {
             self.collections.adapter_remaining_len.insert(dest_local, rl);
         }
@@ -88,18 +74,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 None
             }
         });
+        let source_a = iter_a_local
+            .and_then(|local| self.collections.adapter_source_data.get(&local).cloned());
+        let source_b = iter_b_local
+            .and_then(|local| self.collections.adapter_source_data.get(&local).cloned());
+        self.collections.adapter_source_data.remove(&dest_local);
         {
             let mut combined_arrays = Vec::new();
             let mut combined_has_transform = false;
             let mut both_have_data = true;
-            for opt_local in [iter_a_local, iter_b_local] {
-                if let Some(il) = opt_local {
-                    if let Some(src) = self.collections.adapter_source_data.get(&il) {
-                        combined_arrays.extend(src.data_arrays.iter().cloned());
-                        combined_has_transform |= src.has_transform;
-                    } else {
-                        both_have_data = false;
-                    }
+            for source in [source_a, source_b] {
+                if let Some(src) = source {
+                    combined_arrays.extend(src.data_arrays.iter().cloned());
+                    combined_has_transform |= src.has_transform;
                 } else {
                     both_have_data = false;
                 }
@@ -124,7 +111,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Zip output sort is typically BV64 (opaque) — attempt Datatype
         // construction but expect fallback to symbolic.
         let (inner_iter, _) = self.iterator_receiver_expr_and_local(args, modified_locals)?;
-        let (_, out_sort) = self.state_var_mgr.output_state_vars.get(dest_vec_idx)?;
-        self.construct_adapter_with_inner_iter(out_sort, inner_iter)
+        let (_, out_sort) = self.state_var_mgr.output_state_vars.get(dest_vec_idx)?.clone();
+        self.construct_adapter_with_inner_iter(&out_sort, inner_iter)
     }
 }

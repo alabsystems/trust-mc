@@ -11,62 +11,18 @@
 //! Split from codegen_decl_static.rs per file size limit.
 //! Part of #3496 Phase 5.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
-use rustc_public::mir::alloc::{AllocId, GlobalAlloc};
 
 use crate::codegen_ay::provenance::{Loc, Val};
+use crate::codegen_ay::shared::const_pointer::ConstRead;
 use std::sync::Arc;
 use tracing::debug;
 
 use super::ChcCtx;
-use super::codegen_types::CodegenTypes;
-use super::codegen_types_adt_sort::CodegenTypesAdtSort;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    pub(in crate::codegen_ay::chc) fn canonical_static_seed_alloc(
-        &self,
-        target_alloc_id: AllocId,
-    ) -> Option<(AllocId, rustc_public::ty::Allocation)> {
-        use rustc_public::CrateDef;
-        use rustc_public::ty::{RigidTy, TyKind};
-
-        let mut current_alloc_id = target_alloc_id;
-        for _ in 0..8 {
-            match GlobalAlloc::from(current_alloc_id) {
-                GlobalAlloc::Static(target_def) => {
-                    let target_def_id =
-                        rustc_public::rustc_internal::internal(self.tcx, target_def.def_id());
-                    // A foreign (`extern "C"`) static has no initializer body;
-                    // `eval_initializer()` would span_bug/panic (uncatchable by
-                    // `.ok()`). Stop following the ref chain (nondet referent).
-                    if self.tcx.is_foreign_item(target_def_id) {
-                        return None;
-                    }
-                    let target_alloc = target_def.eval_initializer().ok()?;
-                    let should_follow_nested_ref = !self.tcx.is_mutable_static(target_def_id)
-                        && matches!(
-                            target_def.ty().kind(),
-                            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))
-                        )
-                        && !target_alloc.provenance.ptrs.is_empty();
-                    if should_follow_nested_ref {
-                        let next_alloc_id = target_alloc.provenance.ptrs[0].1.0;
-                        if next_alloc_id == current_alloc_id {
-                            return Some((current_alloc_id, target_alloc));
-                        }
-                        current_alloc_id = next_alloc_id;
-                        continue;
-                    }
-                    return Some((current_alloc_id, target_alloc));
-                }
-                GlobalAlloc::Memory(alloc) => return Some((current_alloc_id, alloc)),
-                _ => return None,
-            }
-        }
-
-        None
-    }
-
     /// Records "the initializer datum `value` lives at address `addr`" for the
     /// entry rule's typed-memory mirror.
     ///
@@ -128,11 +84,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Mirrors a static's initializer into typed memory, decomposing arrays and
     /// structs into per-element / per-field `(value, address)` pairs.
+    ///
+    /// `mutable`: the memory can be written after entry (a `static mut`, the
+    /// referent of a mutable nested static). An immutable static's
+    /// `MaybeUninit` / `ManuallyDrop` value is decomposed as its content
+    /// ([`Self::static_image_wrapper_content`]); a mutable one's is not.
     pub(in crate::codegen_ay::chc) fn register_static_memory_init_entries(
         &mut self,
         rust_ty: rustc_public::ty::Ty,
         value: Val,
         addr: Loc,
+        mutable: bool,
     ) {
         use rustc_public::ty::{RigidTy, TyKind};
 
@@ -160,6 +122,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // the typed memory array's element sort is per-element (e.g., BV32 for char).
         // Without decomposition, `push_static_memory_init_entry` silently drops the
         // whole-array value due to sort mismatch, leaving memory unconstrained.
+        // The declared type may carry unevaluated constants
+        // (`[(u64, u64); SIZE1]`): decompose it as a body sees it.
+        let rust_ty = self.normalize_static_ty(rust_ty);
+        // An immutable static's wrapper holds its content under the content's
+        // decomposition (the whole-value entry above already has the content's
+        // key: the typed memory keys `MaybeUninit<T>` like `T`).
+        let rust_ty = match self.static_image_wrapper_content(rust_ty) {
+            Some(content) if !mutable => content,
+            _ => rust_ty,
+        };
         if let TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) = rust_ty.kind() {
             if let Ok(array_len) = len_const.eval_target_usize() {
                 if let Some(elem_size) = self.get_type_size(elem_ty) {
@@ -178,7 +150,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             let elem_addr =
                                 Self::static_addr_with_offset(addr.clone(), i * elem_size as u64);
                             self.register_static_memory_init_entries(
-                                elem_ty, elem_value, elem_addr,
+                                elem_ty, elem_value, elem_addr, mutable,
                             );
                         }
                         debug!(
@@ -192,38 +164,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         }
 
-        let TyKind::RigidTy(RigidTy::Adt(def, args)) = rust_ty.kind() else {
+        // A struct or tuple, whether its value is the datatype or the flattened
+        // bitvector of an array element: each field at its ABI offset
+        // (`static_image_fields`, the decomposition `write_static_image`
+        // writes and the untyped-view net 2 reads as seeded).
+        let Some(fields) = self.static_image_fields(rust_ty, &value_expr) else {
             return;
         };
-        if def.variants().len() != 1 {
-            return;
-        }
-
-        let Some(dt) = value_expr.sort().datatype_sort() else {
-            return;
-        };
-        let Some(ctor) = dt.constructors.first() else {
-            return;
-        };
-        let variant = &def.variants()[0];
-
-        for (field_idx, field_def) in variant.fields().iter().enumerate() {
-            let Some(offset) = self.get_field_offset(rust_ty, field_idx) else {
-                continue;
-            };
-            let Some(field) = ctor.fields.get(field_idx) else {
-                continue;
-            };
-            let field_ty =
-                <ChcCtx as CodegenTypesAdtSort>::resolve_generic_ty(field_def.ty(), &args)
-                    .unwrap_or_else(|| field_def.ty());
-            let field_value = Val::of_value(value_expr.clone().field_select(
-                &dt.name,
-                &field.name,
-                field.sort.clone(),
-            ));
+        for (field_ty, field_value, offset) in fields {
             let field_addr = Self::static_addr_with_offset(addr.clone(), offset);
-            self.register_static_memory_init_entries(field_ty, field_value, field_addr);
+            self.register_static_memory_init_entries(
+                field_ty,
+                Val::of_value(field_value),
+                field_addr,
+                mutable,
+            );
         }
     }
 
@@ -236,61 +191,59 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// This is a producer of [`Val`]: whatever the initializer image decodes to
     /// is the static's *datum*, including the case where that datum happens to
     /// be a pointer the static holds. It is never the address of the static
-    /// itself — that is minted separately, and confusing the two is what
-    /// `static_address_exprs` vs `static_initial_values` keeps apart.
+    /// itself — that is minted separately (the object table
+    /// `RefResolution::global_objects`, chc/decl/global_objects.rs), and
+    /// confusing the two is what that table vs `static_initial_values` keeps
+    /// apart.
     pub(in crate::codegen_ay::chc) fn static_init_from_alloc(
         &mut self,
-        alloc: &rustc_public::ty::Allocation,
+        bytes: &dyn ConstRead,
         sort: &Sort,
         rust_ty: rustc_public::ty::Ty,
     ) -> Option<Val> {
         use rustc_public::ty::{RigidTy, TyKind};
 
-        // Check if this is an Array whose element sort was flattened from a Datatype.
-        if let Some(arr) = sort.array_sort() {
-            if let Some(bv_width) = arr.element_sort.bitvec_width() {
-                // Get the Rust element type.
-                let elem_ty = match rust_ty.kind() {
-                    TyKind::RigidTy(RigidTy::Array(et, _))
-                    | TyKind::RigidTy(RigidTy::Slice(et)) => Some(et),
-                    _ => None,
-                };
-
-                if let Some(elem_ty) = elem_ty {
-                    // Get the unflattened element sort.
-                    if let Some(dt_sort) = Self::translate_ty(elem_ty) {
-                        if dt_sort.is_datatype() {
-                            debug!(
-                                ?bv_width,
-                                "static_init: detected flattened DT array, reading with unflatten"
-                            );
-                            return Self::read_array_with_flatten(
-                                &alloc.bytes,
-                                0,
-                                sort,
-                                &dt_sort,
-                                bv_width,
-                            )
-                            .map(Val::of_value);
-                        }
-                    }
-                }
-            }
-
-            if let TyKind::RigidTy(RigidTy::Array(elem_ty, len)) = rust_ty.kind()
-                && matches!(elem_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
-            {
-                let array_len = len.eval_target_usize().ok()? as usize;
-                return self
-                    .read_array_with_pointer_elements_from_allocation(
-                        alloc, 0, sort, elem_ty, array_len,
-                    )
-                    .map(Val::of_value);
-            }
+        // A fn-pointer static holds a relocation to a function, whose bytes
+        // are all zero: the value is the function's identity (the same term
+        // a reification of it produces). Read as bytes, `static SF: fn(..) =
+        // f` started at 0, so `SF == f as fn(..)` failed, certified Genuine
+        // (`walker_fn_ptr_completeness_dual.rs::safe_static_eq_reified`).
+        if matches!(rust_ty.kind(), TyKind::RigidTy(RigidTy::FnPtr(..)))
+            && sort.bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH)
+            && let Some(ptr) = bytes.stored_pointer(0)
+            && let Some(identity) = Self::fn_ptr_identity_of_const_ptr(&ptr)
+        {
+            return Some(Val::of_value(identity.into_expr()));
         }
 
-        // Fall back to standard reading for non-array or non-flattened statics.
-        Self::scalar_from_alloc(alloc, sort).map(Val::of_value)
+        if let TyKind::RigidTy(RigidTy::Array(elem_ty, len)) = rust_ty.kind()
+            && sort.is_array()
+            && matches!(elem_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
+        {
+            let array_len = len.eval_target_usize().ok()? as usize;
+            return self
+                .read_array_with_pointer_elements_from_allocation(
+                    bytes, 0, sort, elem_ty, array_len,
+                )
+                .map(Val::of_value);
+        }
+
+        // Arrays, slices, structs and tuples by their real layout: fields at
+        // their ABI offsets, elements at their stride, a datatype element
+        // flattened as `translate_ty` flattens it. The sequential readers
+        // decoded every static whose fields rustc reorders wrongly
+        // (`codegen_decl_static_layout.rs`). Every leaf is read under the slot
+        // clause (`shared::const_pointer`), so an initializer that holds
+        // pointers goes through here too, scalar or not: a pointer field is
+        // its relocation's address (D8), never its offset bytes — `static HS:
+        // Holder = Holder { r: &ARR[1] }` decoded `HS.r` as object 0 + 4.
+        if bytes.has_relocations() || sort.is_array() || sort.is_datatype() {
+            debug!(?rust_ty, "static_init: reading the initializer by its layout");
+            return self.read_static_value_by_layout(bytes, 0, rust_ty, sort, 0).map(Val::of_value);
+        }
+
+        // Scalars.
+        Self::scalar_from_alloc(bytes, sort).map(Val::of_value)
     }
 
     /// Both halves of a referent seed are values: the referent's contents and,
@@ -299,7 +252,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         value_ty: rustc_public::ty::Ty,
         value: Val,
-        backing_alloc: Option<&rustc_public::ty::Allocation>,
+        backing_len: Option<usize>,
     ) -> Option<(Expr, Option<Expr>)> {
         use rustc_public::ty::{RigidTy, TyKind};
 
@@ -315,14 +268,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if elem_bytes == 0 {
                     return None;
                 }
-                let len = backing_alloc?.bytes.len() / elem_bytes;
+                let len = backing_len? / elem_bytes;
                 let len_expr =
                     Expr::bitvec_const(len as u128, crate::codegen_ay::types::POINTER_WIDTH);
                 Some((value_expr, Some(len_expr)))
             }
             TyKind::RigidTy(RigidTy::Str) => {
                 let len_expr = Expr::bitvec_const(
-                    backing_alloc?.bytes.len() as u128,
+                    backing_len? as u128,
                     crate::codegen_ay::types::POINTER_WIDTH,
                 );
                 Some((value_expr, Some(len_expr)))
@@ -331,65 +284,38 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// The referent seed of a pointer-typed static (D9): the pointee WINDOW
+    /// its own pointer names (at the pointer's offset in its target, not the
+    /// target's byte 0), and — for a `[T]` / `str` pointee — the length word
+    /// its own bytes carry beside the pointer (not the target's size).
+    ///
+    /// For `static SLS: &[u32] = ARR.split_at(1).1`, both `SLS.len() == 3`
+    /// and `SLS[0] == 1` PROVED when this read the target from byte 0 and
+    /// measured it.
     pub(in crate::codegen_ay::chc) fn resolve_pointer_static_seed_metadata(
         &mut self,
-        target_alloc_id: AllocId,
+        static_bytes: &dyn ConstRead,
         pointee_ty: rustc_public::ty::Ty,
     ) -> Option<(Expr, Option<Expr>)> {
-        let (_resolved_alloc_id, target_alloc_data) =
-            self.canonical_static_seed_alloc(target_alloc_id)?;
-
-        let pointee_sort = Self::translate_ty(pointee_ty)?;
-        let referent_value =
-            self.static_init_from_alloc(&target_alloc_data, &pointee_sort, pointee_ty)?;
-        self.static_seed_metadata_for_value(pointee_ty, referent_value, Some(&target_alloc_data))
-    }
-
-    /// Read an array from allocation bytes, reading elements as Datatypes then
-    /// flattening to BV for correct field ordering.
-    ///
-    /// The CHC concat convention puts field 0 at HIGH bits (`concat(fld_0, fld_1)`),
-    /// but LE byte reading puts field 0 at LOW bits. This function reads each
-    /// element as a Datatype (which reads fields individually at correct offsets)
-    /// and then flattens to the target BV width using `flatten_datatype_to_bitvec`.
-    ///
-    /// Part of #3496 Phase 5: correct byte ordering for packed struct array elements.
-    fn read_array_with_flatten(
-        bytes: &[Option<u8>],
-        offset: usize,
-        array_sort: &Sort,
-        dt_elem_sort: &Sort,
-        bv_width: u32,
-    ) -> Option<Expr> {
-        use trust_mc_codegen_types::types::flatten_datatype_to_bitvec;
-
-        let arr = array_sort.array_sort()?;
-        let dt_byte_width = Self::sort_byte_width(dt_elem_sort)?;
-        if dt_byte_width == 0 {
+        let (r, value) = self.fixed_window_value(static_bytes, 0, pointee_ty)?;
+        if !value.sort().is_array() {
             return None;
         }
-
-        let remaining = bytes.len().saturating_sub(offset);
-        let array_len = remaining / dt_byte_width;
-        if array_len == 0 {
-            return None;
+        match pointee_ty.kind() {
+            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Array(..)) => {
+                Some((value, None))
+            }
+            rustc_public::ty::TyKind::RigidTy(
+                rustc_public::ty::RigidTy::Slice(_) | rustc_public::ty::RigidTy::Str,
+            ) => {
+                let len = Expr::bitvec_const(
+                    u128::from(r.metadata?),
+                    crate::codegen_ay::types::POINTER_WIDTH,
+                );
+                Some((value, Some(len)))
+            }
+            _ => None,
         }
-
-        let default_elem = Self::sort_default_expr(&arr.element_sort)?;
-        let mut result = Expr::const_array(arr.index_sort.clone(), default_elem);
-        let idx_width =
-            arr.index_sort.bitvec_width().unwrap_or(crate::codegen_ay::types::POINTER_WIDTH);
-
-        for i in 0..array_len {
-            let elem_offset = offset + i * dt_byte_width;
-            // Read as Datatype (correct field ordering via recursive decomposition).
-            let dt_expr = Self::read_composite_from_bytes(bytes, elem_offset, dt_elem_sort)?;
-            // Flatten Datatype to BV using MSB-first concat convention.
-            let bv_expr = flatten_datatype_to_bitvec(&dt_expr, bv_width)?;
-            let idx = Expr::bitvec_const(i as u128, idx_width);
-            result = result.store(idx, bv_expr);
-        }
-        Some(result)
     }
 
     // read_array_with_pointer_elements_from_allocation, read_pointer_like_from_allocation,

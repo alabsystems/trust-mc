@@ -266,6 +266,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.infer_sort_from_place(place),
             Operand::Constant(c) => Self::infer_sort_from_ty(c.const_.ty()),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => Self::infer_sort_from_ty(rustc_public::ty::Ty::bool_ty()),
         }
     }
 
@@ -276,11 +278,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return sort;
         }
         match rvalue {
-            Rvalue::Use(Operand::Constant(_c)) => {
+            Rvalue::Use(Operand::Constant(_c), ..) => {
                 // For constants, infer from the constant type
                 Sort::bitvec(32) // Default to 32-bit
             }
-            Rvalue::Use(_) => Sort::bitvec(32),
+            Rvalue::Use(_, ..) => Sort::bitvec(32),
+            // Trust: a reborrow is a copy of its place (retyped to the
+            // `CoerceShared` target when shared). This fallback is reached only
+            // when the rvalue's type has no sort, so it takes the `Use` fallback.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(..) => Sort::bitvec(32),
             Rvalue::BinaryOp(op, ..) => {
                 match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -330,9 +337,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
             }
             Rvalue::Discriminant(..) => Sort::bitvec(32), // Discriminants are integers
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(..) => ptr_sort(),
             Rvalue::CopyForDeref(..) => ptr_sort(),
             Rvalue::ThreadLocalRef(..) => ptr_sort(),
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(..) => ptr_sort(),
             Rvalue::Repeat(..) => Sort::array(ptr_sort(), bv8_sort()), // Array fallback
         }
@@ -358,6 +367,44 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Some(struct_sort(name, fields))
     }
 
+    /// Whether a check flag turns this MIR `Assert` off: an arithmetic
+    /// overflow check under `--no-overflow-checks`, a bounds or pointer-UB
+    /// check under `--no-memory-safety-checks`. The CHC lane's
+    /// `assert_check_disabled` (transition_gen_terminators.rs), arm for arm.
+    ///
+    /// Signed `MIN / -1` (`Overflow(Div|Rem)`) is not an overflow check:
+    /// rustc asserts it whatever `-C overflow-checks` says (rustc_mir_build
+    /// as_rvalue.rs `build_binary_op`, outside its `check_overflow` branch),
+    /// and the program panics there in every build profile.
+    pub(super) fn mir_assert_check_disabled(&self, msg: &AssertMessage) -> bool {
+        let config = &self.ctx.config;
+        match msg {
+            AssertMessage::Overflow(BinOp::Div | BinOp::Rem, ..) => false,
+            AssertMessage::Overflow(..) | AssertMessage::OverflowNeg(..) => !config.overflow_checks,
+            AssertMessage::BoundsCheck { .. }
+            | AssertMessage::NullPointerDereference
+            | AssertMessage::MisalignedPointerDereference { .. } => !config.memory_safety_checks,
+            #[cfg(trust_toolchain)]
+            AssertMessage::NullReferenceConstructed => !config.memory_safety_checks,
+            _ => false,
+        }
+    }
+
+    /// Whether Kani files this MIR `Assert` as `PropertyClass::SafetyCheck`
+    /// (UB), not `Assertion` (a panic): the pointer-UB asserts. The CHC lane
+    /// gives exactly these a non-`Assertion` kind
+    /// (`emit_assert_error_rule_shared`), and only they survive
+    /// `--prove-safety-only` in either lane.
+    pub(super) fn mir_assert_is_safety_check(msg: &AssertMessage) -> bool {
+        match msg {
+            AssertMessage::NullPointerDereference
+            | AssertMessage::MisalignedPointerDereference { .. } => true,
+            #[cfg(trust_toolchain)]
+            AssertMessage::NullReferenceConstructed => true,
+            _ => false,
+        }
+    }
+
     /// Get assertion label for a given AssertMessage type.
     ///
     /// Returns standard Kani property class names for verification output.
@@ -380,6 +427,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             AssertMessage::ResumedAfterReturn { .. }
             | AssertMessage::ResumedAfterDrop { .. }
             | AssertMessage::ResumedAfterPanic { .. } => "coroutine_check",
+            #[cfg(trust_toolchain)]
+            AssertMessage::NullReferenceConstructed => "raw_ptr_deref_null",
         }
     }
 }

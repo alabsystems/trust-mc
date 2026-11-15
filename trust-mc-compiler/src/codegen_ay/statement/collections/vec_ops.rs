@@ -65,6 +65,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         } else {
             let default_name = self.ctx.fresh_name("vec_fe_default");
             let default_elem = self.ctx.declare_var(&default_name, elem_sort);
+            self.ctx.bmc_sound_havoc("vec_from_elem_default");
             Expr::const_array(ptr_sort(), default_elem)
         };
 
@@ -81,7 +82,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Codegen `Vec::resize(&mut self, new_len, value)`.
     ///
-    /// Model: len' = new_len, cap' = max(cap, new_len), data/ptr preserved.
+    /// Model: len' = new_len, cap' = RawVec's amortized growth, data/ptr preserved.
     /// CHC equivalent: codegen_call_vec_ops.rs `vec_op_resize`.
     pub(in crate::codegen_ay::statement) fn codegen_vec_resize(
         &mut self,
@@ -103,8 +104,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             && let Some(fields) = Self::extract_all_vec_fields(&vec)
         {
             let new_len = self.coerce_to_ptr_width(new_len_raw);
-            let grow_needed = fields.cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), fields.cap);
+            // Growth reserves through `extend_with`: RawVec's amortized growth.
+            let new_cap = self.bmc_vec_reserved_cap(
+                &args[0],
+                &fields.cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            );
 
             let new_vec = Expr::datatype_constructor(
                 fields.dt_name,
@@ -119,7 +125,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Codegen `Vec::extend_from_slice(&mut self, &[T])`.
     ///
-    /// Model: len' = old_len + source_len, cap' = max(cap, new_len).
+    /// Model: len' = old_len + source_len, cap' = RawVec's amortized growth.
     /// Data contents left unconstrained (sound over-approximation).
     /// CHC equivalent: codegen_call_vec_ops_len.rs `vec_op_extend_from_slice`.
     pub(in crate::codegen_ay::statement) fn codegen_vec_extend_from_slice(
@@ -132,6 +138,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             warn!("Vec::extend_from_slice requires 2 args — fail-closed (#3494)");
             return None;
         }
+        // An adapter source (`map`, `filter`, `take`, a user iterator): the
+        // model reads only the sequence underneath, never the adapter's
+        // closure or its element count
+        // (`reduce_loop_rule::extend_source_is_modelled`).
+        if args[1]
+            .ty(self.body.locals())
+            .into_option()
+            .is_some_and(|ty| !crate::codegen_ay::reduce_loop_rule::extend_source_is_modelled(ty))
+        {
+            self.ctx.unsupported_with_fallback(
+                "vec_extend_adapter_unmodeled",
+                "Vec::extend from an iterator adapter the model does not replay",
+            );
+            if let Some((base, vec)) = self.resolve_collection_base(&args[0]) {
+                let name = self.ctx.fresh_name("vec_extend_adapter");
+                let havoc = self.ctx.declare_var(&name, vec.sort().clone());
+                self.env_update(base, havoc);
+            }
+            return target;
+        }
+
+        // A range of 64- or 128-bit integers can hold more elements than an
+        // allocation can: `extend` then panics with "capacity overflow"
+        // (`extend_trusted`, `RawVec::reserve`), which this model does not
+        // state, and it assumes the new length does not wrap.
+        // `v.extend(0u64..=u64::MAX)` verified clean where Kani fails (walker
+        // fail-closed repair round 5, `range_extend_kinds_dual.rs` `k2`). Such
+        // a source fails closed; a narrower range cannot reach the limit
+        // (`u32` ranges hold at most 2^32 elements of at most 16 bytes).
+        if args[1].ty(self.body.locals()).into_option().is_some_and(wide_integer_range) {
+            self.ctx.unsupported_with_fallback(
+                "vec_extend_wide_range_capacity_unmodeled",
+                "Vec::extend from a 64- or 128-bit range may panic with capacity overflow",
+            );
+        }
 
         let Some((base, vec)) = self.resolve_collection_base(&args[0]) else {
             return target;
@@ -141,6 +182,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Try to resolve source slice length from args[1]
             let source_len = self.slice_len_expr(&args[1]).unwrap_or_else(|| {
                 let name = self.ctx.fresh_name("ext_src_len");
+                self.ctx.bmc_sound_havoc("extend_from_slice_src_len");
                 self.ctx.declare_var(&name, ptr_sort())
             });
 
@@ -148,8 +190,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Part of #3409: guard against unsigned overflow on len+source_len.
             // Rust's Vec::extend panics on capacity overflow (checked_add).
             self.ctx.assert(new_len.clone().bvuge(fields.len.clone()));
-            let grow_needed = fields.cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), fields.cap);
+            // `extend_trusted` reserves the count: RawVec's amortized growth.
+            let new_cap = self.bmc_vec_reserved_cap(
+                &args[0],
+                &fields.cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            );
 
             let new_vec = Expr::datatype_constructor(
                 fields.dt_name,
@@ -228,6 +275,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // every element really IS the same value, so a shared symbol is exact.
         let data_name = self.ctx.fresh_name("vec_iv_data");
         let data = self.ctx.declare_var(&data_name, array_sort);
+        // The fresh `ptr` and `data` stand in for program-produced values (the
+        // boxed literal's address and elements). A proof over them is sound; a
+        // counterexample that reads them is not evidence of a real bug:
+        // `v.truncate(2); assert!(v[1] == 20)` on `vec![10, 20, ..]` was
+        // certified Genuine (tools/soundness-duals/dual69_safe_twin.rs). Until
+        // the boxed array's elements are threaded through exactly, tag it.
+        self.ctx.bmc_sound_havoc("slice_into_vec_fresh_data");
 
         let ctor_name = crate::codegen_ay::names::resolve_ctor_name(&vec_sort, &vec_sort_name);
         let vec = Expr::datatype_constructor(
@@ -329,4 +383,27 @@ fn constrain_allocator_pointer(
         let mask = Expr::bitvec_const(align - 1, POINTER_WIDTH);
         ctx.assert(ptr.clone().bvand(mask).eq(zero));
     }
+}
+
+/// Is `ty` a `core::ops::Range` / `RangeInclusive` of a 64- or 128-bit
+/// integer (or `usize` / `isize`)?
+fn wide_integer_range(ty: rustc_public::ty::Ty) -> bool {
+    use rustc_public::CrateDef;
+    use rustc_public::ty::{GenericArgKind, IntTy, RigidTy, TyKind, UintTy};
+    let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
+        return false;
+    };
+    let name = def.name();
+    let last = name.rsplit("::").next().unwrap_or(&name);
+    if !(matches!(last, "Range" | "RangeInclusive") && name.contains("ops")) {
+        return false;
+    }
+    matches!(
+        args.0.first(),
+        Some(GenericArgKind::Type(elem)) if matches!(
+            elem.kind(),
+            TyKind::RigidTy(RigidTy::Int(IntTy::I64 | IntTy::I128 | IntTy::Isize)
+                | RigidTy::Uint(UintTy::U64 | UintTy::U128 | UintTy::Usize))
+        )
+    )
 }

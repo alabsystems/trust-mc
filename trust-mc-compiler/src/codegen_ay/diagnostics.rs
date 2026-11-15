@@ -12,11 +12,34 @@
 //! See `designs/archive/2026-02-01-stub-coverage-validation.md` for design.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 
 /// Global diagnostics state for the current compilation session.
 static DIAGNOSTICS: OnceLock<Mutex<StubDiagnostics>> = OnceLock::new();
+
+/// Monotonic count of unresolved unstubbed-abstraction encounters (D1).
+///
+/// Deliberately SEPARATE from [`StubDiagnostics::unstubbed_abstractions`], which
+/// `reset_stub_diagnostics` clears between compilation sessions and which keys
+/// by path: the per-harness accumulator reads this counter as a monotone delta
+/// across one harness's `codegen_items` call. Pending reachability events are
+/// finalized at that boundary after exact callsite reconciliation; aborted
+/// scopes finalize all events. Early coverage remains in `StubDiagnostics`.
+/// (`unsoundness_per_harness::snapshot_counters`), so it must not be reset
+/// mid-compilation, and it counts events, not distinct paths.
+static UNSTUBBED_ABSTRACTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Non-destructive read of the unstubbed-abstraction counter.
+pub(in crate::codegen_ay) fn get_unstubbed_abstraction_count() -> usize {
+    UNSTUBBED_ABSTRACTION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Drain the unstubbed-abstraction counter (crate-total collection).
+pub(in crate::codegen_ay) fn take_unstubbed_abstraction_count() -> usize {
+    UNSTUBBED_ABSTRACTION_COUNT.swap(0, Ordering::Relaxed)
+}
 
 /// Tracking state for stub coverage diagnostics.
 #[derive(Debug, Default)]
@@ -40,8 +63,8 @@ impl StubDiagnostics {
 
     /// Record an unstubbed abstraction.
     ///
-    /// Call this when `is_abstract_function` returns true due to prefix match
-    /// but no stub exists in the registry.
+    /// Call this when reachability abstracts a standard-library function
+    /// (`kani_middle::std_abstraction`) for which no stub exists in the registry.
     ///
     /// REQUIRES: `path` is a non-empty function path string.
     /// ENSURES: Entry for `path` exists in unstubbed_abstractions.
@@ -138,16 +161,25 @@ fn lock_diagnostics(diagnostics: &Mutex<StubDiagnostics>) -> MutexGuard<'_, Stub
 
 /// Record an unstubbed abstraction in the global tracker.
 ///
-/// This is called from `is_abstract_function` in reachability.rs when a function
-/// is abstracted via prefix match but has no corresponding stub.
+/// Reachability (`Boundary::abstracts` in reachability.rs) calls this when a
+/// standard-library function is abstracted but has no corresponding stub.
 ///
 /// REQUIRES: `path` is a non-empty function path string.
 /// ENSURES: Global diagnostics tracker has entry for `path`.
 /// ENSURES: Call count for `path` is incremented by 1.
 pub(crate) fn record_unstubbed_abstraction(path: &str) {
-    let diagnostics = get_diagnostics();
-    let mut diag = lock_diagnostics(diagnostics);
-    diag.record_unstubbed(path);
+    add_unstubbed_semantic_events(1);
+    record_unstubbed_coverage(path);
+}
+
+/// Early reachability coverage is preserved even if later exact modeling succeeds.
+pub(super) fn record_unstubbed_coverage(path: &str) {
+    lock_diagnostics(get_diagnostics()).record_unstubbed(path);
+}
+
+/// Only append finalized unresolved events; never decrement a monotone counter.
+pub(super) fn add_unstubbed_semantic_events(count: usize) {
+    UNSTUBBED_ABSTRACTION_COUNT.fetch_add(count, Ordering::Relaxed);
 }
 
 /// Reset the global diagnostics state for a new compilation session.
@@ -177,6 +209,24 @@ pub(in crate::codegen_ay) fn print_stub_coverage_summary() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D1 (2026-09-14): `record_unstubbed_abstraction` must move the monotone
+    /// counter the per-harness accumulator reads, not only the path map.
+    ///
+    /// Asserted as a DELTA, not an absolute: the counter is process-global and
+    /// deliberately never reset (see its docs), and the engine's test binary
+    /// runs tests in parallel, so any absolute expectation is a flake.
+    #[test]
+    fn test_record_unstubbed_abstraction_increments_the_monotone_counter() {
+        let before = get_unstubbed_abstraction_count();
+        record_unstubbed_abstraction("std::sync::MutexGuard::<T>::deref");
+        record_unstubbed_abstraction("std::sync::MutexGuard::<T>::deref");
+        assert!(
+            get_unstubbed_abstraction_count() >= before + 2,
+            "every encounter counts, including repeats of one path: the warning is \
+             deduplicated, the unsoundness event is not"
+        );
+    }
 
     #[test]
     fn test_diagnostics_new() {
@@ -228,4 +278,9 @@ mod tests {
         recovered.record_unstubbed("poison_recovery");
         assert_eq!(recovered.unstubbed_call_count(), 1);
     }
+}
+
+#[cfg(test)]
+pub(super) fn coverage_count_for_test(path: &str) -> usize {
+    lock_diagnostics(get_diagnostics()).unstubbed_abstractions.get(path).copied().unwrap_or(0)
 }

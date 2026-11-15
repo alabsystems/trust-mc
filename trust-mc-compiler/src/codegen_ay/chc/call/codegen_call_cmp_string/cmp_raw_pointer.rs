@@ -39,6 +39,8 @@ pub(super) fn operand_is_raw_pointer_like(
     let local_idx = match operand {
         Operand::Copy(place) | Operand::Move(place) => place.local,
         Operand::Constant(_) => return false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return false,
     };
     if local_idx >= locals.len() {
         return false;
@@ -95,7 +97,16 @@ pub(super) fn raw_pointer_cmp_expr_with_operands(
         raw_pointer_order_components_from_operand(ctx, lhs_operand, lhs_expr, modified_locals)?;
     let (rhs_ptr, rhs_meta) =
         raw_pointer_order_components_from_operand(ctx, rhs_operand, rhs_expr, modified_locals)?;
-    raw_pointer_cmp_expr_from_components(lhs_ptr, lhs_meta, rhs_ptr, rhs_meta)
+    // Across allocations the address order is unspecified (heap/stack_address.rs).
+    // Order keys are addresses by construction: they are `Loc`s or the observed
+    // addresses of `Loc`s.
+    let (lhs_ptr, rhs_ptr) = ctx.ptr_order_operands(lhs_ptr.into_expr(), rhs_ptr.into_expr());
+    raw_pointer_cmp_expr_from_components(
+        Loc::of_address(lhs_ptr),
+        lhs_meta,
+        Loc::of_address(rhs_ptr),
+        rhs_meta,
+    )
 }
 
 /// Build a boolean ordering predicate (`lt`, `le`, `gt`, `ge`) from a
@@ -199,7 +210,7 @@ fn resolve_raw_pointer_source_place(
                         );
                     }
                 }
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                 | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                 | Rvalue::CopyForDeref(src)
                     if src.projection.is_empty() =>

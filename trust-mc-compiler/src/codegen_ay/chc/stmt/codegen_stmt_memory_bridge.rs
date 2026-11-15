@@ -49,6 +49,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             constraints.push(store_constraint);
         }
+        // The Cell lane reads and writes a cell at its field's memory-mirror
+        // address, through a projected borrow that never re-mirrors the
+        // register (`&t.cells[1]`, the `get` receiver). A whole value MOVED or
+        // copied into an interior-mutable local therefore has to reach memory
+        // field by field, as the `&c` mirror does
+        // (`mirror_ref_value_to_memory`): stored only as one whole-struct cell,
+        // `let t = s; t.cells[1].get()` read a field no store wrote, and a
+        // counterexample on that unconstrained byte was certified Genuine
+        // for a safe harness (review of fix/chc-cell-set-write, 2026-09-26).
+        // An aggregate is decomposed below from its operands instead.
+        if !matches!(rhs, Rvalue::Aggregate(..))
+            && coerced_rhs.sort().is_datatype()
+            && self.ty_has_interior_mut(local_ty)
+        {
+            self.try_decompose_struct_store(&addr_expr, coerced_rhs, local_ty, constraints);
+        }
         self.mirror_aggregate_field_stores_to_memory(
             rhs,
             local_ty,

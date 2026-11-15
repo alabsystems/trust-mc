@@ -42,7 +42,7 @@ fn trace_to_vec_local(body: &rustc_public::mir::Body, start_local: usize) -> Opt
                 if dest.local != current || !dest.projection.is_empty() {
                     continue;
                 }
-                if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::CopyForDeref(place) = rhs
                 {
                     let src_local = place.local;

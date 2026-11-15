@@ -14,15 +14,22 @@ description = "trust_ir Module consumption for trust-mc BMC verification"
 trust-mc-core = { path = "../trust-mc-core" }
 ay_bindings.workspace = true
 thiserror.workspace = true
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
 serde_json = { workspace = true, optional = true }
+# One canonical complete module validator for every direct BMC input.
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
 
 [features]
 # The direct-call-summary census CLI (`call-summary-census`). Opt-in so the
 # default dependency graph of this crate gains NOTHING: serde/serde_json enter
 # only when the measurement binary is asked for. Build it with
-#   cargo build -p trust-mc-trust-bmc --features census-cli --bin call-summary-census
+#   targo --unverified build -p trust-mc-trust-bmc --features census-cli --bin call-summary-census
 census-cli = ["dep:serde_json", "trust_ir/serde"]
+# TEST-ONLY. Exposes the pre-fix CHC relation liveness as a hidden translation
+# entry point, the differential oracle the driver's verdict-parity test compares
+# the precise analysis against. Adds one function and changes nothing else;
+# production builds never enable it.
+legacy-liveness-oracle = []
 
 [[bin]]
 name = "call-summary-census"
@@ -30,13 +37,12 @@ path = "src/bin/call_summary_census.rs"
 required-features = ["census-cli"]
 
 [dev-dependencies]
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
 # In-process AY solving for guarded-path CFG encoding tests (SAT/UNSAT checks).
 ay_bindings = { workspace = true, features = ["direct"] }
 # Load a REAL `-Ztrust-dump=native-bundle` module (produced by trustc from Rust
 # source through the trust-ir-bridge) so the interior-pointer store tests run on
 # the production lowering path, not only on hand-built IR.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", features = ["serde", "binary"] }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["serde", "binary"] }
 serde_json.workspace = true
 
 [lints]

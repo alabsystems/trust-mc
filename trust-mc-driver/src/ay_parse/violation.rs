@@ -338,7 +338,7 @@ pub(crate) fn parse_violation_properties(
     location_map: Option<&VcLocationMap>,
 ) -> Vec<Property> {
     let mut properties = Vec::new();
-    let trace_items = if is_sat { Some(any_trace.unwrap_or(&[])) } else { None };
+    let trace_items = if is_sat { any_trace } else { None };
 
     for (violation_name, value_token) in scan_violation_entries(output) {
         let is_violated = is_sat && value_token == "true";
@@ -698,11 +698,8 @@ pub(crate) fn apply_loop_contract_naming(properties: &mut [Property]) {
         else {
             continue;
         };
-        let Some(fn_name) = prop
-            .property_id
-            .fn_name
-            .clone()
-            .or_else(|| prop.source_location.function.clone())
+        let Some(fn_name) =
+            prop.property_id.fn_name.clone().or_else(|| prop.source_location.function.clone())
         else {
             continue;
         };
@@ -744,31 +741,83 @@ pub(crate) fn apply_kani_property_naming(properties: &mut [Property]) {
     }
 }
 
+/// Whether a failing check of this property class is a RUST PANIC — the
+/// question `#[kani::should_panic]` asks.
+///
+/// ONE rule for both lanes, and it is Kani's rule. Kani lowers every MIR
+/// `Assert` terminator — `BoundsCheck`, `Overflow`, `OverflowNeg`,
+/// `DivisionByZero`, `RemainderByZero` as well as the plain `assert!` — to a
+/// check with `PropertyClass::Assertion`, so a Kani `should_panic` harness
+/// whose only failure is an out-of-bounds index or an arithmetic overflow
+/// passes. Each of those really is a Rust panic: the program unwinds with
+/// "index out of bounds: …", "attempt to add with overflow", "attempt to
+/// divide by zero".
+///
+/// Both lane spellings of each family are listed because the two lanes name
+/// their classes independently and the two lists have to stay one rule:
+/// `classify_violation` below gives BMC `array_bounds` / `overflow` /
+/// `division-by-zero`, while the CHC lane's `kind_class`
+/// (`call_ay::chc::property_report`) gives `bounds` / `division_by_zero`.
+/// MEASURED before they were joined: BMC reported
+/// `FAILED (encountered failures other than panics, which were unexpected)`
+/// for an out-of-bounds index, a slice index, an overflow and a division by
+/// zero under `#[kani::should_panic]`, while CHC reported `SUCCESSFUL
+/// (encountered one or more panics as expected)` for all four — the same
+/// source program, opposite verdicts, and the BMC column a counted Kani-parity
+/// loss.
+///
+/// `arithmetic_overflow` deliberately stays OUT even though it reads like the
+/// overflow family: it is the class both lanes give an UNCHECKED intrinsic's
+/// UB obligation (`unchecked_add`, a shift past the width —
+/// `properties::label_to_property_kind` files `shift_distance_check` under it),
+/// and Kani words the same rejection in
+/// `tests/ui/should-panic-attribute/unexpected-failures/expected`: a
+/// `should_panic` harness whose extra failure is `arithmetic_overflow` is
+/// `FAILED (encountered failures other than panics, …)` there too. The rustc
+/// `Assert` overflow a Rust program actually panics on reaches this classifier
+/// as BMC's `overflow` class, or through the CHC lane's panic arm as
+/// `assertion` — both of which are in.
+///
+/// What stays OUT is everything that is UB or a verifier-internal obligation
+/// rather than a panicking Rust program: `memory_safety`,
+/// `pointer_dereference` / `null_pointer`, `safety_check`, `pointer-overflow`,
+/// `undefined-behavior` / `undefined_behavior`, `undefined-shift`,
+/// `unsoundness`, `unsupported_construct`, `NaN`, `assigns`, the loop-contract
+/// classes — and `unwind`, which is a statement about the `--unwind` BOUND, not
+/// about the program (see `classify_violation`'s `unwind_assert` arm, which
+/// names this function as one of three consumers that key off that).
+pub(crate) fn class_is_rust_panic(class: &str) -> bool {
+    matches!(
+        class,
+        // An explicit `panic!`, a failing `assert!`, `Option::unwrap` on `None`,
+        // a reached `unreachable!()`.
+        "assertion" | "panic" | "unreachable"
+        // MIR `Assert` terminators. BMC spelling, then CHC spelling.
+        | "array_bounds" | "bounds"
+        | "overflow"
+        | "division-by-zero" | "division_by_zero"
+    )
+}
+
 /// Determine the FailedProperties classification from a list of properties.
 ///
-/// Classifies the failure mode based on which property types failed:
+/// Classifies the failure mode by [`class_is_rust_panic`]:
 /// - None: All properties passed (no Failure status)
-/// - PanicsOnly: Only assertion failures (kani::assert, panic)
-/// - Other: Non-assertion failures (overflow, bounds, etc.)
+/// - PanicsOnly: every failing check is a Rust panic
+/// - Other: at least one failing check is not (UB, a memory-safety obligation,
+///   an exhausted unwind bound, …)
 ///
 /// REQUIRES: properties contains valid Property structs with status field set
-/// REQUIRES: property_id.class is "assertion" for kani::assert failures
 /// ENSURES: Returns None iff no property has status == Failure
-/// ENSURES: Returns Other if any non-assertion property has Failure status
-/// ENSURES: Returns PanicsOnly only when assertion failures exist and no other failures exist
+/// ENSURES: Returns Other if any failing property's class is not a Rust panic
+/// ENSURES: Returns PanicsOnly only when panic failures exist and no other failures exist
 pub(crate) fn determine_failed_from_properties(properties: &[Property]) -> FailedProperties {
     let mut has_panic_failure = false;
     let mut has_other_failure = false;
 
     for prop in properties {
         if prop.status == CheckStatus::Failure {
-            // A Rust panic reaches trust-mc as an "assertion", "panic", or
-            // "unreachable" class check (see `classify_violation` and the CHC
-            // `kind_class` mapping). All three count as a panic for
-            // should_panic; every other class (memory_safety, null_pointer,
-            // pointer_overflow, undefined_behavior, bounds, overflow, …) is a
-            // non-panic failure.
-            if matches!(prop.property_id.class.as_ref(), "assertion" | "panic" | "unreachable") {
+            if class_is_rust_panic(prop.property_id.class.as_ref()) {
                 has_panic_failure = true;
             } else {
                 has_other_failure = true;
@@ -840,12 +889,86 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         "mod_by_zero_check" => {
             ("division-by-zero", "attempt to calculate the remainder with a divisor of zero")
         }
-        // Generic/SIMD/bigint division-by-zero sites keep the neutral wording:
-        // they are not the scalar `/` or `%` operator, so Kani's operator-specific
-        // phrasing would be a false claim (and simd expected files pin this text).
+        // Generic/bigint division-by-zero sites keep the neutral wording: they
+        // are not the scalar `/` or `%` operator, so Kani's operator-specific
+        // phrasing would be a false claim.
         "division_by_zero" | "bigint_div_by_zero" | "bigint_mod_by_zero" => {
             ("division-by-zero", "division by zero")
         }
+        // `simd_div` / `simd_rem` with a zero integer lane divisor
+        // (statement/intrinsics/simd/ops.rs): UB of an unsafe `#[rustc_nounwind]`
+        // intrinsic ("`rhs` must not contain any zero elements"), never a panic.
+        // Kani emits no check of its own; CBMC's `division-by-zero` property
+        // fires, and Kani's should_panic accepts only `assertion`. In this lane
+        // `division-by-zero` is a panic class, so the SIMD site leaves it. The
+        // text is CBMC's, which the corpus pins (intrinsics/simd-{div,rem}-div-zero)
+        // and the emitter carries.
+        "simd_div_by_zero_check" => ("undefined-behavior", "division by zero"),
+        // Zero divisors of the integer methods the BMC lane intercepts
+        // (statement/arithmetic.rs, arithmetic_overflow.rs). One label covers
+        // `div` and `rem`, so the text is the neutral one. `wrapping_`,
+        // `saturating_` and `overflowing_` div/rem panic on a zero divisor
+        // (their documented `# Panics`), the scalar operator's panic class;
+        // `unchecked_div`/`unchecked_rem` make it UB of the unsafe intrinsic,
+        // never a panic. All four fell to the generic `assertion` fallback.
+        "wrapping_div_by_zero" | "saturating_div_by_zero" | "overflowing_div_by_zero" => {
+            ("division-by-zero", "division by zero")
+        }
+        "unchecked_div_by_zero" => ("undefined-behavior", "division by zero"),
+        // `unchecked_add`/`sub`/`mul` overflow (statement/arithmetic_checks.rs
+        // `overflow_check` for `BinOp::*Unchecked` and the intercepted
+        // `<int>::unchecked_*` methods): UB of an unsafe intrinsic, never a
+        // panic. Kani reports it as `arithmetic_overflow` with these texts
+        // (kani-compiler rvalue.rs `codegen_binop_with_overflow_check`), which
+        // `tests/ui/Property-Class-UI/arithmetic_overflow` and the
+        // `cargo_autoharness_{harnesses_fail,contracts}` script tests pin. On the
+        // safe operators' `overflow_check_*` labels it took the `overflow` panic
+        // class, and a `#[kani::should_panic]` harness banked the UB.
+        "unchecked_add_overflow" => {
+            ("arithmetic_overflow", "attempt to compute `unchecked_add` which would overflow")
+        }
+        "unchecked_sub_overflow" => {
+            ("arithmetic_overflow", "attempt to compute `unchecked_sub` which would overflow")
+        }
+        "unchecked_mul_overflow" => {
+            ("arithmetic_overflow", "attempt to compute `unchecked_mul` which would overflow")
+        }
+        // `unchecked_shl`/`unchecked_shr` by a distance past the width, or a
+        // negative signed one (statement/arithmetic_checks.rs
+        // `emit_shift_distance_check`): UB of an unsafe intrinsic, never a panic.
+        // Kani asserts it as `arithmetic_overflow` with these texts
+        // (tests/ui/should-panic-attribute/unexpected-failures pins the first);
+        // on the shared `shift_distance_check` label it was CBMC's
+        // `undefined-shift` class, "shift distance too large".
+        "unchecked_shift_distance_check" => {
+            ("arithmetic_overflow", "attempt to shift by excessive shift distance")
+        }
+        "unchecked_shift_distance_check_negative" => {
+            ("arithmetic_overflow", "attempt to shift by negative distance")
+        }
+        // Operator-level integer `Div`/`Rem` checks (statement/rvalue.rs): Kani's
+        // `check_div_overflow` (codegen/rvalue.rs), class `arithmetic_overflow`,
+        // with its texts. On a lowered `unchecked_div`/`unchecked_rem` they are
+        // the only checks and UB, never a panic. After a source `/` or `%` they
+        // are the redundant SUCCESS rows tests/ui/duplicates pins. The MIR
+        // `Assert` keeps the panic labels above.
+        "binop_div_by_zero" => ("arithmetic_overflow", "attempt to divide by zero"),
+        "binop_rem_by_zero" => {
+            ("arithmetic_overflow", "attempt to calculate the remainder with a divisor of zero")
+        }
+        "binop_div_overflow" => ("arithmetic_overflow", "attempt to divide with overflow"),
+        "binop_rem_overflow" => {
+            ("arithmetic_overflow", "attempt to calculate the remainder with overflow")
+        }
+        // `--nan-check` NaN-generation obligations (BMC float binops and
+        // fast-math intrinsics). Kani inherits CBMC's `NaN` property class and
+        // "NaN on <op>" wording; `PropertyId::has_property_class_format` admits
+        // exactly this mixed-case class.
+        "nan_check_add" => ("NaN", "NaN on +"),
+        "nan_check_sub" => ("NaN", "NaN on -"),
+        "nan_check_mul" => ("NaN", "NaN on *"),
+        "nan_check_div" => ("NaN", "NaN on /"),
+        "nan_check_rem" => ("NaN", "NaN on %"),
         "overflow_check_add" => ("overflow", "attempt to add with overflow"),
         "overflow_check_sub" => ("overflow", "attempt to subtract with overflow"),
         "overflow_check_mul" => ("overflow", "attempt to multiply with overflow"),
@@ -853,19 +976,47 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         // Signed INT_MIN / -1 overflow — Kani words `/` and `%` differently
         // (rustc's AssertKind texts), and the corpus pins both wordings.
         "overflow_check_div" => ("overflow", "attempt to divide with overflow"),
-        "overflow_check_rem" => {
-            ("overflow", "attempt to calculate the remainder with overflow")
+        "overflow_check_rem" => ("overflow", "attempt to calculate the remainder with overflow"),
+        // SIMD lane checks (statement/intrinsics/simd/ops.rs). Kani files both as
+        // `PropertyClass::ArithmeticOverflow`, never `Assertion`. Integer
+        // simd_add/sub/mul wrap, signed simd_div/rem `MIN / -1` is UB, and every
+        // one of them is `rustc_nounwind`, so none is a Rust panic: the
+        // `starts_with("overflow")` arm below would file them under the panic
+        // class `overflow`. The site's message carries Kani's per-intrinsic
+        // text; these are the message-less fallbacks.
+        "overflow_check_simd_arith" => ("arithmetic_overflow", "SIMD lane arithmetic overflow"),
+        "overflow_check_simd_div_rem" => {
+            ("arithmetic_overflow", "SIMD lane signed division overflow")
         }
-        "bounds_check" => {
-            ("array_bounds", "index out of bounds: the length is less than or equal to the given index")
-        }
+        "bounds_check" => (
+            "array_bounds",
+            "index out of bounds: the length is less than or equal to the given index",
+        ),
         // Name WHICH intrinsic went out of bounds. The corpus expected files
         // (intrinsics/simd-{extract,insert}-out-of-bounds) pin the intrinsic
         // name on the line after `Status: FAILURE`, i.e. in this description —
         // and a user staring at a lane-index CTREX needs the callee, since the
         // check's Location points at the call site of an opaque intrinsic.
-        "simd_extract" => ("array_bounds", "simd_extract: SIMD index out of bounds"),
-        "simd_insert" => ("array_bounds", "simd_insert: SIMD index out of bounds"),
+        // An out-of-bounds lane index is UB of an unsafe `#[rustc_nounwind]`
+        // intrinsic (core::intrinsics::simd `# Safety`: `idx` must be in-bounds;
+        // const-eval rejects it as UB), never a panic. Kani leaves the bound to
+        // CBMC's `--bounds-check`, whose `array_bounds` class its driver does not
+        // count as a panic; this lane's `array_bounds` IS a panic class (the MIR
+        // `Assert` spelling), so sharing it let a `should_panic` harness bank the
+        // UB. The corpus pins only the description text, never the class.
+        "simd_extract" => ("undefined-behavior", "simd_extract: SIMD index out of bounds"),
+        "simd_insert" => ("undefined-behavior", "simd_insert: SIMD index out of bounds"),
+        // `simd_shuffle`'s indices must be below twice the input length: an
+        // unsafe-intrinsic precondition (rustc rejects a constant one at compile
+        // time), so no execution panics. `array_bounds` is in the panic family
+        // and would let a should_panic harness bank it; the CHC twin reports it
+        // as memory safety, also not a panic. The text is the corpus pin
+        // (tests/expected/intrinsics/simd-shuffle-indexes-out) and the message
+        // both emitters (statement/intrinsics/simd/access.rs) carry.
+        "simd_shuffle_index_check" => (
+            "undefined-behavior",
+            "index out of bounds: the length is less than or equal to the given index",
+        ),
         "null_pointer_check" => ("pointer_dereference", "dereference failure: pointer NULL"),
         "alignment_check" => ("pointer_dereference", "dereference failure: pointer misaligned"),
         // Raw-pointer dereference validity — Kani instruments `*ptr` / `&*ptr`
@@ -879,6 +1030,51 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
             "misaligned pointer dereference: address must be a multiple of its type's alignment",
         ),
         "pointer_invalid" => ("pointer_dereference", "dereference failure: pointer invalid"),
+        // Deref-site object bounds (BMC `emit_deref_object_bounds_check`) and the
+        // copy-family region check: the access itself leaves the object.
+        "pointer_bounds_check" | "region_validity_check" => {
+            ("pointer_dereference", "dereference failure: pointer outside object bounds")
+        }
+        // `copy_nonoverlapping` source and destination overlap (codegen_copy.rs,
+        // copy_shadow.rs): UB of the unsafe intrinsic, CBMC's memcpy
+        // precondition in Kani, so it joins the copy family's region check under
+        // `pointer_dereference`. Both emitters carry this message; the corpus
+        // pins the text only (intrinsics/copy-nonoverlapping/copy-overlapping).
+        "copy_overlap_check" => ("pointer_dereference", "memcpy src/dst overlap"),
+        // Kani's pointer-offset models (kani_core models.rs `offset`,
+        // `ptr_offset_from`, `ptr_offset_from_unsigned`) raise these through
+        // `kani::safety_check`. A safety check is UB detection, never a panic:
+        // under `#[kani::should_panic]` it reads as "failures other than
+        // panics" (tests/expected/offset-bounds-check pins the verdicts). They
+        // fell to the `assertion` default below, so an out-of-bounds
+        // `offset_from` under should_panic printed SUCCESSFUL — a missed bug.
+        "ptr_offset_same_alloc" => {
+            ("safety_check", "Offset result and original pointer must point to the same allocation")
+        }
+        "ptr_offset_from_same_alloc" => (
+            "safety_check",
+            "Offset result and original pointer should point to the same allocation",
+        ),
+        "ptr_offset_from_exact_multiple" => (
+            "safety_check",
+            "Expected the distance between the pointers, in bytes, to be a multiple of the size of `T`",
+        ),
+        "ptr_offset_from_non_negative" => {
+            ("safety_check", "Expected non-negative distance between pointers")
+        }
+        // Comparing pointers to `dyn` compares vtable addresses, whose identity
+        // is unspecified (statement/rvalue.rs). Kani raises this as a
+        // `SafetyCheck` ("Reached unstable vtable comparison '<op>'", the message
+        // the emitter carries). The comparison is safe Rust, so it is neither a
+        // panic nor UB.
+        "unstable_vtable_comparison" => (
+            "safety_check",
+            "unstable vtable comparison must not be reached: vtable identity is unspecified",
+        ),
+        // `intrinsics::assume(P)` with P false is UB. Kani asserts it as class
+        // `assume` ("Rust intrinsic assumption failed"), which is not a panic;
+        // the `assertion` default let a should_panic harness pass on it.
+        "assume_intrinsic" => ("assume", "Rust intrinsic assumption failed"),
         "dead_object" => ("pointer_dereference", "dereference failure: dead object"),
         "use_after_free_check" => ("pointer_dereference", "dereference failure: use after free"),
         // Part of #2740: Heap deallocation safety labels from context/heap.
@@ -903,14 +1099,67 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         | "bigint_shr_negative_shift"
         | "bigint_shl_assign_negative_shift"
         | "bigint_shr_assign_negative_shift" => ("undefined-shift", "negative shift amount"),
-        "exact_div_zero" => ("division-by-zero", "exact_div division by zero"),
-        "exact_div_not_exact" => ("undefined-behavior", "exact_div remainder is nonzero"),
-        "exact_div_overflow" => ("overflow", "exact_div signed overflow"),
+        // `exact_div` is an UNSAFE intrinsic: none of its three obligations is a
+        // Rust panic, they are UB. They used to ride the `division-by-zero` and
+        // `overflow` classes, which is now load-bearing — `class_is_rust_panic`
+        // counts those two families as panics, so a `should_panic` harness
+        // would have banked this UB as the panic it asked for. Kani puts all
+        // three in its own `exact_div` class with these exact descriptions, and
+        // `tests/ui/Property-Class-UI/exact_div/expected` pins them.
+        "exact_div_not_exact" => ("exact_div", "exact_div arguments divide exactly"),
+        "exact_div_zero" => ("exact_div", "exact_div divisor is nonzero"),
+        "exact_div_overflow" => ("exact_div", "exact_div division does not overflow"),
+        // `div_euclid` / `rem_euclid` are SAFE and really do panic — "attempt to
+        // divide by zero", "attempt to divide with overflow" — so unlike the
+        // `exact_div` family above they belong in the panic classes.
         "div_euclid_zero" | "rem_euclid_zero" => ("division-by-zero", "euclidean division by zero"),
         "div_euclid_overflow" | "rem_euclid_overflow" => {
             ("overflow", "euclidean division signed overflow")
         }
-        "step_unchecked_overflow" => ("overflow", "step unchecked overflow"),
+        // `Step::forward_unchecked` / `backward_unchecked`: UB, not a panic —
+        // same reason as the `exact_div` family above.
+        "step_unchecked_overflow" => ("undefined-behavior", "step unchecked overflow"),
+        // `float_to_int_unchecked` / `to_int_unchecked` on a NaN or infinite
+        // value, or on a finite one whose truncation does not fit the target
+        // (statement/dispatch/intrinsic/math.rs), and a `copy`/`write_bytes`
+        // byte count `count * size_of::<T>()` that overflows `usize`
+        // (codegen_copy.rs): UB of unsafe intrinsics, not panics, for the same
+        // reason as the families above. Kani's codegen files all three as
+        // ArithmeticOverflow, but no corpus file pins that class for them and
+        // this lane's `overflow` is a panic class; the texts are Kani's, which
+        // the corpus pins (intrinsics/float-to-int, copy-overflow) and the
+        // emitters carry. The compiler maps all three to its ungated `Other`
+        // kind, not the overflow-gated one, so disabling overflow checks never
+        // drops them.
+        "float_to_int_unchecked_non_finite" => (
+            "undefined-behavior",
+            "float_to_int_unchecked: attempt to convert a non-finite value to an integer",
+        ),
+        "float_to_int_unchecked_out_of_range" => (
+            "undefined-behavior",
+            "float_to_int_unchecked: attempt to convert a value out of range of the target integer",
+        ),
+        "copy_byte_count_overflow" => {
+            ("undefined-behavior", "attempt to compute number in bytes which would overflow")
+        }
+        // Native BMC Box validity (048c5fabb, `statement/box_deref`): at a Box
+        // deref, construction, transfer or drop, and at the raw-pointer source of
+        // a native null/alignment check, the carried pointer must be non-null,
+        // aligned for its pointee, of an inhabited pointee type, and, for a
+        // non-zero-sized pointee, inside a live allocation's extent. Each
+        // conjunct is its own check under this label. Breaking that invariant
+        // is UB, never a panic: the compiler already records this label as
+        // `PropertyKind::UndefinedBehavior`, and the generic `assertion`
+        // fallback would let `class_is_rust_panic` bank it as the panic a
+        // `#[kani::should_panic]` harness asked for. Sites that carry their own
+        // message ("Box drop source validity", …) keep it; this is the
+        // description of the deref site and of every message-less listing, and
+        // its "validity" wording is what the soundness-dual gate's `valid-value`
+        // category reads.
+        "box_deref_validity" => (
+            "undefined-behavior",
+            "Box pointer validity: non-null, aligned, inhabited pointee; live and in bounds unless zero-sized",
+        ),
         // FC-06 (BMC): contract modifies-clause enforcement. The class name
         // must contain "assigns" — corpus expectations match the CBMC DFCC
         // check-id line ("assigns") immediately above the FAILURE status.
@@ -931,6 +1180,9 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         "unsound_interior_mutable_read" => {
             ("unsoundness", "interior-mutable read over-approximation")
         }
+        "unsound_raw_ptr_cached_read" => {
+            ("unsoundness", "raw pointer read through a cached value that byte memory contradicts")
+        }
         "kani_assert_no_args" => ("assertion", "kani::assert missing condition"),
         // Compile-time type-validity assertion (`assert_inhabited` / `assert_zero_valid`
         // / `assert_mem_uninitialized_valid`) that rustc definitively proves violated.
@@ -946,9 +1198,34 @@ fn classify_violation(label: &str) -> (&'static str, &'static str) {
         "unsupported_cfg_cycle" | "unsupported_check" | "unsupported_shadow_memory" => {
             ("unsupported_construct", "unsupported construct")
         }
+        // BMC fail-closed stand-in for a `#[kani::loop_decreases]` measure the
+        // loop-contract pass could not encode (codegen_function.rs). Same class
+        // and wording as the CHC lane's `PropertyKind::LoopDecreases` property,
+        // so both lanes report `<harness>.loop_decreases.N`.
+        "unsupported_loop_decreases" => {
+            ("loop_decreases", "loop `decreases` ranking not proven (termination measure)")
+        }
         "unsupported_oversized_object" => (
             "unsupported_construct",
             "unsupported construct: object larger than the 1MB heap region stride",
+        ),
+        // Fail-closed stand-ins that describe the encoder, not the program: a
+        // call to a foreign function with no model (statement/terminator.rs;
+        // Kani's `codegen_ffi_unsupported` uses UnsupportedConstruct), a loop
+        // invariant capture the loop-contract pass refused, and a panic inside
+        // BMC codegen (codegen_function.rs). As `assertion` a should_panic
+        // harness could bank any of them as its expected panic.
+        "unsupported_foreign_function" => (
+            "unsupported_construct",
+            "unsupported construct: call to a foreign function with no model or --c-lib definition",
+        ),
+        "unsupported_loop_contract" => (
+            "unsupported_construct",
+            "unsupported construct: loop invariant captures a dereference the loop-contract encoding does not support",
+        ),
+        "bmc_codegen_panic" => (
+            "unsupported_construct",
+            "unsupported construct: BMC codegen panic while encoding this function",
         ),
         _ if label.ends_with("_non_finite_lhs") || label.ends_with("_non_finite_rhs") => {
             ("undefined-behavior", "fast-math operand is non-finite")
@@ -1065,7 +1342,10 @@ mod tests {
         );
         assert_eq!(
             classify_violation("bounds_check"),
-            ("array_bounds", "index out of bounds: the length is less than or equal to the given index")
+            (
+                "array_bounds",
+                "index out of bounds: the length is less than or equal to the given index"
+            )
         );
         assert_eq!(
             classify_violation("null_pointer_check"),
@@ -1338,7 +1618,11 @@ mod tests {
 
     /// Build one property as `hook_safety_check` delivers it: class
     /// `assertion`, description = the instrumentation's message.
-    fn loop_obligation(desc: &'static str, function: Option<&str>, status: CheckStatus) -> Property {
+    fn loop_obligation(
+        desc: &'static str,
+        function: Option<&str>,
+        status: CheckStatus,
+    ) -> Property {
         Property {
             description: Cow::Borrowed(desc),
             property_id: PropertyId { fn_name: None, class: Cow::Borrowed("assertion"), id: 0 },
@@ -1406,11 +1690,8 @@ mod tests {
     /// assertions that happen to sit next to a loop obligation.
     #[test]
     fn loop_contract_naming_ignores_unrelated_checks() {
-        let mut props = vec![loop_obligation(
-            "assertion failed: x == 2",
-            Some("f"),
-            CheckStatus::Success,
-        )];
+        let mut props =
+            vec![loop_obligation("assertion failed: x == 2", Some("f"), CheckStatus::Success)];
         apply_loop_contract_naming(&mut props);
         assert_eq!(props[0].property_id.class, "assertion");
         assert_eq!(props[0].description, "assertion failed: x == 2");
@@ -1453,6 +1734,45 @@ mod tests {
             trace: None,
         }];
         assert!(matches!(determine_failed_from_properties(&props), FailedProperties::None));
+    }
+
+    /// The pointer-offset models' safety checks are UB detection, not panics:
+    /// a `#[kani::should_panic]` harness whose only failure is one of them
+    /// must read as "failures other than panics" (Kani prints FAILED for
+    /// tests/expected/offset-bounds-check `check_offset_from_oob_ptr` and
+    /// `check_ptr_oob`). Before the explicit arms these labels fell to the
+    /// `assertion` default and the harness printed SUCCESSFUL.
+    #[test]
+    fn test_offset_safety_checks_are_not_panics() {
+        for label in [
+            "ptr_offset_same_alloc",
+            "ptr_offset_from_same_alloc",
+            "ptr_offset_from_exact_multiple",
+            "ptr_offset_from_non_negative",
+        ] {
+            let (class, _) = classify_violation(label);
+            assert_eq!(class, "safety_check", "{label}");
+            let props = vec![Property {
+                description: Cow::Borrowed("x"),
+                property_id: PropertyId { fn_name: None, class: Cow::Borrowed(class), id: 0 },
+                source_location: RawSourceLocation {
+                    column: None,
+                    file: None,
+                    function: None,
+                    line: None,
+                },
+                status: CheckStatus::Failure,
+                trace: None,
+            }];
+            assert!(
+                matches!(determine_failed_from_properties(&props), FailedProperties::Other),
+                "{label} must not satisfy should_panic"
+            );
+        }
+        assert_eq!(classify_violation("assume_intrinsic").0, "assume");
+        assert!(!class_is_rust_panic("assume"), "a failed intrinsic assume is UB, not a panic");
+        assert_eq!(classify_violation("pointer_bounds_check").0, "pointer_dereference");
+        assert_eq!(classify_violation("region_validity_check").0, "pointer_dereference");
     }
 
     #[test]
@@ -1543,9 +1863,215 @@ mod tests {
         assert!(matches!(determine_failed_from_properties(&props), FailedProperties::Other));
     }
 
+    fn failing(class: &'static str) -> Property {
+        Property {
+            description: Cow::Borrowed("failed"),
+            property_id: PropertyId { fn_name: None, class: Cow::Borrowed(class), id: 0 },
+            source_location: RawSourceLocation {
+                column: None,
+                file: None,
+                function: None,
+                line: None,
+            },
+            status: CheckStatus::Failure,
+            trace: None,
+        }
+    }
+
+    /// Every MIR `Assert` terminator is a Rust panic, in BOTH lanes' spelling.
+    /// Kani gives them all `PropertyClass::Assertion`, so a `should_panic`
+    /// harness over an out-of-bounds index, an overflow or a division by zero
+    /// passes there; it used to fail in the BMC lane and pass in CHC.
+    #[test]
+    fn mir_assert_classes_are_panics_in_both_lane_spellings() {
+        for class in [
+            "assertion",
+            "panic",
+            "unreachable",
+            "array_bounds",
+            "bounds",
+            "overflow",
+            "division-by-zero",
+            "division_by_zero",
+        ] {
+            assert!(class_is_rust_panic(class), "{class} must count as a Rust panic");
+            assert!(
+                matches!(
+                    determine_failed_from_properties(&[failing(class)]),
+                    FailedProperties::PanicsOnly
+                ),
+                "{class} must make a should_panic harness PanicsOnly"
+            );
+        }
+    }
+
+    /// UB and verifier-internal obligations are NOT Rust panics: a
+    /// `should_panic` harness resting on one still fails closed.
+    #[test]
+    fn ub_and_verifier_obligation_classes_are_not_panics() {
+        for class in [
+            // The CHC lane's class for an UNCHECKED intrinsic's UB obligation,
+            // which Kani also refuses as an expected panic.
+            "arithmetic_overflow",
+            "exact_div",
+            "memory_safety",
+            "pointer_dereference",
+            "null_pointer",
+            "safety_check",
+            "pointer-overflow",
+            "pointer_overflow",
+            "undefined-behavior",
+            "undefined_behavior",
+            "undefined-shift",
+            "unsoundness",
+            "unsupported_construct",
+            "NaN",
+            "assigns",
+            "enum-range-check",
+            "loop_decreases",
+            "loop_invariant",
+            // The `--unwind` bound is a statement about the BOUND, never about
+            // the program, so an exhausted bound can never be banked as "it
+            // panicked as expected".
+            "unwind",
+        ] {
+            assert!(!class_is_rust_panic(class), "{class} must NOT count as a Rust panic");
+            assert!(
+                matches!(
+                    determine_failed_from_properties(&[failing(class)]),
+                    FailedProperties::Other
+                ),
+                "{class} must make a should_panic harness Other"
+            );
+        }
+    }
+
+    /// The classes `classify_violation` actually mints for the three MIR
+    /// `Assert` families, so the predicate cannot drift from the taxonomy.
+    #[test]
+    fn classify_violation_bmc_assert_labels_land_in_the_panic_family() {
+        for label in [
+            "bounds_check",
+            "overflow_check_add",
+            "overflow_check_sub",
+            "overflow_check_mul",
+            "overflow_check_neg",
+            "overflow_check_div",
+            "overflow_check_rem",
+            "div_by_zero_check",
+            "mod_by_zero_check",
+            "division_by_zero",
+            // SAFE: these really panic.
+            "div_euclid_zero",
+            "rem_euclid_zero",
+            "div_euclid_overflow",
+            "rem_euclid_overflow",
+            "wrapping_div_by_zero",
+            "saturating_div_by_zero",
+            "overflowing_div_by_zero",
+            "kani_assert",
+            "panic",
+            "unreachable",
+        ] {
+            let (class, _) = classify_violation(label);
+            assert!(class_is_rust_panic(class), "{label} -> {class} must be a Rust panic");
+        }
+        // …and the ones that must stay out.
+        for label in [
+            "unwind_assert",
+            "null_pointer_check",
+            "raw_ptr_deref_null",
+            "coroutine_check",
+            // UNSAFE intrinsics: UB, never a panic.
+            "exact_div_zero",
+            "exact_div_overflow",
+            "exact_div_not_exact",
+            "step_unchecked_overflow",
+            "shift_distance_check",
+            "simd_extract",
+            "simd_insert",
+            "simd_div_by_zero_check",
+            "unchecked_div_by_zero",
+            // Operator-level Div/Rem checks: the only checks on a lowered
+            // `unchecked_div`/`unchecked_rem` (UB), Kani `arithmetic_overflow`.
+            "binop_div_by_zero",
+            "binop_rem_by_zero",
+            "binop_div_overflow",
+            "binop_rem_overflow",
+            // UNSAFE `unchecked_{add,sub,mul}` overflow: Kani `arithmetic_overflow`.
+            "unchecked_add_overflow",
+            "unchecked_sub_overflow",
+            "unchecked_mul_overflow",
+            // UNSAFE `unchecked_shl`/`unchecked_shr` distance: Kani `arithmetic_overflow`.
+            "unchecked_shift_distance_check",
+            "unchecked_shift_distance_check_negative",
+            // SIMD lane checks: Kani `arithmetic_overflow`, never a panic.
+            "overflow_check_simd_arith",
+            "overflow_check_simd_div_rem",
+            "float_to_int_unchecked_non_finite",
+            "float_to_int_unchecked_out_of_range",
+            "copy_byte_count_overflow",
+            "copy_overlap_check",
+            "simd_shuffle_index_check",
+            "box_deref_validity",
+            // A safe-Rust comparison Kani flags as a safety check.
+            "unstable_vtable_comparison",
+            // Verifier stand-ins: a statement about the encoder, never the program.
+            "unsupported_foreign_function",
+            "unsupported_loop_contract",
+            "bmc_codegen_panic",
+        ] {
+            let (class, _) = classify_violation(label);
+            assert!(!class_is_rust_panic(class), "{label} -> {class} must NOT be a Rust panic");
+        }
+    }
+
+    /// A should_panic harness whose only failure is an `unchecked_add`
+    /// overflow hit UB, not a panic: Kani reports `arithmetic_overflow` and
+    /// `FAILED (encountered failures other than panics, …)`. On the shared
+    /// `overflow_check_add` label this was `PanicsOnly`, i.e. SUCCESSFUL.
+    #[test]
+    fn unchecked_arith_overflow_failure_is_not_a_panic() {
+        for (label, op) in [
+            ("unchecked_add_overflow", "unchecked_add"),
+            ("unchecked_sub_overflow", "unchecked_sub"),
+            ("unchecked_mul_overflow", "unchecked_mul"),
+        ] {
+            let output = format!("sat\n((ay_violation_{label}_0 true))\n");
+            let props = parse_violation_properties(&output, true, None, None);
+            assert_eq!(props.len(), 1, "{label}");
+            assert_eq!(props[0].status, CheckStatus::Failure, "{label}");
+            assert_eq!(props[0].property_id.class, "arithmetic_overflow", "{label}");
+            assert_eq!(
+                props[0].description,
+                format!("attempt to compute `{op}` which would overflow"),
+                "{label}"
+            );
+            assert!(
+                matches!(determine_failed_from_properties(&props), FailedProperties::Other),
+                "{label} must not satisfy should_panic"
+            );
+        }
+        // The safe operator's overflow really panics and stays PanicsOnly.
+        let props = parse_violation_properties(
+            "sat\n((ay_violation_overflow_check_add_0 true))\n",
+            true,
+            None,
+            None,
+        );
+        assert!(matches!(determine_failed_from_properties(&props), FailedProperties::PanicsOnly));
+    }
+
+    /// One non-panic failure still makes the whole harness `Other`, whatever
+    /// panicked alongside it.
+    #[test]
+    fn a_single_non_panic_failure_still_dominates() {
+        let props = vec![failing("array_bounds"), failing("memory_safety")];
+        assert!(matches!(determine_failed_from_properties(&props), FailedProperties::Other));
+    }
+
     // Part of #1162: Tests for cover satisfiability check parsing
 
-    #[test]
     /// An undecided probe must not hand its slot to the next one.
     ///
     /// The parser used to count only `sat`/`unsat` lines and pad `None` at the
@@ -1574,6 +2100,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_parse_cover_sat_check_output_all_sat() {
         let output = "sat\nsat\nsat\n";
         let results = parse_cover_sat_check_output(output, 3);
@@ -1630,6 +2157,17 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], None);
         assert_eq!(results[1], None);
+    }
+
+    #[test]
+    fn missing_input_witness_is_not_an_explicit_zero_input_trace() {
+        let output = "sat\n((ay_violation_kani_assert_0 true))\n";
+        let absent = parse_violation_properties(output, true, None, None);
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0].status, CheckStatus::Failure);
+        assert!(absent[0].trace.is_none());
+        let complete_empty = parse_violation_properties(output, true, Some(&[]), None);
+        assert!(complete_empty[0].trace.as_ref().is_some_and(Vec::is_empty));
     }
 
     #[test]

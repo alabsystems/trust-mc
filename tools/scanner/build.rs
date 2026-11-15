@@ -17,12 +17,6 @@ macro_rules! path_str {
     };
 }
 
-fn rustup_toolchain_lib() -> Option<String> {
-    let rustup_home = env::var("RUSTUP_HOME").ok()?;
-    let rustup_tc = env::var("RUSTUP_TOOLCHAIN").ok()?;
-    Some(path_str!([&rustup_home, "toolchains", &rustup_tc, "lib"]))
-}
-
 fn active_rustc_sysroot_lib() -> Option<String> {
     let rustc = env::var_os("RUSTC")?;
     let output = Command::new(rustc).args(["--print", "sysroot"]).output().ok()?;
@@ -37,16 +31,16 @@ fn active_rustc_sysroot_lib() -> Option<String> {
     Some(path_str!([sysroot, "lib"]))
 }
 
+/// `<sysroot>/lib` of the compiler cargo builds this crate with, which holds the
+/// `librustc_driver` it links: the Trust seal under `targo`. Not a rustup
+/// toolchain directory: that follows a moving channel link (and a targo build
+/// sets no `RUSTUP_TOOLCHAIN`), while the sysroot names the exact build.
 fn rustc_driver_rpath() -> String {
-    rustup_toolchain_lib()
-        .or_else(active_rustc_sysroot_lib)
-        .expect("RUSTUP_HOME/RUSTUP_TOOLCHAIN must be set, or RUSTC must print a sysroot")
+    active_rustc_sysroot_lib().expect("RUSTC must print a sysroot (`$RUSTC --print sysroot`)")
 }
 
 /// Configure the compiler to properly link the scanner binary with rustc's library.
 pub fn main() {
-    println!("cargo:rerun-if-env-changed=RUSTUP_HOME");
-    println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=RUSTC");
     let rustc_lib = rustc_driver_rpath();
     println!("cargo:rustc-link-arg-bin=scan=-Wl,-rpath,{rustc_lib}");

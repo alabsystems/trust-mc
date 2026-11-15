@@ -15,6 +15,119 @@ use super::{
 };
 use tracing::debug;
 
+/// The INNERMOST (rightmost) projection a derived pointee base name records.
+///
+/// `ssa_base_name_for_projections` appends one marker per projection, so the
+/// LAST marker is the projection that must be undone first when a write landed
+/// on the derived name and has to travel back to the storage that holds it.
+/// `parent_len` is the byte length of the enclosing place's own base name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::codegen_ay::statement) enum DerivedSlot {
+    /// `{parent}_field_{M}`, optionally `{parent}_variant_{V}_field_{M}`.
+    Field { parent_len: usize, field_idx: usize, variant: Option<usize> },
+    /// `{parent}_idx_by_{L}` — an element at the value of local `L`.
+    IndexLocal { parent_len: usize, idx_local: usize },
+    /// `{parent}_cidx_{N}` — an element at the constant index `N`.
+    IndexConst { parent_len: usize, offset: u64 },
+    /// `{parent}_cidx_end_{N}`, `{parent}_subslice_{a}_{b}`: a sub-place this
+    /// naming scheme records but the write-back cannot place exactly.
+    Unencodable { parent_len: usize },
+}
+
+impl DerivedSlot {
+    pub(in crate::codegen_ay::statement) fn parent_len(&self) -> usize {
+        match self {
+            DerivedSlot::Field { parent_len, .. }
+            | DerivedSlot::IndexLocal { parent_len, .. }
+            | DerivedSlot::IndexConst { parent_len, .. }
+            | DerivedSlot::Unencodable { parent_len } => *parent_len,
+        }
+    }
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse the rightmost projection marker of a derived base name.
+///
+/// `None` for a plain local, for a `_deref` / `_cast` alias (which names other
+/// storage, not a slot of an aggregate), and for anything whose tail does not
+/// parse — a marker that is not the LAST projection never parses, because the
+/// markers that follow it are still in the tail.
+pub(in crate::codegen_ay::statement) fn last_derived_slot(base: &str) -> Option<DerivedSlot> {
+    let mut best: Option<DerivedSlot> = None;
+    let mut best_pos = 0usize;
+    let mut consider = |pos: usize, slot: DerivedSlot| {
+        if best.is_none() || pos > best_pos {
+            best_pos = pos;
+            best = Some(slot);
+        }
+    };
+    if let Some(pos) = base.rfind("_field_")
+        && all_digits(&base[pos + 7..])
+        && let Ok(field_idx) = base[pos + 7..].parse::<usize>()
+    {
+        // A `Downcast` immediately before the field names the variant.
+        let before = &base[..pos];
+        match before.rfind("_variant_") {
+            Some(vpos) if all_digits(&before[vpos + 9..]) => {
+                let variant = before[vpos + 9..].parse::<usize>().ok();
+                consider(pos, DerivedSlot::Field { parent_len: vpos, field_idx, variant });
+            }
+            _ => {
+                consider(pos, DerivedSlot::Field { parent_len: pos, field_idx, variant: None })
+            }
+        }
+    }
+    if let Some(pos) = base.rfind("_idx_by_")
+        && all_digits(&base[pos + 8..])
+        && let Ok(idx_local) = base[pos + 8..].parse::<usize>()
+    {
+        consider(pos, DerivedSlot::IndexLocal { parent_len: pos, idx_local });
+    }
+    if let Some(pos) = base.rfind("_cidx_end_")
+        && all_digits(&base[pos + 10..])
+    {
+        consider(pos, DerivedSlot::Unencodable { parent_len: pos });
+    }
+    if let Some(pos) = base.rfind("_cidx_")
+        && all_digits(&base[pos + 6..])
+        && let Ok(offset) = base[pos + 6..].parse::<u64>()
+    {
+        consider(pos, DerivedSlot::IndexConst { parent_len: pos, offset });
+    }
+    for marker in ["_subslice_end_", "_subslice_"] {
+        if let Some(pos) = base.rfind(marker) {
+            let tail = &base[pos + marker.len()..];
+            if let Some((a, b)) = tail.split_once('_')
+                && all_digits(a)
+                && all_digits(b)
+            {
+                consider(pos, DerivedSlot::Unencodable { parent_len: pos });
+            }
+        }
+    }
+    best
+}
+
+/// The walk's fail-closed contract, as one decidable predicate.
+///
+/// A RECOGNISED slot (`last_derived_slot` parsed it) that the walk could not
+/// place must leave a recorded fail-closed reason behind. When it did not, the
+/// walk records one itself: a silent `None` after a recognised slot is a DROPPED
+/// STORE, which is the false-proof shape this walk exists to close.
+///
+/// `placed` is whether the arm returned a new parent; `before`/`after` are the
+/// `unsupported_with_fallback` counter around the arm.
+pub(in crate::codegen_ay::statement) fn walk_must_record_fallback(
+    placed: bool,
+    before: usize,
+    after: usize,
+) -> bool {
+    !placed && after == before
+}
+
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// When MIR writes through a reference to a datatype field (e.g., `(*_ref).field_1`),
     /// the pointee SSA variable is updated but the parent container state variable is
@@ -29,31 +142,157 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         updated_pointee: &Expr,
         place: &Place,
     ) {
-        // Parse _variant_N_field_M or _field_M suffix to find parent container.
-        let Some(field_pos) = pointee_base.rfind("_field_") else {
-            return;
-        };
-        let Ok(field_idx) = pointee_base[field_pos + 7..].parse::<usize>() else {
-            return;
-        };
-        let before_field = &pointee_base[..field_pos];
-
-        let (parent_base, variant_idx) = if let Some(variant_pos) = before_field.rfind("_variant_")
-        {
-            if let Ok(v_idx) = before_field[variant_pos + 9..].parse::<usize>() {
-                (&pointee_base[..variant_pos], Some(v_idx))
-            } else {
-                (before_field, None)
+        let mut base = pointee_base.to_owned();
+        let mut value = updated_pointee.clone();
+        let outer_source = self.derived_write_source.replace(pointee_base.to_owned());
+        // `&mut g.buf[i]` names `..._field_1_idx_by_L`: two levels, innermost
+        // first. Bounded because every step strips one marker.
+        for _ in 0..8 {
+            match self.propagate_derived_write_one_level(&base, &value, place) {
+                Some((parent_base, parent_value)) => {
+                    base = parent_base;
+                    value = parent_value;
+                }
+                None => break,
             }
-        } else {
-            (before_field, None)
-        };
+        }
+        self.derived_write_source = outer_source;
+    }
 
-        let Some(parent_expr) = self.env_lookup(parent_base).cloned() else {
-            return;
+    /// Undo ONE projection of a derived pointee name: write `value` back into
+    /// the slot `base` denotes of its enclosing place, and return that place's
+    /// base name and new value so the caller can continue outwards.
+    ///
+    /// `None` ends the walk — either `base` names no slot of an enclosing place
+    /// (a plain local, a `_deref` alias), or the write-back could not be encoded
+    /// exactly, in which case it has ALREADY recorded a fail-closed reason. A
+    /// silent `None` after a recognised slot would be a DROPPED STORE, which is
+    /// the false-proof shape this walk exists to close.
+    fn propagate_derived_write_one_level(
+        &mut self,
+        base: &str,
+        value: &Expr,
+        place: &Place,
+    ) -> Option<(String, Expr)> {
+        let slot = last_derived_slot(base)?;
+        let parent_base = base[..slot.parent_len()].to_owned();
+        // The contract is ENFORCED, not merely documented: whatever an arm below
+        // does, a recognised slot the walk cannot place leaves a recorded
+        // reason. Commit 7fe93048b routed `&mut a[i].field` through this walk
+        // while three of `propagate_field_write_to_parent`'s four `None` returns
+        // were silent, and `let p = &mut a[1].x; *p = 9; assert!(a[1].x == 0)`
+        // became a clean SUCCESSFUL proof in BMC (fourth adversarial review,
+        // 2026-09-14). The arms record their own precise reasons; this counter
+        // check is the backstop that makes a future silent `None` a demotion
+        // instead of a dropped store.
+        let fallbacks_before = crate::codegen_ay::context::get_unsupported_construct_fallback_count();
+        let placed = match slot {
+            DerivedSlot::Field { field_idx, variant, .. } => {
+                self.propagate_field_write_to_parent(&parent_base, field_idx, variant, value, place)
+            }
+            DerivedSlot::IndexLocal { idx_local, .. } => {
+                self.propagate_element_write_to_parent(&parent_base, Some(idx_local), None, value, place)
+            }
+            DerivedSlot::IndexConst { offset, .. } => {
+                self.propagate_element_write_to_parent(&parent_base, None, Some(offset), value, place)
+            }
+            DerivedSlot::Unencodable { .. } => {
+                // A sub-slice or a from-the-end element: the write landed on a
+                // name whose slot in `parent_base` is not known here.
+                self.ctx.unsupported_with_fallback(
+                    "derived pointee write not propagated",
+                    format!("{base}: sub-place cannot be placed in {parent_base}"),
+                );
+                None
+            }
         };
+        let fallbacks_after = crate::codegen_ay::context::get_unsupported_construct_fallback_count();
+        if walk_must_record_fallback(placed.is_some(), fallbacks_before, fallbacks_after) {
+            self.ctx.unsupported_with_fallback(
+                "derived pointee write not propagated",
+                format!("{base}: slot not placed in {parent_base} and no reason was recorded"),
+            );
+        }
+        placed
+    }
+
+    /// `{parent}[_variant_V]_field_M` — rebuild the parent datatype.
+    ///
+    /// EVERY `None` this returns records a fail-closed reason first. It did not:
+    /// a missing parent value, a non-datatype parent sort and a
+    /// `datatype_field_update` failure each returned `None` SILENTLY, which the
+    /// walk reads as "nothing more to do" and the store is DROPPED. That is the
+    /// exact false-proof shape the walk exists to close, and it was live:
+    /// `let p = &mut a[1].x; *p = 9; assert!(a[1].x == 0)` was
+    /// `VERIFICATION:- SUCCESSFUL` with `[AY:PROOF_QUALIFIERS:clean]` in BMC,
+    /// and its safe twin `FAILED [AY:CTREX_CAT:Genuine]`, because
+    /// `..._cidx_1_field_0`'s parent `..._cidx_1` is an ELEMENT slot that has no
+    /// register of its own (fourth adversarial review of m3/soundness-fixes-2,
+    /// 2026-09-14, defect B/D1 — a regression of commit 7fe93048b, which routed
+    /// this shape through the walk after removing the array-coercion havoc that
+    /// used to demote it).
+    fn propagate_field_write_to_parent(
+        &mut self,
+        parent_base: &str,
+        field_idx: usize,
+        variant_idx: Option<usize>,
+        updated_pointee: &Expr,
+        place: &Place,
+    ) -> Option<(String, Expr)> {
+        // A parent that is itself a recognised slot (an element of an array, a
+        // field of a struct) has no register until something writes it, so its
+        // CURRENT value is read out of its own enclosing place. That is what
+        // lets a field be placed under an element: `..._cidx_1_field_0` rebuilds
+        // `..._cidx_1` from the array, updates field 0 in it, and hands the new
+        // element to the next level, which stores it back into the array.
+        let parent_expr = match self.env_lookup(parent_base).cloned() {
+            Some(expr) => expr,
+            None => match self.derived_place_current_value(parent_base, place, 0) {
+                Some(expr) => expr,
+                None => {
+                    self.ctx.unsupported_with_fallback(
+                        "field pointee write not propagated",
+                        format!("{parent_base}: enclosing place has no value"),
+                    );
+                    return None;
+                }
+            },
+        };
+        if parent_expr.sort().is_bitvec()
+            && self
+                .env_lookup(&crate::codegen_ay::names::discrim_name(parent_base))
+                .is_some()
+        {
+            // A flattened Option-like parent keeps its payload word under the base
+            // name and its variant under `{base}.0`. A store to the payload slot
+            // `{base}_variant_1_field_0` (`if let Some(x) = &mut o { *x = 5 }`)
+            // left the payload word at the old value, and `o == Some(5)` read
+            // `Some(4)`: the BMC lane proved `assert!(!(o == Some(5)))`
+            // (tools/soundness-duals/negative/review_r18_mutate_then_compare.rs).
+            if variant_idx == Some(1) && field_idx == 0 && updated_pointee.sort() == parent_expr.sort()
+            {
+                let parent_ssa = self.ssa_name_from_base(parent_base, true);
+                let parent_var = self.ctx.declare_var(&parent_ssa, parent_expr.sort().clone());
+                self.assert_ssa_def(parent_var.clone(), updated_pointee.clone(), parent_base);
+                self.env_update(parent_base, parent_var.clone());
+                debug!(
+                    "propagate_field_write_to_parent: flattened payload -> {}",
+                    parent_ssa
+                );
+                return Some((parent_base.to_owned(), parent_var));
+            }
+            self.ctx.unsupported_with_fallback(
+                "deref_write_flattened_parent",
+                format!("{parent_base}: store into a flattened parent not propagated"),
+            );
+            return None;
+        }
         if !parent_expr.sort().is_datatype() {
-            return;
+            self.ctx.unsupported_with_fallback(
+                "field pointee write not propagated",
+                format!("{parent_base}: enclosing place is not a datatype"),
+            );
+            return None;
         }
 
         let Some(new_parent) = Self::datatype_field_update(
@@ -64,17 +303,312 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             place,
             self.ctx,
         ) else {
-            return;
+            // `datatype_field_update` records `unsupported`, which demotes
+            // NOTHING on its own. The write is dropped here, so the demotion has
+            // to be recorded here.
+            self.ctx.unsupported_with_fallback(
+                "field pointee write not propagated",
+                format!("{parent_base}: field {field_idx} not written back"),
+            );
+            return None;
         };
 
         let parent_ssa = self.ssa_name_from_base(parent_base, true);
         let parent_var = self.ctx.declare_var(&parent_ssa, parent_expr.sort().clone());
         self.assert_ssa_def(parent_var.clone(), new_parent, parent_base);
-        self.env_update(parent_base, parent_var);
+        self.env_update(parent_base, parent_var.clone());
         debug!(
-            "try_propagate_deref_write_to_parent_datatype: {} -> {} (variant={:?}, field={}) (Part of #3041)",
-            pointee_base, parent_ssa, variant_idx, field_idx
+            "propagate_field_write_to_parent: -> {} (variant={:?}, field={}) (Part of #3041)",
+            parent_ssa, variant_idx, field_idx
         );
+        Some((parent_base.to_owned(), parent_var))
+    }
+
+    /// The CURRENT value of a derived place name that has no register of its
+    /// own, read out of the enclosing place it names a slot of.
+    ///
+    /// `{parent}_field_M` selects field M of `parent`'s value; `{parent}_cidx_N`
+    /// and `{parent}_idx_by_L` select an element of `parent`'s element array.
+    /// This is what lets the walk PLACE a field under an element: the element
+    /// slot `a_cidx_1` has no register, so its value is rebuilt from the array,
+    /// the field is updated in it, and the next level stores the new element
+    /// back. Without it the field arm had no parent to rebuild and the store was
+    /// dropped.
+    ///
+    /// `None` for a sub-slice or from-the-end slot, for a name that parses as no
+    /// slot, and for any enclosing place that is itself unavailable. Every
+    /// caller records a fail-closed reason on `None`; this helper deliberately
+    /// records none of its own, so a probe that simply cannot read a value never
+    /// demotes a harness by itself.
+    fn derived_place_current_value(
+        &mut self,
+        base: &str,
+        place: &Place,
+        depth: u32,
+    ) -> Option<Expr> {
+        if let Some(expr) = self.env_lookup(base) {
+            return Some(expr.clone());
+        }
+        if depth >= 8 {
+            return None;
+        }
+        let slot = last_derived_slot(base)?;
+        let parent_base = base[..slot.parent_len()].to_owned();
+        let parent_expr = self.derived_place_current_value(&parent_base, place, depth + 1)?;
+        match slot {
+            DerivedSlot::Field { field_idx, variant, .. } => {
+                if !parent_expr.sort().is_datatype() {
+                    return None;
+                }
+                Self::datatype_field_select(&parent_expr, field_idx, variant, place, self.ctx)
+            }
+            DerivedSlot::IndexLocal { idx_local, .. } => {
+                self.element_select_quiet(&parent_expr, Some(idx_local), None)
+            }
+            DerivedSlot::IndexConst { offset, .. } => {
+                self.element_select_quiet(&parent_expr, None, Some(offset))
+            }
+            DerivedSlot::Unencodable { .. } => None,
+        }
+    }
+
+    /// The element array inside a value that holds elements: the value itself
+    /// when it is an array, else its `fld_data` / `fld_buf` field. Records
+    /// nothing; mirrors the storage `propagate_element_write_to_parent` writes.
+    fn element_storage_array(parent_expr: &Expr) -> Option<Expr> {
+        if parent_expr.sort().is_array() {
+            return Some(parent_expr.clone());
+        }
+        let dt = parent_expr.sort().datatype_sort()?;
+        let (dt_name, field_name, field_sort) = dt.constructors.first().and_then(|cons| {
+            cons.fields.iter().find_map(|f| {
+                (matches!(&*f.name, "fld_data" | "fld_buf") && f.sort.is_array())
+                    .then(|| (dt.name.to_string(), f.name.to_string(), f.sort.clone()))
+            })
+        })?;
+        Some(parent_expr.clone().field_select(&dt_name, &field_name, field_sort))
+    }
+
+    /// Read one element out of `parent_expr`'s element array. Records nothing;
+    /// the caller records the fail-closed reason on `None`.
+    fn element_select_quiet(
+        &mut self,
+        parent_expr: &Expr,
+        idx_local: Option<usize>,
+        const_offset: Option<u64>,
+    ) -> Option<Expr> {
+        let array = Self::element_storage_array(parent_expr)?;
+        let arr_sort = array.sort().array_sort()?;
+        let index_width = arr_sort
+            .index_sort
+            .bitvec_width()
+            .unwrap_or(crate::codegen_ay::types::POINTER_WIDTH);
+        let idx_expr = if let Some(offset) = const_offset {
+            if arr_sort.index_sort.is_int() {
+                Expr::int_const(offset as i128)
+            } else {
+                Expr::bitvec_const(offset as u128, index_width)
+            }
+        } else {
+            let idx_local = idx_local?;
+            let idx_name =
+                crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), idx_local);
+            let raw = self.env_lookup(&idx_name).cloned().or_else(|| {
+                let idx_ssa = self.ssa_name_from_base(&idx_name, false);
+                self.ctx.lookup_var(&idx_ssa).cloned()
+            })?;
+            if arr_sort.index_sort.is_int() {
+                if raw.sort().is_int() {
+                    raw
+                } else if raw.sort().is_bitvec() {
+                    raw.bv2int()
+                } else {
+                    return None;
+                }
+            } else {
+                match raw.sort().bitvec_width() {
+                    Some(w) if w == index_width => raw,
+                    Some(w) if w < index_width => raw.zero_extend(index_width - w),
+                    Some(w) if w > index_width => raw.extract(index_width - 1, 0),
+                    _ => return None,
+                }
+            }
+        };
+        Some(array.select(idx_expr))
+    }
+
+    /// `{parent}_idx_by_{L}` / `{parent}_cidx_{N}` — store the element back.
+    ///
+    /// A `&mut` taken of an ARRAY ELEMENT names the element, not the array, so
+    /// a field store through it (`let p = &mut a[1]; p.x = 9`) updated only the
+    /// element's own register and the array never changed: the store was
+    /// DROPPED and `assert!(a[1].x == 0)` verified SUCCESSFUL with
+    /// `[AY:PROOF_QUALIFIERS:clean]` in both lanes (adversarial review of
+    /// m3/soundness-fixes-2, 2026-09-14; pre-existing on main).
+    fn propagate_element_write_to_parent(
+        &mut self,
+        parent_base: &str,
+        idx_local: Option<usize>,
+        const_offset: Option<u64>,
+        value: &Expr,
+        _place: &Place,
+    ) -> Option<(String, Expr)> {
+        let location = || format!("{parent_base} element write-back");
+        let parent_expr = match self.env_lookup(parent_base).cloned() {
+            Some(expr) => expr,
+            // A parent that is itself a slot (`a_cidx_1` of a 2-D array) has no
+            // register until something writes it; read its current value out of
+            // its own enclosing place, exactly as the field arm does.
+            None => match self.derived_place_current_value(parent_base, _place, 0) {
+                Some(expr) => expr,
+                None => {
+                    self.ctx.unsupported_with_fallback(
+                        "element pointee write not propagated",
+                        format!("{}: enclosing place has no value", location()),
+                    );
+                    return None;
+                }
+            },
+        };
+        // The element storage: the value itself, or `fld_data` / `fld_buf` of a
+        // slice / Vec datatype.
+        let data_field: Option<(String, usize, String, ay_bindings::Sort)> =
+            if parent_expr.sort().is_array() {
+                None
+            } else {
+                let Some(dt) = parent_expr.sort().datatype_sort() else {
+                    self.ctx.unsupported_with_fallback(
+                        "element pointee write not propagated",
+                        format!("{}: enclosing place is not indexable", location()),
+                    );
+                    return None;
+                };
+                let found = dt.constructors.first().and_then(|cons| {
+                    cons.fields.iter().enumerate().find_map(|(i, f)| {
+                        (matches!(&*f.name, "fld_data" | "fld_buf") && f.sort.is_array()).then(
+                            || (dt.name.to_string(), i, f.name.to_string(), f.sort.clone()),
+                        )
+                    })
+                });
+                let Some(found) = found else {
+                    self.ctx.unsupported_with_fallback(
+                        "element pointee write not propagated",
+                        format!("{}: enclosing datatype has no element array", location()),
+                    );
+                    return None;
+                };
+                Some(found)
+            };
+        let array = match &data_field {
+            None => parent_expr.clone(),
+            Some((dt_name, _, field_name, field_sort)) => {
+                parent_expr.clone().field_select(dt_name, field_name, field_sort.clone())
+            }
+        };
+        let Some(arr_sort) = array.sort().array_sort() else {
+            self.ctx.unsupported_with_fallback(
+                "element pointee write not propagated",
+                format!("{}: element storage is not an array", location()),
+            );
+            return None;
+        };
+        let index_width = arr_sort
+            .index_sort
+            .bitvec_width()
+            .unwrap_or(crate::codegen_ay::types::POINTER_WIDTH);
+        let idx_expr = if let Some(offset) = const_offset {
+            if arr_sort.index_sort.is_int() {
+                Expr::int_const(offset as i128)
+            } else {
+                Expr::bitvec_const(offset as u128, index_width)
+            }
+        } else {
+            let Some(idx_local) = idx_local else {
+                self.ctx.unsupported_with_fallback(
+                    "element pointee write not propagated",
+                    format!("{}: no index for the element slot", location()),
+                );
+                return None;
+            };
+            let idx_name =
+                crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), idx_local);
+            let raw = self.env_lookup(&idx_name).cloned().or_else(|| {
+                let idx_ssa = self.ssa_name_from_base(&idx_name, false);
+                self.ctx.lookup_var(&idx_ssa).cloned()
+            });
+            let Some(raw) = raw else {
+                self.ctx.unsupported_with_fallback(
+                    "element pointee write not propagated",
+                    format!("{}: index local {idx_local} has no value", location()),
+                );
+                return None;
+            };
+            if arr_sort.index_sort.is_int() {
+                if raw.sort().is_int() {
+                    raw
+                } else if raw.sort().is_bitvec() {
+                    raw.bv2int()
+                } else {
+                    self.ctx.unsupported_with_fallback(
+                        "element pointee write not propagated",
+                        format!("{}: index sort is not numeric", location()),
+                    );
+                    return None;
+                }
+            } else {
+                match raw.sort().bitvec_width() {
+                    Some(w) if w == index_width => raw,
+                    Some(w) if w < index_width => raw.zero_extend(index_width - w),
+                    Some(w) if w > index_width => raw.extract(index_width - 1, 0),
+                    _ => {
+                        self.ctx.unsupported_with_fallback(
+                            "element pointee write not propagated",
+                            format!("{}: index sort is not a bitvector", location()),
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+
+        let store_val = self.coerce_store_value_for_array(&array, value.clone());
+        if let Some(arr) = array.sort().array_sort()
+            && *store_val.sort() != arr.element_sort
+        {
+            self.ctx.unsupported_with_fallback(
+                "element pointee write not propagated",
+                format!("{}: element sort mismatch", location()),
+            );
+            return None;
+        }
+        let new_array = array.store(idx_expr, store_val);
+        let new_parent = match &data_field {
+            None => new_array,
+            Some((_, field_idx, _, _)) => {
+                let Some(rebuilt) = Self::datatype_field_update(
+                    &parent_expr,
+                    *field_idx,
+                    None,
+                    new_array,
+                    _place,
+                    self.ctx,
+                ) else {
+                    self.ctx.unsupported_with_fallback(
+                        "element pointee write not propagated",
+                        format!("{}: element array not written back", location()),
+                    );
+                    return None;
+                };
+                rebuilt
+            }
+        };
+        let parent_ssa = self.ssa_name_from_base(parent_base, true);
+        let parent_var = self.ctx.declare_var(&parent_ssa, new_parent.sort().clone());
+        self.assert_ssa_def(parent_var.clone(), new_parent, parent_base);
+        self.env_update(parent_base.to_owned(), parent_var.clone());
+        self.repeat_array_values.remove(parent_base);
+        debug!("propagate_element_write_to_parent: element written back into {parent_ssa}");
+        Some((parent_base.to_owned(), parent_var))
     }
 
     pub(super) fn datatype_field_select(
@@ -414,4 +948,155 @@ pub(super) enum ArrayIndexPrefix<'p> {
     None(&'p [ProjectionElem]),
     Some((&'p str, Expr), &'p [ProjectionElem]),
     Unsupported,
+}
+
+#[cfg(test)]
+mod derived_slot_tests {
+    use super::{DerivedSlot, last_derived_slot, walk_must_record_fallback};
+
+    /// A plain local names no slot of an enclosing place: the walk stops.
+    #[test]
+    fn a_plain_local_has_no_slot() {
+        assert_eq!(last_derived_slot("main::local_3"), None);
+        assert_eq!(last_derived_slot("main::local_3_deref"), None);
+        assert_eq!(last_derived_slot("main::local_3_cast"), None);
+    }
+
+    #[test]
+    fn a_field_names_its_parent() {
+        assert_eq!(
+            last_derived_slot("main::local_3_field_2"),
+            Some(DerivedSlot::Field { parent_len: 13, field_idx: 2, variant: None })
+        );
+        let base = "main::local_3_variant_1_field_0";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::Field { parent_len: 13, field_idx: 0, variant: Some(1) });
+        assert_eq!(&base[..slot.parent_len()], "main::local_3");
+    }
+
+    /// The RIGHTMOST projection is the one to undo first: `&mut g.buf[i]` is
+    /// `..._field_1_idx_by_7`, and taking the field first would store a field's
+    /// value as if it were a whole element.
+    #[test]
+    fn the_rightmost_projection_wins() {
+        let base = "main::local_3_field_1_idx_by_7";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::IndexLocal { parent_len: 21, idx_local: 7 });
+        assert_eq!(&base[..slot.parent_len()], "main::local_3_field_1");
+
+        let base = "main::local_3_idx_by_7_field_1";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::Field { parent_len: 22, field_idx: 1, variant: None });
+        assert_eq!(&base[..slot.parent_len()], "main::local_3_idx_by_7");
+    }
+
+    #[test]
+    fn a_constant_index_names_its_array() {
+        let base = "main::local_3_cidx_2";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::IndexConst { parent_len: 13, offset: 2 });
+        assert_eq!(&base[..slot.parent_len()], "main::local_3");
+    }
+
+    /// A from-the-end index and a sub-slice are recorded by the naming scheme
+    /// but cannot be placed: they must FAIL CLOSED, never be silently dropped.
+    #[test]
+    fn from_the_end_and_subslice_are_unencodable() {
+        assert!(matches!(
+            last_derived_slot("main::local_3_cidx_end_2"),
+            Some(DerivedSlot::Unencodable { .. })
+        ));
+        assert!(matches!(
+            last_derived_slot("main::local_3_subslice_1_3"),
+            Some(DerivedSlot::Unencodable { .. })
+        ));
+        assert!(matches!(
+            last_derived_slot("main::local_3_subslice_end_1_3"),
+            Some(DerivedSlot::Unencodable { .. })
+        ));
+    }
+
+    /// A marker inside the FUNCTION name is not a projection: its tail does not
+    /// parse, which is exactly what keeps `my_field_3::local_2` a plain local.
+    #[test]
+    fn a_marker_in_the_function_name_is_not_a_slot() {
+        assert_eq!(last_derived_slot("my_field_3::local_2"), None);
+        assert_eq!(last_derived_slot("my_cidx_3::local_2"), None);
+        assert_eq!(last_derived_slot("idx_by_7::local_2"), None);
+    }
+
+    /// The WRITE-BACK's fail-closed contract, which the parser tests never
+    /// covered and which is the half that broke: for EVERY recognised slot, if
+    /// the walk did not place the store it must record a fail-closed reason, and
+    /// when the arm recorded none the walk records one itself.
+    #[test]
+    fn a_recognised_slot_that_is_not_placed_must_record_a_fallback() {
+        // Placed: nothing to record, whatever the counter did.
+        assert!(!walk_must_record_fallback(true, 7, 7));
+        assert!(!walk_must_record_fallback(true, 7, 9));
+        // Not placed, a reason already recorded by the arm: do not double-count.
+        assert!(!walk_must_record_fallback(false, 7, 8));
+        // Not placed and SILENT: this is the dropped store; the walk must record.
+        assert!(walk_must_record_fallback(false, 7, 7));
+        assert!(walk_must_record_fallback(false, 0, 0));
+    }
+
+    /// Every slot the parser recognises is one the walk must answer for: name
+    /// them explicitly so a new variant cannot be added without deciding.
+    #[test]
+    fn every_recognised_slot_is_covered_by_the_contract() {
+        let recognised = [
+            last_derived_slot("main::local_3_field_2"),
+            last_derived_slot("main::local_3_variant_1_field_0"),
+            last_derived_slot("main::local_3_idx_by_7"),
+            last_derived_slot("main::local_3_cidx_2"),
+            last_derived_slot("main::local_3_cidx_end_2"),
+            last_derived_slot("main::local_3_subslice_1_3"),
+        ];
+        for slot in recognised {
+            let slot = slot.expect("a recognised slot");
+            match slot {
+                DerivedSlot::Field { .. }
+                | DerivedSlot::IndexLocal { .. }
+                | DerivedSlot::IndexConst { .. }
+                | DerivedSlot::Unencodable { .. } => {}
+            }
+            // Recognised and unplaced with a silent arm: the walk records.
+            assert!(walk_must_record_fallback(false, 3, 3), "{slot:?} must fail closed");
+        }
+    }
+
+    /// The element's FIELD is the shape that regressed: `a[1].x` is
+    /// `..._cidx_1_field_0`, whose parent `..._cidx_1` is an element slot with
+    /// no register. The walk must undo the FIELD first and then the element, so
+    /// the field is placed under the element rather than dropped.
+    #[test]
+    fn an_element_field_undoes_the_field_then_the_element() {
+        let base = "main::local_3_cidx_1_field_0";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::Field { parent_len: 20, field_idx: 0, variant: None });
+        let parent = &base[..slot.parent_len()];
+        assert_eq!(parent, "main::local_3_cidx_1");
+        let parent_slot = last_derived_slot(parent).unwrap();
+        assert_eq!(parent_slot, DerivedSlot::IndexConst { parent_len: 13, offset: 1 });
+        assert_eq!(&parent[..parent_slot.parent_len()], "main::local_3");
+    }
+
+    /// The same two levels with a SYMBOLIC index, and one level deeper
+    /// (`a[i].inner.x`), which is the pre-existing half of the same family.
+    #[test]
+    fn a_nested_element_field_walks_out_one_level_at_a_time() {
+        let base = "main::local_3_idx_by_9_field_1_field_0";
+        let slot = last_derived_slot(base).unwrap();
+        assert_eq!(slot, DerivedSlot::Field { parent_len: 30, field_idx: 0, variant: None });
+        let l1 = &base[..slot.parent_len()];
+        assert_eq!(l1, "main::local_3_idx_by_9_field_1");
+        let s1 = last_derived_slot(l1).unwrap();
+        assert_eq!(s1, DerivedSlot::Field { parent_len: 22, field_idx: 1, variant: None });
+        let l2 = &l1[..s1.parent_len()];
+        assert_eq!(l2, "main::local_3_idx_by_9");
+        let s2 = last_derived_slot(l2).unwrap();
+        assert_eq!(s2, DerivedSlot::IndexLocal { parent_len: 13, idx_local: 9 });
+        assert_eq!(&l2[..s2.parent_len()], "main::local_3");
+    }
 }

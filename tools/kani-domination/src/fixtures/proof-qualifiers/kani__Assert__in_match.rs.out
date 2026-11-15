@@ -1,0 +1,22 @@
+# Reconstructed transcript: the chc-m1 unit log (trust-mc 04d4e4e67, --ay-chc) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_assert_in_match...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_assert_in_match.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: x == 1"
+	 - Location: /corpus/kani/Assert/in_match.rs:14:17 in function check_assert_in_match
+
+Check 2: check_assert_in_match.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: x == 2"
+	 - Location: /corpus/kani/Assert/in_match.rs:15:17 in function check_assert_in_match
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Complete - 1 successfully verified harnesses, 0 failures, 1 total.

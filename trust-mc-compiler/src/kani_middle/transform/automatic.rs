@@ -18,13 +18,15 @@ use crate::kani_middle::kani_functions::{KaniHook, KaniIntrinsic, KaniModel};
 use crate::kani_middle::transform::body::{InsertPosition, MutableBody, SourceInstruction};
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AggregateKind, BasicBlockIdx, BinOp, Body, BorrowKind, Local, MutBorrowKind, Mutability,
-    Operand, Place, Rvalue, SwitchTargets, Terminator, TerminatorKind,
+    Operand, Place, Rvalue, SwitchTargets, TerminatorKind,
 };
 use rustc_public::ty::{
     AdtDef, AdtKind, FnDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind, UintTy, VariantDef,
@@ -208,11 +210,11 @@ impl AutomaticArbitraryPass {
         body.insert_terminator(
             source,
             InsertPosition::Before,
-            Terminator { kind: TerminatorKind::Return, span: source.span(body.blocks()) },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Return, source.span(body.blocks())),
         );
         let mut assign_instr = SourceInstruction::Terminator { bb: source.bb() - 1 };
         let rvalue = Rvalue::Aggregate(
-            AggregateKind::Adt(adt_def, variant.idx, adt_args.clone(), None, None),
+            AggregateKind::Adt(adt_def, variant.variant_idx(), adt_args.clone(), None, None),
             field_locals.into_iter().map(|lcl| Operand::Move(lcl.into())).collect(),
         );
         body.assign_to(Place::from(0), rvalue, &mut assign_instr, InsertPosition::Before);
@@ -254,7 +256,7 @@ impl AutomaticArbitraryPass {
         new_body.insert_terminator(
             &mut source,
             InsertPosition::Before,
-            Terminator { kind: TerminatorKind::Unreachable, span },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, span),
         );
         let switch_int_instr = SourceInstruction::Terminator { bb: source.bb() - 1 };
 
@@ -262,17 +264,17 @@ impl AutomaticArbitraryPass {
         for variant in def.variants_iter() {
             let target_bb =
                 self.call_kani_any_for_variant(def, &args, &mut new_body, &mut source, variant);
-            branches.push((variant.idx.to_index() as u128, target_bb));
+            branches.push((variant.variant_idx().to_index() as u128, target_bb));
         }
 
         let otherwise = branches.pop().expect("enum should have at least one variant").1;
-        let match_term = Terminator {
-            kind: TerminatorKind::SwitchInt {
+        let match_term = crate::rustc_compat::mir_terminator(
+            TerminatorKind::SwitchInt {
                 discr: Operand::Copy(Place::from(discr_lcl)),
                 targets: SwitchTargets::new(branches, otherwise),
             },
-            span: source.span(new_body.blocks()),
-        };
+            source.span(new_body.blocks()),
+        );
         new_body.replace_terminator(&switch_int_instr, match_term);
 
         new_body.into()
@@ -420,7 +422,7 @@ impl AutomaticArbitraryPass {
         new_body.insert_terminator(
             &mut source,
             InsertPosition::Before,
-            Terminator { kind: TerminatorKind::Return, span: ret_span },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Return, ret_span),
         );
 
         // _0 = (_u8 == 1u8) — assign to return place

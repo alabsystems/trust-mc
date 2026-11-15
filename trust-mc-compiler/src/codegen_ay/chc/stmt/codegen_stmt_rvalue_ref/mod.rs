@@ -8,12 +8,14 @@
 //! Submodules:
 //! - `cast_dispatch`: `translate_rvalue_cast` + fn-pointer reification
 //! - `collection_elem_ref`: `&((*index_result).field)` value-lane resolution
+//! - `niche_transmute`: bits or a raw pointer transmuted into `Option<&T>` and kin
 //! - `ref_address`: translate_ref_or_addressof (Ref/AddressOf encoding)
 //! - `transmute_reinterpret`: fixed-layout transmute helpers
 //! - `unsize_dyn`: PointerCoercion::Unsize helpers
 
 mod cast_dispatch;
 mod collection_elem_ref;
+mod niche_transmute;
 mod ref_address;
 mod transmute_reinterpret;
 mod unsize_dyn;

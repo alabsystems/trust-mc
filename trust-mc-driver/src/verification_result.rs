@@ -208,17 +208,53 @@ pub(crate) struct VerificationResult {
     /// by the vacuity classification ([`classify_vacuity`]); `Undetermined` on
     /// every path that does not probe.
     pub harness_feasibility: HarnessFeasibility,
+    /// The CHC layer DERIVED this failure's error state rather than failing to
+    /// decide (`ChcSolverResult::exact_counterexample`).
+    ///
+    /// `false` on every non-CHC lane and on every CHC path that computed no
+    /// derivation, so absence of the signal keeps the fail-closed reading of an
+    /// unattributed failure. Consumed once, by the CTREX classification in
+    /// `harness_runner`.
+    pub chc_exact_counterexample: bool,
 }
 
+/// The proof qualifier a compiler-certified obligation-free harness carries.
+///
+/// A harness whose obligation set is EMPTY and whose body the compiler
+/// certified obligation-free (`ArtifactMetadata.obligation_free_body`: the walk
+/// in `codegen_ay/obligation_free_walk.rs` read every reachable statement and
+/// terminator and found no obligation site) exits 0, as Kani reports the same
+/// shape — but never as a CLEAN success (D16,
+/// docs/kani-spec-engine-plan-2026-09-10.md). This qualifier is the one signal
+/// every channel keys on: [`format_result`] words the verdict line,
+/// `proof_qualifiers_marker` prints it in place of `clean`,
+/// `classify_harness_verdict` files `successful_no_checks`, and `--sarif`
+/// leaves a note under `trust_mc.harness.no_checks`.
+pub(crate) const OBLIGATION_FREE_CERTIFIED_QUALIFIER: &str =
+    "no_checks=compiler_certified_obligation_free";
+
 impl VerificationResult {
+    /// Was this harness settled as a compiler-certified obligation-free success
+    /// (see [`OBLIGATION_FREE_CERTIFIED_QUALIFIER`])?
+    pub(crate) fn is_certified_obligation_free(&self) -> bool {
+        self.proof_qualifiers.iter().any(|q| q == OBLIGATION_FREE_CERTIFIED_QUALIFIER)
+    }
+
     pub(crate) fn render(&self, output_format: &OutputFormat, should_panic: bool) -> String {
         let results = &self.results;
         let status = self.status;
         let failed_properties = self.failed_properties;
         let validation_status = self.validation_status;
+        // The two exceptions: a process that accepted an off-pin `ay` under
+        // --allow-unpinned-ay demotes every success whatever its logic tier
+        // (`crate::ay_binary::demote_for_unpinned_solver`), and a process with
+        // `TRUST_MC_LOOP_LANE=properties` demotes every success because it
+        // checks no loop contract (`crate::loop_two_lane::demote_properties_lane_success`).
         debug_assert!(
             !(validation_status == ValidationStatus::Unvalidated
-                && self.logic_tier == LogicTier::TierA),
+                && self.logic_tier == LogicTier::TierA
+                && !crate::ay_binary::unpinned_solver_accepted()
+                && !crate::loop_two_lane::is_properties_lane_child()),
             "linear logic results must remain validated"
         );
         let show_checks = matches!(output_format, OutputFormat::Regular);
@@ -259,6 +295,7 @@ impl VerificationResult {
                 validation_status,
                 self.solver_unknown_reason,
                 self.harness_feasibility,
+                self.is_certified_obligation_free(),
             )
         } else {
             format_result(
@@ -270,6 +307,7 @@ impl VerificationResult {
                 validation_status,
                 self.solver_unknown_reason,
                 self.harness_feasibility,
+                self.is_certified_obligation_free(),
             )
         };
         if !old_listing.is_empty() {
@@ -440,6 +478,11 @@ pub(crate) fn has_satisfied_cover(properties: &[Property]) -> bool {
     properties.iter().any(|p| p.is_cover_property() && p.status == CheckStatus::Satisfied)
 }
 
+/// `certified_obligation_free` is [`VerificationResult::is_certified_obligation_free`]:
+/// a Success over an EMPTY table that the compiler vouched for (D16). It words
+/// the verdict line; it never decides the status, which `harness_runner`'s
+/// no-checks gate settled before anything reached here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_result(
     properties: &[Property],
     status: VerificationStatus,
@@ -449,6 +492,7 @@ pub(crate) fn format_result(
     validation_status: ValidationStatus,
     solver_unknown_reason: Option<SolverUnknownReason>,
     harness_feasibility: HarnessFeasibility,
+    certified_obligation_free: bool,
 ) -> String {
     let mut result_str = String::new();
     let mut number_checks_failed = 0;
@@ -584,9 +628,15 @@ pub(crate) fn format_result(
     }
 
     let effective_success = is_effective_manual_success(status, should_panic, failed_properties);
-    let verification_result = if effective_success
-        && validation_status == ValidationStatus::Unvalidated
-    {
+    let verification_result = if effective_success && certified_obligation_free {
+        // D16: an EMPTY obligation set the compiler certified obligation-free.
+        // Exit 0, as Kani reports this shape, but the verdict line says what
+        // it is — a proof of nothing is never a bare SUCCESSFUL. The
+        // UNCERTIFIED empty table never reaches this arm: the no-checks gate
+        // failed it closed, and it prints the `(no checks)` INCONCLUSIVE arm
+        // below, because there an obligation may have been dropped.
+        style("SUCCESSFUL (no checks — compiler-certified obligation-free)").yellow()
+    } else if effective_success && validation_status == ValidationStatus::Unvalidated {
         style("SUCCESSFUL (UNVALIDATED)").yellow()
     } else if effective_success {
         style("SUCCESSFUL").green()
@@ -633,9 +683,26 @@ pub(crate) fn format_result(
         )
         .yellow()
     } else if !has_decided_check(properties)
+        && matches!(solver_unknown_reason, Some(SolverUnknownReason::LostErrorRules))
+    {
+        // The harness registered checks, but no CHC rule derives `error`, so no
+        // solver ever saw an obligation: lost checks, not proved checks. Not
+        // an undecided solve either — no budget or engine changes it, so the
+        // undecided arm's remedy would mislead.
+        style(
+            "INCONCLUSIVE (checks lost from the CHC encoding — no rule derives error; nothing \
+             was verified)",
+        )
+        .yellow()
+    } else if !has_decided_check(properties)
         && matches!(
             solver_unknown_reason,
-            Some(SolverUnknownReason::UndecidedModel | SolverUnknownReason::Timeout)
+            Some(
+                SolverUnknownReason::UndecidedModel
+                    | SolverUnknownReason::Timeout
+                    | SolverUnknownReason::TranslationTimeout
+                    | SolverUnknownReason::BudgetExhausted
+            )
         )
     {
         // "No checks" and "the solver could not decide" both arrive here with an
@@ -657,6 +724,12 @@ pub(crate) fn format_result(
         // an `== 0` test would stop firing and the harness would fall through to
         // `FAILED` — a WRONG verdict on a harness nothing was decided about.
         // `has_decided_check` is false for both shapes, so both still land here.
+        //
+        // `BudgetExhausted` sits beside `Timeout` deliberately: the solver was
+        // not spawned because the harness budget was already spent, which is
+        // the same "had something, could not settle it" shape as a solver
+        // that was spawned and killed — and it used to print exactly this
+        // line, as a zero-budget spawn that "timed out after 0.0s".
         //
         // Only for the reasons that actually mean "we had something and could
         // not settle it". A solver reason and an empty property list are NOT
@@ -746,6 +819,7 @@ pub(crate) fn effective_success_reason(
 
 /// Separate checks into coverage and non-coverage based on property class and
 /// format them separately for `--coverage`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_coverage(
     properties: &[Property],
     cov_results: &CoverageResults,
@@ -756,6 +830,7 @@ pub(crate) fn format_coverage(
     validation_status: ValidationStatus,
     solver_unknown_reason: Option<SolverUnknownReason>,
     harness_feasibility: HarnessFeasibility,
+    certified_obligation_free: bool,
 ) -> String {
     let (_coverage_checks, non_coverage_checks): (Vec<Property>, Vec<Property>) =
         properties.iter().cloned().partition(|x| x.property_class() == "code_coverage");
@@ -769,6 +844,7 @@ pub(crate) fn format_coverage(
         validation_status,
         solver_unknown_reason,
         harness_feasibility,
+        certified_obligation_free,
     );
     let cov_results_intro = "Source-based code coverage results:";
     format!("{verification_output}\n{cov_results_intro}\n\n{cov_results}")

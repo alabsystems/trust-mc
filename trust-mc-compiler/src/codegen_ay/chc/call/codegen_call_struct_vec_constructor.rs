@@ -13,6 +13,11 @@
 //!
 //! Part of #3348: struct-Vec constructor bridge for CnfClause-style patterns.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -26,7 +31,6 @@ use super::call_accumulator::CallAccumulator;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use crate::codegen_ay::chc::codegen_ctx::globals::declare_pending_var;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
 /// Extension trait for struct-Vec constructor dispatch on `ChcCtx`.
@@ -128,8 +132,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
         let fields = variants[0].fields();
-        let field_is_vec: Vec<bool> =
-            fields.iter().map(|field| is_vec_type(&field.ty_with_args(&adt_args))).collect();
+        let field_is_vec: Vec<bool> = fields
+            .iter()
+            .map(|field| mono_ty::field_ty(field, &adt_args).is_some_and(|t| is_vec_type(&t)))
+            .collect();
         let vec_count = field_is_vec.iter().filter(|v| **v).count();
         if vec_count != 1 {
             return None;
@@ -137,7 +143,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let vec_field_idx = field_is_vec.iter().position(|v| *v)?;
 
         let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        let callee_body = instance.body()?;
+        let callee_body = instance.callee_body()?;
         let (vec_source, non_vec_field_sources) =
             scan_vec_constructor_pattern(&callee_body, &field_is_vec)?;
 
@@ -194,7 +200,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let data = data_expr.unwrap_or_else(|| {
             let fresh_name = format!("vec_ctor_data_{}_{}", self.fn_name, dest_local);
-            declare_pending_var(fresh_name, data_sort.clone())
+            Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_COLLECTION_STATE,
+                fresh_name,
+                data_sort.clone(),
+            )
         });
 
         // Fresh symbolic pointer.
@@ -205,8 +216,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .get(ptr_sort_idx)
             .map(|(_, s)| s.clone())
             .unwrap_or_else(ptr_sort);
-        let ptr =
-            declare_pending_var(format!("vec_ctor_ptr_{}_{}", self.fn_name, dest_local), ptr_s);
+        let ptr = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_POINTER_VALUE,
+            format!("vec_ctor_ptr_{}_{}", self.fn_name, dest_local),
+            ptr_s,
+        );
 
         let field_count =
             self.flatten.flattened_local_field_count.get(&dest_local).copied().unwrap_or(0);
@@ -308,7 +323,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .unwrap_or_else(|| elem_exprs[0].sort().clone());
 
         let base_name = format!("vec_ctor_base_{}", self.fn_name);
-        let mut arr = declare_pending_var(base_name, Sort::array(ptr_sort(), elem_sort));
+        let mut arr = ExactVar::nondet(base_name, Sort::array(ptr_sort(), elem_sort));
         for (i, elem) in elem_exprs.into_iter().enumerate() {
             let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
             let elem = Self::coerce_store_value(arr.sort(), elem, false, &self.diagnostics);
@@ -477,7 +492,7 @@ fn trace_to_parameter(body: &Body, mut local: usize, arg_count: usize) -> Option
                     continue;
                 }
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         local = src.local;

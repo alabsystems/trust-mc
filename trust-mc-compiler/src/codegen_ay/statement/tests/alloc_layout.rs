@@ -32,6 +32,10 @@ pub fn option_probe(ptr: *mut u8, len: usize, opt: Option<*mut u8>) -> *mut u8 {
 pub fn bool_probe(flag: bool) -> bool {
     !flag
 }
+
+pub fn layout_validity_probe(size: usize, align: usize) -> bool {
+    Layout::from_size_align(size, align).is_ok()
+}
 "#;
 
 fn seed_alloc_arg_locals(
@@ -146,7 +150,7 @@ fn test_codegen_layout_helpers_mir_paths() {
 #[test]
 fn test_codegen_layout_is_size_align_valid_sets_bool_destination() {
     with_test_ay_ctx_for_source(ALLOC_MIR_PROBE_SOURCE, |mut ctx| {
-        let instance = find_instance_by_suffix(&ctx, "bool_probe");
+        let instance = find_instance_by_suffix(&ctx, "layout_validity_probe");
         let body = instance.body().expect("function body");
         ctx.set_current_fn(instance);
         let tuple_usage = TupleUsageAnalysis::run(&body);
@@ -154,7 +158,14 @@ fn test_codegen_layout_is_size_align_valid_sets_bool_destination() {
         seed_alloc_arg_locals(&mut codegen, &body);
 
         let destination = local_place(0);
-        assert_eq!(codegen.codegen_layout_is_size_align_valid(&destination, Some(31)), Some(31));
+        assert_eq!(
+            codegen.codegen_layout_is_size_align_valid(
+                &[local_operand(1), local_operand(2)],
+                &destination,
+                Some(31)
+            ),
+            Some(31)
+        );
 
         let dest_base = codegen.ssa_base_name(&destination);
         let assigned = codegen.env_lookup(&dest_base).expect("destination should be assigned");

@@ -11,7 +11,7 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::debug;
 use trust_mc_core::violation::PropertyKind;
 
@@ -20,6 +20,7 @@ use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
+use super::RelationApp;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
@@ -30,6 +31,7 @@ use super::inline_body::{
 use super::inline_result_shared::{
     InlineResultEpilogueSpec, emit_prepared_inline_result, prepare_inline_result_epilogue,
 };
+use super::inline_shared::check_is_trivially_valid;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn emit_translated_inline_call_result(
@@ -66,6 +68,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .flatten();
         let mut extra_dests = Vec::new();
         let mut extra_constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
+        // An assume guard the host's dominating argument bounds already imply
+        // cuts nothing (`host_bound_discharge.rs`).
+        let inline_assume_guard =
+            super::codegen_call_virtual_inline::host_bound_discharge::drop_host_discharged_assume_guard(
+                self,
+                dcx.bb_idx,
+                dcx.modified_locals,
+                inline_assume_guard,
+            );
         if let Some(inline_assume_guard) = inline_assume_guard {
             extra_constraints.push(inline_assume_guard);
         }
@@ -138,11 +149,36 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.known_alloc_ids.remove(&local_idx);
             self.clear_known_vtable_discriminant(local_idx);
 
+            // A flattened local has one slot per leaf, and `resolve_destination`
+            // names only the first: a default of THAT slot's sort, handed to the
+            // whole-local builder, bound slot 0 and left the others free (a
+            // value that does not tile the local, now refused fail-closed by
+            // the builder). Every slot's dead placeholder is its own sort's
+            // default.
+            if self.flatten.flattened_tuple_locals.contains(&local_idx) {
+                constraints.extend(self.moved_flattened_local_placeholders(local_idx));
+                continue;
+            }
+
             let Some((_, dest_var)) = self.resolve_destination(local_idx) else {
                 continue;
             };
             let Some(default_expr) = ChcCtx::sort_default_expr(dest_var.sort()) else {
                 continue;
+            };
+            // A moved-out local is never read before it is assigned again, so
+            // its placeholder value is dead. For a wide slice slot, state the
+            // same all-zero bits as an explicit (null, 0) slice, so the design 4
+            // write boundary does not book a fresh length for a dead value.
+            let default_expr = if crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::is_slice_len_pointer_ty(
+                self.body.locals()[local_idx].ty,
+            ) {
+                self.pack_slice_slot(
+                    Expr::bitvec_const(0u64, crate::codegen_ay::types::POINTER_WIDTH),
+                    Expr::bitvec_const(0u64, crate::codegen_ay::types::POINTER_WIDTH),
+                )
+            } else {
+                default_expr
             };
             if let Some(mut local_constraints) = self.build_local_update_constraints(
                 local_idx,
@@ -151,6 +187,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             ) {
                 constraints.append(&mut local_constraints);
             }
+        }
+        constraints
+    }
+
+    /// The dead placeholder of every slot of the moved-out flattened local
+    /// `local_idx`: each slot's output equals its sort's default. A slot whose
+    /// sort has none (an array, a datatype left by the depth cap) stays free:
+    /// a moved-out local is never read before it is assigned again, so the
+    /// value is unobserved either way.
+    fn moved_flattened_local_placeholders(&mut self, local_idx: usize) -> Vec<Expr> {
+        let Some(vec_idx) = self.try_state_idx_for_local(local_idx) else { return Vec::new() };
+        let mut constraints = Vec::new();
+        for slot in 0..self.flattened_field_count(local_idx) {
+            let Some((out_name, out_sort)) =
+                self.state_var_mgr.output_state_vars.get(vec_idx + slot).cloned()
+            else {
+                continue;
+            };
+            let Some(default) = ChcCtx::sort_default_expr(&out_sort) else { continue };
+            self.encode.flattened_field_env.insert((local_idx, slot), default.clone());
+            constraints.push(Expr::var(&*out_name, out_sort).eq(default));
         }
         constraints
     }
@@ -172,23 +229,125 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dcx: &DispatchCallContext<'_>,
         deferred_checks: Vec<DeferredInlineCheck>,
     ) {
-        for check in deferred_checks {
-            self.emit_error_rule_for_condition_with_kind(
-                dcx.from_app,
-                check.check,
-                dcx.stmt_constraints,
+        // An unwinding assertion the host's dominating argument bounds make
+        // unviolable is not a property (`host_bound_discharge.rs`).
+        let deferred_checks =
+            super::codegen_call_virtual_inline::host_bound_discharge::drop_host_discharged_unwinding_checks(
+                self,
                 dcx.bb_idx,
+                dcx.modified_locals,
+                deferred_checks,
+            );
+        self.emit_deferred_inline_checks_at(
+            dcx.from_app,
+            dcx.stmt_constraints,
+            dcx.bb_idx,
+            deferred_checks,
+        );
+    }
+
+    /// [`Self::emit_deferred_inline_check_errors`] for hosts that are not a
+    /// call dispatch (the drop consumers), from their own rule context.
+    ///
+    /// Two kinds of entry are not emitted, and neither can change a verdict:
+    /// * a check that is valid whatever the host state
+    ///   ([`check_is_trivially_valid`]: `checked_sub`'s `a >= b -> no
+    ///   underflow`, `wrapping_shl`'s `(s & 7) < 8`). Its violation is
+    ///   unsatisfiable, but as a property it still took a slice of the
+    ///   harness's solve budget (measured 9-13 s each, enough to turn a proof
+    ///   UNKNOWN).
+    /// * an exact duplicate of a check already emitted here: the same
+    ///   condition under the same path, so the same violation set. A walked
+    ///   user `a / b` records its MIR `Assert` and, since the walker checks
+    ///   Div/Rem itself, the identical divisor check; one property suffices.
+    ///   The first (the MIR `Assert`'s) message is kept.
+    ///
+    /// Duplicates are found by node identity, and structurally only for a
+    /// check small written out as a tree: `Hash` / `Eq` on `Expr` walk the
+    /// term as a tree, and a check over a long walked replay shares its
+    /// subterms exponentially, so the structural set spent the compile budget
+    /// hashing it (walker fail-closed review 6 round 3, `iter().any(|_|
+    /// false)`, a 600 s CompileTimeout).
+    pub(in crate::codegen_ay::chc) fn emit_deferred_inline_checks_at(
+        &mut self,
+        from_app: &RelationApp,
+        stmt_constraints: &[Expr],
+        bb_idx: usize,
+        deferred_checks: Vec<DeferredInlineCheck>,
+    ) {
+        const MAX_STRUCTURAL_DEDUP_NODES: u64 = 4096;
+        let mut emitted: HashSet<Expr> = HashSet::new();
+        let mut emitted_nodes: HashSet<*const ay_bindings::ExprValue> = HashSet::new();
+        let mut sizes = HashMap::new();
+        for check in deferred_checks {
+            if check_is_trivially_valid(&check.check) {
+                debug!(bb_idx, message = ?check.message, "deferred inline check is valid, not emitted");
+                continue;
+            }
+            let duplicate = !emitted_nodes.insert(std::ptr::from_ref(check.check.value()))
+                || (super::codegen_call_virtual_inline::expr_written_out_size(
+                    &check.check,
+                    &mut sizes,
+                    MAX_STRUCTURAL_DEDUP_NODES,
+                ) <= MAX_STRUCTURAL_DEDUP_NODES
+                    && !emitted.insert(check.check.clone()));
+            if duplicate {
+                debug!(bb_idx, message = ?check.message, "duplicate deferred inline check, not emitted");
+                continue;
+            }
+            self.emit_error_rule_for_condition_with_kind(
+                from_app,
+                check.check,
+                stmt_constraints,
+                bb_idx,
                 check.kind,
                 check.message,
             );
         }
     }
 
+    /// The inline walk's two path side channels in a result value, for a host
+    /// emit: the assert guard (its error rule, plus the success edge's
+    /// constraint) and the assume guard (a transition constraint), with both
+    /// kinds of marker leaf stripped from the value. Returns the stripped
+    /// value and the constraints for the success edge.
+    ///
+    /// The fn-pointer, virtual, closure and `block_on` emits took only the
+    /// assert guard. A `kani::assume` in a body reached through them left its
+    /// `__assume_pruned_inline` leaf in the value, as an unconstrained fresh
+    /// variable, and the assume itself was lost: the caller's assertion of the
+    /// assumed fact failed, certified Genuine, where Kani proves it
+    /// (`walker_callee_assume_dual.rs`). The direct inline emit above always
+    /// took both.
+    pub(in crate::codegen_ay::chc) fn take_inline_result_guards(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+        result_expr: Expr,
+    ) -> (Expr, Vec<Expr>) {
+        let inline_assert_guard = extract_inline_assert_guard(&result_expr);
+        let inline_assume_guard = extract_inline_assume_guard(&result_expr);
+        let result_expr = strip_inline_assert_fallback(&result_expr).unwrap_or(result_expr);
+        let result_expr = strip_inline_assume_pruned(&result_expr).unwrap_or(result_expr);
+        let mut constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
+        let inline_assume_guard =
+            super::codegen_call_virtual_inline::host_bound_discharge::drop_host_discharged_assume_guard(
+                self,
+                dcx.bb_idx,
+                dcx.modified_locals,
+                inline_assume_guard,
+            );
+        constraints.extend(inline_assume_guard);
+        (result_expr, constraints)
+    }
+
     /// Part of #4048: Emit both edges for an inline assert guard.
     ///
     /// The success transition keeps the guard as an extra constraint, but the
     /// negated guard must also reach `error()` rather than silently pruning the
-    /// path into a false proof.
+    /// path into a false proof. A guard valid whatever the state
+    /// ([`check_is_trivially_valid`], as for the deferred checks above) has an
+    /// unsatisfiable negation, so its error rule is not emitted; it is still
+    /// returned as the success edge's constraint.
     pub(in crate::codegen_ay::chc) fn emit_inline_assert_guard_error(
         &mut self,
         dcx: &DispatchCallContext<'_>,
@@ -197,6 +356,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(inline_assert_guard) = inline_assert_guard else {
             return Vec::new();
         };
+        if check_is_trivially_valid(&inline_assert_guard) {
+            debug!(bb_idx = dcx.bb_idx, "inline assert guard is valid, error rule not emitted");
+            return vec![inline_assert_guard];
+        }
         // Report this as the ASSERTION it is. `emit_error_rule_for_condition`
         // defaults to `PropertyKind::MemorySafety` with no message, so every
         // inline-assert-guard failure previously surfaced as

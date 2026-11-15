@@ -26,4 +26,5 @@ mod shared;
 pub(in crate::codegen_ay::chc) use constructors::VecOpNewContext;
 pub(in crate::codegen_ay::chc) use resize::quantified_resize_growth_array;
 pub(in crate::codegen_ay::chc) use shared::ProjectedVecState;
-pub(crate) use shared::coerce_array_element;
+pub(in crate::codegen_ay::chc) use shared::coerce_array_element;
+pub(crate) use shared::coerce_array_element_exact;

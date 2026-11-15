@@ -30,17 +30,22 @@ jobs:
       - name: 'Build and install trust-mc from source'
         run: |
           cd /tmp/trust-mc
-          cargo run --release -p build-trust-mc -- build-dev --release
-          cargo install --path .   # trust-mc, cargo-trust-mc, targo-trust-mc
+          targo --unverified build-dev --trust-checkout "$TRUST_CHECKOUT" --release
+          targo --unverified install --path .   # trust-mc, cargo-trust-mc, targo-trust-mc
 
       - name: 'Run trust-mc on your code.'
-        run: cargo trust-mc
+        run: targo trust-mc
 ```
 
-> **NOTE**: `rust-toolchain.toml` pins `channel = "trust"`, a locally linked
-> custom toolchain that rustup cannot fetch, so `setup-rust-toolchain` with
-> `toolchain-file:` will not resolve it. A runner has to provide that toolchain
-> before the build step above will work.
+> **NOTE**: `rust-toolchain.toml` pins `channel = "trust"`, the Trust toolchain,
+> which rustup cannot fetch, so `setup-rust-toolchain` with `toolchain-file:`
+> will not resolve it. A runner has to provide that toolchain (`targo` on PATH)
+> before the build step above will work — trust's `INSTALL.md` documents a
+> sealed toolchain artifact. `TRUST_CHECKOUT` names a trust checkout holding
+> that toolchain's commit; `build-dev` extracts the standard-library sources
+> from it when the seal ships none (drop the flag for a seal that does). The
+> flag must come before `--release`: anything after the first cargo argument is
+> passed to cargo.
 
 This builds trust-mc from source and runs verification on your crate.
 

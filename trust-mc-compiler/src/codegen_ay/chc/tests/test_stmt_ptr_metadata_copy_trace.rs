@@ -124,7 +124,8 @@ fn test_trace_subslice_len_copy_chain_from_fixed_array() {
             for block in &body.blocks {
                 for stmt in &block.statements {
                     if let StatementKind::Assign(lhs, rvalue) = &stmt.kind {
-                        if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rvalue {
+                        if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) = rvalue
+                        {
                             if place.local == dest && place.projection.is_empty() {
                                 copy_dest = Some(lhs.local);
                             }

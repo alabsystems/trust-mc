@@ -1,0 +1,69 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# THE MEASUREMENT TUPLE: the exact inputs a counted Kani-corpus row names.
+#
+# Plan of record: docs/kani-spec-engine-plan-2026-09-10.md, milestone M0 and
+# gate G1 ("one number, one tuple"). A row produced from inputs that differ from
+# this file is not a row of this tuple. `tools/tuple-check` compares every field
+# below with what this host actually resolves and exits nonzero, naming the
+# field, on any mismatch; `tools/tuple-check --json` emits the same result for
+# provenance consumers. How to update it on a bump: docs/KANI-LANE-REVIVAL.md,
+# "The measurement tuple".
+#
+# The trust-mc revision is deliberately absent: a file cannot name the commit
+# that contains it. The --json report records trust-mc's HEAD and dirty state.
+
+schema = 1
+
+# The Trust compiler (plan decision D5). `rev` is the commit-hash `trustc -Vv`
+# reports for the toolchain scripts/resolve-trust-tool.sh resolves; `build` is
+# the numbered seal directory that toolchain's sysroot is; `channel` is
+# rust-toolchain.toml's channel.
+[trust]
+rev = "29ebb403de7a102850d6cb10a62d5cc3baf723ed"
+build = 16387
+channel = "trust"
+
+# The frozen Kani-lane (T0) toolchain, as rust-toolchain.legacy.toml records it.
+# STOCK-AS-ORACLE: the nightly comparison baseline only, kept by the owner's
+# ruling of 2026-09-29 (pinned, advisory).
+[frozen_toolchain]
+channel = "nightly-2025-12-03"
+
+# AY: the one rev every AY git dependency in Cargo.toml declares, and the exact
+# clean HEAD of the ../ay checkout the [patch] table links. The external `ay`
+# CLI a counted run spawns must report this commit in its `+build.<n>.<sha>`
+# stamp (the driver refuses anything else, [AY:SOLVER_PIN_MISMATCH]).
+# scripts/build-pinned-ay-cli.sh builds it at this rev (`targo --unverified
+# build --release -p ay --features cli` in a detached worktree under the cache,
+# never in ../ay) into ~/Library/Caches/trust-mc-ay-cli-<first 9 of rev>/release
+# and prints the binary's path; name that with TRUST_MC_AY_BIN.
+[ay]
+rev = "688dd4b3b22d82fdd5021e42e99a002d751dc0cc"
+
+# TrustIR: the one rev trust-mc's member manifests declare, and the clean HEAD
+# of the ../trust-ir checkout the [patch] table links.
+[trust_ir]
+rev = "bd313b4fbfae2c2826bade463e23224f1df9a61a"
+
+# trust-vc: the rev trust-mc-trust-vc-ingest declares and Cargo.lock resolves.
+[trust_vc]
+rev = "0ed96de07900249cb9155b38b22e7d74ceefa9dc"
+
+# Clean kernel, consumed through TrustIR: the one rev the ../trust-ir checkout's
+# manifests declare, and the commit Cargo.lock resolves clean-kernel at. It is a
+# frozen content pin, so ../clean's own HEAD may be later.
+[clean]
+rev = "550ad0858df6a00c61a7cdabc7f37fa0bc975258"
+
+# Kani. `corpus_rev` is the upstream checkout the corpus is measured against
+# (tools/kani-domination's DEFAULT_KANI_REV, and the HEAD of the checkout it
+# reads: $KANI_DOMINATION_CORPUS_DIR, else
+# <user cache>/trust-mc/kani-domination/<rev>). `spec_rev` is the upstream rev the
+# generated per-harness spec is taken from; tuple-check refuses either rev unless
+# tools/kani-spec/pins.toml pins it ([revs.corpus] / [revs.spec]) and
+# spec/kani/<rev>/manifest.json exists recording it as kani_rev.
+[kani]
+corpus_rev = "4c0fce8c300e1f049f2b0c6766a5111dfc9ff32e"
+spec_rev = "b07abe8a72f8eb1ef1ea3521ca6b00a973d341bc"

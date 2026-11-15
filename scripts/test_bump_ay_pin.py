@@ -8,8 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
+
+from python_executable import python_executable_header
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,6 +86,7 @@ class BumpAyPinTests(unittest.TestCase):
         for script in (
             "bump-ay-pin.py",
             "check_first_party_git_pins.py",
+            "git_authority_environment.py",
             "ay_manifest_pin.py",
             "resolve-trust-tool.sh",
         ):
@@ -108,18 +112,27 @@ class BumpAyPinTests(unittest.TestCase):
             for name in AY_PACKAGES
         )
         (root / "Cargo.lock").write_text(lock, encoding="utf-8")
+        (root / "tools").mkdir()
+        (root / "tools/tuple.toml").write_text(
+            'schema = 1\n\n[trust]\n'
+            f'rev = "{old_revision}" # another authority must not move\n'
+            'build = 9192\nchannel = "trust"\n\n'
+            f'[ay] # measured AY\nrev = "{old_revision}" # keep this comment\n\n'
+            f'[trust_ir]\nrev = "{old_revision}"\n',
+            encoding="utf-8",
+        )
         subprocess.run(["git", "init", "-q", str(root)], check=True)
-        git(root, "add", "Cargo.toml", "Cargo.lock")
+        git(root, "add", "Cargo.toml", "Cargo.lock", "tools/tuple.toml")
 
         fake_bin = root / "fake-bin"
         fake_bin.mkdir()
         sysroot_bin = root / "trust-sysroot" / "bin"
         sysroot_bin.mkdir(parents=True)
-        cargo = sysroot_bin / "cargo"
-        cargo.write_text(
-            f"""#!{sys.executable}
-import os
+        targo = sysroot_bin / "targo"
+        targo.write_text(
+            python_executable_header(sys.executable) + f"""import os
 import sys
+import tomllib
 from pathlib import Path
 
 root = Path.cwd()
@@ -127,6 +140,10 @@ args = sys.argv[1:]
 with Path(os.environ["FAKE_CARGO_LOG"]).open("a", encoding="utf-8") as log:
     log.write(" ".join(args) + "\\n")
 mode = os.environ.get("FAKE_CARGO_MODE", "ok")
+manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+tuple_pin = tomllib.loads((root / "tools/tuple.toml").read_text(encoding="utf-8"))["ay"]["rev"]
+if any(spec["rev"] != tuple_pin for spec in manifest["workspace"]["dependencies"].values()):
+    raise SystemExit("metadata observed a tuple/manifest pin mismatch")
 if "--locked" not in args:
     lock = root / "Cargo.lock"
     if mode != "stale-refresh":
@@ -141,14 +158,19 @@ elif mode == "locked-failure":
 """,
             encoding="utf-8",
         )
-        cargo.chmod(0o755)
-        (sysroot_bin / "targo").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        (sysroot_bin / "targo").chmod(0o755)
+        targo.chmod(0o755)
+        # The helper runs the Trust driver; the sysroot's stock-cargo frontend
+        # must never be reached, so it fails distinctly.
+        (sysroot_bin / "cargo").write_text("#!/bin/sh\nexit 98\n", encoding="utf-8")
+        (sysroot_bin / "cargo").chmod(0o755)
         (sysroot_bin / "rustc").write_text(
             '#!/bin/sh\nprintf "%s\\n" "$FAKE_TRUST_SYSROOT"\n',
             encoding="utf-8",
         )
         (sysroot_bin / "rustc").chmod(0o755)
+        # A seal ships its compiler as `trustc` too; the resolver requires it.
+        (sysroot_bin / "trustc").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (sysroot_bin / "trustc").chmod(0o755)
         (fake_bin / "rustup").write_text(
             '#!/bin/sh\nprintf "%s\\n" "$FAKE_PINNED_RUSTC"\n',
             encoding="utf-8",
@@ -176,6 +198,8 @@ elif mode == "locked-failure":
         env["FAKE_PINNED_RUSTC"] = str(root / "trust-sysroot/bin/rustc")
         env["FAKE_TRUST_SYSROOT"] = str(root / "trust-sysroot")
         env["TRUST_MC_RUSTUP"] = str(root / "fake-bin/rustup")
+        # An exported Trust toolchain override would bypass the fake rustup.
+        env.pop("TRUST_MC_TRUST_TOOLCHAIN", None)
         return subprocess.run(
             [
                 sys.executable,
@@ -196,6 +220,8 @@ elif mode == "locked-failure":
     def test_refreshes_lock_before_locked_validation(self) -> None:
         temporary, root, _, _, _, new_revision = self.fixture()
         with temporary:
+            original_tuple = (root / "tools/tuple.toml").read_bytes()
+            old_revision = tomllib.loads(original_tuple.decode())["ay"]["rev"]
             result = self.run_helper(root, new_revision)
             self.assertEqual(result.returncode, 0, result.stdout)
             manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
@@ -205,6 +231,13 @@ elif mode == "locked-failure":
                 manifest.count(f'rev = "{new_revision}"'), len(AY_PACKAGES)
             )
             self.assertEqual(lock.count('version = "0.9.0"'), len(AY_PACKAGES))
+            self.assertEqual(
+                (root / "tools/tuple.toml").read_bytes(),
+                original_tuple.replace(
+                    f'rev = "{old_revision}" # keep this comment'.encode(),
+                    f'rev = "{new_revision}" # keep this comment'.encode(),
+                ),
+            )
             commands = (root / "cargo.log").read_text(encoding="utf-8").splitlines()
             self.assertEqual(
                 commands,
@@ -217,20 +250,24 @@ elif mode == "locked-failure":
     def test_refresh_failure_restores_manifest_and_lock(self) -> None:
         temporary, root, original, _, original_lock, new_revision = self.fixture()
         with temporary:
+            original_tuple = (root / "tools/tuple.toml").read_bytes()
             result = self.run_helper(root, new_revision, "refresh-failure")
             self.assertNotEqual(result.returncode, 0, result.stdout)
-            self.assertIn("restored Cargo.toml and Cargo.lock", result.stdout)
+            self.assertIn("restored Cargo.toml, Cargo.lock and tools/tuple.toml", result.stdout)
             self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
             self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertEqual((root / "tools/tuple.toml").read_bytes(), original_tuple)
 
     def test_stale_refresh_is_rejected_and_rolled_back(self) -> None:
         temporary, root, original, _, original_lock, new_revision = self.fixture()
         with temporary:
+            original_tuple = (root / "tools/tuple.toml").read_bytes()
             result = self.run_helper(root, new_revision, "stale-refresh")
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("differs from sibling version", result.stdout)
             self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
             self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertEqual((root / "tools/tuple.toml").read_bytes(), original_tuple)
             self.assertEqual(
                 (root / "cargo.log").read_text(encoding="utf-8").splitlines(),
                 ["metadata --format-version 1"],
@@ -239,14 +276,17 @@ elif mode == "locked-failure":
     def test_locked_metadata_failure_restores_manifest_and_lock(self) -> None:
         temporary, root, original, _, original_lock, new_revision = self.fixture()
         with temporary:
+            original_tuple = (root / "tools/tuple.toml").read_bytes()
             result = self.run_helper(root, new_revision, "locked-failure")
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
             self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertEqual((root / "tools/tuple.toml").read_bytes(), original_tuple)
 
     def test_rejects_invalid_version_without_change(self) -> None:
         temporary, root, original, _, original_lock, new_revision = self.fixture()
         with temporary:
+            original_tuple = (root / "tools/tuple.toml").read_bytes()
             result = subprocess.run(
                 [
                     sys.executable,
@@ -265,6 +305,68 @@ elif mode == "locked-failure":
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
             self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertEqual((root / "tools/tuple.toml").read_bytes(), original_tuple)
+
+    def test_missing_tuple_refuses_before_metadata_or_mutation(self) -> None:
+        temporary, root, original, _, original_lock, new_revision = self.fixture()
+        with temporary:
+            (root / "tools/tuple.toml").unlink()
+            result = self.run_helper(root, new_revision)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("cannot read tools/tuple.toml", result.stdout)
+            self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
+            self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertFalse((root / "tools/tuple.toml").exists())
+            self.assertFalse((root / "cargo.log").exists())
+
+    def test_mismatched_tuple_refuses_without_changing_any_file(self) -> None:
+        temporary, root, original, _, original_lock, new_revision = self.fixture()
+        with temporary:
+            tuple_path = root / "tools/tuple.toml"
+            old_revision = tomllib.loads(tuple_path.read_text(encoding="utf-8"))["ay"]["rev"]
+            tuple_path.write_text(
+                tuple_path.read_text(encoding="utf-8").replace(
+                    f'rev = "{old_revision}" # keep this comment',
+                    f'rev = "{new_revision}" # keep this comment',
+                ),
+                encoding="utf-8",
+            )
+            original_tuple = tuple_path.read_bytes()
+            result = self.run_helper(root, new_revision)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("must match the existing manifest pin", result.stdout)
+            self.assertEqual((root / "Cargo.toml").read_text(encoding="utf-8"), original)
+            self.assertEqual((root / "Cargo.lock").read_bytes(), original_lock)
+            self.assertEqual(tuple_path.read_bytes(), original_tuple)
+            self.assertFalse((root / "cargo.log").exists())
+
+    def test_failure_restores_original_crlf_bytes_in_all_three_files(self) -> None:
+        temporary, root, _, _, _, new_revision = self.fixture()
+        with temporary:
+            paths = [root / name for name in ("Cargo.toml", "Cargo.lock", "tools/tuple.toml")]
+            originals = []
+            for path in paths:
+                original = path.read_bytes().replace(b"\n", b"\r\n")
+                path.write_bytes(original)
+                originals.append(original)
+            result = self.run_helper(root, new_revision, "locked-failure")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("restored Cargo.toml, Cargo.lock and tools/tuple.toml", result.stdout)
+            self.assertEqual([path.read_bytes() for path in paths], originals)
+
+    def test_synchronized_repeat_is_noop(self) -> None:
+        temporary, root, _, _, _, new_revision = self.fixture()
+        with temporary:
+            first = self.run_helper(root, new_revision)
+            self.assertEqual(first.returncode, 0, first.stdout)
+            paths = [root / name for name in ("Cargo.toml", "Cargo.lock", "tools/tuple.toml")]
+            originals = [path.read_bytes() for path in paths]
+            commands = (root / "cargo.log").read_bytes()
+            second = self.run_helper(root, new_revision)
+            self.assertEqual(second.returncode, 0, second.stdout)
+            self.assertIn("already at", second.stdout)
+            self.assertEqual([path.read_bytes() for path in paths], originals)
+            self.assertEqual((root / "cargo.log").read_bytes(), commands)
 
 
 if __name__ == "__main__":

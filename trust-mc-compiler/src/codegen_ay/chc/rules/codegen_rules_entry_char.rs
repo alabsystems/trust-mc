@@ -7,6 +7,9 @@
 //! Part of #3930: Constrains char-typed state variables to valid Unicode
 //! scalar values at function entry so memory mirrors always contain valid data.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
@@ -102,7 +105,12 @@ fn collect_adt_char_fields(
     let fields = def.variants()[0].fields();
     let mut leaf_offset = 0usize;
     for field_def in &fields {
-        let field_ty = field_def.ty_with_args(&args);
+        // A field whose type does not instantiate: its leaves are unknown, so
+        // no later offset is either; constrain nothing further (an assumption
+        // not made is never unsound).
+        let Some(field_ty) = mono_ty::field_ty(field_def, &args) else {
+            return;
+        };
         let num_leaves = match ChcCtx::translate_ty(field_ty) {
             Some(s) => collect_leaf_sorts(&s, 0).len(),
             None => 1,

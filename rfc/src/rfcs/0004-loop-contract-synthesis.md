@@ -222,4 +222,3 @@ The loop invariant could be broken when users modify their code.
 However, we could probably cache previously working loop invariants and attempt to reuse them when users modify their code.
 Even if the cached loop invariants are not enough to prove the post-condition, they could still be used as a starting point for the synthesizer to find new loop invariants.
 
-[^1]: We say an integer variable is unbounded if there is no other bound on its value besides the width of its bit-vector representation.

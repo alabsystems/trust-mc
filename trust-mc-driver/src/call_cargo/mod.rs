@@ -7,18 +7,21 @@
 
 use crate::args::VerificationArgs;
 use crate::call_cargo::output::cargo_message_format_arg;
-use crate::call_cargo::targets::{filter_features_for_package, package_targets};
-use crate::call_single_file::LibConfig;
+use crate::call_cargo::targets::{
+    VerificationTarget, filter_features_for_package, package_targets,
+};
+use crate::call_single_file::{LibConfig, ambient_rustflags};
 use crate::project::Artifact;
+use crate::session::trustc_route;
 use crate::session::{
-    DEFAULT_TOOL_TIMEOUT_SECS, KaniSession, lib_folder, lib_no_core_folder, resolve_cargo_path,
-    setup_cargo_command, setup_cargo_command_inner, wait_with_timeout,
+    CompilerRoute, DEFAULT_TOOL_TIMEOUT_SECS, KaniSession, resolve_cargo_path, wait_with_timeout,
 };
 use crate::util;
-use crate::util::args::{CargoArg, CommandWrapper as _, KaniArg, PassTo, encode_as_rustc_arg};
+use crate::util::args::{CargoArg, CommandWrapper as _, KaniArg, PassTo, RustcArg};
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{CrateType, Metadata, MetadataCommand, Package, PackageId, Target};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -29,15 +32,18 @@ use tracing::{debug, trace};
 use trust_mc_metadata::{ArtifactType, CompilerArtifactStub};
 
 mod output;
+#[cfg(test)]
+mod route_tests;
 mod targets;
 #[cfg(test)]
 mod tests;
-pub(crate) use output::cargo_config_args;
+pub(crate) use output::{cargo_config_args, trustc_cargo_config_args};
 
 /// The outputs of kani-compiler being invoked via cargo on a project.
 pub(crate) struct CargoOutputs {
-    /// The directory where compiler outputs should be directed.
-    /// Usually 'target/BUILD_TRIPLE/debug/deps/'
+    /// The target profile directory shared by all compiled units.
+    /// Artifact paths come from compiler messages and harness metadata; Targo
+    /// places them in per-unit directories without creating `debug/deps`.
     pub outdir: PathBuf,
     /// The kani-metadata.json files written by kani-compiler.
     pub metadata: Vec<Artifact>,
@@ -87,22 +93,23 @@ crate-type = ["lib"]
         std_path: &Path,
         krate_path: &Path,
     ) -> Result<Vec<Artifact>> {
-        let lib_path = lib_no_core_folder()?;
+        let lib_path = self.route.library_folder("no_core/lib")?;
         let mut rustc_args = self.kani_rustc_flags(LibConfig::new_no_core(lib_path)?);
 
         // In theory, these could be passed just to the local crate rather than all crates,
         // but the `cargo build` command we use for building `std` doesn't allow you to pass `rustc`
         // arguments, so we have to pass them through the environment variable instead.
-        rustc_args.push(encode_as_rustc_arg(&self.kani_compiler_local_flags()));
+        let mut std_flags = self.route_check_version_flags();
+        std_flags.extend(self.kani_compiler_local_flags());
+        rustc_args.push(self.encode_kani_args(&std_flags));
 
         // Ignore global assembly, since `compiler_builtins` has some.
-        rustc_args.push(encode_as_rustc_arg(&[
-            KaniArg::from("--ignore-global-asm"),
-            self.reachability_arg(),
-        ]));
+        rustc_args.push(
+            self.encode_kani_args(&[KaniArg::from("--ignore-global-asm"), self.reachability_arg()]),
+        );
 
         let mut cargo_args: Vec<CargoArg> = vec!["build".into()];
-        cargo_args.append(&mut cargo_config_args());
+        cargo_args.append(&mut self.route_cargo_config_args());
 
         // Configuration needed to parse cargo compilation status.
         cargo_args.push("--message-format".into());
@@ -120,16 +127,20 @@ crate-type = ["lib"]
         full_path.push("library");
 
         // Since we are verifying the standard library, we set the reachability to all crates.
-        let mut cmd = setup_cargo_command()?;
+        // The std-verification build runs from `krate_path`, so that is where cargo
+        // reads its `[env]` table from.
+        self.refuse_cargo_env_table(Some(krate_path))?;
+        let mut cmd = self.cargo_command(None)?;
         cmd.pass_cargo_args(&cargo_args)
             .current_dir(krate_path)
-            .env("RUSTC", self.kani_compiler()?)
+            .env("RUSTC", self.compiler_program()?)
             .pass_rustc_args(&rustc_args, PassTo::AllCrates)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("__CARGO_TESTS_ONLY_SRC_ROOT", full_path.as_os_str());
+        self.apply_route_env(&mut cmd);
 
         Ok(self
-            .run_build(cmd, None)?
+            .with_backend_recheck(|| self.run_build(cmd, None))?
             .into_iter()
             .filter_map(|artifact| {
                 if artifact.target.crate_types.contains(&CrateType::Lib)
@@ -141,6 +152,16 @@ crate-type = ["lib"]
                 }
             })
             .collect())
+    }
+
+    /// The cargo `--target` and host-configuration arguments of this route: Kani's on
+    /// DevCli ([`cargo_config_args`]), and on Trustc the same with host units given
+    /// the route's host posture ([`trustc_cargo_config_args`]).
+    pub(crate) fn route_cargo_config_args(&self) -> Vec<CargoArg> {
+        match self.route {
+            CompilerRoute::DevCli => cargo_config_args(),
+            CompilerRoute::Trustc { .. } => trustc_cargo_config_args(),
+        }
     }
 
     /// Build the shared cargo arguments for verification (excludes per-package features).
@@ -163,7 +184,7 @@ crate-type = ["lib"]
         // per-package in cargo_build to handle workspaces where packages don't
         // all declare the same features. This matches cargo's behavior.
 
-        cargo_args.append(&mut cargo_config_args());
+        cargo_args.append(&mut self.route_cargo_config_args());
 
         cargo_args.push("--target-dir".into());
         cargo_args.push(target_dir.into());
@@ -186,25 +207,33 @@ crate-type = ["lib"]
     pub(crate) fn cargo_build(&mut self, keep_going: bool) -> Result<CargoOutputs> {
         let build_target = env!("TARGET"); // see build.rs
         let metadata = self.cargo_metadata(build_target)?;
+        // Before any compile: a cargo `[env]` table would set variables on every
+        // rustc after the launcher's edits (Trustc route only; a probe, not a compile).
+        self.refuse_cargo_env_table(None)?;
         let default_target_dir: PathBuf = metadata.target_directory.as_std_path().to_owned();
-        let target_dir = self.args.target_dir.as_ref().unwrap_or(&default_target_dir).join("kani");
-        let outdir = target_dir.join(build_target).join("debug/deps");
+        let target_dir = self
+            .args
+            .target_dir
+            .as_ref()
+            .unwrap_or(&default_target_dir)
+            .join(self.kani_target_namespace()?);
+        let outdir = target_dir.join(build_target).join("debug");
 
         if self.args.force_build && target_dir.exists() {
             fs::remove_dir_all(&target_dir)?;
         }
 
-        let lib_path = lib_folder()?;
-        let mut rustc_args = self.kani_rustc_flags(LibConfig::new(lib_path)?);
-        rustc_args.push(encode_as_rustc_arg(&self.kani_compiler_dependency_flags()));
+        let rustc_args = self.cargo_build_rustc_args(
+            self.route.library_folder("lib")?,
+            ambient_rustflags().as_deref(),
+        )?;
 
         let cargo_args = self.cargo_build_args(target_dir);
         let requested_features = self.args.cargo.features();
 
         // Arguments passed only to the target package (not dependencies).
         // See https://doc.rust-lang.org/cargo/commands/cargo-rustc.html
-        let mut kani_pkg_args = vec![self.reachability_arg()];
-        kani_pkg_args.extend(self.kani_compiler_local_flags());
+        let local_kani_arg = self.cargo_build_local_kani_arg();
 
         let mut found_target = false;
         let packages = self.packages_to_verify(&self.args, &metadata)?;
@@ -214,24 +243,22 @@ crate-type = ["lib"]
             let pkg_features = filter_features_for_package(&requested_features, package);
 
             for verification_target in package_targets(&self.args, package) {
-                let mut cmd =
-                    setup_cargo_command_inner(Some(verification_target.target().name.clone()))?;
-                cmd.pass_cargo_args(&cargo_args).args(vec!["-p", &package.id.to_string()]);
+                let cargo = self.cargo_command(Some(verification_target.target().name.clone()))?;
+                let cmd = self.cargo_build_command(
+                    cargo,
+                    &cargo_args,
+                    &package.id.to_string(),
+                    &pkg_features,
+                    &verification_target,
+                    &rustc_args,
+                    local_kani_arg.clone(),
+                )?;
 
-                if !pkg_features.is_empty() {
-                    cmd.arg(format!("--features={}", pkg_features.join(",")));
-                }
-
-                cmd.args(verification_target.to_args())
-                    .arg("--")
-                    .env("RUSTC", self.kani_compiler()?)
-                    .pass_rustc_args(&rustc_args, PassTo::AllCrates)
-                    .pass_rustc_arg(encode_as_rustc_arg(&kani_pkg_args), PassTo::OnlyLocalCrate)
-                    .env("RUSTC_BOOTSTRAP", "1")
-                    .env("RUST_BACKTRACE", "1")
-                    .env("CARGO_TERM_PROGRESS_WHEN", "never");
-
-                match self.run_build_target(cmd, verification_target.target(), Some(&metadata)) {
+                let built =
+                    self.run_build_target(cmd, verification_target.target(), Some(&metadata));
+                // Outside the match: `keep_going` must never absorb a changed backend.
+                self.recheck_trustc_backend()?;
+                match built {
                     Err(err) => {
                         if keep_going {
                             let target_str = format!("{verification_target}");
@@ -255,14 +282,105 @@ crate-type = ["lib"]
         Ok(CargoOutputs { outdir, metadata: artifacts, cargo_metadata: metadata })
     }
 
+    /// The command that builds one verification target: `cargo` (from
+    /// [`Self::cargo_command`]) with the shared cargo arguments, the package, its
+    /// features and target, then `RUSTC` set to this route's compiler (the Trustc
+    /// route prints its marker here, once per compile), `rustc_args` for every crate
+    /// through `CARGO_ENCODED_RUSTFLAGS`, which cargo applies to target units only,
+    /// and `local_kani_arg` for the selected target alone.
+    #[allow(clippy::too_many_arguments)]
+    fn cargo_build_command(
+        &self,
+        mut cargo: Command,
+        cargo_args: &[CargoArg],
+        package_id: &str,
+        pkg_features: &[String],
+        verification_target: &VerificationTarget,
+        rustc_args: &[RustcArg],
+        local_kani_arg: RustcArg,
+    ) -> Result<Command> {
+        cargo.pass_cargo_args(cargo_args).args(["-p", package_id]);
+
+        if !pkg_features.is_empty() {
+            cargo.arg(format!("--features={}", pkg_features.join(",")));
+        }
+
+        cargo
+            .args(verification_target.to_args())
+            .arg("--")
+            .env("RUSTC", self.compiler_program()?)
+            .pass_rustc_args(rustc_args, PassTo::AllCrates)
+            .pass_rustc_arg(local_kani_arg, PassTo::OnlyLocalCrate)
+            .env("RUSTC_BOOTSTRAP", "1")
+            .env("RUST_BACKTRACE", "1")
+            .env("CARGO_TERM_PROGRESS_WHEN", "never");
+        self.apply_route_env(&mut cargo);
+        Ok(cargo)
+    }
+
+    /// The rustc arguments `cargo_build` passes to every crate (through
+    /// `CARGO_ENCODED_RUSTFLAGS`), as a pure function of the session.
+    pub(crate) fn cargo_build_rustc_args(
+        &self,
+        lib_path: PathBuf,
+        rustflags: Option<&str>,
+    ) -> Result<Vec<RustcArg>> {
+        let mut rustc_args = self.kani_rustc_flags_with(LibConfig::new(lib_path)?, rustflags);
+        rustc_args.push(self.encode_kani_args(&self.kani_compiler_dependency_flags()));
+        Ok(rustc_args)
+    }
+
+    /// The engine arguments `cargo_build` passes only to the target package.
+    pub(crate) fn cargo_build_local_kani_arg(&self) -> RustcArg {
+        let mut kani_pkg_args = vec![self.reachability_arg()];
+        kani_pkg_args.extend(self.kani_compiler_local_flags());
+        self.encode_kani_args(&kani_pkg_args)
+    }
+
     pub(crate) fn cargo_metadata(&self, build_target: &str) -> Result<Metadata> {
+        let cmd = self.cargo_metadata_command_on(build_target, std::env::vars_os().collect())?;
+        self.exec_cargo_metadata(cmd)
+    }
+
+    /// The `cargo metadata` command, with the driver's environment passed in.
+    /// DevCli runs the pinned toolchain's cargo. Trustc refuses a rustc wrapper, an
+    /// engine knob or a route-owned `RUSTFLAGS` token named in that environment
+    /// (`trustc_route::refuse_cargo_route_env`), establishes the identity, and runs
+    /// the seal's own cargo
+    /// with the route's cargo environment (`trustc_route::trustc_cargo_env`): the
+    /// `--filter-platform` query asks `RUSTC` for target information.
+    fn cargo_metadata_command_on(
+        &self,
+        build_target: &str,
+        env: Vec<(OsString, OsString)>,
+    ) -> Result<MetadataCommand> {
         let mut cmd = MetadataCommand::new();
 
-        // Use Kani's toolchain when running `cargo metadata`
-        let cargo_resolution = resolve_cargo_path()?;
-        cmd.cargo_path(&cargo_resolution.metadata_path);
-        if cargo_resolution.direct_build_uses_rustup_shim {
-            cmd.env("RUSTUP_TOOLCHAIN", crate::session::install::rustup_toolchain());
+        match self.route {
+            CompilerRoute::DevCli => {
+                // Use Kani's toolchain when running `cargo metadata`
+                let cargo_resolution = resolve_cargo_path()?;
+                cmd.cargo_path(&cargo_resolution.metadata_path);
+                for (key, value) in cargo_resolution.toolchain_env() {
+                    cmd.env(key, value);
+                }
+            }
+            CompilerRoute::Trustc { .. } => {
+                trustc_route::refuse_cargo_route_env(&env)?;
+                let identity = self.trustc_identity()?;
+                cmd.cargo_path(identity.seal_cargo()?);
+                let keys = env.into_iter().map(|(key, _)| key);
+                for (key, value) in trustc_route::trustc_cargo_env(&identity.trustc, keys) {
+                    match value {
+                        Some(value) => {
+                            cmd.env(key, value);
+                        }
+                        None => {
+                            cmd.env_remove(key);
+                        }
+                    }
+                }
+            }
         }
 
         // restrict metadata command to host platform. References:
@@ -290,7 +408,11 @@ crate-type = ["lib"]
         if !features.is_empty() {
             cmd.features(cargo_metadata::CargoOpt::SomeFeatures(features));
         }
+        Ok(cmd)
+    }
 
+    /// Run `cmd` under the tool timeout.
+    fn exec_cargo_metadata(&self, cmd: MetadataCommand) -> Result<Metadata> {
         // Use timeout protection (#997)
         // MetadataCommand doesn't have built-in timeout, so we run it in a thread
         let timeout = self.tool_timeout().unwrap_or(Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS));
@@ -372,7 +494,7 @@ crate-type = ["lib"]
         package_names
             .iter()
             .map(|pkg| {
-                let mut cmd = setup_cargo_command()?;
+                let mut cmd = self.cargo_query_command()?;
                 cmd.arg("pkgid");
                 if let Some(path) = &self.args.cargo.manifest_path {
                     cmd.arg("--manifest-path");

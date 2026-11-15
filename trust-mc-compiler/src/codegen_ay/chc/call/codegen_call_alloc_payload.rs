@@ -10,7 +10,6 @@
 //! heap store constrains the value correctly for later dyn dispatch read-back.
 
 use ay_bindings::Expr;
-use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
 
@@ -32,25 +31,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
             _ => ty,
         };
-        let key = match fn_like_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, args)) => {
-                format!("{}_{:?}", def.trimmed_name(), args)
-            }
-            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                format!("closure_{}_{:?}", def.trimmed_name(), args)
-            }
-            _ => return None,
-        };
-
-        if let Some(expr) = self.fn_ptr_ids.get(&key) {
-            return Some(expr.clone());
-        }
-
-        let id = self.next_fn_ptr_id;
-        self.next_fn_ptr_id += 1;
-        let expr = Expr::bitvec_const(id as i128, POINTER_WIDTH);
-        self.fn_ptr_ids.insert(key, expr.clone());
-        Some(expr)
+        // Keyed like a reification of the same function (design 3, D1:
+        // `crate::codegen_ay::fn_ptr_identity`), so the payload marker of
+        // `Box::new(&f)` and `f as fn(..)` are one identity.
+        let target = crate::codegen_ay::fn_ptr_identity::fn_ptr_target_of_ty(fn_like_ty)?;
+        let id = self.fn_ptr_id_for_target(target);
+        Some(Expr::bitvec_const(u128::from(id), POINTER_WIDTH))
     }
 
     pub(in crate::codegen_ay::chc) fn boxnew_operand_is_callable(&self, operand: &Operand) -> bool {

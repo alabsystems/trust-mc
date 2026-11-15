@@ -82,19 +82,201 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.bmc_modifies_certify_swap_store(x_base.as_deref());
         self.bmc_modifies_certify_swap_store(y_base.as_deref());
 
+        // The flattened components of each pointee (`{base}.0` discriminant,
+        // `{base}_variant_V_field_N` payload, `{base}_field_N`) are part of its
+        // value: a flattened `Option<u8>` keeps its variant under `{base}.0`, and
+        // a swap that exchanged only the payload word left `o.0 = 1` after
+        // `mem::swap(&mut o, &mut q)` with `q = None`, so `o == None` read
+        // `Some(0)` and `assert!(!(o == None))` was proved
+        // (tools/soundness-duals/negative/review_r18_mutate_then_compare.rs).
+        let x_components = self.typed_swap_components(x_base.as_deref());
+        let y_components = self.typed_swap_components(y_base.as_deref());
+
         // Cross-store: *x = old_y, *y = old_x
-        self.ctx.store_memory_bytes(ptr_x, old_y.clone());
-        self.ctx.store_memory_bytes(ptr_y, old_x.clone());
+        self.store_memory_bytes_on_path(ptr_x, old_y.clone(), "typed_swap store");
+        self.store_memory_bytes_on_path(ptr_y, old_x.clone(), "typed_swap store");
         self.typed_swap_update_pointees(x_pointee.as_ref(), old_y);
         self.typed_swap_update_pointees(y_pointee.as_ref(), old_x);
+        self.typed_swap_exchange_components(
+            x_pointee.as_ref(),
+            y_pointee.as_ref(),
+            x_components,
+            y_components,
+        );
+
+        // The swapped VALUES may themselves be pointers (`mem::swap(&mut p, &mut q)`
+        // with `p, q: &mut u8`): their storage now holds each other's address, so
+        // the pointee bindings recorded for `p` and `q` must travel with them, or a
+        // later `*p = 7` writes `p`'s OLD referent: `swap_refs_store_must_fail`
+        // (`assert!(a == 7)` after the swap made `p` point at `b`) verified
+        // SUCCESSFUL and the safe twin FAILED with a Genuine counterexample
+        // (negative/merged_pointer_shapes.rs). Swap the two entries, or poison both
+        // so any later read through them fails closed.
+        //
+        // The pointer need not BE the swapped value: an `Option<*mut u8>`, a
+        // `Result`, a tuple or an array carries one just as well, and
+        // `let mut a: Option<*mut u8> = Some(&mut x); let mut b = Some(&mut y);
+        // mem::swap(&mut a, &mut b); *a.unwrap() = 9; assert!(y == 2)` verified
+        // SUCCESSFUL with `[AY:PROOF_QUALIFIERS:clean]` while its safe twin was
+        // FAILED [AY:CTREX_CAT:Genuine], because `is_pointer_like_ty` answered
+        // `false` for the carrier and nothing was exchanged OR recorded (fourth
+        // adversarial review of m3/soundness-fixes-2, 2026-09-14, defect M2/D3).
+        if Self::is_pointer_like_ty(pointee_ty) || Self::ty_carries_a_pointer_value(pointee_ty) {
+            self.typed_swap_pointer_bindings(x_base.as_deref(), y_base.as_deref());
+        }
 
         target
+    }
+
+    /// Snapshot the flattened components recorded under a pointee base.
+    fn typed_swap_components(&self, base: Option<&str>) -> Vec<(String, ay_bindings::Expr)> {
+        base.map(|base| Self::collect_flattened_value_entries(&self.current_env, base))
+            .unwrap_or_default()
+    }
+
+    /// Give each pointee the other's flattened components.
+    ///
+    /// A component one side records and the other does not has no exact
+    /// counterpart: it is left unconstrained, and the harness is marked so it
+    /// cannot come back clean.
+    fn typed_swap_exchange_components(
+        &mut self,
+        x_pointee: Option<&TypedSwapPointee>,
+        y_pointee: Option<&TypedSwapPointee>,
+        x_components: Vec<(String, ay_bindings::Expr)>,
+        y_components: Vec<(String, ay_bindings::Expr)>,
+    ) {
+        if x_components.is_empty() && y_components.is_empty() {
+            return;
+        }
+        let x_suffixes: Vec<&String> = x_components.iter().map(|(suffix, _)| suffix).collect();
+        let y_suffixes: Vec<&String> = y_components.iter().map(|(suffix, _)| suffix).collect();
+        let unmatched: Vec<(String, ay_bindings::Sort)> = x_components
+            .iter()
+            .filter(|(suffix, _)| !y_suffixes.contains(&suffix))
+            .chain(y_components.iter().filter(|(suffix, _)| !x_suffixes.contains(&suffix)))
+            .map(|(suffix, expr)| (suffix.clone(), expr.sort().clone()))
+            .collect();
+        let (Some(x_pointee), Some(y_pointee)) = (x_pointee, y_pointee) else {
+            self.ctx.unsupported_with_fallback(
+                "typed_swap_components",
+                "flattened components of an unresolved swap pointee".to_string(),
+            );
+            return;
+        };
+        for base in &x_pointee.update_bases {
+            self.apply_flattened_value_entries(base, y_components.clone());
+        }
+        for base in &y_pointee.update_bases {
+            self.apply_flattened_value_entries(base, x_components.clone());
+        }
+        if unmatched.is_empty() {
+            return;
+        }
+        self.ctx.unsupported_with_fallback(
+            "typed_swap_components",
+            format!("flattened components without a counterpart: {unmatched:?}"),
+        );
+        for base in x_pointee.update_bases.iter().chain(&y_pointee.update_bases) {
+            for (suffix, sort) in &unmatched {
+                let key = format!("{base}{suffix}");
+                let name = self.ssa_name_from_base(&key, true);
+                let fresh = self.ctx.declare_var(&name, sort.clone());
+                self.env_update(key, fresh);
+            }
+        }
+    }
+
+    /// Exchange the `ref_pointees` entries of two pointer-typed storages whose
+    /// values were just swapped. Both entries must be present, unpoisoned and
+    /// unaliased by nested bindings; otherwise every binding under either name is
+    /// poisoned and the statement records a fail-closed fallback.
+    fn typed_swap_pointer_bindings(&mut self, x_base: Option<&str>, y_base: Option<&str>) {
+        let (Some(x_base), Some(y_base)) = (x_base, y_base) else {
+            self.ctx.unsupported_with_fallback(
+                "mem::swap of pointers: a swapped storage is not tracked",
+                "typed_swap",
+            );
+            return;
+        };
+        let generation = self.ref_pointees.generation();
+        let x_target = self.ref_pointees.get(x_base).cloned();
+        let y_target = self.ref_pointees.get(y_base).cloned();
+        let exact = !self.ref_pointees.is_poisoned(x_base)
+            && !self.ref_pointees.is_poisoned(y_base)
+            && self.ref_pointees.nested_keys(x_base).is_empty()
+            && self.ref_pointees.nested_keys(y_base).is_empty();
+        match (x_target, y_target) {
+            (Some(xt), Some(yt)) if exact => {
+                self.ref_pointees.insert(std::sync::Arc::from(x_base), yt);
+                self.ref_pointees.insert(std::sync::Arc::from(y_base), xt);
+                debug!(x_base, y_base, "typed_swap: pointee bindings exchanged");
+            }
+            // A CARRIER (an `Option`, a `Result`, a tuple, an array) holds the
+            // pointer under a derived name, so neither base has an entry of its
+            // own. Exchange the nested entries when both sides carry exactly the
+            // same slots; anything else falls through and fails closed.
+            (None, None) if self.typed_swap_exchange_carrier_bindings(x_base, y_base) => {}
+            _ => {
+                // Bindings exist for at most one side, are merged, or carry nested
+                // entries: poison what is there (a stale entry would name the old
+                // referent) and fail closed.
+                self.ref_pointees.poison_stale_since(x_base, generation);
+                self.ref_pointees.poison_stale_since(y_base, generation);
+                self.ctx.unsupported_with_fallback(
+                    "mem::swap of pointers: pointee bindings not exchanged",
+                    format!("{x_base} <-> {y_base}"),
+                );
+            }
+        }
+    }
+
+    /// Exchange the pointee bindings held under two CARRIER storages: every
+    /// entry `{x_base}{suffix}` against `{y_base}{suffix}`, and only when both
+    /// sides carry exactly the same suffixes and none of them is poisoned.
+    ///
+    /// Returns `false` when the exchange cannot be made exactly; the caller then
+    /// poisons both sides and records a fail-closed reason.
+    fn typed_swap_exchange_carrier_bindings(&mut self, x_base: &str, y_base: &str) -> bool {
+        let x_keys = self.ref_pointees.nested_keys(x_base);
+        let y_keys = self.ref_pointees.nested_keys(y_base);
+        if x_keys.is_empty() || x_keys.len() != y_keys.len() {
+            return false;
+        }
+        let mut pairs = Vec::with_capacity(x_keys.len());
+        for x_key in &x_keys {
+            let Some(suffix) = x_key.strip_prefix(x_base) else {
+                return false;
+            };
+            let y_key = format!("{y_base}{suffix}");
+            if !self.ref_pointees.has_entry(&y_key) {
+                return false;
+            }
+            if self.ref_pointees.is_poisoned(x_key) || self.ref_pointees.is_poisoned(&y_key) {
+                return false;
+            }
+            let (Some(xt), Some(yt)) = (
+                self.ref_pointees.get(x_key.as_ref()).cloned(),
+                self.ref_pointees.get(y_key.as_str()).cloned(),
+            ) else {
+                return false;
+            };
+            pairs.push((std::sync::Arc::clone(x_key), std::sync::Arc::<str>::from(y_key), xt, yt));
+        }
+        for (x_key, y_key, xt, yt) in pairs {
+            self.ref_pointees.insert(x_key, yt);
+            self.ref_pointees.insert(y_key, xt);
+        }
+        debug!(x_base, y_base, "typed_swap: carrier pointee bindings exchanged");
+        true
     }
 
     fn typed_swap_pointee(&mut self, operand: &Operand) -> Option<TypedSwapPointee> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         let ref_base = self.ssa_base_name(place);
         let pointee_base = self.ref_pointees.get(ref_base.as_str())?.to_string();

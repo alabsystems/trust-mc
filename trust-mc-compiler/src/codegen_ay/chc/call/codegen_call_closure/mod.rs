@@ -22,11 +22,10 @@ use tracing::debug;
 
 use self::alias_writeback::pre_resolve_closure_alias_target_locals;
 use self::register_contract::resolve_closure_body_for_ty;
-use super::inline_body::{
-    InlineReturn, extract_inline_assert_guard, strip_inline_assert_fallback,
-    translate_closure_inline_result, translate_inline_body,
+use super::inline_body::{InlineReturn, translate_closure_inline_result, translate_inline_body};
+pub(in crate::codegen_ay::chc) use dyn_callable_resolver::{
+    fn_family_candidate_fits, resolve_unique_dyn_callable_body,
 };
-pub(in crate::codegen_ay::chc) use dyn_callable_resolver::resolve_unique_dyn_callable_body;
 pub(in crate::codegen_ay::chc) use register_contract::operand_is_closure_shaped;
 pub(in crate::codegen_ay::chc) use register_contract::resolve_closure_body_for_operand;
 pub(in crate::codegen_ay::chc) use register_contract::resolve_closure_body_via_unique_aggregate_def;
@@ -138,6 +137,26 @@ impl<'tcx, 'body> CallDispatchClosure for ChcCtx<'tcx, 'body> {
             closure_body.locals().len(),
         );
 
+        // A native Box callable must walk its real forwarding shim. That shim
+        // carries the checked BoxDerefTransmute and any ownership/drop work;
+        // a uniquely resolved callable body does not authorize skipping them.
+        if let Some(receiver) = args.first() {
+            let ty = receiver.ty(self.body.locals()).ok().map(|ty| self.resolve_body_ty(ty));
+            let mut ty = ty;
+            if let Some(rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(
+                _,
+                pointee,
+                _,
+            ))) = ty.map(|ty| ty.kind())
+            {
+                ty = Some(pointee);
+            }
+            let native_box = ty.is_some_and(|ty| matches!(ty.kind(), rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _)) if def.is_box()) && crate::codegen_ay::shared::native_box_raw::native_dyn_pointer_pointee(self.tcx, ty).is_some());
+            if native_box {
+                return false;
+            }
+        }
+
         // Extract captures from the closure environment (args[0] = &self/&mut self).
         // The closure aggregate was built by translate_closure_aggregate with cap_N fields.
         let captures = if !args.is_empty() {
@@ -146,58 +165,73 @@ impl<'tcx, 'body> CallDispatchClosure for ChcCtx<'tcx, 'body> {
             Vec::new()
         };
 
-        // Extract call arguments. For Fn::call, args[1] is the argument tuple.
-        // For a 1-arg closure |n: i32|, args[1] is (n,) — a 1-element tuple.
-        // For a 2-arg closure |a, b|, args[1] is (a, b) — a 2-element tuple.
-        let call_params = if args.len() >= 2 {
-            self.extract_closure_call_args(&args[1], modified_locals)
-        } else {
-            Vec::new()
+        // Keep the binder's value/address/read facts beside RustCall fields.
+        // Missing, reassigned and unsupported carriers cannot borrow an older
+        // argument list from a whole-body first-producer scan.
+        let Some(call_args) =
+            args.get(1).and_then(|tuple| self.extract_closure_call_args(tuple, modified_locals))
+        else {
+            self.record_sound_fallback_reason("closure_call_args_unmodeled");
+            return false;
         };
-
-        // Translate the closure body inline, preserving full InlineReturn.
-        // Part of #3805: use translate_closure_inline_result to preserve
-        // vtable, alias_updates, and heap side effects.
-        // Part of #4185: Snapshot heap state before speculative inline walk.
+        let is_closure = if closure_body.arg_locals().len() == call_args.values.len() {
+            false
+        } else if closure_body.arg_locals().len() == call_args.values.len() + 1 {
+            true
+        } else {
+            self.record_sound_fallback_reason("closure_call_args_arity_unmodeled");
+            return false;
+        };
+        let first_local = if is_closure { 2 } else { 1 };
         let heap_snapshot = self.heap_state.snapshot_transient_rule_state();
-        // Part of #4185 Fix 4: Snapshot modified_state_indices alongside heap.
         let modified_snapshot = self.encode.modified_state_indices.clone();
-        let result = if closure_body.arg_locals().len() == call_params.len() {
-            // dyn-callable resolution can recover a plain function-item body
-            // (for example a boxed `&fn item`) rather than a closure ABI body.
-            // Those bodies do not reserve local 1 for a capture environment, so
-            // the closure-specific local mapping would drop the real arguments.
-            //
-            // Part of #4000: For `&mut T` parameters, resolve addresses to VALUES
-            // before the inline walk. The inline walker uses Deref-as-identity
-            // (`*_1` = `local_exprs[1]`), so if the arg holds an ADDRESS (bv64),
-            // the body would compute on the address instead of the pointee value.
-            let mut resolved_params = call_params;
-            let mut_targets = resolve_mut_ref_value_args(self, &mut resolved_params, &closure_body);
+        let mut call_params = call_args.values.clone();
+        let owners =
+            args.get(1).map(|arg| self.host_rustcall_mut_ref_args(arg)).unwrap_or_default();
+        let Some(mut_targets) =
+            resolve_mut_ref_value_args(self, &mut call_params, &closure_body, is_closure, &owners)
+        else {
+            self.heap_state.restore_transient_rule_state(&heap_snapshot);
+            self.encode.modified_state_indices = modified_snapshot;
+            return false;
+        };
+        call_args.seed(self, first_local);
+        self.inline_walk_param_referent_seeds
+            .as_mut()
+            .unwrap()
+            .extend(mut_targets.iter().map(|&(local, _)| local));
+        self.inline_walk_param_mut_owner_seeds = Some(
+            owners
+                .iter()
+                .enumerate()
+                .filter_map(|(i, binding)| {
+                    binding.as_ref().map(|binding| (i + first_local, binding.owner.clone()))
+                })
+                .collect(),
+        );
+        let result = if is_closure {
+            translate_closure_inline_result(self, &closure_body, &call_params, &captures, bb_idx, 0)
+        } else {
             let empty_vtable_ids = std::collections::HashMap::new();
-            let result = translate_inline_body(
+            translate_inline_body(
                 self,
                 &closure_body,
-                &resolved_params,
+                &call_params,
                 bb_idx,
                 &empty_vtable_ids,
                 None,
                 0,
-            );
-            // Part of #4000: Bridge alias_updates from modified `&mut T` args back
-            // to outer target locals (state vars + heap memory at Mem level).
-            if let Some(mut r) = result {
-                bridge_mut_ref_alias_updates(self, &r, &mut_targets);
-                for &(body_arg_idx, _) in &mut_targets {
-                    r.alias_updates.remove(&body_arg_idx);
-                }
-                Some(r)
-            } else {
-                None
-            }
-        } else {
-            translate_closure_inline_result(self, &closure_body, &call_params, &captures, bb_idx, 0)
+            )
         };
+        call_args::ClosureCallArgs::clear(self);
+        self.inline_walk_param_mut_owner_seeds = None;
+        let result = result.map(|mut result| {
+            bridge_mut_ref_alias_updates(self, &result, &mut_targets);
+            for &(body_arg_idx, _) in &mut_targets {
+                result.alias_updates.remove(&body_arg_idx);
+            }
+            result
+        });
 
         let Some(inline_result) = result else {
             debug!(
@@ -434,7 +468,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     {
                         return Some(src.local);
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                     | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                         if src.projection.is_empty() =>
                     {
@@ -482,11 +516,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             inline_result;
         // Assert-guard SIDE-CHANNEL host emission (see emit_deferred_inline_check_errors).
         self.emit_deferred_inline_check_errors(dcx, deferred_checks);
-        let inline_assert_guard = extract_inline_assert_guard(&result_expr);
-        let result_expr = strip_inline_assert_fallback(&result_expr).unwrap_or(result_expr);
+        let (result_expr, extra_constraints) = self.take_inline_result_guards(dcx, result_expr);
         let result_expr =
             widen_inline_result_for_fat_pointer(self, dest_local, result_expr, &vtable);
-        let extra_constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
         let pre_resolved_args = pre_resolve_closure_alias_target_locals(self, dcx, closure_ref);
         let prepared = prepare_inline_result_epilogue(
             self,

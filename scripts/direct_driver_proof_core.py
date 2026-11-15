@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -113,7 +114,11 @@ def _current_tree_fingerprint(repo_root: Path) -> str:
 
 
 def _solver_binary_attestation(solver: str, expected_pin: str) -> dict[str, Any]:
-    solver_path = shutil.which(solver)
+    # The driver runs $TRUST_MC_AY_BIN in preference to PATH; attest that one
+    # when it is named.
+    solver_path = (os.environ.get("TRUST_MC_AY_BIN") if solver == "ay" else None) or shutil.which(
+        solver
+    )
     if solver_path is None:
         raise ValueError(f"solver {solver!r} not found in PATH")
 

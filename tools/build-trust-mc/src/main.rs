@@ -8,23 +8,42 @@
 //! This file is a glorified shell script for constructing a trust-mc release bundle.
 //! We use Rust here just to aid in making the "script" more robust.
 //!
-//! Run with `cargo run -p build-trust-mc -- release` and this will produce
-//! (e.g.) `trust-mc-1.0-x86_64-unknown-linux-gnu.tar.gz`.
+//! Run with `<seal>/bin/targo --unverified bundle` (the `.cargo/config.toml`
+//! alias for `targo --unverified run -p build-trust-mc -- bundle`) and this will
+//! produce (e.g.) `trust-mc-1.0-aarch64-apple-darwin.tar.gz`, cut on that Trust
+//! seal and refused on any other toolchain (`release.rs`). `targo --unverified
+//! build-dev` builds the development sysroot; see `dev_std.rs` for where its
+//! `-Z build-std` sources come from on a Trust seal that ships none.
+//!
+//! `build-keyed --trustc <path> --trust-checkout <path> --std build-std|prebuilt`
+//! builds the Kani library with one Trust compiler into
+//! `target/trust-mc/keyed/<KEY>/` (see `keyed.rs`).
 
+mod dev_std;
+mod keyed;
 mod parser;
+mod private_ay;
+mod release;
 mod sysroot;
+mod watchdog;
 
+use crate::dev_std::{
+    CheckoutCandidates, DevCompiler, StdSource, checkout_holds_commit, choose_std_source,
+    prepare_std_source, probe_compiler, require_driver_commit, require_rustc_dev,
+};
+use crate::release::ReleaseSeal;
 use crate::sysroot::{
-    build_bin, build_lib, build_tools, trust_mc_no_core_lib, trust_mc_playback_lib,
+    ReleaseFlags, build_bin, build_lib, build_tools, launching_cargo, toolchain_rustc,
+    trust_mc_no_core_lib, trust_mc_playback_lib, trust_mc_repo_root, trust_mc_sysroot,
     trust_mc_sysroot_lib,
 };
-use anyhow::{Result, bail};
+use crate::watchdog::Watchdog;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::{
     ffi::OsString,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
     time::Duration,
 };
 
@@ -33,27 +52,35 @@ fn main() -> Result<()> {
 
     match args.subcommand {
         parser::Commands::BuildDev(build_parser) => {
-            preflight_toolchain_components()?;
-            let bin_folder = &build_bin(&build_parser.args)?;
-            if !build_parser.skip_libs {
-                build_lib(bin_folder)?;
+            // Decide everything the library build needs before the long binary
+            // build, so a missing std source fails in seconds, not after it.
+            let compiler = preflight_toolchain()?;
+            let std_source = if build_parser.skip_libs {
+                None
+            } else {
+                Some(select_std_source(&compiler, build_parser.trust_checkout.as_deref())?)
+            };
+            let bin_folder = &build_bin(&build_parser.args, None)?;
+            if let Some(source) = std_source {
+                build_lib_from(bin_folder, &compiler, &source)?;
             }
             Ok(())
         }
+        parser::Commands::BuildKeyed(keyed_parser) => keyed::build_keyed(&keyed_parser),
         parser::Commands::Bundle(bundle_parser) => {
-            let version_string = bundle_parser.version;
+            let version_string = bundle_version(bundle_parser.version)?;
             let trust_mc_string = format!("trust-mc-{version_string}");
             let bundle_name = format!("{trust_mc_string}-{}.tar.gz", env!("TARGET"));
             let dir = Path::new(&trust_mc_string);
 
             // Check everything is ready before we start copying files
             println!("-- Build release bundle {bundle_name}");
-            prebundle(dir)?;
+            let (seal, std_source, ay) = prebundle(dir)?;
 
             std::fs::create_dir(dir)?;
 
-            bundle_trust_mc(dir)?;
-            bundle_kissat(dir)?;
+            bundle_trust_mc(dir, &seal, std_source)?;
+            private_ay::stage(&trust_mc_repo_root(), &seal, &ay, dir)?;
 
             create_release_bundle(dir, &bundle_name)?;
 
@@ -68,77 +95,55 @@ fn main() -> Result<()> {
 
 /// Preflight: trust-mc-compiler is a **rustc driver** (`#![feature(rustc_private)]`,
 /// `extern crate rustc_driver`), so the build links the compiler's internal
-/// crates and rebuilds `std` with `-Z build-std`. That requires the `rustc-dev`
-/// and `rust-src` components of the pinned toolchain. When they are missing the
-/// build otherwise dies deep inside cargo with a cryptic
-/// "can't find crate for `rustc_driver`" / "can't find crate for `std`" — the
-/// thing that trips people (and AI sessions) up. Fail fast with the exact fix.
+/// crates, and `build_lib` rebuilds `std` with `-Z build-std`. Probe the compiler
+/// of the launching toolchain (the seal's `trustc` under `targo`) and fail fast
+/// when it carries no `librustc_driver`. When that is missing the build otherwise
+/// dies deep inside cargo with "can't find crate for `rustc_driver`".
+fn preflight_toolchain() -> Result<DevCompiler> {
+    let compiler = probe_compiler(&toolchain_rustc())?;
+    require_rustc_dev(&compiler)?;
+    println!(
+        "-- toolchain: {} ({}, sysroot {})",
+        compiler.rustc.display(),
+        compiler.version,
+        compiler.sysroot.display()
+    );
+    Ok(compiler)
+}
+
+/// Where the library build's `-Z build-std` reads std from (see `dev_std.rs`).
+fn select_std_source(compiler: &DevCompiler, trust_checkout: Option<&Path>) -> Result<StdSource> {
+    let candidates = CheckoutCandidates::discover(trust_checkout);
+    let source = choose_std_source(compiler, &candidates, &checkout_holds_commit)?;
+    match &source {
+        StdSource::Sysroot => println!("-- std sources: the toolchain sysroot's own"),
+        StdSource::Checkout(checkout) => println!(
+            "-- std sources: trust checkout {} at {}",
+            checkout.display(),
+            compiler.commit.as_deref().unwrap_or_default()
+        ),
+    }
+    Ok(source)
+}
+
+/// Build the Kani libraries with the freshly built driver, against `source`.
+fn build_lib_from(bin_folder: &Path, compiler: &DevCompiler, source: &StdSource) -> Result<()> {
+    if let StdSource::Checkout(_) = source {
+        require_driver_commit(compiler, &bin_folder.join("trust-mc-compiler"))?;
+    }
+    let std_src_root = prepare_std_source(source, compiler, &launching_cargo())?;
+    build_lib(bin_folder, std_src_root.as_deref(), None)
+}
+
+/// Ensures everything is good to go before we begin to build the release bundle,
+/// then builds it: the binaries in release mode and the libraries with the
+/// release trust-mc-compiler. Returns the admitted seal and the std source label
+/// the bundle records.
 ///
-/// Best-effort: if `rustup` is not on PATH (e.g. a `RUSTC_BOOTSTRAP` shell or a
-/// vendored toolchain), skip silently rather than block a working environment.
-fn preflight_toolchain_components() -> Result<()> {
-    let output = match Command::new("rustup").args(["component", "list", "--installed"]).output() {
-        Ok(o) if o.status.success() => o,
-        _ => return Ok(()),
-    };
-    let installed = String::from_utf8_lossy(&output.stdout);
-    let missing: Vec<&str> = ["rustc-dev", "rust-src"]
-        .into_iter()
-        .filter(|component| !installed.lines().any(|line| line.starts_with(component)))
-        .filter(|component| !component_in_sysroot(component))
-        .collect();
-    if !missing.is_empty() {
-        let toolchain = rustup_toolchain();
-        let toolchain = toolchain.trim();
-        bail!(
-            "missing toolchain component(s) required to build trust-mc: {missing}\n\
-             \n\
-             trust-mc-compiler is a rustc driver (it links rustc internals via\n\
-             rustc_private and rebuilds std with -Z build-std), so these are required\n\
-             — the same way Kani needs them. Install with:\n\
-             \n    rustup component add {add} --toolchain {toolchain}\n",
-            missing = missing.join(", "),
-            add = missing.join(" "),
-        );
-    }
-    Ok(())
-}
-
-/// Linked toolchains (`rustup toolchain link`, e.g. the Trust stage2) have no
-/// rustup component model: `component list` reports nothing for them even when
-/// the artifacts are on disk. Probe the active sysroot before declaring a
-/// component missing — the same skip-don't-block intent as the rustup-absent
-/// branch above.
-fn component_in_sysroot(component: &str) -> bool {
-    let Ok(out) = Command::new("rustc").args(["--print", "sysroot"]).output() else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let sysroot = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    match component {
-        "rust-src" => sysroot.join("lib/rustlib/src/rust/library").is_dir(),
-        "rustc-dev" => {
-            // librustc_driver* under any lib/rustlib/<triple>/lib
-            let Ok(triples) = std::fs::read_dir(sysroot.join("lib/rustlib")) else {
-                return false;
-            };
-            triples.flatten().any(|t| {
-                std::fs::read_dir(t.path().join("lib")).map_or(false, |files| {
-                    files
-                        .flatten()
-                        .any(|f| f.file_name().to_string_lossy().starts_with("librustc_driver"))
-                })
-            })
-        }
-        _ => false,
-    }
-}
-
-/// Ensures everything is good to go before we begin to build the release bundle.
-/// Notably, builds trust-mc in release mode.
-fn prebundle(dir: &Path) -> Result<()> {
+/// Everything that decides WHAT is built — the seal ([`release::admit`]), the std
+/// sources, the remap flags — is settled before the long binary build, so a stock
+/// toolchain or a missing source is refused in seconds.
+fn prebundle(dir: &Path) -> Result<(ReleaseSeal, &'static str, PathBuf)> {
     if !Path::new("trust-mc-compiler").exists() {
         bail!("Run from project root directory. Couldn't find 'trust-mc-compiler'.");
     }
@@ -150,15 +155,44 @@ fn prebundle(dir: &Path) -> Result<()> {
         );
     }
 
-    build_tools(&["--release"])?;
+    let root = trust_mc_repo_root();
+    let seal = release::admit_this_launch(preflight_toolchain()?, &root)?;
+    println!(
+        "-- release seal: {} (commit {}, build {}, {} {})",
+        seal.compiler.sysroot.display(),
+        seal.commit,
+        seal.build().as_deref().unwrap_or("none"),
+        seal.identity.driver_name,
+        seal.identity.driver_sha256
+    );
+    let source = select_std_source(&seal.compiler, None)?;
+    let prepared = prepare_std_source(&source, &seal.compiler, &launching_cargo())?;
+    let library = seal.std_library(&source, prepared.as_deref());
+    let release = ReleaseFlags {
+        rustflags: seal.remap_flags(&release::HostPaths::of_this_host(&root), &library)?,
+        env: seal.cargo_env(),
+    };
+    println!("-- release std sources: {}", library.display());
+    let ay = private_ay::prepare(&root, &seal)?;
+    build_tools(&["--release"], Some(&release))?;
 
-    // Before we begin, ensure trust-mc is built successfully in release mode.
-    // And that libraries have been built too.
-    build_lib(&build_bin(&["--release"])?)
+    // Before we begin, ensure trust-mc is built successfully in release mode,
+    // and build the libraries with that very trust-mc-compiler. It carries only
+    // the relative rpath an installed bundle uses, so link the seal where that
+    // rpath looks first.
+    let bin_folder = build_bin(&["--release"], Some(&release))?;
+    seal.link_toolchain(&trust_mc_sysroot())?;
+    require_driver_commit(&seal.compiler, &bin_folder.join("trust-mc-compiler"))?;
+    build_lib(&bin_folder, Some(&library), Some(&release))?;
+    let label = match source {
+        StdSource::Sysroot => "seal-rust-src",
+        StdSource::Checkout(_) => "trust-checkout-at-commit",
+    };
+    Ok((seal, label, ay))
 }
 
 /// Copy trust-mc files into `dir`
-fn bundle_trust_mc(dir: &Path) -> Result<()> {
+fn bundle_trust_mc(dir: &Path, seal: &ReleaseSeal, std_source: &str) -> Result<()> {
     let bin = dir.join("bin");
     std::fs::create_dir(&bin)?;
 
@@ -184,23 +218,18 @@ fn bundle_trust_mc(dir: &Path) -> Result<()> {
     cp_dir(&trust_mc_sysroot_lib(), dir)?;
     cp_dir(trust_mc_playback_lib().parent().expect("playback lib path must have parent"), dir)?;
     cp_dir(trust_mc_no_core_lib().parent().expect("no_core lib path must have parent"), dir)?;
+    // librustc_codegen_trust_mc.dylib, which `build_bin` put there.
+    cp_dir(&trust_mc_sysroot().join("codegen-backends"), dir)?;
 
-    // 5. Record the exact toolchain and rustc version we use
-    std::fs::write(dir.join("rust-toolchain-version"), rustup_toolchain())?;
-    std::fs::write(dir.join("rustc-version"), get_rustc_version()?)?;
+    // 5. Record the exact toolchain: the channel consumers link (`trust`), the
+    //    seal itself (commit, build, driver), and the version line of the seal
+    //    compiler under the name an install runs and setup checks (`bin/rustc`).
+    std::fs::write(dir.join("rust-toolchain-version"), bundle_toolchain_name()?)?;
+    std::fs::write(dir.join(release::SEAL_RECORD), seal.record(std_source))?;
+    std::fs::write(dir.join("rustc-version"), seal.installed_rustc_version()?)?;
 
     // 6. Include a licensing note
     cp(Path::new("tools/build-trust-mc/license-notes.txt"), dir)?;
-
-    Ok(())
-}
-
-/// Copy Kissat binary into `dir`
-fn bundle_kissat(dir: &Path) -> Result<()> {
-    let bin = dir.join("bin");
-
-    // We use these directly
-    cp(&which::which("kissat")?, &bin)?;
 
     Ok(())
 }
@@ -209,7 +238,10 @@ fn bundle_kissat(dir: &Path) -> Result<()> {
 /// This should include all files as `dir/<path>` in the tarball.
 /// e.g. `trust-mc-1.0/bin/trust-mc-compiler` not just `bin/trust-mc-compiler`.
 fn create_release_bundle(dir: &Path, bundle: &str) -> Result<()> {
-    Command::new("tar").args(["zcf", bundle]).arg(dir).run_with_timeout(TAR_TIMEOUT)
+    Command::new("tar")
+        .args(["zcf", bundle])
+        .arg(dir)
+        .run_with_watchdog(Watchdog::fixed(TAR_TIMEOUT))
 }
 
 /// Timeout for tar operations (5 minutes).
@@ -219,52 +251,21 @@ const BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Helper trait to fallibly run commands
 pub(crate) trait AutoRun {
-    fn run_with_timeout(&mut self, timeout: Duration) -> Result<()>;
+    fn run_with_watchdog(&mut self, watchdog: Watchdog) -> Result<()>;
 }
 
 impl AutoRun for Command {
-    /// Run with timeout. On non-Unix, process may not be killed on timeout.
-    fn run_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+    /// Run under `watchdog`, which kills the command and its descendants on
+    /// timeout (on Unix; elsewhere the process may not be killed).
+    fn run_with_watchdog(&mut self, watchdog: Watchdog) -> Result<()> {
         let cmd_str = render_command(self);
 
-        let mut child = self.stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn()?;
-
-        #[cfg(unix)]
-        let child_pid = child.id();
-
-        let (tx, rx) = mpsc::channel();
-
-        // Use wait() since we inherit stdio and don't need output capture
-        std::thread::spawn(move || {
-            let result = child.wait();
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(timeout) {
-            Ok(result) => {
-                let status = result?;
-                if !status.success() {
-                    bail!("Failed command: {}", cmd_str.to_string_lossy());
-                }
-                Ok(())
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                #[cfg(unix)]
-                {
-                    unsafe {
-                        libc::kill(child_pid as i32, libc::SIGKILL);
-                    }
-                }
-                bail!(
-                    "Command timed out after {:.0}s: {}",
-                    timeout.as_secs_f64(),
-                    cmd_str.to_string_lossy()
-                )
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("Command thread panicked unexpectedly: {}", cmd_str.to_string_lossy())
-            }
+        let child = self.stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn()?;
+        let status = watchdog.wait(child, &format!("Command {}", cmd_str.to_string_lossy()))?;
+        if !status.success() {
+            bail!("Failed command: {}", cmd_str.to_string_lossy());
         }
+        Ok(())
     }
 }
 
@@ -283,23 +284,56 @@ fn cp(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Record version of rustc being used to build trust-mc
-fn get_rustc_version() -> Result<String> {
-    let output = Command::new("rustc").arg("--version").output();
-    let rustc_version = String::from_utf8(output.expect("failed to run rustc --version").stdout)?;
-    Ok(rustc_version)
+/// The toolchain name a bundle records in `rust-toolchain-version`: `trust`, the
+/// channel this repository pins, and nothing else. A `RUSTUP_TOOLCHAIN` naming
+/// another toolchain is refused, not recorded (it once stamped
+/// `nightly-2025-12-03`, sending consumers to a stock toolchain), and so is a
+/// checkout pinned to another channel ([`release::toolchain_name`]).
+fn bundle_toolchain_name() -> Result<String> {
+    let pin = trust_mc_repo_root().join("rust-toolchain.toml");
+    let text =
+        std::fs::read_to_string(&pin).with_context(|| format!("cannot read {}", pin.display()))?;
+    let selected = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    release::toolchain_name(selected.as_deref(), pinned_channel(&text).as_deref())
+        .map(str::to_string)
 }
 
-/// The rustup toolchain this build was produced with. Prefers the value baked at
-/// build time (set when built under rustup), then the runtime `RUSTUP_TOOLCHAIN`,
-/// then `stable`. Using `option_env!` instead of `env!` lets this tool build
-/// outside a rustup shell (e.g. under `RUSTC_BOOTSTRAP`) without a hard
-/// compile-time failure — matching `trust-mc-driver`'s `rustup_toolchain()`.
-fn rustup_toolchain() -> String {
-    option_env!("RUSTUP_TOOLCHAIN")
-        .map(str::to_string)
-        .or_else(|| std::env::var("RUSTUP_TOOLCHAIN").ok())
-        .unwrap_or_else(|| "stable".to_string())
+/// The version a bundle is named for: `explicit`, else trust-mc's own
+/// `[package] version`. It used to default to this tool's CARGO_PKG_VERSION
+/// (`0.1.0`), naming a 0.7.0 bundle `trust-mc-0.1.0`.
+fn bundle_version(explicit: Option<String>) -> Result<String> {
+    if let Some(version) = explicit {
+        return Ok(version);
+    }
+    let manifest = trust_mc_repo_root().join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("cannot read {}", manifest.display()))?;
+    package_version(&text)
+        .ok_or_else(|| anyhow::format_err!("{} has no [package] version", manifest.display()))
+}
+
+/// `version = "…"` of a manifest's `[package]` table.
+fn package_version(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    manifest.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            return None;
+        }
+        let value = in_package.then_some(line)?.strip_prefix("version")?.trim_start();
+        let value = value.strip_prefix('=')?.trim().strip_prefix('"')?;
+        value.split('"').next().filter(|v| !v.is_empty()).map(str::to_string)
+    })
+}
+
+/// `channel = "trust"` from a `rust-toolchain.toml`.
+fn pinned_channel(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("channel")?.trim_start().strip_prefix('=')?;
+        let value = value.trim().strip_prefix('"')?;
+        value.split('"').next().filter(|channel| !channel.is_empty()).map(str::to_string)
+    })
 }
 
 /// Invoke `cp -r`
@@ -309,7 +343,7 @@ fn cp_dir(src: &Path, dst: &Path) -> Result<()> {
     cmd.push(" ");
     cmd.push(dst.as_os_str());
 
-    Command::new("bash").arg("-c").arg(cmd).run_with_timeout(BASH_TIMEOUT)
+    Command::new("bash").arg("-c").arg(cmd).run_with_watchdog(Watchdog::fixed(BASH_TIMEOUT))
 }
 
 /// Render a Command as a string, to log it
@@ -342,8 +376,56 @@ pub(crate) fn render_command(cmd: &Command) -> OsString {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a panicking assertion is the point in tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_channel_reads_rust_toolchain_toml() {
+        assert_eq!(pinned_channel("[toolchain]\nchannel = \"trust\"\n").as_deref(), Some("trust"));
+        assert_eq!(pinned_channel("# channel = x\n[toolchain]\n").as_deref(), None);
+        assert_eq!(
+            pinned_channel("[toolchain]\nchannel=\"nightly-2025-12-03\"").as_deref(),
+            Some("nightly-2025-12-03")
+        );
+        let pin =
+            std::fs::read_to_string(trust_mc_repo_root().join("rust-toolchain.toml")).unwrap();
+        assert_eq!(pinned_channel(&pin).as_deref(), Some("trust"));
+    }
+
+    /// The default bundle version is trust-mc's own, not this tool's 0.1.0.
+    #[test]
+    fn a_bundle_is_named_for_trust_mc_s_own_version() {
+        let manifest = "[workspace.package]\nversion = \"9.9.9\"\n[package]\nname = \"trust-mc\"\n\
+                        version = \"0.7.0\"\n[dependencies]\nversion = \"1\"\n";
+        assert_eq!(package_version(manifest).as_deref(), Some("0.7.0"));
+        assert_eq!(package_version("[dependencies]\nversion = \"1\"\n"), None);
+        let ours = std::fs::read_to_string(trust_mc_repo_root().join("Cargo.toml")).unwrap();
+        let version = bundle_version(None).unwrap();
+        assert_eq!(Some(version.as_str()), package_version(&ours).as_deref());
+        assert_eq!(bundle_version(Some("2.0.0".to_string())).unwrap(), "2.0.0");
+    }
+
+    /// Regression (REL-C1): `bundle_toolchain_name` recorded `RUSTUP_TOOLCHAIN`
+    /// verbatim, so a release bundle built with the frozen nightly selected
+    /// stamped `nightly-2025-12-03` into `rust-toolchain-version` and sent every
+    /// consumer to a stock toolchain. It must refuse instead; with nothing
+    /// selected it stamps the Trust channel.
+    #[test]
+    fn a_release_bundle_never_stamps_a_stock_rustup_toolchain() {
+        let saved = std::env::var_os("RUSTUP_TOOLCHAIN");
+        // SAFETY: no other test in this binary reads or writes RUSTUP_TOOLCHAIN.
+        unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", "nightly-2025-12-03") };
+        let stamped = bundle_toolchain_name();
+        unsafe { std::env::remove_var("RUSTUP_TOOLCHAIN") };
+        let unselected = bundle_toolchain_name();
+        if let Some(saved) = saved {
+            unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", saved) };
+        }
+        let error = stamped.expect_err("a stock RUSTUP_TOOLCHAIN must be refused, not stamped");
+        assert!(format!("{error:#}").contains("RUSTUP_TOOLCHAIN=nightly-2025-12-03"), "{error:#}");
+        assert_eq!(unselected.unwrap(), "trust");
+    }
 
     #[test]
     fn test_render_command_simple() {

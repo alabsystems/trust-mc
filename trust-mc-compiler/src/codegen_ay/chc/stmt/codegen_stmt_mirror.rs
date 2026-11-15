@@ -22,6 +22,10 @@ use super::ChcCtx;
 use super::codegen_decl_flatten::collect_leaf_sorts;
 use super::codegen_types::CodegenTypes;
 
+/// Largest array expanded into element-typed flat-memory cells.
+/// Raw element reads may rely on this mirror only within the same bound.
+pub(in crate::codegen_ay::chc) const ARRAY_ELEMENT_MEMORY_MIRROR_LIMIT: usize = 256;
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Mirror aggregate operand values into field-addressed memory slots.
     ///
@@ -143,11 +147,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Cap expansion to avoid solver blowup for large arrays.
         // 256 matches the raw_eq element-wise comparison limit in
         // try_raw_eq_array (Part of #1739).
-        const MAX_EXPANSION: usize = 256;
-        if array_len > MAX_EXPANSION {
+        if array_len > ARRAY_ELEMENT_MEMORY_MIRROR_LIMIT {
             debug!(
                 array_len,
-                max = MAX_EXPANSION,
+                max = ARRAY_ELEMENT_MEMORY_MIRROR_LIMIT,
                 "CHC: skipping array→flat memory bridge for large array (Part of #2958)"
             );
             return;
@@ -323,11 +326,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// struct local needs to inherit this alias so that later field accesses
     /// (e.g., `self.stores.get(&k)`) can find the presence array through the
     /// struct local.
+    ///
+    /// The side state is one presence / length / capacity var per LOCAL, so a
+    /// struct can carry one collection's. An aggregate with two collection
+    /// fields aliased the first and equated the struct's length with both
+    /// (`propagate_collection_len_cap_from_flattened_aggregate`): `Two { a:
+    /// vec![1, 2, 3], b: Vec::new() }` made every path that built it
+    /// infeasible, so the checks after it on that path were lost, and an
+    /// unconditional one left the harness VACUOUS (walker fail-closed repair
+    /// round 5, `two_collection_fields_dual.rs`). A kind that two operands
+    /// carry is now aliased to neither ([`aggregate_side_state_carriers`]);
+    /// the fields are read where they live (the struct-embedded paths).
     pub(in crate::codegen_ay::chc) fn propagate_collection_presence_from_aggregate(
         &mut self,
         dest_local: usize,
         operands: &[Operand],
     ) {
+        let carriers = self.aggregate_side_state_carriers(operands);
         for operand in operands {
             let src_local = match operand {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
@@ -336,8 +351,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => continue,
             };
             // Propagate presence alias (BTreeMap/HashMap/HashSet).
-            if let Some(presence_var) =
-                self.collections.len_state.get_present_var(src_local).cloned()
+            if carriers.present <= 1
+                && let Some(presence_var) =
+                    self.collections.len_state.get_present_var(src_local).cloned()
             {
                 if self.collections.len_state.get_present_var(dest_local).is_none() {
                     self.collections
@@ -353,18 +369,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             // Propagate len alias.
-            if let Some(len_var) = self.collections.len_state.get_len_var(src_local).cloned() {
+            if carriers.len <= 1
+                && let Some(len_var) = self.collections.len_state.get_len_var(src_local).cloned()
+            {
                 if self.collections.len_state.get_len_var(dest_local).is_none() {
                     self.collections.len_state.len_var_names.insert(dest_local, len_var);
                 }
             }
             // Propagate cap alias (Vec).
-            if let Some(cap_var) = self.collections.len_state.get_cap_var(src_local).cloned() {
+            if carriers.cap <= 1
+                && let Some(cap_var) = self.collections.len_state.get_cap_var(src_local).cloned()
+            {
                 if self.collections.len_state.get_cap_var(dest_local).is_none() {
                     self.collections.len_state.cap_var_names.insert(dest_local, cap_var);
                 }
             }
         }
+    }
+
+    /// How many of an aggregate's operands (whole locals) carry each kind of
+    /// collection side state: a presence, length or capacity var.
+    pub(in crate::codegen_ay::chc) fn aggregate_side_state_carriers(
+        &self,
+        operands: &[Operand],
+    ) -> SideStateCarriers {
+        let mut carriers = SideStateCarriers::default();
+        for operand in operands {
+            let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+                continue;
+            };
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let len_state = &self.collections.len_state;
+            carriers.present += usize::from(len_state.get_present_var(place.local).is_some());
+            carriers.len += usize::from(len_state.get_len_var(place.local).is_some());
+            carriers.cap += usize::from(len_state.get_cap_var(place.local).is_some());
+        }
+        carriers
     }
 
     /// Propagate collection ghost state when a Vec is extracted through struct field projection.
@@ -494,4 +536,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         );
         Some(expr)
     }
+}
+
+/// The operands of one aggregate that carry each kind of collection side
+/// state ([`ChcCtx::aggregate_side_state_carriers`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::codegen_ay::chc) struct SideStateCarriers {
+    pub(in crate::codegen_ay::chc) present: usize,
+    pub(in crate::codegen_ay::chc) len: usize,
+    pub(in crate::codegen_ay::chc) cap: usize,
 }

@@ -7,9 +7,9 @@
 use super::super::classifier::smt_file_uses_horn_logic;
 use super::super::datatypes;
 use super::super::declarations::{
-    build_cover_sat_query, build_cover_sat_query_for_chc, extract_cover_declarations,
-    extract_coverage_declarations_from_content, extract_violation_declarations,
-    strip_cover_assertions_for_chc_solver,
+    build_cover_sat_query, build_cover_sat_query_for_chc, build_cover_witness_query,
+    extract_cover_declarations, extract_coverage_declarations_from_content,
+    extract_violation_declarations, strip_cover_assertions_for_chc_solver,
 };
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -278,6 +278,73 @@ fn test_build_cover_sat_query_preserves_constraint_assertions() {
     assert!(!query.contains("(assert (or ay_violation_kani_assert_0))"));
 }
 
+/// Implication definitions remain constraints when the named question is
+/// removed. In particular, an impossible failure must not make a feasible
+/// harness or cover look unreachable.
+#[cfg(feature = "ay-chc-native")]
+#[test]
+fn split_property_definition_keeps_primary_and_secondary_query_semantics() {
+    use super::super::declarations::build_harness_reachability_query;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn verdicts(smt: &str) -> Vec<String> {
+        let commands = ay_frontend::parse(smt).expect("well-formed secondary query");
+        let mut executor = ay::executor::Executor::new();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        executor.set_interrupt(Arc::clone(&interrupt));
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let timer_interrupt = Arc::clone(&interrupt);
+        let timer = std::thread::spawn(move || {
+            if cancel_rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                timer_interrupt.store(true, Ordering::Relaxed);
+            }
+        });
+        let outputs = executor.execute_all(&commands);
+        let _ = cancel_tx.send(());
+        timer.join().expect("timer thread");
+        assert!(!interrupt.load(Ordering::Relaxed), "AY timeout:\n{smt}");
+        outputs
+            .expect("AY execution")
+            .into_iter()
+            .filter(|s| matches!(s.as_str(), "sat" | "unsat" | "unknown"))
+            .collect()
+    }
+
+    let feasible_safe = "\
+(set-logic QF_BV)
+(declare-const x (_ BitVec 8))
+(assert (= x #x03))
+(declare-const ay_violation_kani_assert_0 Bool)
+(assert (=> ay_violation_kani_assert_0 (= x #x04)))
+(assert (=> (= x #x04) ay_violation_kani_assert_0))
+(declare-const ay_cover_0 Bool)
+(assert (= ay_cover_0 (= x #x03)))
+(declare-const ay_reach_kani_assert_0 Bool)
+(assert (= ay_reach_kani_assert_0 (= x #x03)))
+(assert ay_violation_kani_assert_0)
+(check-sat)
+";
+    for (source, expected_secondary) in [
+        (feasible_safe.to_owned(), "sat"),
+        (feasible_safe.replace("(check-sat)", "(assert (= x #x04))\n(check-sat)"), "unsat"),
+    ] {
+        assert_eq!(verdicts(&source), ["unsat"]);
+        let reach = build_harness_reachability_query(&source);
+        let covers = build_cover_sat_query(
+            &source,
+            &["ay_cover_0".to_owned(), "ay_reach_kani_assert_0".to_owned()],
+        );
+        for query in [&reach, &covers] {
+            assert!(query.contains("(assert (=> ay_violation_kani_assert_0 (= x #x04)))"));
+            assert!(query.contains("(assert (=> (= x #x04) ay_violation_kani_assert_0))"));
+            assert!(!query.contains("(assert ay_violation_kani_assert_0)"));
+        }
+        assert_eq!(verdicts(&reach), [expected_secondary]);
+        assert_eq!(verdicts(&covers), [expected_secondary, expected_secondary]);
+    }
+}
+
 #[test]
 fn test_strip_cover_assertions_for_chc_solver_keeps_query_and_rules() {
     let smt_content = "\
@@ -381,8 +448,10 @@ fn chc_cover_query_asks_one_check_sat_per_cover() {
 (declare-const ay_cover_1 Bool)
 (assert (= ay_cover_1 (bvult x #x05)))
 ";
-    let query =
-        build_cover_sat_query_for_chc(content, &["ay_cover_0".to_string(), "ay_cover_1".to_string()]);
+    let query = build_cover_sat_query_for_chc(
+        content,
+        &["ay_cover_0".to_string(), "ay_cover_1".to_string()],
+    );
     assert_eq!(query.matches("(check-sat)").count(), 2, "{query}");
     assert_eq!(query.matches("(push 1)").count(), 2, "{query}");
     assert_eq!(query.matches("(pop 1)").count(), 2, "{query}");
@@ -435,4 +504,60 @@ fn strip_cover_assertions_drops_a_cover_assert_that_wrapped_across_lines() {
     assert!(stripped.contains("(declare-const keep_me Bool)"), "{stripped}");
     assert!(stripped.contains("(query error)"), "{stripped}");
     assert!(stripped.contains("(rule (=> false error))"), "{stripped}");
+}
+
+#[test]
+fn property_witness_query_keeps_inputs_inside_its_own_asserted_scope() {
+    let input = "\
+(set-option :produce-models true)
+(declare-const ay_playback_value_0 (_ BitVec 8))
+(declare-const ay_playback_guard_0 Bool)
+(declare-const ay_playback_count (_ BitVec 64))
+(declare-const ay_violation_first Bool)
+(declare-const ay_violation_second Bool)
+(assert (= ay_violation_first (= ay_playback_value_0 #x89)))
+(assert (= ay_violation_second (= ay_playback_value_0 #x8a)))
+(assert (or ay_violation_first ay_violation_second))
+(check-sat)
+(get-value (ay_playback_count ay_playback_guard_0 ay_playback_value_0))
+(exit)
+";
+    let query = build_cover_witness_query(input, "ay_violation_second");
+    assert!(!query.contains("(assert (or ay_violation_first ay_violation_second))"));
+    assert!(query.contains("(assert (= ay_violation_first (= ay_playback_value_0 #x89)))"));
+    assert!(query.contains("(assert (= ay_violation_second (= ay_playback_value_0 #x8a)))"));
+    assert!(query.contains("(assert ay_violation_second)\n(check-sat)\n(get-value (ay_playback_count ay_playback_guard_0 ay_playback_value_0))\n(pop 1)"));
+    assert_eq!(query.matches("(check-sat)").count(), 1);
+    assert_eq!(query.matches("(get-value").count(), 1);
+    assert!(!build_cover_sat_query(input, &["ay_violation_second".into()]).contains("(get-value"));
+}
+
+#[test]
+fn multiline_witness_commands_and_disjunction_stay_whole() {
+    let input = "\
+(declare-const ay_playback_count (_ BitVec 64))
+(declare-const ay_playback_value_0 (_ BitVec 8))
+(declare-const ay_violation_first Bool)
+(declare-const ay_violation_second Bool)
+(assert (= ay_violation_first (= ay_playback_value_0 #x89)))
+(assert (= ay_violation_second (= ay_playback_value_0 #x8a)))
+(assert
+ (or
+  ay_violation_first
+  ay_violation_second))
+(check-sat
+)
+(get-value
+ (ay_playback_count
+  ay_playback_value_0))
+(exit
+)
+";
+    let query = build_cover_witness_query(input, "ay_violation_second");
+    assert!(!query.contains("(assert\n (or"));
+    assert!(!query.contains("(check-sat\n"));
+    assert!(query.contains("(assert (= ay_violation_first (= ay_playback_value_0 #x89)))"));
+    assert!(query.contains("(assert ay_violation_second)\n(check-sat)\n(get-value\n (ay_playback_count\n  ay_playback_value_0))\n(pop 1)"));
+    assert_eq!(query.matches("get-value").count(), 1);
+    assert_eq!(query.matches("check-sat").count(), 1);
 }

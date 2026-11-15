@@ -16,6 +16,7 @@
 //!
 //! Part of #3159: DynTrait category recovery Phase 1.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::{Expr, Sort, SortInner};
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -29,11 +30,8 @@ use super::codegen_call_virtual_inline::{
     InlineReturn, build_dispatch_ite_chain, is_fn_trait_call, receiver_base_local,
     translate_virtual_body_inline, try_fn_trait_direct_dispatch,
 };
-use super::codegen_ctx::diagnostics::CellCounter;
-use super::codegen_ctx::record_translation_drop_site_reason_for_fn;
 use super::codegen_rules::CodegenRules;
 use super::dyn_coercion::{self, ResolvedDispatchBody};
-use super::inline_body::{extract_inline_assert_guard, strip_inline_assert_fallback};
 use super::inline_field_map::populate_inline_self_field_hints;
 use super::inline_result_shared::{
     InlineResultEpilogueSpec, emit_prepared_inline_result, prepare_inline_result_epilogue,
@@ -67,10 +65,22 @@ impl<'tcx, 'body> CallDispatchVirtual for ChcCtx<'tcx, 'body> {
         // impls with MIR-coercion-derived candidates. This replaces the old
         // two-step pattern (find_concrete_virtual_impls then fallback) which
         // missed blanket impls when non-blanket impls existed for the same trait.
-        let Some(trait_def_id) = self.resolve_parent_trait_def_id(fn_def) else {
+        let Some(method_trait_def_id) = self.resolve_parent_trait_def_id(fn_def) else {
             return false;
         };
+        // Design 3 (dyn_dispatch_scope.rs): dispatch over the receiver's
+        // principal, whose candidate list the stored vtable ids index, and
+        // decide the default arm from the harness's dyn-coercion universe.
+        let Some(dispatch_trait) =
+            super::dyn_dispatch_scope::dispatch_trait_for_call(self, method_trait_def_id, &fn_args)
+        else {
+            self.record_sound_fallback_reason(super::dyn_dispatch_scope::DYN_PRINCIPAL_MISMATCH);
+            return false;
+        };
+        let trait_def_id = dispatch_trait.def_id;
         let candidates = dyn_coercion::collect_dyn_trait_candidates(self, trait_def_id);
+        let scope =
+            super::dyn_dispatch_scope::DynDispatchScope::new(self, &dispatch_trait, &candidates);
         let (concrete_bodies, dropped_candidate) =
             dyn_coercion::resolve_dispatch_bodies(self, &candidates, fn_def, &fn_args);
 
@@ -104,7 +114,9 @@ impl<'tcx, 'body> CallDispatchVirtual for ChcCtx<'tcx, 'body> {
 
         // Part of #3995: Short-circuit Fn/FnMut/FnOnce trait calls to the
         // direct fn-item body, bypassing the blanket impl shim.
-        if let Some(result) = self.try_fn_trait_shortcircuit(dcx, &candidates) {
+        if let Some(result) =
+            self.try_fn_trait_shortcircuit(dcx, &candidates, &concrete_bodies, &scope)
+        {
             self.emit_virtual_result(dcx, result, *target);
             return true;
         }
@@ -131,8 +143,16 @@ impl<'tcx, 'body> CallDispatchVirtual for ChcCtx<'tcx, 'body> {
             return false;
         }
 
-        if concrete_bodies.len() == 1 && !dropped_candidate {
-            // Single-impl: inline directly (original path).
+        // Single-impl: inline directly, only when the harness's dyn-coercion
+        // universe says this impl is the receiver's ONLY runtime type (design
+        // 3). A one-entry candidate list is not enough: a type coerced in a
+        // callee need not be in it. Anything else takes the guarded dispatch
+        // below, whose default arm fails closed unless the arms cover every
+        // runtime type.
+        if concrete_bodies.len() == 1
+            && !dropped_candidate
+            && scope.is_sole_runtime(concrete_bodies[0].vtable_id)
+        {
             let impl_body = &concrete_bodies[0].body;
 
             let Some(inline_result) = self.translate_and_inline_virtual(dcx, impl_body) else {
@@ -146,7 +166,7 @@ impl<'tcx, 'body> CallDispatchVirtual for ChcCtx<'tcx, 'body> {
 
         // Multi-impl: inline each body and build ITE case-split.
         let Some(inline_result) =
-            self.dispatch_multi_impl_virtual(dcx, &concrete_bodies, trait_def_id)
+            self.dispatch_multi_impl_virtual(dcx, &concrete_bodies, method_trait_def_id, &scope)
         else {
             debug!(bb_idx = dcx.bb_idx, "virtual call: multi-impl dispatch failed");
             return false;
@@ -330,7 +350,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dcx: &DispatchCallContext<'_>,
         concrete_bodies: &[ResolvedDispatchBody],
         trait_def_id: rustc_span::def_id::DefId,
+        scope: &super::dyn_dispatch_scope::DynDispatchScope,
     ) -> Option<InlineReturn> {
+        let native_vtable = self.checked_host_receiver_vtable(dcx, Some(trait_def_id));
         // Translate arguments once (shared across all inlined bodies).
         let mut param_exprs = Vec::with_capacity(dcx.args.len());
         for arg in dcx.args {
@@ -341,11 +363,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3159: pass receiver operand so we can look up its local in
         // dyn_vtable_ids when the receiver sort is BV64 (not Dyn_Trait DT).
         let receiver_local = dcx.args.first().and_then(receiver_base_local);
-        let vtable_disc = self.try_extract_vtable_discriminant_for_trait(
-            &param_exprs,
-            receiver_local,
-            Some(trait_def_id),
-        );
+        let vtable_disc = native_vtable.unwrap_or_else(|| {
+            self.try_extract_vtable_discriminant_for_trait(
+                &param_exprs,
+                receiver_local,
+                Some(trait_def_id),
+            )
+        });
 
         // Part of #3608: Mark type arrays read by each impl's virtual inline field map.
         for dispatch_body in concrete_bodies {
@@ -363,6 +387,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             vtable_disc,
             dcx.bb_idx,
             &empty_vtable_ids,
+            scope,
         )
     }
 
@@ -412,12 +437,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Fallback: fresh declared symbolic — solver picks any value (sound).
         // Part of #3447: Record diagnostic — unconstrained vtable discriminant
         // means dispatch will explore all branches (sound over-approximation).
-        self.diagnostics.place_translation_drop.inc();
-        record_translation_drop_site_reason_for_fn(&self.fn_name, "virtual_missing_vtable");
-        super::declare_pending_var(
-            super::chc_fresh_name("__vtable_disc"),
-            Sort::bitvec(POINTER_WIDTH),
-        )
+        // `virtual_missing_vtable` is not on the audited list: the recorder
+        // counts it fail-closed (`place_translation_drop`), as the two lines
+        // this replaced did by hand, and records its site reason.
+        let booked = self.record_sound_fallback_reason("virtual_missing_vtable");
+        Havoc::booked(booked, super::chc_fresh_name("__vtable_disc"), Sort::bitvec(POINTER_WIDTH))
     }
 
     /// Part of #3995: Short-circuit Fn/FnMut/FnOnce trait calls to the direct
@@ -428,11 +452,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         dcx: &DispatchCallContext<'_>,
         candidates: &[dyn_coercion::DynCandidate],
+        concrete_bodies: &[ResolvedDispatchBody],
+        scope: &super::dyn_dispatch_scope::DynDispatchScope,
     ) -> Option<InlineReturn> {
         if !dcx.callee_path.as_deref().is_some_and(is_fn_trait_call) {
             return None;
         }
-        let candidate_types: Vec<_> = candidates.iter().map(|c| c.concrete_ty).collect();
+        // Only candidates whose `Fn*::call` resolved for this signature.
+        let candidate_types: Vec<_> = candidates
+            .iter()
+            .filter(|c| concrete_bodies.iter().any(|b| b.vtable_id == c.vtable_id))
+            .map(|c| (c.concrete_ty, c.vtable_id))
+            .collect();
         let param_exprs: Option<Vec<Expr>> = dcx
             .args
             .iter()
@@ -443,10 +474,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let closure_captures = dcx.args.first().map_or_else(Vec::new, |receiver| {
             self.extract_closure_env_captures(receiver, dcx.modified_locals)
         });
+        // Several candidates are merged under their dispatch conditions, which
+        // needs the receiver's discriminant (read only then: a one-candidate
+        // call walks its body unconditionally, as before).
+        //
+        // Only the receiver's own vtable sources are read: the generic
+        // extraction would also CONSUME the spawn scheduler's next run vtable,
+        // which belongs to a later `Future::poll` call, not to this one.
+        let sole = candidate_types.len() == 1 && scope.is_sole_runtime(candidate_types[0].1);
+        let vtable_disc = (!sole).then(|| {
+            let receiver_local = dcx.args.first().and_then(receiver_base_local);
+            self.fn_trait_vtable_discriminant(&param_exprs, receiver_local)
+        });
+        let mut_ref_args =
+            dcx.args.get(1).map(|arg| self.host_rustcall_mut_ref_args(arg)).unwrap_or_default();
+        let receiver_origin = dcx.args.first().and_then(|arg| self.host_native_dyn_origin(arg));
         let result = try_fn_trait_direct_dispatch(
             self,
             &candidate_types,
+            scope,
+            vtable_disc.as_ref(),
             &param_exprs,
+            receiver_origin.as_ref(),
+            &mut_ref_args,
             &closure_captures,
             &empty_vtable_ids,
             0,
@@ -460,12 +510,40 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         result
     }
 
+    /// The receiver's vtable discriminant for the Fn-trait short-circuit: the
+    /// embedded or tracked vtable, else a fresh value recorded as
+    /// `virtual_missing_vtable` (every candidate stays possible), as
+    /// [`Self::try_extract_vtable_discriminant_for_trait`] does, but without
+    /// consuming the spawn scheduler's vtable model.
+    fn fn_trait_vtable_discriminant(
+        &mut self,
+        param_exprs: &[Expr],
+        receiver_local: Option<usize>,
+    ) -> Expr {
+        if let Some(receiver) = param_exprs.first()
+            && let Some(vtable_expr) = self.extract_embedded_vtable_expr(receiver)
+        {
+            return vtable_expr.into_expr();
+        }
+        if let Some(vtable_expr) =
+            receiver_local.and_then(|local| self.known_vtable_expr_for_local(local))
+        {
+            return vtable_expr;
+        }
+        // `virtual_missing_vtable` is not on the audited list: the recorder
+        // counts it fail-closed (`place_translation_drop`), as the two lines
+        // this replaced did by hand, and records its site reason.
+        let booked = self.record_sound_fallback_reason("virtual_missing_vtable");
+        Havoc::booked(booked, super::chc_fresh_name("__vtable_disc"), Sort::bitvec(POINTER_WIDTH))
+    }
+
     /// Translate arguments and inline the virtual method body.
     fn translate_and_inline_virtual(
         &mut self,
         dcx: &DispatchCallContext<'_>,
         impl_body: &rustc_public::mir::Body,
     ) -> Option<InlineReturn> {
+        let _ = self.checked_host_receiver_vtable(dcx, None);
         let mut param_exprs = Vec::with_capacity(dcx.args.len());
         for arg in dcx.args {
             param_exprs.push(self.translate_operand_with_modified(arg, dcx.modified_locals)?);
@@ -475,7 +553,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.mark_inline_field_reads(impl_body, &param_exprs, dcx.bb_idx);
         populate_inline_self_field_hints(self, dcx);
         let empty_vtable_ids = std::collections::HashMap::new();
-        translate_virtual_body_inline(
+        // F2 (inline_walk_guard.rs): the dyn door binds raw operand terms.
+        self.inline_walk_param_address_seeds =
+            Some(super::inline_walk_guard::dyn_door_address_seeds(self, impl_body, &param_exprs));
+        let result = translate_virtual_body_inline(
             self,
             impl_body,
             &param_exprs,
@@ -483,7 +564,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             &empty_vtable_ids,
             None,
             0,
-        )
+        );
+        self.inline_walk_param_address_seeds = None;
+        result
+    }
+
+    /// A unique native coercion retains its vtable through the compiler's
+    /// actual Box cast and payload reborrow. Selecting its real arm avoids
+    /// publishing approximations from an unreachable implementation. Recheck
+    /// current allocation metadata here, before any field-value shortcut.
+    fn checked_host_receiver_vtable(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+        expected_trait: Option<rustc_span::def_id::DefId>,
+    ) -> Option<Expr> {
+        let origin = self.host_native_dyn_receiver_origin(dcx.args.first()?)?;
+        if let Some(expected) = expected_trait {
+            let principal = origin.dynamic.kind().trait_principal()?;
+            let actual = rustc_public::rustc_internal::internal(
+                self.tcx,
+                rustc_public::CrateDef::def_id(&principal.value.def_id),
+            );
+            if actual != expected {
+                self.record_sound_fallback_reason(
+                    super::dyn_dispatch_scope::DYN_PRINCIPAL_MISMATCH,
+                );
+                return None;
+            }
+        }
+        let address =
+            Expr::bitvec_const(origin.allocation, 32).concat(Expr::bitvec_const(0u32, 32));
+        let Some(checked) = self.checked_native_dyn_pointer(address, &origin) else {
+            self.record_sound_fallback_reason("box_deref_validity_unmodeled");
+            return None;
+        };
+        self.heap_state.pending_checks.extend(checked.checks);
+        Some(origin.vtable_expr())
     }
 
     /// Emit the CHC rule constraining the destination to the virtual call result.
@@ -502,11 +618,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             inline_result;
         // Assert-guard SIDE-CHANNEL host emission (see emit_deferred_inline_check_errors).
         self.emit_deferred_inline_check_errors(dcx, deferred_checks);
-        let inline_assert_guard = extract_inline_assert_guard(&result_expr);
-        let result_expr = strip_inline_assert_fallback(&result_expr).unwrap_or(result_expr);
+        let (result_expr, extra_constraints) = self.take_inline_result_guards(dcx, result_expr);
         let result_expr =
             widen_inline_result_for_fat_pointer(self, dest_local, result_expr, &vtable);
-        let extra_constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
         let empty_pre_resolved = std::collections::BTreeMap::new();
         let prepared = prepare_inline_result_epilogue(
             self,

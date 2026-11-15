@@ -24,7 +24,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ty: rustc_public::ty::Ty,
     ) -> Option<rustc_public::mir::Body> {
         match ty.kind() {
-            TyKind::RigidTy(RigidTy::Coroutine(def, _)) => def.body(),
+            // With the unit's `#[kani::stub]`s applied (`CalleeBody` does this
+            // for every callee body; a coroutine def is fetched raw).
+            TyKind::RigidTy(RigidTy::Coroutine(coroutine_def, _)) => {
+                coroutine_def.body().map(crate::kani_middle::transform::apply_unit_stubs)
+            }
             _ => None,
         }
     }

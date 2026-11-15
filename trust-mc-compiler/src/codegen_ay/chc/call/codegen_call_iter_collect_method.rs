@@ -17,6 +17,10 @@
 
 mod emit;
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -87,6 +91,15 @@ impl<'tcx, 'body> CallDispatchIterCollectMethod for ChcCtx<'tcx, 'body> {
         if !handled {
             return false;
         }
+        // The model states the map/collect pattern only; any other check in
+        // the method's body is dropped with it (`assert!(self.x != 100)`
+        // before the collect verified SUCCESSFUL clean where Kani fails,
+        // walker_caller_fallback_dual.rs). A method that can fail for its
+        // caller fails closed.
+        if self.iter_collect_callee_may_fail(dcx) {
+            debug!(callee = %callee_name, "iter_collect_method: the method can fail — fail closed");
+            self.record_sound_fallback_reason(ITER_COLLECT_METHOD_UNSTATED_CHECK);
+        }
 
         debug!(
             fn_name = %self.fn_name,
@@ -98,7 +111,31 @@ impl<'tcx, 'body> CallDispatchIterCollectMethod for ChcCtx<'tcx, 'body> {
     }
 }
 
+/// Fail-closed record of an iter-collect-method model whose method can fail
+/// for its caller.
+pub(in crate::codegen_ay::chc) const ITER_COLLECT_METHOD_UNSTATED_CHECK: &str =
+    "iter_collect_method_unstated_check";
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Can the method this dispatcher models fail for its caller
+    /// (`obligation_free_walk::callee_may_fail_for_caller`)? `true` when it
+    /// does not resolve.
+    fn iter_collect_callee_may_fail(&self, dcx: &DispatchCallContext<'_>) -> bool {
+        let Ok(func_ty) = dcx.func.ty(self.body.locals()) else {
+            return true;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_substs)) = func_ty.kind() else {
+            return true;
+        };
+        Instance::resolve(fn_def, &fn_substs).ok().is_none_or(|instance| {
+            crate::codegen_ay::obligation_free_walk::callee_may_fail_for_caller(
+                self.tcx,
+                instance,
+                &crate::kani_middle::transform::walker_stub_map(),
+            )
+        })
+    }
+
     /// Validate that this call is a candidate for iter-collect-method dispatch.
     /// Returns the callee name, body, and detected pattern on success.
     fn validate_iter_collect_candidate(
@@ -128,7 +165,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        let callee_body = instance.body()?;
+        let callee_body = instance.callee_body()?;
         let pattern = detect_iter_map_collect(&callee_body)?;
 
         if pattern.source_count > dcx.args.len() {
@@ -201,7 +238,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut resolved_body = None;
         for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
             if let Ok(instance) = Instance::resolve_closure(closure_def, &closure_args, kind) {
-                if let Some(body) = instance.body() {
+                if let Some(body) = instance.callee_body() {
                     resolved_body = Some(body);
                     break;
                 }
@@ -347,11 +384,13 @@ fn type_contains_vec(ty: &rustc_public::ty::Ty) -> bool {
             def.trimmed_name() == "Vec"
                 || def.variants().first().is_some_and(|v| {
                     v.fields().iter().any(|f| {
-                        matches!(
-                            f.ty_with_args(&args).kind(),
-                            TyKind::RigidTy(RigidTy::Adt(inner_def, _))
-                            if inner_def.trimmed_name() == "Vec"
-                        )
+                        mono_ty::field_ty(f, &args).is_some_and(|t| {
+                            matches!(
+                                t.kind(),
+                                TyKind::RigidTy(RigidTy::Adt(inner_def, _))
+                                if inner_def.trimmed_name() == "Vec"
+                            )
+                        })
                     })
                 })
         }
@@ -367,11 +406,13 @@ fn find_vec_field_idx(ty: &rustc_public::ty::Ty) -> Option<usize> {
                 return Some(0);
             }
             def.variants().first()?.fields().iter().position(|f| {
-                matches!(
-                    f.ty_with_args(&args).kind(),
-                    TyKind::RigidTy(RigidTy::Adt(inner_def, _))
-                    if inner_def.trimmed_name() == "Vec"
-                )
+                mono_ty::field_ty(f, &args).is_some_and(|t| {
+                    matches!(
+                        t.kind(),
+                        TyKind::RigidTy(RigidTy::Adt(inner_def, _))
+                        if inner_def.trimmed_name() == "Vec"
+                    )
+                })
             })
         }
         _ => None,

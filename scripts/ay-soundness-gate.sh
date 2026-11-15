@@ -22,7 +22,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
-TRUST_MC_CARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" cargo)"
+TRUST_MC_TARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" targo)"
 
 # Soundness regression files — must match tests/ay/soundness_ledger.toml.
 # The ledger test enforces this list matches the ledger exactly.
@@ -58,8 +58,9 @@ export AY_SOLVER AY_TEST_TIMEOUT
 echo "[soundness-gate] AY_SOLVER=${AY_SOLVER}"
 echo "[soundness-gate] AY_TEST_TIMEOUT=${AY_TEST_TIMEOUT}"
 
-# PRECONDITION: the driver resolves its SMT backend with `which::which("ay")`
-# (trust-mc-driver/src/args/solver.rs), so without `ay` on PATH every harness
+# PRECONDITION: the driver runs `$TRUST_MC_AY_BIN` when it is set and otherwise
+# `ay` on PATH (trust-mc-driver/src/ay_binary.rs), and refuses a build that is
+# not the pinned AY commit. Without either, every harness
 # exits instantly with "AY solver not found in PATH". compiletest's
 # `kani-verify-fail` accepts ANY nonzero exit as the expected failure, so the
 # run reports "ok" in 0.01s and this gate then reports all N files VACUOUS —
@@ -68,7 +69,7 @@ echo "[soundness-gate] AY_TEST_TIMEOUT=${AY_TEST_TIMEOUT}"
 # its verdicts happen to match. Check both existence and the build commit up
 # front. `AY_BIN` does NOT satisfy this: it is read by the kani-domination
 # harness, not by the driver's backend resolution.
-if ! command -v ay >/dev/null 2>&1; then
+if [[ -z "${TRUST_MC_AY_BIN:-}" ]] && ! command -v ay >/dev/null 2>&1; then
     echo "[soundness-gate] ERROR: no \`ay\` on PATH — the driver would exit instantly on"
     echo "[soundness-gate]        every file and this gate would report VACUOUS for all of"
     echo "[soundness-gate]        them. Put the AY binary on PATH, e.g.:"
@@ -109,8 +110,8 @@ echo ""
 # Build the verifier ONCE; per-file runs then use --skip-build. The ledgered
 # files live in tests/ay/, so each run is `ay-compiletest.sh <suite=ay>` with a
 # --filter on the file name (ay-compiletest.sh takes a SUITE dir, not a file).
-echo "[soundness-gate] building trust-mc (cargo build-dev) ..."
-"${TRUST_MC_CARGO}" build-dev
+echo "[soundness-gate] building trust-mc (targo --unverified build-dev) ..."
+"${TRUST_MC_TARGO}" --unverified build-dev
 
 for file in "${SOUNDNESS_FILES[@]}"; do
     if [[ ! -f "${file}" ]]; then

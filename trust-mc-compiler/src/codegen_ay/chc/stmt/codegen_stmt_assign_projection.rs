@@ -13,6 +13,9 @@
 //!
 //! Extracted from codegen_stmt.rs to keep production LOC under 500.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::{Place, ProjectionElem};
@@ -29,7 +32,93 @@ use super::codegen_types::CodegenTypes;
 use super::stmt_accumulator::StmtAccumulator;
 use super::{ChcCtx, FieldProjection, UnknownProjectionPolicy, collect_field_projections};
 
+/// One projection element, reduced to the shape this decision needs. Keeps the
+/// rule below testable without a rustc type context (`ProjectionElem::Field`
+/// carries a `Ty`, which cannot be built outside one).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::codegen_ay::chc) enum ProjShape {
+    Index,
+    Other,
+}
+
+fn proj_shape(p: &ProjectionElem) -> ProjShape {
+    match p {
+        ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => ProjShape::Index,
+        _ => ProjShape::Other, // external enum: ProjectionElem
+    }
+}
+
+/// Does this store place NEST a projection under an element index in a shape no
+/// handler can encode exactly? See the call site in `encode_projection_assignment`.
+///
+/// `real_deref` says the leading `Deref` is a genuine pointer indirection (some
+/// range-lowered MIR carries a spurious one over a scalar local).
+pub(in crate::codegen_ay::chc) fn store_nests_under_element_index(
+    projection: &[ProjectionElem],
+    real_deref: bool,
+) -> bool {
+    let shapes: Vec<ProjShape> = projection.iter().map(proj_shape).collect();
+    store_nests_under_element_index_shape(&shapes, real_deref)
+}
+
+fn store_nests_under_element_index_shape(shapes: &[ProjShape], real_deref: bool) -> bool {
+    let Some(first_idx) = shapes.iter().position(|p| *p == ProjShape::Index) else {
+        return false;
+    };
+    let tail = &shapes[first_idx + 1..];
+    tail.contains(&ProjShape::Index) || (real_deref && !tail.is_empty())
+}
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Is `ty` a pointer, or a SHALLOW carrier of one?
+    ///
+    /// `mem::replace` of a `&mut T` stores a bare pointer; `Option::replace`
+    /// stores an `Option<&mut T>`; `mem::swap` of two `Box`es stores a `Box`.
+    /// All three rebind what the written storage points at. Bounded at depth 2
+    /// plus an explicit list of the pointer wrappers, so `Vec` and `String`,
+    /// whose raw pointer sits deeper and whose buffer identity this lane does
+    /// not key on a points-at edge, do not arm the guard.
+    pub(in crate::codegen_ay::chc) fn ty_carries_a_pointer_value(ty: rustc_public::ty::Ty) -> bool {
+        Self::ty_carries_a_pointer_value_at(ty, 0)
+    }
+
+    fn ty_carries_a_pointer_value_at(ty: rustc_public::ty::Ty, depth: u32) -> bool {
+        if depth > 2 {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)) => true,
+            TyKind::RigidTy(RigidTy::Tuple(tys)) => {
+                tys.iter().any(|t| Self::ty_carries_a_pointer_value_at(*t, depth + 1))
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                let name = def.name();
+                let trimmed = def.trimmed_name();
+                if matches!(
+                    name.as_str(),
+                    "std::boxed::Box"
+                        | "alloc::boxed::Box"
+                        | "std::rc::Rc"
+                        | "alloc::rc::Rc"
+                        | "std::sync::Arc"
+                        | "alloc::sync::Arc"
+                ) || trimmed == "NonNull"
+                    || trimmed == "Unique"
+                    || trimmed == "Box"
+                {
+                    return true;
+                }
+                def.variants().into_iter().any(|v| {
+                    v.fields().into_iter().any(|f| {
+                        mono_ty::field_ty(&f, &args)
+                            .is_none_or(|t| Self::ty_carries_a_pointer_value_at(t, depth + 1))
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// Return whether a projection base local represents a real dereference.
     ///
     /// Mirrors `deref_pointee_ty` for pointer-like wrappers without emitting
@@ -72,6 +161,45 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.record_sound_fallback_categorized(category);
     }
 
+    /// Write a projected store of interior-mutable data to the place's memory
+    /// image (see the call site in `encode_projection_assignment`). A store
+    /// that cannot be mirrored exactly fails closed.
+    fn mirror_interior_mut_projected_store(
+        &mut self,
+        lhs: &Place,
+        rhs_expr: &Expr,
+        acc: &mut StmtAccumulator<'_>,
+    ) {
+        let Ok(place_ty) = lhs.ty(self.body.locals()) else { return };
+        let place_ty = self.resolve_body_ty(place_ty);
+        if !self.ty_has_interior_mut(place_ty) {
+            return;
+        }
+        if Self::translate_ty(place_ty).as_ref() != Some(rhs_expr.sort()) {
+            self.record_sound_fallback_reason("interior_mut_projected_store_unmirrored");
+            return;
+        }
+        let modified = acc.modified.clone();
+        let Some(loc) = self.translate_ref_to_address(lhs, &modified) else {
+            self.record_sound_fallback_reason("interior_mut_projected_store_unmirrored");
+            return;
+        };
+        let addr = loc.into_expr();
+        let prev_suppress = self.suppress_heap_store_checks;
+        self.suppress_heap_store_checks = true;
+        #[allow(deprecated)]
+        if let Some(store) =
+            self.build_memory_store_untyped(addr.clone(), rhs_expr.clone(), place_ty)
+        {
+            acc.constraints.push(store);
+        }
+        if rhs_expr.sort().is_datatype() {
+            self.try_decompose_struct_store(&addr, rhs_expr, place_ty, acc.constraints);
+        }
+        self.suppress_heap_store_checks = prev_suppress;
+        debug!(?lhs, "CHC: interior-mutable projected store mirrored to memory");
+    }
+
     /// Encode a projection assignment (`_N.field = rhs`, `*ptr = rhs`, etc.).
     ///
     /// Dispatches to the appropriate handler for deref stores, array stores,
@@ -102,7 +230,141 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // non-raw-pointer bases and provably non-null pointers.
         if lhs_has_deref && lhs_base_is_pointer {
             self.emit_raw_ptr_null_deref_check(lhs, acc.modified);
+            // A store through a raw pointer to a local whose storage is dead
+            // (`{ let mut z = 0; p = &mut z; } *p = 1`): the load side has
+            // failed such a dereference since #762, the store side wrote the
+            // dead local's register and proved the program clean where Kani
+            // reports a dangling write (self-review of round 10 of
+            // fix/chc-false-certificates, `q_dangle.rs` dg01, dg03; the same on
+            // main f5dfb8d48).
+            self.push_dead_raw_target_check(lhs, acc.modified);
+            self.emit_const_object_deref_bound_check(lhs, acc.modified);
+            // A store through a pointer chosen on a path: the register and
+            // memory lanes below resolve ONE referent (the producer encoded
+            // last), so the store may miss the object it writes on another
+            // path. No proof or certified counterexample may rest on it.
+            if self.pointer_value_is_path_dependent(local_idx) {
+                self.record_sound_fallback_reason("deref_through_path_merged_pointer");
+            }
         }
+        // A projection NESTED UNDER an element index that no handler below can
+        // encode exactly. The handlers resolve ONE index and drop whatever
+        // follows it: `handle_field_index_store` refuses a trailing projection
+        // outright, and the ref_target route picks the FIRST index in
+        // `lhs.projection[1..]` and ignores the rest. The store then lands
+        // nowhere while the harness still claims a proof —
+        // `let r: &mut [[u8; 2]; 2] = &mut g; r[i][1] = 9; assert!(g[i][1] == 0)`
+        // verified SUCCESSFUL and `r[1].x = 9` certified a Genuine counterexample
+        // for its safe twin (negative/ref_index_ops.rs, main 31793ccc3).
+        //
+        // Exactly two shapes are unencodable, and both fail closed here:
+        //   * two element indices in one place (`(*r)[i][j]`, `g[i][j]`), and
+        //   * anything after the index under a REAL dereference (`(*r)[i].x`).
+        // `g[i].x = v` (index first, fields after, no dereference) IS exact —
+        // `handle_array_element_store` rebuilds the element — and `s.buf[i] = v`
+        // (index last) is exact too; neither is touched.
+        if store_nests_under_element_index(&lhs.projection, lhs_has_deref && lhs_base_is_pointer) {
+            warn!(?lhs, "CHC: store nested under an element index is not encodable — fail closed");
+            self.record_sound_fallback_reason("store_nested_under_element_index");
+        }
+        // The same nesting with the element index in the REFERENT rather than
+        // in the place: `let p = &mut a[1]; p.b[0] = 9;` is `[Deref, Field,
+        // Index]` over a pointer whose ref_target is already `a[1]`, so the
+        // rule above cannot see the outer index and no handler below resolves
+        // both. The store landed nowhere and `assert!(a[1].b[0] == 0)` verified
+        // SUCCESSFUL (adversarial review of m3/soundness-fixes-2, 2026-09-14).
+        if lhs_has_deref
+            && lhs_base_is_pointer
+            && lhs.projection.len() > 1
+            && lhs.projection[1..].iter().any(|p| {
+                matches!(p, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+            })
+            && self.ref_resolution.ref_targets.get(&local_idx).is_some_and(|t| {
+                t.projections.iter().any(|p| {
+                    matches!(p, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+                })
+            })
+        {
+            warn!(
+                ?lhs,
+                "CHC: store nested under a REFERENCED element index is not encodable — fail closed"
+            );
+            self.record_sound_fallback_reason("store_nested_under_referenced_element");
+        }
+
+        // A POINTER VALUE stored THROUGH a dereference rebinds what the written
+        // storage points at, and the points-at edges this lane keeps were
+        // computed from the BORROWS in the body — they know nothing about a
+        // pointer that travels through memory. `mem::replace`, `mem::take`,
+        // `Option::replace` and `ptr::replace` are INLINED, so no call
+        // terminator names them, and they all lower to exactly this store:
+        // `let old = mem::replace(&mut a, &mut y); *old = 7; *a = 9;
+        // assert!(y == 2)` verified SUCCESSFUL because `*a = 9` still resolved
+        // through `a`'s PRE-CALL target (adversarial review of
+        // m3/soundness-fixes-2, 2026-09-14; pre-existing on main). The written
+        // storage's edge is dropped, so a later store through it is unresolved
+        // and fails closed rather than writing the wrong object.
+        if lhs_has_deref
+            && lhs_base_is_pointer
+            && lhs.projection.len() == 1
+            && lhs.ty(self.body.locals()).is_ok_and(Self::ty_carries_a_pointer_value)
+            && let Some(target) = self.ref_resolution.ref_targets.get(&local_idx).map(|t| t.local)
+        {
+            warn!(
+                ?lhs,
+                target,
+                "CHC: a pointer stored through a dereference rebinds its target — fail closed"
+            );
+            // The REASON alone is what makes this fail closed: no proof over
+            // this harness is clean and no counterexample through it is
+            // certified. Dropping the target's points-at edge as well was
+            // measured to cost 420s+ on
+            // negative/frozen_views_indirect.rs::rc_cells_set_through_view_must_fail
+            // (quick and decided on the pre-repair bundle) — the extra havoc
+            // blew the search space up — for no soundness the reason does not
+            // already give.
+            let _ = target;
+            self.record_sound_fallback_reason("pointer_stored_through_deref_rebinds_target");
+        }
+
+        // The same rebinding one step out: a pointer stored into an AGGREGATE
+        // SLOT of a local (`h.p = &mut y`, `t.0 = &mut y`, `(*r).p = &mut y`).
+        // The guard above covers a store THROUGH a dereference whose place is
+        // exactly `[Deref]`; a field or element store is a different handler and
+        // kept the stale points-at edge, so `*h.p = 9` afterwards wrote the OLD
+        // target. `struct H { p: *mut u8 } let mut h = H { p: &mut x };
+        // h.p = &mut y; *h.p = 9; assert!(y == 2)` verified SUCCESSFUL with
+        // `[AY:PROOF_QUALIFIERS:clean]` and ZERO recorded drop reasons, and its
+        // safe twin was FAILED [AY:CTREX_CAT:Genuine] (fourth adversarial review
+        // of m3/soundness-fixes-2, 2026-09-14, defect M3/D4). The same shapes
+        // through an array element, an `Option`, a call return and a branch join
+        // already failed closed; this is the aggregate-slot hole.
+        //
+        // A store of a WHOLE local (`lhs.projection.is_empty()`) is not this
+        // shape: the local's own edge is re-derived from the new value.
+        if !lhs.projection.is_empty()
+            && !(lhs_has_deref && lhs_base_is_pointer && lhs.projection.len() == 1)
+            && lhs.ty(self.body.locals()).is_ok_and(Self::ty_carries_a_pointer_value)
+        {
+            warn!(
+                ?lhs,
+                "CHC: a pointer stored into an aggregate slot rebinds its target — fail closed"
+            );
+            self.record_sound_fallback_reason("pointer_stored_into_aggregate_rebinds_target");
+        }
+
+        // A projected write of interior-mutable data (`s.c = Cell::new(200)`,
+        // `a[0] = Cell::new(200)`) must reach the local's memory image too:
+        // the Cell lane reads and writes a cell at its memory-mirror address,
+        // and a projected borrow (`&s.c`, the `get` receiver) never re-mirrors
+        // the register. Updating only the register left an earlier `set`'s
+        // value in memory, and `s.c.set(7); s.c = Cell::new(200);
+        // assert!(s.c.get() < 100)` verified SUCCESSFUL clean (review of
+        // fix/chc-cell-set-write, 2026-09-26).
+        if !lhs_has_deref && !lhs.projection.is_empty() {
+            self.mirror_interior_mut_projected_store(lhs, &rhs_expr, acc);
+        }
+
         let scalar_deref_field_zero = matches!(
             lhs.projection.as_slice(),
             [ProjectionElem::Deref, ProjectionElem::Field(0, field_ty)] if *field_ty == local_ty
@@ -285,6 +547,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && field_projections.len() > 1
             && field_projections.iter().all(|fp| fp.cons_idx.is_none())
         {
+            // The slot must be the one read case C reads: drop the same
+            // sort-identity steps it drops (`t.0.c` on `t: (P,)` resolved
+            // `[0, 1]` against P's sort, which is `inner.b`), and refuse the
+            // paths it refuses. A write to an unfaithful slot landed on a
+            // sibling: `o.k1.k2.k3.k4.y = v` on a five-level owner wrote `o.z`.
+            let field_projections = match self
+                .faithful_flat_field_path(local_idx, &field_projections)
+            {
+                Ok(path) => path,
+                Err(why) => {
+                    warn!(
+                        ?lhs,
+                        why, "CHC: nested flattened store has no faithful slot (fail closed)"
+                    );
+                    self.havoc_local_fail_closed(local_idx, "flat_nested_store_unfaithful", acc);
+                    return;
+                }
+            };
             if let Some(local_decl) = self.body.locals().get(local_idx)
                 && let Some(sort) = Self::translate_ty(local_decl.ty)
             {
@@ -306,9 +586,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         // Part of #3041: Union field projection assignment (e.g., `u.g = 42`).
-        // All union fields overlap at offset 0, so writing any field is writing
-        // the entire union. Coerce the RHS to the union's BV width.
-        // For ZST field writes (e.g., `u.f = ()`), the write is a no-op.
+        // All union fields overlap at offset 0, so writing a field writes its
+        // bytes into the low end of the union's bitvector, in memory order
+        // (`codegen_stmt_union_bits.rs`). For ZST field writes (e.g.,
+        // `u.f = ()`), the write is a no-op.
         if let TyKind::RigidTy(RigidTy::Adt(def, _)) = local_ty.kind() {
             if def.kind() == rustc_public::ty::AdtKind::Union {
                 // Part of #3768: graceful fallback instead of panic
@@ -333,7 +614,86 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         return;
                     }
 
-                    // Non-ZST field: coerce RHS to union BV width and assign.
+                    // Non-ZST field: the field's MEMORY image replaces the
+                    // union's low bytes; the bytes past the field keep their
+                    // value. A write into a field of the field (`u.q.b = v`)
+                    // reads the field out of the union, updates it, and writes
+                    // it back. The old coercion wrote the right-hand side over
+                    // the WHOLE union, whatever the projection: `u.q.b = 1` made
+                    // the union 1 (subfield_assign_bug SUCCESSFUL) and a narrow
+                    // field zeroed the tail.
+                    if let Some(target_width) = out_sort.bitvec_width()
+                        && self.flat_union_width(local_ty) == Some(target_width)
+                        && let Some(field_ty) = field_projections.first().and_then(|fp| fp.field_ty)
+                    {
+                        use super::codegen_stmt_union_bits::UnionLane;
+                        let old = if acc.modified.contains(&local_idx) {
+                            self.encode
+                                .local_expr_env
+                                .get(&local_idx)
+                                .cloned()
+                                .unwrap_or_else(|| Expr::var(&*out_name, out_sort.clone()))
+                        } else {
+                            match self.state_var_mgr.state_vars.get(proj_vec_idx) {
+                                Some((in_name, in_sort)) => Expr::var(&**in_name, in_sort.clone()),
+                                None => {
+                                    self.projection_sound_fallback(
+                                        local_idx,
+                                        "state_idx_missing_union_proj",
+                                        acc,
+                                    );
+                                    return;
+                                }
+                            }
+                        };
+                        let field_value = if field_projections.len() == 1 {
+                            Some(rhs_expr)
+                        } else {
+                            match self.union_field_lane(&old, field_ty) {
+                                UnionLane::Exact(current) if current.sort().is_datatype() => {
+                                    Self::apply_projection_update(
+                                        &current,
+                                        &field_projections[1..],
+                                        rhs_expr,
+                                    )
+                                }
+                                _ => None,
+                            }
+                        };
+                        let lane = match field_value {
+                            Some(value) => self.union_bits_of_field_write(
+                                Some(&old),
+                                target_width,
+                                field_ty,
+                                &value,
+                            ),
+                            None => UnionLane::Unmodeled("union sub-field update not modeled"),
+                        };
+                        match lane {
+                            UnionLane::Exact(bits) => {
+                                let out_var = Expr::var(&*out_name, out_sort);
+                                acc.replace_constraint(local_idx, out_var.eq(bits.clone()));
+                                self.encode.local_expr_env.insert(local_idx, bits);
+                                acc.modified.insert(local_idx);
+                                debug!(
+                                    local_idx,
+                                    target_width, "CHC: union field write in memory order"
+                                );
+                            }
+                            UnionLane::Unmodeled(why) => {
+                                debug!(
+                                    local_idx,
+                                    why, "CHC: union field write not modeled; fresh union"
+                                );
+                                self.havoc_local_fail_closed(
+                                    local_idx,
+                                    "transmute_layout_fallback",
+                                    acc,
+                                );
+                            }
+                        }
+                        return;
+                    }
                     if let Some(target_width) = out_sort.bitvec_width() {
                         let coerced = coerce_bitvec_width_safe(
                             rhs_expr,
@@ -458,5 +818,57 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             self.projection_sound_fallback(local_idx, "proj_update_failed", acc);
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_index_store_tests {
+    use super::{
+        ProjShape::Index, ProjShape::Other, store_nests_under_element_index_shape as nested,
+    };
+
+    #[test]
+    fn plain_element_store_is_encodable() {
+        // `a[i] = v` and `(*r)[i] = v`
+        assert!(!nested(&[Index], false));
+        assert!(!nested(&[Other, Index], true));
+    }
+
+    #[test]
+    fn field_before_the_index_is_encodable() {
+        // `s.buf[i] = v`, `(*r).buf[i] = v`
+        assert!(!nested(&[Other, Index], false));
+        assert!(!nested(&[Other, Other, Index], true));
+    }
+
+    #[test]
+    fn field_after_the_index_on_a_local_is_encodable() {
+        // `a[i].x = v` — handle_array_element_store rebuilds the element.
+        assert!(!nested(&[Index, Other], false));
+    }
+
+    #[test]
+    fn field_after_the_index_under_a_deref_fails_closed() {
+        // `(*r)[1].x = v` — the ref_target route drops the field.
+        assert!(nested(&[Other, Index, Other], true));
+    }
+
+    #[test]
+    fn two_indices_fail_closed_with_or_without_a_deref() {
+        // `g[i][j] = v` and `(*r)[i][j] = v`
+        assert!(nested(&[Index, Index], false));
+        assert!(nested(&[Other, Index, Index], true));
+    }
+
+    #[test]
+    fn a_spurious_deref_over_a_scalar_does_not_fail_closed() {
+        // Range-lowered MIR writes `(*x).0` where `x` is a scalar local.
+        assert!(!nested(&[Other, Index, Other], false));
+    }
+
+    #[test]
+    fn a_place_without_an_index_is_never_nested() {
+        assert!(!nested(&[Other, Other], false));
+        assert!(!nested(&[Other, Other], true));
     }
 }

@@ -20,6 +20,7 @@
 //!
 //! For all instrumentation passes, always use exhaustive matches to ensure soundness in case a new
 //! case is added.
+use crate::callee_body::CalleeBody;
 use crate::kani_middle::codegen_units::CodegenUnit;
 use crate::kani_middle::reachability::CallGraph;
 use crate::kani_middle::transform::body::CheckType;
@@ -29,7 +30,7 @@ use crate::kani_middle::transform::clone::{ClonableGlobalPass, ClonableTransform
 use crate::kani_middle::transform::contracts::{AnyModifiesPass, FunctionWithContractPass};
 use crate::kani_middle::transform::kani_intrinsics::IntrinsicGeneratorPass;
 use crate::kani_middle::transform::loop_contracts::LoopContractPass;
-use crate::kani_middle::transform::stubs::{ExternFnStubPass, FnStubPass, LoweredMethodStubPass};
+use crate::kani_middle::transform::stubs::{CallSiteStubPass, FnStubPass, LoweredMethodStubPass};
 use crate::kani_queries::QueryDb;
 use automatic::{AutomaticArbitraryPass, AutomaticHarnessPass};
 use dump_mir_pass::DumpMirPass;
@@ -55,6 +56,7 @@ mod check_uninit;
 mod check_values;
 mod contracts;
 mod contracts_frame;
+mod contracts_mutual_recursion;
 mod dump_mir_pass;
 pub(crate) mod inline;
 mod internal_mir;
@@ -65,6 +67,7 @@ mod range_iter_transform;
 mod rustc_intrinsics;
 mod simple_str_iter;
 mod stubs;
+pub(crate) use stubs::stubbed_callee_instance;
 
 /// Object used to retrieve a transformed instance body.
 /// The transformations to be applied may be controlled by user options.
@@ -89,6 +92,44 @@ pub(crate) struct BodyTransformation {
     cache: HashMap<Instance, TransformationResult>,
 }
 
+/// The smallest unwind bound a harness of `unit` declares (`--unwind`, else
+/// its `#[kani::unwind(U)]`, else `--default-unwind`) while Kani's unwinding
+/// assertions are on; `None` when none does. A pass that removes a loop must
+/// keep the loop's unwinding assertion under it (`array_iter.rs`).
+fn unit_declared_unwind(queries: &QueryDb, tcx: TyCtxt, unit: &CodegenUnit) -> Option<u32> {
+    let args = queries.args();
+    if args.no_default_checks || args.no_unwinding_checks {
+        return None;
+    }
+    unit.harnesses
+        .iter()
+        .filter_map(|harness| {
+            let attributes =
+                crate::kani_middle::attributes::KaniAttributes::for_instance(tcx, *harness);
+            let declared = if attributes.is_proof_harness() {
+                attributes.harness_attributes().unwind_value
+            } else {
+                None
+            };
+            args.unwind.or(declared).or(args.default_unwind)
+        })
+        .min()
+}
+
+/// The unwind bound `harness` runs under with Kani's unwinding assertions on
+/// (`--unwind`, then `#[kani::unwind(U)]`, then `--default-unwind`), or `None`
+/// (see [`BodyTransformation::set_harness_declared_unwind`]).
+pub(crate) fn harness_declared_unwind(
+    queries: &QueryDb,
+    harness_unwind: Option<u32>,
+) -> Option<u32> {
+    let args = queries.args();
+    if args.no_default_checks || args.no_unwinding_checks {
+        return None;
+    }
+    args.unwind.or(harness_unwind).or(args.default_unwind)
+}
+
 impl BodyTransformation {
     pub(crate) fn new(queries: &QueryDb, tcx: TyCtxt, unit: &CodegenUnit) -> Self {
         let mut transformer = BodyTransformation {
@@ -106,19 +147,29 @@ impl BodyTransformation {
         transformer.add_pass(queries, AutomaticHarnessPass::new(queries));
         transformer.add_pass(queries, AutomaticArbitraryPass::new(unit, queries));
         transformer.add_pass(queries, FnStubPass::new(&unit.stubs));
-        transformer.add_pass(queries, ExternFnStubPass::new(&unit.stubs));
+        transformer.add_pass(queries, CallSiteStubPass::new(&unit.stubs));
         transformer.add_pass(queries, LoweredMethodStubPass::new(&unit.stubs));
         transformer.add_pass(queries, FunctionWithContractPass::new(tcx, queries, unit));
         // This has to come after the contract pass since we want this to only replace the closure
         // body that is relevant for this harness.
         transformer.add_pass(queries, AnyModifiesPass::new(tcx, queries, unit));
         // Transform array for-loops to indexed loops (before other instrumentation).
-        transformer.add_pass(queries, array_iter::ArrayIterUnrollPass::new());
+        transformer.add_pass(
+            queries,
+            array_iter::ArrayIterUnrollPass::with_declared_unwind(unit_declared_unwind(
+                queries, tcx, unit,
+            )),
+        );
         // Transform range for-loops to explicit index loops (before other instrumentation).
         transformer.add_pass(queries, range_iter::RangeIterUnrollPass::new());
         // Rewrite direct str::chars()/bytes().nth(...) chains to indexed helpers before CHC
         // sees iterator-state datatypes.
-        transformer.add_pass(queries, simple_str_iter::SimpleStrIterPass::new());
+        transformer.add_pass(
+            queries,
+            simple_str_iter::SimpleStrIterPass::with_declared_unwind(unit_declared_unwind(
+                queries, tcx, unit,
+            )),
+        );
         transformer.add_pass(
             queries,
             ValidValuePass {
@@ -155,6 +206,26 @@ impl BodyTransformation {
             inst_passes: vec![],
             cache: Default::default(),
             stubs: Default::default(),
+        }
+    }
+
+    /// Re-key the loop-removing passes on the bound of the harness about to
+    /// be translated (`harness_declared_unwind`), and drop every body
+    /// transformed under the previous one.
+    ///
+    /// The passes start at the unit's smallest bound (`unit_declared_unwind`),
+    /// which is sound for every harness of the unit but costs a harness with a
+    /// larger bound a rewrite Kani's semantics allow: `"abcdefgh".chars().nth(4)`
+    /// under `#[kani::unwind(8)]` kept the std loop, and failed, because another
+    /// harness of the same file declared `unwind(3)` (walker fail-closed
+    /// review 6 round 3, `str_chars_nth_unwind_dual.rs`
+    /// `n1_chars_nth_u8_safe`). Every body a harness runs, a callee's
+    /// included, runs under that harness's bound, and the cache is per
+    /// harness (`clear_cache`), so the harness's own bound is exact.
+    pub(crate) fn set_harness_declared_unwind(&mut self, declared_unwind: Option<u32>) {
+        self.cache.clear();
+        for pass in self.stub_passes.iter_mut().chain(self.inst_passes.iter_mut()) {
+            pass.set_harness_declared_unwind(declared_unwind);
         }
     }
 
@@ -198,7 +269,8 @@ impl BodyTransformation {
             .entry(instance)
             .or_insert_with(|| {
                 // Transform and add to the cache if there's no existing entry.
-                let mut body = instance.body().expect("instance should have body");
+                let mut body = crate::callee_body::transform_input_body(&instance)
+                    .expect("instance should have body");
 
                 for pass in self.stub_passes.iter_mut().chain(self.inst_passes.iter_mut()) {
                     let result = pass.transform(tcx, body, instance);
@@ -252,7 +324,7 @@ impl BodyTransformation {
         if !self.cache.contains_key(&instance) {
             // Resolve BEFORE touching the cache, so a decline leaves no entry
             // behind to poison a later lookup.
-            let mut body = instance.body()?;
+            let mut body = instance.callee_body()?;
             for pass in self.stub_passes.iter_mut().chain(self.inst_passes.iter_mut()) {
                 body = pass.transform(tcx, body, instance).1;
             }
@@ -286,6 +358,17 @@ impl BodyTransformation {
 }
 
 thread_local! {
+    /// The stub map of the unit whose harness the CHC encoder is translating,
+    /// installed with [`WalkerTransformerScope`] when the unit stubs anything
+    /// (`#[kani::stub]`). Read by [`stub_aware_instance_body`], which every raw
+    /// callee-body fetch goes through (`CalleeBody::callee_body`). A separate
+    /// slot from `WALKER_TRANSFORMER`, which [`walker_transformed_body`] holds
+    /// mutably borrowed while it fetches a raw body.
+    static UNIT_STUBS: RefCell<Option<std::rc::Rc<crate::kani_middle::codegen_units::Stubs>>> =
+        const { RefCell::new(None) };
+}
+
+thread_local! {
     /// Per-harness transformer snapshot for the CHC inline walker.
     ///
     /// The walker (codegen_call_fn_inline / codegen_call_virtual_inline) runs
@@ -309,6 +392,10 @@ impl WalkerTransformerScope {
         WALKER_TRANSFORMER.with(|slot| {
             *slot.borrow_mut() = Some(transformer.clone_for_walker());
         });
+        UNIT_STUBS.with(|slot| {
+            *slot.borrow_mut() =
+                transformer.has_stubs().then(|| std::rc::Rc::new(transformer.stubs.clone()));
+        });
         WalkerTransformerScope { _private: () }
     }
 }
@@ -318,7 +405,106 @@ impl Drop for WalkerTransformerScope {
         WALKER_TRANSFORMER.with(|slot| {
             slot.borrow_mut().take();
         });
+        UNIT_STUBS.with(|slot| {
+            slot.borrow_mut().take();
+        });
     }
+}
+
+/// Test support: install `stubs` as the unit stub map
+/// [`stub_aware_instance_body`] applies, without a transformer, until drop.
+#[cfg(test)]
+pub(crate) struct UnitStubsTestScope {
+    _private: (),
+}
+
+#[cfg(test)]
+impl UnitStubsTestScope {
+    pub(crate) fn install(stubs: crate::kani_middle::codegen_units::Stubs) -> Self {
+        UNIT_STUBS.with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::new(stubs)));
+        UnitStubsTestScope { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for UnitStubsTestScope {
+    fn drop(&mut self) {
+        UNIT_STUBS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+/// The installed unit stub map, when the unit stubs anything.
+fn installed_unit_stubs() -> Option<std::rc::Rc<crate::kani_middle::codegen_units::Stubs>> {
+    UNIT_STUBS.with(|slot| slot.borrow().clone())
+}
+
+/// A semantic shortcut must preserve every transitive replacement, not just
+/// a stub of its outer entry point.
+pub(crate) fn unit_has_stubs() -> bool {
+    UNIT_STUBS.with(|slot| slot.borrow().as_ref().is_some_and(|stubs| !stubs.is_empty()))
+}
+
+/// Whether the current harness replaces this resolved instance. An exact
+/// semantic shortcut must not substitute the original body for a unit stub.
+pub(crate) fn instance_has_unit_stub(instance: &Instance) -> bool {
+    installed_unit_stubs().is_some_and(|stubs| {
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(def, _)) =
+            instance.ty().kind()
+        else {
+            return true;
+        };
+        stubs.contains_key(&def)
+    })
+}
+
+/// `instance`'s body AS THE UNIT RUNS IT, for a raw callee-body fetch
+/// (`CalleeBody::callee_body`): with the unit's stubs (`#[kani::stub]`)
+/// applied when a CHC harness translation installed them
+/// ([`WalkerTransformerScope`]), else the plain `instance.body()`.
+///
+/// Stubbing is a program transformation the harness asks for, and the pipeline
+/// applies it to every body it transforms. The CHC inline walker and the
+/// statement path's raw fetches (drop glue, `Fn`-trait and fn-pointer targets,
+/// candidate bodies) read MIR outside the pipeline, so without this they saw
+/// the unstubbed program: a stubbed function called from a walked body kept
+/// its original meaning, and a path-keyed model of a stubbed standard-library
+/// function claimed the call before any body fetch
+/// (`tools/soundness-duals/stub_modelled_std_dual.rs`,
+/// `walker_extern_stub_dual.rs`). Applied here:
+/// - `FnStubPass`: a stubbed `instance` runs the stub's body
+///   ([`stubs::stub_replacement_instance`]);
+/// - `CallSiteStubPass`: every call site and fn-item operand naming a stubbed
+///   function names the stub ([`stubs::rewrite_stubbed_call_sites`]), so no
+///   handler keyed on the original's path claims it;
+/// - `LoweredMethodStubPass`: a lowered `<[T]>::len` the unit stubs calls the
+///   stub.
+///
+/// The instrumentation passes are NOT applied: the walker's raw route exists
+/// to keep them off ordinary callees (see [`walker_transformed_body`]).
+pub(crate) fn stub_aware_instance_body(instance: &Instance) -> Option<Body> {
+    stubs::unit_instance_body(installed_unit_stubs().as_deref(), instance)
+}
+
+/// [`stub_aware_instance_body`] for a POLYMORPHIC def's body
+/// (`CalleeBody::callee_body` on a `FnDef`).
+pub(crate) fn stub_aware_def_body(def: &rustc_public::ty::FnDef) -> Option<Body> {
+    stubs::unit_def_body(installed_unit_stubs().as_deref(), def)
+}
+
+/// The installed unit stubs' call-site rewrites applied to a body fetched
+/// another way (a coroutine's `body()`); the body unchanged when the unit
+/// stubs nothing.
+pub(crate) fn apply_unit_stubs(body: Body) -> Body {
+    match installed_unit_stubs() {
+        Some(unit_stubs) => apply_stubs_to_body(&unit_stubs, body),
+        None => body,
+    }
+}
+
+fn apply_stubs_to_body(unit_stubs: &crate::kani_middle::codegen_units::Stubs, body: Body) -> Body {
+    stubs::apply_call_site_stubs(unit_stubs, body)
 }
 
 /// Fetch the TRANSFORMED body for `instance` for the CHC inline walker.
@@ -342,6 +528,9 @@ impl Drop for WalkerTransformerScope {
 ///   perturbs their encoding (the `loop_assigns_for_ptr_fail` regression: a
 ///   transformed `as_ptr` collapsed the clause-tuple path, orphan-pruning
 ///   every error rule into a degenerate `(rule (=> false error))` false Safe).
+/// - `instance` is a function the unit STUBS: the transformed body, which
+///   `FnStubPass` makes the stub's ([`transformer_stubs`]); `None` when the
+///   original has no body (an extern stub), fail-closed.
 /// - A transform pass panics (e.g. an out-of-unit shape a pass does not
 ///   expect): `None`, FAIL-CLOSED — the walker treats the callee as body-less
 ///   and takes its existing fresh-symbolic fallback + demotion path instead of
@@ -350,7 +539,7 @@ pub(crate) fn walker_transformed_body(tcx: TyCtxt, instance: Instance) -> Option
     WALKER_TRANSFORMER.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(transformer) = slot.as_mut() else {
-            return instance.body();
+            return instance.callee_body();
         };
         // Out-of-scope fetches take the RAW route. Note `has_body()` false
         // does NOT imply raw `body()` is None (shims — e.g. the Fn
@@ -358,8 +547,8 @@ pub(crate) fn walker_transformed_body(tcx: TyCtxt, instance: Instance) -> Option
         // this must be `instance.body()`, never a forced None (tupled_closure
         // regression: a None here degraded the Fn::call shim inline to an
         // inferable predicate).
-        if !walker_wants_transformed(tcx, instance) {
-            return instance.body();
+        if !transformer_stubs(transformer, instance) && !walker_wants_transformed(tcx, instance) {
+            return instance.callee_body();
         }
         // Contract-relevant but the transform pipeline cannot run (no body to
         // transform): FAIL-CLOSED. Walking the raw body here would walk the
@@ -370,7 +559,31 @@ pub(crate) fn walker_transformed_body(tcx: TyCtxt, instance: Instance) -> Option
         if !instance.has_body() {
             return None;
         }
-        catch_unwind(AssertUnwindSafe(|| transformer.body(tcx, instance))).ok()
+        match catch_unwind(AssertUnwindSafe(|| transformer.body(tcx, instance))) {
+            Ok(body) => Some(body),
+            Err(payload) => {
+                // A translation timeout must reach the per-harness boundary,
+                // not turn into "no body".
+                let _ = crate::codegen_ay::translation_deadline::resume_if_timeout(payload);
+                None
+            }
+        }
+    })
+}
+
+/// The stub map of the unit the CHC walker is encoding (`#[kani::stub]`),
+/// from the installed walker transformer; empty when none is installed (unit
+/// tests, standalone `ChcCtx` probes) or the unit stubs nothing.
+///
+/// The walker's obligation scans resolve callees through it
+/// (`obligation_free_walk::resolve_through_stubs`), so they inspect the body
+/// the unit runs, not the original a stub replaces.
+pub(crate) fn walker_stub_map() -> crate::kani_middle::codegen_units::Stubs {
+    WALKER_TRANSFORMER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|transformer| transformer.stub_map_for_walk())
+            .unwrap_or_default()
     })
 }
 
@@ -388,6 +601,22 @@ pub(crate) fn walker_transformed_body(tcx: TyCtxt, instance: Instance) -> Option
 ///
 /// Everything else (stdlib helpers, plain closures, ordinary callees) walks
 /// the RAW body, exactly as before the transformed-fetch keystone.
+///
+/// NOT opted in, on purpose: `kani_register_loop_contract`. Its declared body
+/// is `{ true }`; `LoopContractPass` swaps in a call of the invariant closure.
+/// Walking that swapped body (tried in 290ac7cb8, reverted before landing)
+/// made the walker EVALUATE the invariant at every legacy register call, but
+/// the walker reads a closure's by-reference captures as addresses, and the
+/// loop-contract macro lowers `while guard` to
+/// `while kani_register_loop_contract(&inv, _) && guard`: a garbage invariant
+/// value silently exited the loop. Measured against Kani, that proved bug
+/// harnesses and made a safe one FAIL Genuine
+/// (tools/soundness-duals/loop_contract_register_walk_dual.rs). Opt it in only
+/// once the walker loads through by-reference captures AND the walked value
+/// feeds a check rather than the loop-exit condition. Design 5 checks the legacy
+/// latch without it: `LoopContractPass::instrument_declined_loops` evaluates the
+/// invariant through the closure's `Fn::call` shim next to the register call and
+/// feeds only an assert-only check, and the register body stays `{ true }`.
 fn walker_wants_transformed(tcx: TyCtxt, instance: Instance) -> bool {
     let def_id = rustc_internal::internal(tcx, instance.def.def_id());
     if KaniAttributes::for_item(tcx, def_id).has_contract() {
@@ -401,6 +630,21 @@ fn walker_wants_transformed(tcx: TyCtxt, instance: Instance) -> bool {
         ancestor = parent;
     }
     ancestor != def_id && KaniAttributes::for_item(tcx, ancestor).has_contract()
+}
+
+/// Does `transformer`'s unit stub `instance` (`#[kani::stub(f, g)]`)?
+///
+/// [`walker_transformed_body`] opts such an instance in: `FnStubPass` replaces
+/// `f`'s body with `g`'s, and the raw fetch walked `f`'s own body instead, so
+/// a walked `dyn` method calling a stubbed `clean` lost the stub's `assert!`
+/// and the harness proved (`walker_stub_dual.rs`).
+fn transformer_stubs(transformer: &BodyTransformation, instance: Instance) -> bool {
+    let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(def, _)) =
+        instance.ty().kind()
+    else {
+        return false;
+    };
+    transformer.stub_target(def).is_some()
 }
 
 /// The type of transformation that a pass may perform.
@@ -425,6 +669,12 @@ pub(crate) trait TransformPass: Debug {
 
     /// Run a transformation pass in the function body.
     fn transform(&mut self, tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body);
+
+    /// The unwind bound of the harness whose bodies the pass transforms next,
+    /// with Kani's unwinding assertions on (`None` when it declares none, or
+    /// the assertions are off). Only a pass that removes a loop Kani unwinds
+    /// reads it ([`BodyTransformation::set_harness_declared_unwind`]).
+    fn set_harness_declared_unwind(&mut self, _declared_unwind: Option<u32>) {}
 }
 
 /// A trait to represent transformation passes that operate on the whole codegen unit.

@@ -7,10 +7,13 @@
 //
 //! Utility functions that help calculate type layout.
 
+use crate::rustc_compat::ValueAbi;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::fmt::Display;
 
 use rustc_public::{
-    abi::{FieldsShape, Scalar, TagEncoding, ValueAbi, VariantsShape},
+    abi::{FieldsShape, Scalar, TagEncoding, VariantsShape},
     target::{MachineInfo, MachineSize},
     ty::{AdtKind, RigidTy, Ty, TyKind, UintTy, VariantIdx},
 };
@@ -205,7 +208,7 @@ fn data_bytes_for_ty(
     let layout = ty.layout().expect("type should have layout").shape();
 
     match layout.fields {
-        FieldsShape::Primitive => Ok(vec![match layout.abi {
+        FieldsShape::Primitive => Ok(vec![match layout_value_abi!(layout) {
             ValueAbi::Scalar(Scalar::Initialized { value, .. }) => {
                 DataBytes { offset: current_offset, size: value.size(machine_info) }
             }
@@ -392,34 +395,41 @@ fn data_bytes_for_ty(
                 RigidTy::Str | RigidTy::Slice(_) | RigidTy::Array(_, _) => {
                     unreachable!("Expected array layout for {ty:?}")
                 }
-                RigidTy::RawPtr(_, _) | RigidTy::Ref(_, _, _) => Ok(match layout.abi {
-                    ValueAbi::Scalar(Scalar::Initialized { value, .. }) => {
-                        // Thin pointer, ABI is a single scalar.
-                        vec![DataBytes { offset: current_offset, size: value.size(machine_info) }]
-                    }
-                    ValueAbi::ScalarPair(
-                        Scalar::Initialized { value: value_first, .. },
-                        Scalar::Initialized { value: value_second, .. },
-                    ) => {
-                        // Fat pointer, ABI is a scalar pair.
-                        let FieldsShape::Arbitrary { offsets } = layout.fields else {
-                            unreachable!("fat pointer ScalarPair must have FieldsShape::Arbitrary")
-                        };
-                        // Since this is a scalar pair, only 2 elements are in the offsets vec.
-                        assert!(offsets.len() == 2);
-                        vec![
-                            DataBytes {
-                                offset: current_offset + offsets[0].bytes(),
-                                size: value_first.size(machine_info),
-                            },
-                            DataBytes {
-                                offset: current_offset + offsets[1].bytes(),
-                                size: value_second.size(machine_info),
-                            },
-                        ]
-                    }
-                    _ => unreachable!("RigidTy::RawPtr | RigidTy::Ref with a non-scalar ABI."), // external enum: ValueAbi
-                }),
+                RigidTy::RawPtr(_, _) | RigidTy::Ref(_, _, _) => {
+                    Ok(match layout_value_abi!(layout) {
+                        ValueAbi::Scalar(Scalar::Initialized { value, .. }) => {
+                            // Thin pointer, ABI is a single scalar.
+                            vec![DataBytes {
+                                offset: current_offset,
+                                size: value.size(machine_info),
+                            }]
+                        }
+                        scalar_pair_abi!(
+                            Scalar::Initialized { value: value_first, .. },
+                            Scalar::Initialized { value: value_second, .. },
+                        ) => {
+                            // Fat pointer, ABI is a scalar pair.
+                            let FieldsShape::Arbitrary { offsets } = layout.fields else {
+                                unreachable!(
+                                    "fat pointer ScalarPair must have FieldsShape::Arbitrary"
+                                )
+                            };
+                            // Since this is a scalar pair, only 2 elements are in the offsets vec.
+                            assert!(offsets.len() == 2);
+                            vec![
+                                DataBytes {
+                                    offset: current_offset + offsets[0].bytes(),
+                                    size: value_first.size(machine_info),
+                                },
+                                DataBytes {
+                                    offset: current_offset + offsets[1].bytes(),
+                                    size: value_second.size(machine_info),
+                                },
+                            ]
+                        }
+                        _ => unreachable!("RigidTy::RawPtr | RigidTy::Ref with a non-scalar ABI."), // external enum: ValueAbi
+                    })
+                }
                 RigidTy::FnDef(_, _)
                 | RigidTy::FnPtr(_)
                 | RigidTy::Closure(_, _)

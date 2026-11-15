@@ -4,10 +4,13 @@
 
 //! Custom dyn-wrapper restoration helpers shared by referent resolution.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::types::CtorFieldExt;
 
 fn first_type_arg_ty(args: &rustc_public::ty::GenericArgs) -> Option<rustc_public::ty::Ty> {
@@ -15,17 +18,6 @@ fn first_type_arg_ty(args: &rustc_public::ty::GenericArgs) -> Option<rustc_publi
         GenericArgKind::Type(ty) => Some(*ty),
         _ => None,
     })
-}
-
-fn single_field_storage_ty(
-    adt_def: rustc_public::ty::AdtDef,
-    args: &rustc_public::ty::GenericArgs,
-) -> Option<rustc_public::ty::Ty> {
-    let variants = adt_def.variants();
-    if variants.len() != 1 || variants[0].fields().len() != 1 {
-        return None;
-    }
-    Some(variants[0].fields()[0].ty_with_args(args))
 }
 
 fn peel_pointer_like_storage_ty(ty: rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
@@ -52,9 +44,9 @@ fn peel_pointer_like_wrapper_ty(ty: rustc_public::ty::Ty) -> rustc_public::ty::T
         {
             first_type_arg_ty(&args).unwrap_or(ty)
         }
-        TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-            single_field_storage_ty(def, &args).and_then(peel_pointer_like_storage_ty).unwrap_or(ty)
-        }
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => mono_ty::single_field_storage_ty(def, &args)
+            .and_then(peel_pointer_like_storage_ty)
+            .unwrap_or(ty),
         _ => ty,
     }
 }

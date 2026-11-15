@@ -209,10 +209,24 @@ fn test_write_bytes_unconstrained_handler_records_sound_fallback() {
             };
 
             chc_ctx.codegen_call_primitive_cmp(&dcx);
+            // The destination is a parameter, so its object lane is symbolic.
+            // Its span still takes the checks every span takes: the span fits
+            // the 32-bit offset lane and the end offset does not wrap (the
+            // span lane used to return before them for a symbolic lane; review
+            // of fix/chc-lost-writes, lostwrite round 1, finding 4). No object
+            // exists for the lane to name, so no size bound comes with them.
+            let added = &chc_ctx.vc.rules[before_rules..];
+            assert_eq!(
+                added.iter().filter(|rule| is_error_check_rule(rule)).count(),
+                2,
+                "the destination span's offset-lane and no-wrap checks"
+            );
+            let span_rules =
+                added.iter().filter(|rule| is_error_head(rule.head.name.as_str())).count();
             // Part of #3703 finding 2: write_bytes is memory-mutating with
             // identity retention (under-approximation), so it uses
             // record_fallback (DEMOTED), not record_sound_fallback.
-            assert_demoted_fallback_only(chc_ctx, before_rules);
+            assert_demoted_fallback_only(chc_ctx, before_rules + span_rules);
         },
     );
 }
@@ -251,6 +265,7 @@ fn test_write_bytes_full_local_symbolic_fill_avoids_sound_fallback() {
                 "precondition: expected write_bytes callee path, got {callee_path}"
             );
             assert_eq!(chc_ctx.sound_fallback_count(), 0, "precondition: sound starts at zero");
+            let before = bookings(&chc_ctx);
             assert_eq!(chc_ctx.fallback_count, 0, "precondition: demoted starts at zero");
             let before_rules = chc_ctx.vc.rules.len();
 
@@ -269,11 +284,20 @@ fn test_write_bytes_full_local_symbolic_fill_avoids_sound_fallback() {
 
             chc_ctx.codegen_call_primitive_cmp(&dcx);
 
-            assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one goto rule");
-            assert_eq!(
-                chc_ctx.sound_fallback_count(),
-                0,
-                "full-local write_bytes should model the referent without sound fallback"
+            // Exactly one successor (goto) rule. UB/validity obligations on this path are
+            // error-family rules (`error_p{id}` plus its BSEM-18 bridge) and are not counted.
+            let emitted_goto_rules = chc_ctx.vc.rules[before_rules..]
+                .iter()
+                .filter(|r| !is_error_head(r.head.name.as_str()))
+                .count();
+            assert_eq!(emitted_goto_rules, 1, "expected one goto rule");
+            // A symbolic fill byte replicated over the referent is a value
+            // the model does not compute: a booked, identified havoc (Rule E),
+            // not a fallback.
+            assert_precise_up_to_attributed_havocs(
+                &chc_ctx,
+                &before,
+                "full-local write_bytes should model the referent without a fallback",
             );
             assert_eq!(
                 chc_ctx.fallback_count, 0,
@@ -448,7 +472,13 @@ fn test_float_to_int_unchecked_uses_precise_bv_path_for_i32() {
 
             chc_ctx.codegen_call_primitive_cmp(&dcx);
 
-            assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one goto rule");
+            // Exactly one successor (goto) rule. UB/validity obligations on this path are
+            // error-family rules (`error_p{id}` plus its BSEM-18 bridge) and are not counted.
+            let emitted_goto_rules = chc_ctx.vc.rules[before_rules..]
+                .iter()
+                .filter(|r| !is_error_head(r.head.name.as_str()))
+                .count();
+            assert_eq!(emitted_goto_rules, 1, "expected one goto rule");
             assert_eq!(
                 chc_ctx.sound_fallback_count(),
                 0,
@@ -695,7 +725,13 @@ fn test_write_bytes_partial_stack_array_prefix_store() {
 
             chc_ctx.codegen_call_primitive_cmp(&dcx);
 
-            assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one goto rule");
+            // Exactly one successor (goto) rule. UB/validity obligations on this path are
+            // error-family rules (`error_p{id}` plus its BSEM-18 bridge) and are not counted.
+            let emitted_goto_rules = chc_ctx.vc.rules[before_rules..]
+                .iter()
+                .filter(|r| !is_error_head(r.head.name.as_str()))
+                .count();
+            assert_eq!(emitted_goto_rules, 1, "expected one goto rule");
             assert_eq!(
                 chc_ctx.sound_fallback_count(),
                 0,
@@ -706,7 +742,12 @@ fn test_write_bytes_partial_stack_array_prefix_store() {
                 "partial prefix write_bytes should stay off the demoted fallback path"
             );
 
-            let rule = chc_ctx.vc.rules.last().expect("expected write_bytes goto rule");
+            let rule = chc_ctx
+                .vc
+                .rules
+                .iter()
+                .rfind(|r| !is_error_head(r.head.name.as_str()))
+                .expect("expected write_bytes goto rule");
             let smt = format!("{:?}", rule.body.constraints);
             assert!(
                 smt.contains("Store"),

@@ -65,6 +65,15 @@ mod dead_vars;
 #[path = "chc_normalize_free_arrays.rs"]
 mod normalize_free_arrays;
 
+#[path = "chc_optimize_unconstrained.rs"]
+mod unconstrained;
+
+#[path = "chc_optimize_datatypes.rs"]
+mod datatypes;
+
+#[path = "chc_optimize_ite_chains.rs"]
+mod ite_chains;
+
 /// Strips dead arguments from all relations in a CHC VC.
 ///
 /// Returns the total number of argument positions stripped across all relations.
@@ -433,10 +442,56 @@ impl ChcVc {
     /// universally-quantified free variable (e.g., `__chc_array_N`).
     /// Should run in the emit pipeline before the second-pass scalarizer.
     pub fn normalize_free_array_bases(&mut self) -> usize {
+        normalize_free_arrays::normalize_free_array_bases(self).0
+    }
+
+    /// [`Self::normalize_free_array_bases`], also returning the names of the
+    /// vars whose store chain bases it replaced.
+    pub fn normalize_free_array_bases_named(
+        &mut self,
+    ) -> (usize, std::collections::BTreeSet<String>) {
         normalize_free_arrays::normalize_free_array_bases(self)
+    }
+
+    /// Projects away every relation argument position no clause reads.
+    ///
+    /// Exact (least-fixpoint preserving) — see the `unconstrained` module docs.
+    /// Returns the number of argument positions removed.
+    pub fn prune_unconstrained_relation_args(&mut self) -> usize {
+        unconstrained::prune_unconstrained_relation_args(self)
+    }
+
+    /// Removes datatype declarations nothing emitted reaches, and later
+    /// same-name duplicates the emitter would skip.
+    ///
+    /// Exact — see the `datatypes` module docs. Returns the number of
+    /// declarations removed.
+    pub fn prune_unreachable_datatype_decls(&mut self) -> usize {
+        datatypes::prune_unreachable_datatype_decls(self)
+    }
+
+    /// Names the links of every bitvector `ite` chain too deep for AY to
+    /// decide quickly with a fresh variable and a defining equality in the
+    /// same rule.
+    ///
+    /// Exact — see the `ite_chains` module docs. Runs last in the emit
+    /// pipeline. Returns the number of variables introduced.
+    pub fn name_deep_ite_chains(&mut self) -> usize {
+        ite_chains::name_deep_ite_chains(self)
+    }
+
+    /// [`Self::name_deep_ite_chains`] regardless of the
+    /// `TRUST_MC_CHC_NAME_ITE_CHAINS` lever.
+    #[cfg(test)]
+    pub(crate) fn name_deep_ite_chains_unconditionally(&mut self) -> usize {
+        ite_chains::name_deep_ite_chains_unconditionally(self)
     }
 }
 
 #[cfg(test)]
 #[path = "chc_optimize_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "chc_optimize_ite_chains_tests.rs"]
+mod ite_chains_tests;

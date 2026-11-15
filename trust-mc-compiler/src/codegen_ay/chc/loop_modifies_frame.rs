@@ -141,10 +141,12 @@ fn resolve_const_usize(
                 return None;
             }
             match defs.get(&p.local)? {
-                DefSite::Rv(Rvalue::Use(inner)) => resolve_const_usize(defs, inner, fuel - 1),
+                DefSite::Rv(Rvalue::Use(inner, ..)) => resolve_const_usize(defs, inner, fuel - 1),
                 _ => None,
             }
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -171,6 +173,8 @@ fn resolve_ptr_chain(
     let place = match op {
         Operand::Copy(p) | Operand::Move(p) => p,
         Operand::Constant(_) => return None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
     if !place.projection.is_empty() {
         return None;
@@ -197,7 +201,7 @@ fn resolve_ptr_chain(
                     _ => None,
                 }
             }
-            Rvalue::Use(inner) => resolve_ptr_chain(body, defs, inner, fuel - 1),
+            Rvalue::Use(inner, ..) => resolve_ptr_chain(body, defs, inner, fuel - 1),
             Rvalue::Cast(_, inner, _) => resolve_ptr_chain(body, defs, inner, fuel - 1),
             Rvalue::Aggregate(AggregateKind::RawPtr(_, _), ops) if ops.len() == 2 => {
                 let data = resolve_ptr_chain(body, defs, &ops[0], fuel - 1)?;
@@ -351,6 +355,140 @@ pub(in crate::codegen_ay::chc) fn prescan_loop_rule_nested_legacy_demotion(
     }
 }
 
+/// Sound-fallback reason for one LEGACY loop-contract latch in the harness
+/// body (design 5, docs/chc-hole-fix-designs-2026-09-24.md). Not blessed: a
+/// legacy latch carries at most the reachable-state check, never the inductive
+/// step, so no proof may rest on it.
+pub(in crate::codegen_ay::chc) const LOOP_CONTRACT_LEGACY_LATCH: &str =
+    "loop_contract_legacy_latch";
+
+/// Design 5: book every LEGACY loop-contract latch of the harness body
+/// fail-closed.
+///
+/// A loop the #47 rule declined keeps the cyclic encoding. On the CHC lane its
+/// latch carries the reachable-state check (`loop_contracts::rule`,
+/// `instrument_declined_loops`), which refutes exactly the runs that break the
+/// invariant but passes a true invariant that is not inductive, where Kani
+/// FAILS "Check invariant after step". A latch the transform could not
+/// instrument reads the register fn's `{ true }` body and checks nothing. So a
+/// harness with a legacy latch never reports SUCCESSFUL: each one records the
+/// unblessed [`LOOP_CONTRACT_LEGACY_LATCH`], which the driver fails closed on a
+/// success (`demotion::apply_sound_fallback_fail_close`).
+///
+/// A COUNTEREXAMPLE is another matter: the legacy loop is the concrete loop,
+/// and a run that fails a check of it also fails Kani's contract (the first
+/// latch that breaks the invariant follows a state Kani's step check covers,
+/// and a concrete failure elsewhere is reachable under Kani's abstraction
+/// whenever the invariant is valid). The event frees no value, so it is
+/// recorded ACCOUNTED with no freed variable and leaves a counterexample's
+/// certification to the harness's other approximations. Except under
+/// `#[kani::should_panic]`, where a certified panic IS the success
+/// (`is_effective_manual_success`) and could hide a failed step Kani reports:
+/// there it stays unaccounted, so the panic is never certified and the driver's
+/// V6 gate fails it closed.
+///
+/// Counted, over the LIVE blocks only (see `codegen_function::reachable_blocks`):
+/// * `TRANSFORMED_LEGACY_LATCH` (5) breadcrumbs;
+/// * role-1 latches with no role-2 base breadcrumb of the same register callee
+///   (the rule emits both), whatever `TRUST_MC_NO_LOOP_RULE` says;
+/// * any register call whose role is not a constant or is not a known code.
+///
+/// Role 0 is the codegen gate's (`body_has_untransformed_loop_contract_call`
+/// fails the whole harness closed) and role 4 is
+/// [`prescan_loop_rule_nested_legacy_demotion`]'s.
+///
+/// Waived only in the two-lane retry's properties lane, which is legacy on
+/// purpose (`loop_contracts::is_two_lane_properties_lane`).
+pub(in crate::codegen_ay::chc) fn prescan_loop_contract_legacy_latches(ctx: &mut ChcCtx<'_, '_>) {
+    if crate::kani_middle::transform::loop_contracts::is_two_lane_properties_lane() {
+        return;
+    }
+    let latches = count_legacy_loop_contract_latches(ctx.body);
+    if latches == 0 {
+        return;
+    }
+    let should_panic = ctx.current_instance.is_none_or(|instance| {
+        crate::kani_middle::attributes::KaniAttributes::for_instance(ctx.tcx, instance)
+            .has_should_panic()
+    });
+    for _ in 0..latches {
+        if should_panic {
+            ctx.record_sound_fallback_reason(LOOP_CONTRACT_LEGACY_LATCH);
+        } else {
+            ctx.record_sound_fallback_reason_identified(LOOP_CONTRACT_LEGACY_LATCH, None);
+        }
+    }
+    debug!(latches, should_panic, "design 5: legacy loop-contract latch(es) booked fail-closed");
+}
+
+/// The legacy loop-contract latches of `body` that
+/// [`prescan_loop_contract_legacy_latches`] books (see there for the rules).
+///
+/// A rule latch is paired with its base breadcrumb by the REGISTER CALLEE: the
+/// loop-contract macro emits one `kani_register_loop_contract_<loop id>` fn per
+/// loop, generic over that loop's invariant closure, and the rule calls the
+/// same instance at both sites. The closure operand is not a usable key: a
+/// closure with no captures can be passed as a constant.
+pub(in crate::codegen_ay) fn count_legacy_loop_contract_latches(body: &Body) -> usize {
+    use crate::kani_middle::transform::loop_contracts::{
+        TRANSFORMED_LEGACY_LATCH, TRANSFORMED_NESTED_LEGACY,
+    };
+    let reachable = reachable_block_mask(body);
+    let mut bases: HashSet<Ty> = HashSet::new();
+    let mut latches: Vec<Ty> = Vec::new();
+    let mut legacy = 0usize;
+    for (bb_idx, block) in body.blocks.iter().enumerate() {
+        if !reachable[bb_idx] {
+            continue;
+        }
+        let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else { continue };
+        let Ok(callee) = func.ty(body.locals()) else { continue };
+        let is_register = callee
+            .kind()
+            .fn_def()
+            .is_some_and(|(def, _)| def.name().contains("kani_register_loop_contract"));
+        if !is_register {
+            continue;
+        }
+        let role = match args.get(1) {
+            Some(Operand::Constant(c)) => c.const_.eval_target_usize().ok(),
+            _ => None,
+        };
+        match role {
+            Some(0) => {}
+            Some(1) => latches.push(callee),
+            Some(2) => {
+                bases.insert(callee);
+            }
+            Some(code) if u128::from(code) == TRANSFORMED_NESTED_LEGACY => {}
+            Some(code) if u128::from(code) == TRANSFORMED_LEGACY_LATCH => legacy += 1,
+            _ => legacy += 1,
+        }
+    }
+    legacy + latches.iter().filter(|callee| !bases.contains(callee)).count()
+}
+
+/// Blocks reachable from the entry block by following terminator successors.
+pub(in crate::codegen_ay::chc) fn reachable_block_mask(body: &Body) -> Vec<bool> {
+    let mut reachable = vec![false; body.blocks.len()];
+    if body.blocks.is_empty() {
+        return reachable;
+    }
+    reachable[0] = true;
+    let mut worklist = vec![0usize];
+    while let Some(bb) = worklist.pop() {
+        for succ in body.blocks[bb].terminator.successors() {
+            if let Some(seen) = reachable.get_mut(succ)
+                && !*seen
+            {
+                *seen = true;
+                worklist.push(succ);
+            }
+        }
+    }
+    reachable
+}
+
 /// Pre-scan the body for `kani_loop_modifies` clauses and build enforcement
 /// frames. Runs from `generate_transition_rules` (both step modes) before any
 /// block is encoded.
@@ -431,7 +569,7 @@ pub(in crate::codegen_ay::chc) fn prescan_loop_modifies_frames(ctx: &mut ChcCtx<
                 TyKind::RigidTy(RigidTy::Tuple(tys)),
             ) if ops.len() == tys.len() => ops.iter().cloned().zip(tys.iter().copied()).collect(),
             // Single-element clause: `let kani_loop_modifies = (&x);` is not a tuple.
-            (Rvalue::Use(op), _) => vec![(op.clone(), tuple_ty)],
+            (Rvalue::Use(op, ..), _) => vec![(op.clone(), tuple_ty)],
             (Rvalue::Ref(..) | Rvalue::AddressOf(..) | Rvalue::Cast(..), _) => {
                 // The rvalue itself is the single pointer element; resolve via a
                 // synthetic operand over the tuple local's def (handled below by

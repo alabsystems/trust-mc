@@ -15,12 +15,16 @@
 use ay_bindings::Expr;
 use std::collections::HashMap;
 
+pub(in crate::codegen_ay::chc) mod check_validity;
+pub(in crate::codegen_ay::chc) mod ctor_field;
 mod discriminant;
 pub(in crate::codegen_ay) mod field_map_projection;
 pub(in crate::codegen_ay) mod place;
+pub(in crate::codegen_ay::chc) mod projected_scalar_ref;
 pub(in crate::codegen_ay) mod rvalue;
 mod rvalue_cast;
 mod rvalue_ptr;
+pub(in crate::codegen_ay::chc) mod rvalue_ub;
 mod subslice;
 
 /// Strategy for resolving projected places within inline body translation.
@@ -36,8 +40,15 @@ pub(in crate::codegen_ay) enum PlaceResolver<'a> {
 }
 
 // Re-export the primary public API so existing callers continue to work.
+pub(in crate::codegen_ay::chc) use check_validity::check_is_trivially_valid;
+pub(in crate::codegen_ay) use discriminant::inline_fieldless_enum_validity;
 pub(in crate::codegen_ay) use place::{
     inline_coroutine_discriminant_expr, inline_operand_to_expr, resolve_place,
 };
+pub(in crate::codegen_ay::chc) use rvalue::checked_inline_variant_constructor;
 pub(in crate::codegen_ay) use rvalue::inline_rvalue_to_expr;
+pub(in crate::codegen_ay::chc) use rvalue_ub::{
+    INLINE_RVALUE_UB_CHECK_DROPPED, InlineUbChecks, body_carries_unguarded_binop_ub,
+    inline_binop_ub_checks, inline_unchecked_arith_wrapper_call,
+};
 pub(in crate::codegen_ay) use subslice::apply_inline_subslice_write;

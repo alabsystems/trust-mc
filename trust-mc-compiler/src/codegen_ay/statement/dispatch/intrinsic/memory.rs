@@ -53,7 +53,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         if method == "transmute" {
             debug!("AY codegen: handling transmute");
-            return CallDispatchOutcome::from_handled_target(self.codegen_transmute_intrinsic(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_transmute_intrinsic(
                 args,
                 destination,
                 target,
@@ -120,7 +120,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             {
                 self.emit_intrinsic_alignment_check(ptr, "src");
             }
-            return CallDispatchOutcome::from_handled_target(self.codegen_atomic_load(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_atomic_load(
                 args,
                 destination,
                 target,
@@ -135,7 +135,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if let Some(ptr) = args.first() {
                 self.emit_intrinsic_alignment_check(ptr, "dst");
             }
-            return CallDispatchOutcome::from_handled_target(
+            return CallDispatchOutcome::from_fallthrough_result(
                 self.codegen_atomic_store(args, target),
             );
         }
@@ -190,7 +190,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         if method == "offset_from_unsigned" {
             debug!("AY codegen: handling pointer offset_from_unsigned");
-            return CallDispatchOutcome::from_handled_target(self.codegen_ptr_offset_from(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_ptr_offset_from(
                 args,
                 destination,
                 target,
@@ -199,7 +199,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         if method == "offset_from" {
             debug!("AY codegen: handling pointer offset_from");
-            return CallDispatchOutcome::from_handled_target(self.codegen_ptr_offset_from(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_ptr_offset_from(
                 args,
                 destination,
                 target,
@@ -208,17 +208,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         if method == "arith_offset" {
             debug!("AY codegen: handling arith_offset (wrapping)");
-            return CallDispatchOutcome::from_handled_target(
+            return CallDispatchOutcome::from_fallthrough_result(
                 self.codegen_arith_offset_intrinsic(args, destination, target),
             );
         }
         if method == "offset" {
             debug!("AY codegen: handling pointer offset");
-            return CallDispatchOutcome::from_handled_target(self.codegen_ptr_offset_intrinsic(
-                args,
-                destination,
-                target,
-            ));
+            return CallDispatchOutcome::from_fallthrough_result(
+                self.codegen_ptr_offset_intrinsic(args, destination, target),
+            );
         }
         CallDispatchOutcome::Miss
     }

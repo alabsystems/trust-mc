@@ -4,8 +4,15 @@
 
 //! `Cell`/`RefCell` interior-mutability method handlers for CHC encoding.
 //!
-//! `Cell<T>` and `RefCell<T>` are `#[repr(transparent)]` over `UnsafeCell<T>`,
-//! so `&Cell<T>` / `&RefCell<T>` and `&UnsafeCell<T>` share an address. Their
+//! `Cell<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, so `&Cell<T>` and
+//! `&UnsafeCell<T>` share an address. `RefCell<T>` is NOT (its borrow flag
+//! shares the object), but the heap model sizes it as its payload
+//! (`unwrap_heap_transparent_ty`) and this module accesses it at its base
+//! address, where the `&r` mirror keeps the borrow flag. So a RefCell is not
+//! exact here: its `replace`/`replace_with` old value is a fresh value, its
+//! `as_ptr` is declined into the quarantine, and its store havocs its
+//! (flag, value) register, all fail-closed (`codegen_call_cell_register.rs`).
+//! Their
 //! accessor methods (`get`/`set`/`replace`/`take`/`replace_with`) deep-inline
 //! their std bodies (`Cell::set` -> `replace` -> `mem::replace` -> `ptr` ops)
 //! into a large memory query that the solver returns UNKNOWN/fabricated-CTREX
@@ -27,6 +34,12 @@
 //! denotes an address, `T` narrower than a pointer, not a widened narrow datum)
 //! exclude every non-address lane known here but are not a producer's report.
 //! See `recover_cell_referent_address` for the exact split.
+//!
+//! REGISTER COHERENCE (R5): the stores write memory, but the referent local's
+//! state variable (its register mirror) is copied back into the same address
+//! by the next whole-local borrow, and copied out by a move. Each store
+//! therefore also binds that state variable to the stored value, or havocs
+//! every register the store can have written (`codegen_call_cell_register.rs`).
 //!
 //! REPRESENTATION COHERENCE (the vacuous-ensures trap): every access this
 //! module models — the mutating stores (`set`/`replace`/`take`/`replace_with`),
@@ -55,6 +68,7 @@
 //! Sibling of `codegen_call_unsafe_cell.rs`. Part of the fc-interior-mut
 //! cluster (whole-struct/cell, api/cell, whole-struct/refcell).
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
@@ -68,6 +82,7 @@ use crate::codegen_ay::types::POINTER_WIDTH;
 use super::super::heap::is_value_widened_into_address;
 use super::ChcCtx;
 use super::chc_call_context::CallEmitContext;
+use super::codegen_call_cell_register::{CellRegisterSync, CellStoreTarget, substitute_vars};
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
 use super::codegen_types::CodegenTypes;
@@ -240,12 +255,32 @@ impl<'tcx, 'body> CallCell for ChcCtx<'tcx, 'body> {
             return false;
         };
 
+        // The referent whose register mirror a store must keep equal to the
+        // stored value (R5, `codegen_call_cell_register.rs`).
+        let target = self.cell_store_target(self_arg, &addr, value_ty);
+        // A RefCell's payload does not sit at the object base, where this lane
+        // addresses it: the heap model sizes a RefCell as its payload
+        // (`unwrap_heap_transparent_ty`) while the `&r` mirror writes its
+        // (flag, value) register at the real field offsets, so a load at the
+        // base read the BORROW FLAG. `let r = RefCell::new(5); assert!(
+        // r.replace(6) == 0)` verified SUCCESSFUL clean on main 1f7de891d and
+        // its `== 5` twin FAILED Genuine. The pointer `as_ptr` would hand out
+        // is that same base, so it is declined into the quarantine (a havoced
+        // destination); `replace`/`replace_with` read their old value as a
+        // fresh value (`cell_load_old`).
+        if target.refcell && method == CellMethod::AsPtr {
+            debug!(bb_idx, "refcell::as_ptr: payload address unmodelled — fail-closed");
+            return false;
+        }
+
         match method {
             CellMethod::Get => self.emit_cell_get(bb_idx, ecx, addr, value_ty),
-            CellMethod::Set => self.emit_cell_set(bb_idx, ecx, addr, value_ty),
-            CellMethod::Replace => self.emit_cell_replace(bb_idx, ecx, addr, value_ty),
-            CellMethod::Take => self.emit_cell_take(bb_idx, ecx, addr, value_ty),
-            CellMethod::ReplaceWith => self.emit_cell_replace_with(bb_idx, ecx, addr, value_ty),
+            CellMethod::Set => self.emit_cell_set(bb_idx, ecx, addr, &target, value_ty),
+            CellMethod::Replace => self.emit_cell_replace(bb_idx, ecx, addr, &target, value_ty),
+            CellMethod::Take => self.emit_cell_take(bb_idx, ecx, addr, &target, value_ty),
+            CellMethod::ReplaceWith => {
+                self.emit_cell_replace_with(bb_idx, ecx, addr, &target, value_ty)
+            }
             CellMethod::AsPtr => self.emit_cell_as_ptr(bb_idx, ecx, addr),
         }
     }
@@ -376,10 +411,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
                         exposed.insert(place.local);
                     }
-                    Rvalue::Use(op)
-                    | Rvalue::Repeat(op, _)
-                    | Rvalue::Cast(_, op, _)
-                    | Rvalue::ShallowInitBox(op, _) => {
+                    Rvalue::Use(op, ..) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
+                        note_moved_operand(op, &mut moved_cell_locals);
+                    }
+                    #[cfg(not(trust_toolchain))]
+                    Rvalue::ShallowInitBox(op, _) => {
                         note_moved_operand(op, &mut moved_cell_locals);
                     }
                     Rvalue::Aggregate(_, operands) => {
@@ -518,6 +554,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// The value a mutator's store replaces: the load at the referent
+    /// address, or, for a RefCell (whose payload the lane does not address,
+    /// see `codegen_call_cell_method`), a fresh value of the payload's sort,
+    /// recorded fail-closed.
+    fn cell_load_old(
+        &mut self,
+        addr: &MaybeLoc,
+        value_ty: Ty,
+        target: &CellStoreTarget,
+    ) -> Option<Expr> {
+        if !target.refcell {
+            return self.cell_load_through(addr, value_ty);
+        }
+        let sort = Self::translate_ty(self.resolve_body_ty(value_ty))?;
+        let booked = self.record_sound_fallback_reason("refcell_payload_read_unmodelled");
+        Some(Havoc::booked(
+            booked,
+            super::codegen_ctx::globals::chc_fresh_name("__refcell_old"),
+            sort,
+        ))
+    }
+
     /// Store to a cell referent through an address whose provenance may be
     /// unreported. Same split, and same reason, as [`Self::cell_load_through`].
     fn cell_store_through(&mut self, addr: &MaybeLoc, value: Expr, value_ty: Ty) -> Option<Expr> {
@@ -559,21 +617,45 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(bb_idx, "cell::get load failed — fail-closed");
             return false;
         };
-        let Some((_, dest_var)) = self.resolve_destination(dest_local) else {
+        let Some(binding) = self.bind_cell_result(dest_local, loaded, "cell::get") else {
+            // An unbound destination would be a silent havoc: decline into the
+            // fail-closed quarantine instead.
             self.drain_cell_pending_checks(ecx);
+            debug!(bb_idx, dest_local, "cell::get result unbindable — fail-closed");
             return false;
         };
-        let s = dest_var.sort().clone();
-        let eq = self.make_coerced_eq_constraint(&dest_var, loaded, &s, dest_local, "cell::get");
         let out = self.build_output_args(ecx.modified_locals, &[dest_local]);
         self.drain_cell_pending_checks(ecx);
-        if let Some(eq) = eq {
-            self.emit_goto_rule_extra(ecx.from_app, ecx.target, &out, ecx.stmt_constraints, [eq]);
-        } else {
-            self.emit_goto_rule(ecx.from_app, ecx.target, &out, ecx.stmt_constraints);
-        }
+        self.emit_goto_rule_extra(ecx.from_app, ecx.target, &out, ecx.stmt_constraints, binding);
         debug!(bb_idx, dest_local, "cell::get modeled as direct load(addr)");
         true
+    }
+
+    /// Constraints binding the call destination `dest_local` to `value`.
+    ///
+    /// A flattened destination (`Cell<(u8, u8)>::get`, a tuple result) owns
+    /// one state variable per leaf; binding only the first slot
+    /// (`resolve_destination`) left the others free, so
+    /// `c.set((1, 2)); assert!(c.get().1 == 2)` FAILED with a Genuine
+    /// counterexample. Every slot is bound, or `None` when the value does not
+    /// decompose onto exactly the destination's slots.
+    fn bind_cell_result(
+        &mut self,
+        dest_local: usize,
+        value: Expr,
+        site: &'static str,
+    ) -> Option<Vec<Expr>> {
+        if self.flatten.flattened_tuple_locals.contains(&dest_local) {
+            let slots = self.flattened_field_count(dest_local);
+            let fields = self.build_flattened_destination_field_constraints(dest_local, value)?;
+            if fields.len() != slots || fields.iter().enumerate().any(|(i, (f, _))| *f != i) {
+                return None;
+            }
+            return Some(fields.into_iter().map(|(_, c)| c).collect());
+        }
+        let (_, dest_var) = self.resolve_destination(dest_local)?;
+        let s = dest_var.sort().clone();
+        self.make_coerced_eq_constraint(&dest_var, value, &s, dest_local, site).map(|eq| vec![eq])
     }
 
     /// `Cell::as_ptr(&self) -> *mut T` / `RefCell::as_ptr(&self) -> *mut T` —
@@ -634,6 +716,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
         addr: MaybeLoc,
+        target: &CellStoreTarget,
         value_ty: Ty,
     ) -> bool {
         let Some(value) = ecx
@@ -644,7 +727,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(bb_idx, "cell::set value unresolved — fail-closed");
             return false;
         };
-        self.emit_cell_store_and_return(bb_idx, ecx, addr, value, value_ty, None, "cell::set")
+        self.emit_cell_store_and_return(
+            bb_idx,
+            ecx,
+            addr,
+            target,
+            value,
+            value_ty,
+            None,
+            "cell::set",
+        )
     }
 
     /// `Cell::replace(&self, v) -> T` / `RefCell::replace(&self, v) -> T` —
@@ -654,6 +746,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
         addr: MaybeLoc,
+        target: &CellStoreTarget,
         value_ty: Ty,
     ) -> bool {
         let Some(value) = ecx
@@ -666,7 +759,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         // Load the OLD value BEFORE accumulating the store, so the returned
         // value reflects pre-store memory.
-        let Some(old) = self.cell_load_through(&addr, value_ty) else {
+        let Some(old) = self.cell_load_old(&addr, value_ty, target) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::replace old-load failed — fail-closed");
             return false;
@@ -675,6 +768,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             bb_idx,
             ecx,
             addr,
+            target,
             value,
             value_ty,
             Some(old),
@@ -689,6 +783,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
         addr: MaybeLoc,
+        target: &CellStoreTarget,
         value_ty: Ty,
     ) -> bool {
         // `Default::default()` is `0` only for integer/bool T. Any other T is
@@ -702,7 +797,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(bb_idx, "cell::take old-load failed — fail-closed");
             return false;
         };
-        self.emit_cell_store_and_return(bb_idx, ecx, addr, zero, value_ty, Some(old), "cell::take")
+        self.emit_cell_store_and_return(
+            bb_idx,
+            ecx,
+            addr,
+            target,
+            zero,
+            value_ty,
+            Some(old),
+            "cell::take",
+        )
     }
 
     /// `RefCell::replace_with(&self, f) -> T` —
@@ -719,6 +823,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
         addr: MaybeLoc,
+        target: &CellStoreTarget,
         value_ty: Ty,
     ) -> bool {
         let Some(closure_arg) = ecx.args.get(1) else {
@@ -726,7 +831,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         // Load OLD before the store; it is both the closure's `&mut T` argument
         // (Deref-as-identity in the inline walker) and the returned value.
-        let Some(old) = self.cell_load_through(&addr, value_ty) else {
+        let Some(old) = self.cell_load_old(&addr, value_ty, target) else {
             self.drain_cell_pending_checks(ecx);
             debug!(bb_idx, "cell::replace_with old-load failed — fail-closed");
             return false;
@@ -757,6 +862,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             bb_idx,
             ecx,
             addr,
+            target,
             new_value,
             value_ty,
             Some(old),
@@ -765,41 +871,143 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Shared store-and-emit epilogue: accumulate `store(addr, value)` into the
-    /// heap store chains, optionally bind `dest = old`, thread the modified
-    /// arrays through the output args, drain heap-access checks, and emit the
-    /// goto rule. Mirrors `ptr_receiver_mem::emit_mem_store_transition`.
+    /// heap store chains, keep the referent's register mirror equal to the
+    /// stored value, optionally bind `dest = old`, thread the modified arrays
+    /// through the output args, drain heap-access checks, and emit the goto
+    /// rule. Mirrors `ptr_receiver_mem::emit_mem_store_transition`.
+    #[allow(clippy::too_many_arguments)]
     fn emit_cell_store_and_return(
         &mut self,
         bb_idx: usize,
         ecx: &CallEmitContext<'_>,
         addr: MaybeLoc,
+        target: &CellStoreTarget,
         value: Expr,
         value_ty: Ty,
         old: Option<Expr>,
         site: &'static str,
     ) -> bool {
         let dest_local = ecx.destination.local;
+        // REGISTER COHERENCE (R5): the store below writes memory only, and the
+        // referent's state variable (its register mirror) is read back by the
+        // next whole-local borrow, a mutable-borrow refresh or a by-value move.
+        // Bind that state variable to the stored value too, or havoc every
+        // register the store can have written (`codegen_call_cell_register.rs`).
+        let plan = self.plan_cell_register_mirror(
+            target,
+            &value,
+            value_ty,
+            ecx.modified_locals,
+            ecx.stmt_constraints,
+        );
+        // Every term built before the call that names a rebound output slot
+        // meant the pre-call value: rewrite it (see `CellRegisterPlan`). The
+        // block's statement constraints are rewritten once, and the error
+        // rules of this call's checks and its goto rule are both built over the
+        // rewritten set.
+        let substitution = plan.substitution;
+        let kept: Vec<Expr> = ecx
+            .stmt_constraints
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !plan.superseded.contains(idx))
+            .map(|(_, c)| substitute_vars(c, &substitution))
+            .collect();
+        let ecx = &CallEmitContext {
+            args: ecx.args,
+            destination: ecx.destination,
+            target: ecx.target,
+            from_app: ecx.from_app,
+            stmt_constraints: &kept,
+            modified_locals: ecx.modified_locals,
+        };
+        let value = substitute_vars(&value, &substitution);
+        let old = old.map(|old| substitute_vars(&old, &substitution));
+        // The block's pending heap terms (store chains and their drained
+        // seeds, e.g. the `&c` mirror of the pre-call register) are rewritten
+        // now, before this call adds a term of its own that means the
+        // post-call value.
+        if !substitution.is_empty() {
+            self.heap_state.rewrite_pending_terms(|e| substitute_vars(e, &substitution));
+        }
+
+        // FC-06: a register rebinding that mirrors exactly the stored bytes is
+        // the same write as the store, so it is excused from the frame net
+        // exactly when the store's own precise frame check classified it.
+        // Track whether THIS store's check certified the referent (a
+        // certificate an earlier statement left must not excuse it).
+        let mirrored_local = match &plan.sync {
+            CellRegisterSync::Synced { local, .. } => Some(*local),
+            _ => None,
+        };
+        let prior_certificate =
+            mirrored_local.map(|local| self.modifies_frame_net.certified.remove(&local));
         // Accumulate the store into heap store chains (returns None on success;
         // constraints are flushed via drain_pending_updates below).
         // `build_memory_store` is still `(Expr, Expr)` — wave 13 retypes it to
         // `(Loc, Val)`, which is what makes the address/value swap at this
         // adjacent-argument site a compile error instead of a silent defect.
+        if Self::try_extract_obj_id(addr.as_addr_expr()).is_none() {
+            let addr_expr = addr.as_addr_expr().clone();
+            self.note_symbolic_store_may_alias_regions(&addr_expr);
+        }
         self.cell_store_through(&addr, value, value_ty);
+        let store_certified =
+            mirrored_local.filter(|local| self.modifies_frame_net.certified.contains(local));
+        if let (Some(local), Some(true)) = (mirrored_local, prior_certificate) {
+            self.modifies_frame_net.certified.insert(local);
+        }
 
         let mut extra = Vec::new();
+        let mut out_locals = vec![dest_local];
+        let mut register_constraints = Vec::new();
+        match plan.sync {
+            CellRegisterSync::Synced { local, constraints } => {
+                debug!(bb_idx, local, site, "cell: register mirror bound to the stored value");
+                self.encode.invalidate_local_cache(local);
+                register_constraints = constraints;
+                if local != dest_local {
+                    out_locals.push(local);
+                }
+            }
+            CellRegisterSync::Havoc { locals, reason, cause } => {
+                debug!(
+                    bb_idx,
+                    site,
+                    reason,
+                    cause,
+                    ?locals,
+                    "cell: register mirror not synced exactly — havoc"
+                );
+                self.record_cell_register_havoc(reason, cause, &locals);
+                for local in locals {
+                    self.encode.invalidate_local_cache(local);
+                    if !out_locals.contains(&local) {
+                        out_locals.push(local);
+                    }
+                }
+            }
+            CellRegisterSync::NotNeeded => {}
+        }
         // Bind the value-returning result (`dest = old`) for replace/take/
-        // replace_with. `set` returns `()` and passes `old = None`.
-        if let Some(old) = old
-            && let Some((_, dest_var)) = self.resolve_destination(dest_local)
-        {
-            let s = dest_var.sort().clone();
-            if let Some(eq) = self.make_coerced_eq_constraint(&dest_var, old, &s, dest_local, site)
-            {
-                extra.push(eq);
+        // replace_with. `set` returns `()` and passes `old = None`. A result
+        // that cannot be bound is havoced, so it is recorded fail-closed: a
+        // counterexample through it must not be certified.
+        if let Some(old) = old {
+            match self.bind_cell_result(dest_local, old, site) {
+                Some(binding) => extra.extend(binding),
+                None => {
+                    debug!(bb_idx, dest_local, site, "cell: result unbindable — fail-closed");
+                    self.record_sound_fallback_reason("cell_result_unbound");
+                }
             }
         }
         ptr_receiver_mem::drain_pending_updates(self, &mut extra);
-        let out = self.build_output_args(ecx.modified_locals, &[dest_local]);
+        extra.extend(register_constraints);
+        let out = self.build_output_args(ecx.modified_locals, &out_locals);
+        if let Some(local) = store_certified {
+            self.modifies_frame_certify_mirrored_write(local, &out);
+        }
         self.drain_cell_pending_checks(ecx);
         self.emit_goto_rule_extra(ecx.from_app, ecx.target, &out, ecx.stmt_constraints, extra);
         debug!(bb_idx, dest_local, site, "cell: modeled as direct store(addr, value)");

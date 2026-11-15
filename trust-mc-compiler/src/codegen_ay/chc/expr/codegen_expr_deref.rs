@@ -36,6 +36,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(local_idx, "CHC: resolved Deref base via known_stack_addr_exprs");
             return Some(addr);
         }
+        // Same path-insensitivity as the stack table (`known_stack_addr_expr`):
+        // an allocation id recorded for a local with several producers names
+        // only the producer translated last.
+        if self.local_has_multiple_whole_definitions(local_idx) {
+            return None;
+        }
         self.known_alloc_ids.get(&local_idx).map(|&obj_id| {
             debug!(local_idx, obj_id, "CHC: resolved Deref base via known_alloc_ids (#3608)");
             Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32))

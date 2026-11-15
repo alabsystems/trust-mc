@@ -39,7 +39,7 @@ fn test_encode_block_statements_out_of_bounds_returns_passthrough() {
 }
 
 #[test]
-fn test_encode_block_statements_intrinsic_assume_adds_guard_constraint() {
+fn test_encode_block_statements_intrinsic_assume_records_a_kinded_check() {
     const SOURCE: &str = r#"
         #![allow(dead_code)]
         #![allow(internal_features)]
@@ -81,16 +81,11 @@ fn test_encode_block_statements_intrinsic_assume_adds_guard_constraint() {
         let (constraints, _output_args, _modified, _safety_checks) =
             chc_ctx.encode_block_statements(assume_bb_idx);
         assert!(
-            !constraints.is_empty(),
-            "encode_block_statements must emit an assume guard constraint for intrinsic assume"
-        );
-        assert!(
             constraints.iter().all(|c| c.sort().is_bool()),
-            "all assume constraints should remain Bool-sorted"
+            "all block constraints should remain Bool-sorted"
         );
 
-        // local 1 is the first argument `cond: bool`; the emitted assume guard
-        // should reference its state variable name.
+        // local 1 is the first argument `cond: bool`.
         let cond_vec_idx = *chc_ctx
             .state_var_mgr
             .local_to_state_idx
@@ -102,10 +97,24 @@ fn test_encode_block_statements_intrinsic_assume_adds_guard_constraint() {
             .get(cond_vec_idx)
             .expect("expected cond state variable in state_vars");
 
-        let has_cond_guard = constraints.iter().any(|c| c.to_string().contains(&**cond_state_name));
+        // `intrinsics::assume(P)` is CHECKED, as Kani: P becomes a kinded check
+        // with Kani's message, and is not a block constraint (the check's error
+        // rule reads the block constraints, so P there would make it vacuous).
+        let checks: Vec<_> = chc_ctx
+            .heap_state
+            .pending_kinded_checks
+            .iter()
+            .filter(|(_, _, msg)| msg.as_deref() == Some("Rust intrinsic assumption failed"))
+            .collect();
+        assert_eq!(checks.len(), 1, "one intrinsic assume check");
         assert!(
-            has_cond_guard,
-            "assume guard constraint should reference cond state var `{cond_state_name}`"
+            checks[0].0.to_string().contains(&**cond_state_name),
+            "the check reads cond state var `{cond_state_name}`: {}",
+            checks[0].0
+        );
+        assert!(
+            !constraints.iter().any(|c| c.to_string() == checks[0].0.to_string()),
+            "the assumed condition is not a block constraint"
         );
     });
 }

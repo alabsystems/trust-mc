@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "fork_commit": "c4d858036efec56e02caa743f8732582da973d5a",
+  "reason": "Each original single-harness cover test requires its safety outcome and every named cover outcome. Safety alone supplies no coverage parity credit.",
+  "rows": [
+    {
+      "file": "tests/expected/cover/cover-fail/main.rs",
+      "harness": "cover_overconstrained",
+      "expected": "PROOF",
+      "source_blob": "397b7fafe97dcd3ad34a7cf7cd6a67b327c01625",
+      "source_sha256": "f00bef470994e96f7f5e9f2bae50c295b1c91f63f099024e6e1ce588ab8d574e",
+      "expectation_file": "tests/expected/cover/cover-fail/expected",
+      "expectation_blob": "6878a00e34d38dea38e66ab019f31360616818d2",
+      "expectation_sha256": "205181a52b4db65ee6c6673a333f23fa3158bdef758951b0b38e50bd719066a6",
+      "properties": [
+        {
+          "description": "cover condition: x != 0",
+          "status": "UNSATISFIABLE"
+        }
+      ]
+    },
+    {
+      "file": "tests/expected/cover/cover-message/main.rs",
+      "harness": "cover_match",
+      "expected": "PROOF",
+      "source_blob": "3e40a90d05a04bd9577adffd717b48ad57fa36b7",
+      "source_sha256": "125af42de0b95850417ef4b40db4c629ad3b1d3f9c26954b0934fb92755a4380",
+      "expectation_file": "tests/expected/cover/cover-message/expected",
+      "expectation_blob": "e229cf8167ae49228ba87957e3b995904fef7860",
+      "expectation_sha256": "455a2575e6bda541863bccf4086aca3865e9f0e5e21117d0d7fa8f6e4c3af5b8",
+      "properties": [
+        {
+          "description": "foo may return Err",
+          "status": "SATISFIED"
+        },
+        {
+          "description": "y may be greater than 20",
+          "status": "SATISFIED"
+        },
+        {
+          "description": "y may be greater than 10",
+          "status": "UNSATISFIABLE"
+        }
+      ]
+    },
+    {
+      "file": "tests/expected/cover/cover-pass/main.rs",
+      "harness": "cover_sorted",
+      "expected": "PROOF",
+      "source_blob": "c0332e60f3f6452a76755429f5bd15ba6d9dc858",
+      "source_sha256": "56a8613108f6887dbe13dace2ee850e3167193892774e7e5491ec7ce0592b147",
+      "expectation_file": "tests/expected/cover/cover-pass/expected",
+      "expectation_blob": "59b85ec64ee1f45b7dafda8a7c50bd36e505ab6a",
+      "expectation_sha256": "1fa3c2f710a20e469c7435c65d8391b41db5d02994dade45b81c6c2ed02d4f99",
+      "properties": [
+        {
+          "description": "cover condition: sorted == arr",
+          "status": "SATISFIED"
+        },
+        {
+          "description": "cover condition: sorted != arr",
+          "status": "SATISFIED"
+        }
+      ]
+    },
+    {
+      "file": "tests/expected/cover/cover-undetermined/main.rs",
+      "harness": "cover_undetermined",
+      "expected": "CTREX",
+      "source_blob": "05afa581143bbb9e5a10ec9199df0e0211724a83",
+      "source_sha256": "51951914b8adb595219a39897a1f0a6844cff4e52b25d48cb0910d7591e3eb02",
+      "expectation_file": "tests/expected/cover/cover-undetermined/expected",
+      "expectation_blob": "dcbc9fddb12e534cef3b80064ae8427a7dbafc4d",
+      "expectation_sha256": "e20d0e8e0fac6dfcb1bc1558e8eac145f8d0e24e0c8616baa96a371911995e1e",
+      "properties": [
+        {
+          "description": "cover condition: sum == 10",
+          "status": "UNDETERMINED"
+        }
+      ]
+    },
+    {
+      "file": "tests/expected/cover/cover-unreachable/main.rs",
+      "harness": "cover_unreachable",
+      "expected": "PROOF",
+      "source_blob": "bf35b63df18e939e9fe96126fb2bc3332c584fdb",
+      "source_sha256": "a1687843c1bfca5d218b844d28d1c1064ff2f10e0c1de0d4c632ba1e4bce61ca",
+      "expectation_file": "tests/expected/cover/cover-unreachable/expected",
+      "expectation_blob": "b3324cb3a139be72d4e2990d40af1df39e2faad0",
+      "expectation_sha256": "b02e8d744e7c765a320f4c9995b938e778c3408ea3b1330d48567a7a63edafe7",
+      "properties": [
+        {
+          "description": "cover condition: x == 2",
+          "status": "UNREACHABLE"
+        },
+        {
+          "description": "Unreachable with a message",
+          "status": "UNREACHABLE"
+        },
+        {
+          "description": "cover condition: x == 5",
+          "status": "SATISFIED"
+        }
+      ]
+    }
+  ]
+}

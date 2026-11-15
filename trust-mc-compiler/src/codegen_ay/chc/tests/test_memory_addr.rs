@@ -336,7 +336,7 @@ fn test_translate_ref_array_index_with_bounds_check() {
         let constrained_error_rules = vc
             .rules
             .iter()
-            .filter(|r| r.head.name == "error" && !r.body.constraints.is_empty())
+            .filter(|r| is_error_check_rule(r) && !r.body.constraints.is_empty())
             .count();
         assert!(
             constrained_error_rules >= 1,

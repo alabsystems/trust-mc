@@ -148,9 +148,15 @@ fn test_trace_alloc_id_via_ref_target_two_steps() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        // Chain: 3 → 2 → 1 (known alloc_id)
-        chc_ctx.ref_resolution.ref_targets.insert(3, RefTarget::with_projections(2, vec![]));
-        chc_ctx.ref_resolution.ref_targets.insert(2, RefTarget::with_projections(1, vec![]));
+        // Chain: 3 = &(*2), 2 = &(*1): two reborrows, each the same pointer value.
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(3, RefTarget::with_projections(2, vec![ProjectionElem::Deref]));
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(2, RefTarget::with_projections(1, vec![ProjectionElem::Deref]));
         chc_ctx.known_alloc_ids.insert(1, 0xBEEF);
 
         assert_eq!(
@@ -220,6 +226,69 @@ fn test_trace_alloc_id_ref_target_field_projection_blocks_chain() {
     });
 }
 
+/// Two-field struct reached through a reference: `(*r).a` sits at offset 0 and `(*r).b` at
+/// offset 4, so only the first names the address an object id stands for.
+const TWO_FIELD_REF_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    #[repr(C)]
+    pub struct Pair {
+        pub a: u32,
+        pub b: u32,
+    }
+
+    pub fn probe_two_field_ref(r: &Pair) -> u32 {
+        r.a + r.b
+    }
+"#;
+
+/// A ref_target `&(*base).f` whose field adds bytes is NOT followed: `known_alloc_ids` holds
+/// an object id, and consumers mint `obj ++ 0` from it, which is the wrong cell for a field at
+/// offset 4 (the Rc value field at +16 made a `Rc<dyn T>` receiver read a cell nothing writes).
+#[test]
+fn test_trace_alloc_id_ref_target_nonzero_field_offset_blocks_chain() {
+    with_test_ay_ctx_for_source(TWO_FIELD_REF_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_two_field_ref");
+        let body = instance.body().expect("body");
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_two_field_ref",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let u32_ty = rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U32);
+        chc_ctx.known_alloc_ids.insert(1, 0xBEEF);
+
+        // Use local 4 (produced by AddWithOverflow): local 2's real MIR producer is
+        // `_2 = copy ((*_1).0)`, which the MIR scan follows back to `_1` on its own.
+        chc_ctx.ref_resolution.ref_targets.insert(
+            4,
+            RefTarget::with_projections(
+                1,
+                vec![ProjectionElem::Deref, ProjectionElem::Field(1, u32_ty)],
+            ),
+        );
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(4),
+            None,
+            "a field at a nonzero byte offset must not inherit the base's object id"
+        );
+
+        chc_ctx.ref_resolution.ref_targets.insert(
+            3,
+            RefTarget::with_projections(
+                1,
+                vec![ProjectionElem::Deref, ProjectionElem::Field(0, u32_ty)],
+            ),
+        );
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(3),
+            Some(0xBEEF),
+            "the field at offset 0 names the object's first byte"
+        );
+    });
+}
+
 // =============================================================================
 // trace_deref_store_alloc_id: cycle detection
 // =============================================================================
@@ -238,7 +307,10 @@ fn test_trace_alloc_id_cycle_self_ref_terminates() {
         );
 
         // Self-referencing ref_target
-        chc_ctx.ref_resolution.ref_targets.insert(1, RefTarget::with_projections(1, vec![]));
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(1, RefTarget::with_projections(1, vec![ProjectionElem::Deref]));
 
         // No alloc_ids anywhere. Should terminate, not loop.
         assert_eq!(
@@ -263,8 +335,14 @@ fn test_trace_alloc_id_cycle_mutual_terminates() {
         );
 
         // Mutual cycle: 1 ↔ 2
-        chc_ctx.ref_resolution.ref_targets.insert(1, RefTarget::with_projections(2, vec![]));
-        chc_ctx.ref_resolution.ref_targets.insert(2, RefTarget::with_projections(1, vec![]));
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(1, RefTarget::with_projections(2, vec![ProjectionElem::Deref]));
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(2, RefTarget::with_projections(1, vec![ProjectionElem::Deref]));
 
         assert_eq!(
             chc_ctx.trace_deref_store_alloc_id(1),
@@ -275,21 +353,28 @@ fn test_trace_alloc_id_cycle_mutual_terminates() {
 }
 
 // =============================================================================
-// trace via scan_mir_for_alloc_source: Copy/Move assignment
+// trace via scan_mir_for_alloc_source: a store THROUGH a local is not its
+// definition
 // =============================================================================
 
-/// Acceptance criteria: scan_mir_for_alloc_source finds Copy/Move assignment.
-/// Uses an unsafe function with side effect to force intermediate locals.
-/// Seed alloc_id at _1 (ptr arg). Trace from the intermediate local that
-/// copies/moves _1 should find the alloc_id.
+/// `(*_p) = v` stores THROUGH `_p`; it does not produce `_p`'s pointer value,
+/// so the trace must not hop from `_p` to `v`'s local. Before the alloc-id
+/// provenance fix `scan_mir_for_alloc_source` matched any assignment whose
+/// `lhs.local` was the target, projections included, and this shape handed
+/// `dst` the allocation that `ptr` names.
+///
+/// MIR optimisation forwards `let a = ptr;` away entirely, so the ONLY
+/// assignment naming `_1` in this body is that store — which is what makes the
+/// probe a test of the refusal rather than of a copy hop. The whole-local copy
+/// hop itself is covered by the cast and aggregate probes below.
 #[test]
-fn test_trace_alloc_id_via_mir_copy_chain() {
+fn test_trace_alloc_id_does_not_cross_a_store_through_the_local() {
     with_test_ay_ctx_for_source(COPY_CHAIN_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_copy_chain");
         let body = instance.body().expect("body");
 
-        // Find any Use(Copy/Move) assignment from _1 to a non-return local.
-        let mut copy_dest = None;
+        // Find the `(*_p) = Copy/Move(_1)` store and the local it writes through.
+        let mut store_through = None;
         for bb in &body.blocks {
             for stmt in &bb.statements {
                 if let StatementKind::Assign(
@@ -297,17 +382,19 @@ fn test_trace_alloc_id_via_mir_copy_chain() {
                     Rvalue::Use(
                         rustc_public::mir::Operand::Copy(src)
                         | rustc_public::mir::Operand::Move(src),
+                        ..,
                     ),
                 ) = &stmt.kind
+                    && src.local == 1
+                    && src.projection.is_empty()
+                    && matches!(lhs.projection.first(), Some(ProjectionElem::Deref))
                 {
-                    if src.local == 1 && lhs.local != 0 && lhs.local != 1 {
-                        copy_dest = Some(lhs.local);
-                    }
+                    store_through = Some(lhs.local);
                 }
             }
         }
-        assert_mir_pattern_found(copy_dest.is_some(), "Copy/Move from _1 (ptr arg)");
-        let trace_from = copy_dest.expect("copy destination local");
+        assert_mir_pattern_found(store_through.is_some(), "(*_p) = Copy/Move(_1)");
+        let stored_through = store_through.expect("store destination local");
 
         let mut chc_ctx = ChcCtx::new(
             ctx.tcx,
@@ -320,10 +407,15 @@ fn test_trace_alloc_id_via_mir_copy_chain() {
         chc_ctx.known_alloc_ids.insert(1, 0xA110);
 
         assert_eq!(
-            chc_ctx.trace_deref_store_alloc_id(trace_from),
+            chc_ctx.trace_deref_store_alloc_id(stored_through),
+            None,
+            "a store through local {} is not its definition, so it inherits no alloc_id",
+            stored_through
+        );
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(1),
             Some(0xA110),
-            "trace should follow MIR Copy/Move from local {} back to _1's alloc_id",
-            trace_from
+            "the seeded pointer itself still answers its own alloc_id"
         );
     });
 }
@@ -465,17 +557,14 @@ fn test_trace_alloc_id_aggregate_prefers_known_alloc_id() {
 
         let result = chc_ctx.trace_deref_store_alloc_id(agg_local);
 
-        // If pick_alloc_operand correctly prefers the known operand, it returns
-        // second_local, and then trace finds alloc_id 0x2222.
-        // If it falls back to the first operand (no alloc_id), trace continues
-        // from first_local and may not find any alloc_id.
+        // A `TwoPtr { a, b }` value holds two pointers, so it has no single
+        // base address: naming the operand that happens to carry an alloc_id
+        // made `copy (pair.0)` inherit `pair.1`'s allocation.
         assert_eq!(
-            result,
-            Some(0x2222),
-            "pick_alloc_operand should prefer operand at local {} with known alloc_id \
-             over operand at local {} without one",
-            second_local,
-            first_local
+            result, None,
+            "a two-pointer aggregate at local {} must not inherit the alloc_id of \
+             operand local {} (operand local {} has none)",
+            agg_local, second_local, first_local
         );
     });
 }
@@ -522,8 +611,9 @@ fn test_trace_alloc_id_aggregate_fallback_to_first_operand() {
 
         assert_eq!(
             chc_ctx.trace_deref_store_alloc_id(agg_local),
-            Some(0x1111),
-            "trace should find alloc_id via first operand"
+            None,
+            "a two-pointer aggregate has no single base address, even when its first \
+             operand carries an alloc_id"
         );
     });
 }
@@ -565,8 +655,8 @@ fn test_trace_alloc_id_via_ref_rvalue() {
             for stmt in &bb.statements {
                 if let StatementKind::Assign(lhs, rhs) = &stmt.kind {
                     let source = match rhs {
-                        Rvalue::Use(rustc_public::mir::Operand::Copy(src))
-                        | Rvalue::Use(rustc_public::mir::Operand::Move(src)) => Some(src.local),
+                        Rvalue::Use(rustc_public::mir::Operand::Copy(src), ..)
+                        | Rvalue::Use(rustc_public::mir::Operand::Move(src), ..) => Some(src.local),
                         Rvalue::Ref(_, _, place) if place.projection.is_empty() => {
                             Some(place.local)
                         }
@@ -622,7 +712,7 @@ fn test_trace_alloc_id_exhaustion_long_chain_returns_none() {
             chc_ctx
                 .ref_resolution
                 .ref_targets
-                .insert(100 + i, RefTarget::with_projections(101 + i, vec![]));
+                .insert(100 + i, RefTarget::with_projections(101 + i, vec![ProjectionElem::Deref]));
         }
 
         assert_eq!(
@@ -652,7 +742,7 @@ fn test_trace_alloc_id_long_chain_within_limit_succeeds() {
             chc_ctx
                 .ref_resolution
                 .ref_targets
-                .insert(100 + i, RefTarget::with_projections(101 + i, vec![]));
+                .insert(100 + i, RefTarget::with_projections(101 + i, vec![ProjectionElem::Deref]));
         }
         chc_ctx.known_alloc_ids.insert(106, 0x7777);
 
@@ -672,6 +762,8 @@ fn test_trace_alloc_id_long_chain_within_limit_succeeds() {
 /// Box::new generates ShallowInitBox in MIR. Seed alloc_id at the malloc result
 /// and trace from the ShallowInitBox destination.
 #[test]
+// Rvalue::ShallowInitBox exists only in the frozen nightly MIR.
+#[cfg(not(trust_toolchain))]
 fn test_trace_alloc_id_via_shallow_init_box() {
     const BOX_SOURCE: &str = r#"
         #![allow(dead_code)]
@@ -766,14 +858,159 @@ fn test_trace_alloc_id_via_copy_for_deref() {
         chc_ctx.known_alloc_ids.insert(1, 0xCFDF);
 
         if let Some(dest) = copy_for_deref_dest {
+            // `*r` with `r: &&u32` loads the INNER reference stored where `r`
+            // points; 0xCFDF names the allocation `r` addresses, not the one the
+            // loaded reference addresses.
             assert_eq!(
                 chc_ctx.trace_deref_store_alloc_id(dest),
-                Some(0xCFDF),
-                "trace should follow CopyForDeref rvalue back to source alloc_id"
+                None,
+                "a load through a pointer must not inherit that pointer's alloc_id"
             );
         }
         // Always verify the arg itself.
         assert_eq!(chc_ctx.trace_deref_store_alloc_id(1), Some(0xCFDF));
+    });
+}
+
+// =============================================================================
+// trace_deref_store_alloc_id: hops that change the pointer value are refused
+// =============================================================================
+
+/// `#[repr(C)] struct S { a: u8, b: u8 }` behind a raw pointer, with a store to
+/// field `b` (byte offset 1).
+const FIELD_OFFSET_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    #[repr(C)]
+    pub struct S {
+        pub a: u8,
+        pub b: u8,
+    }
+
+    pub unsafe fn probe_field_offset(p: *mut S) {
+        unsafe { (*p).b = 1; }
+    }
+"#;
+
+/// `ref_targets[r] = (t, [])` names `t`'s own slot; `known_alloc_ids[t]` names
+/// what `t` points to. Following it wrote `*r = q` into `t`'s pointee.
+#[test]
+fn test_trace_alloc_id_slot_borrow_not_followed() {
+    with_test_ay_ctx_for_source(SIMPLE_PTR_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_raw_ptr");
+        let body = instance.body().expect("body");
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_raw_ptr",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        chc_ctx.ref_resolution.ref_targets.insert(2, RefTarget::with_projections(1, vec![]));
+        chc_ctx.known_alloc_ids.insert(1, 0x510D);
+
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(2),
+            None,
+            "a borrow of a local's slot must not inherit the allocation the local points to"
+        );
+    });
+}
+
+/// `ref_targets[r] = (p, [Deref, Field(1)])` is `p + 1`: minting `obj ++ 0` for it
+/// stored `*pb = 9` into field `a`. Field 0 (offset 0) keeps the base address.
+#[test]
+fn test_trace_alloc_id_ref_target_field_offset_decides() {
+    with_test_ay_ctx_for_source(FIELD_OFFSET_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_field_offset");
+        let body = instance.body().expect("body");
+
+        let mut field_b_projection = None;
+        for bb in &body.blocks {
+            for stmt in &bb.statements {
+                if let StatementKind::Assign(lhs, _) = &stmt.kind
+                    && lhs.local == 1
+                    && matches!(
+                        lhs.projection.as_slice(),
+                        [ProjectionElem::Deref, ProjectionElem::Field(1, _)]
+                    )
+                {
+                    field_b_projection = Some(lhs.projection.clone());
+                }
+            }
+        }
+        assert_mir_pattern_found(field_b_projection.is_some(), "store to (*_1).b");
+        let field_b_projection = field_b_projection.expect("field b projection");
+        let ProjectionElem::Field(_, field_ty) = field_b_projection[1] else {
+            panic!("expected a field projection");
+        };
+
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_field_offset",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        chc_ctx.known_alloc_ids.insert(1, 0xF1E1);
+        chc_ctx
+            .ref_resolution
+            .ref_targets
+            .insert(20, RefTarget::with_projections(1, field_b_projection.clone()));
+        chc_ctx.ref_resolution.ref_targets.insert(
+            21,
+            RefTarget::with_projections(
+                1,
+                vec![ProjectionElem::Deref, ProjectionElem::Field(0, field_ty)],
+            ),
+        );
+        chc_ctx.ref_resolution.ref_targets.insert(
+            22,
+            RefTarget::with_projections(1, vec![ProjectionElem::Deref, ProjectionElem::Deref]),
+        );
+
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(20),
+            None,
+            "a reference to field b (offset 1) is not the base address"
+        );
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(21),
+            Some(0xF1E1),
+            "a reference to field a (offset 0) is the base address"
+        );
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(22),
+            None,
+            "a second dereference reads a different pointer"
+        );
+    });
+}
+
+/// `(*_1) = copy _2` stores THROUGH `_1`; it does not define `_1`'s value.
+#[test]
+fn test_trace_alloc_id_store_through_local_is_not_its_definition() {
+    const STORE_THROUGH_SOURCE: &str = r#"
+        #![allow(dead_code)]
+
+        pub unsafe fn probe_store_through(p: *mut *mut u32, q: *mut u32) {
+            unsafe { *p = q; }
+        }
+    "#;
+    with_test_ay_ctx_for_source(STORE_THROUGH_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_store_through");
+        let body = instance.body().expect("body");
+        let mut chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_store_through",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        chc_ctx.known_alloc_ids.insert(2, 0x0BAD);
+
+        assert_eq!(
+            chc_ctx.trace_deref_store_alloc_id(1),
+            None,
+            "a store through _1 must not make _1 inherit the stored pointer's alloc_id"
+        );
     });
 }
 

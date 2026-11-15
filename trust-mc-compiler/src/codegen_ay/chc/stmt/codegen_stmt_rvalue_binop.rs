@@ -7,6 +7,7 @@
 //! Extracted from `codegen_stmt_rvalue.rs` per #3920 to reduce merge-conflict
 //! contention on the 968-line parent file.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -19,7 +20,8 @@ use crate::codegen_ay::types::{POINTER_WIDTH, ty_to_bv_width};
 use super::super::codegen_expr_array_eq::{build_spec_array_eq, recover_spec_array_eq_len};
 use super::super::fieldless_constructor_cmp::try_fieldless_constructor_comparison;
 use super::ChcCtx;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use crate::codegen_ay::chc::heap::stack_address::is_relational_ptr_op;
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_expr_signedness::{ExprSignedness, ty_signedness};
 use crate::codegen_ay::chc::call::codegen_call_kani_model_dst::is_zst_ty;
 use crate::codegen_ay::chc::float_assertion_patterns::{
@@ -41,6 +43,11 @@ fn operand_is_raw_pointer_like(operand: &Operand, locals: &[rustc_public::mir::L
     }
 
     operand.ty(locals).ok().is_some_and(ty_is_raw_pointer_like)
+}
+
+/// True when `operand` is a raw pointer.
+fn operand_is_raw_pointer(operand: &Operand, locals: &[rustc_public::mir::LocalDecl]) -> bool {
+    operand.ty(locals).ok().is_some_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))))
 }
 
 /// True when `operand` is a raw pointer / reference whose *pointee* is a
@@ -67,6 +74,8 @@ fn operands_same_place(a: &Operand, b: &Operand) -> bool {
         match op {
             Operand::Copy(p) | Operand::Move(p) => Some(p),
             Operand::Constant(_) => None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
     match (place_of(a), place_of(b)) {
@@ -108,6 +117,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // ZST-pointee pointers as a fresh nondeterministic boolean so BOTH
         // outcomes stay reachable and the downstream obligation fires. Non-ZST
         // pointers and self-comparisons are unaffected. (zst/main.rs missed_bug.)
+        //
+        // Only DISTINCT allocations may coincide. Within one allocation the
+        // identity terms are the addresses: two `&obj[1..2] as *const ()` data
+        // pointers are equal, and a nondeterministic answer there certified a
+        // Genuine counterexample for a harness Kani proves
+        // (kani/PointerComparison/ptr_comparison.rs `check_box_comparison`,
+        // tools/soundness-duals/zst_ptr_eq_dual.rs). So: same object lane ->
+        // exact identity equality; different lanes -> the nondeterministic bit.
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && operand_pointee_is_zst(lhs_op, self.body.locals())
             && operand_pointee_is_zst(rhs_op, self.body.locals())
@@ -115,9 +132,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             debug!(
                 ?op,
-                "CHC: modeling ZST-pointee address equality as nondeterministic (zst missed_bug)"
+                "CHC: modeling cross-allocation ZST-pointee address equality as nondeterministic (zst missed_bug)"
             );
-            return Some(declare_pending_var(chc_fresh_name("__zst_addr_eq_nondet"), Sort::bool()));
+            let nondet = ExactVar::nondet(
+                chc_fresh_name("__zst_addr_eq_nondet"),
+                Sort::bool(),
+            );
+            let lhs = self.translate_operand_with_modified(lhs_op, modified_locals);
+            let rhs = self.translate_operand_with_modified(rhs_op, modified_locals);
+            let eq = match (lhs, rhs) {
+                (Some(l), Some(r))
+                    if !self.int_lift
+                        && l.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        && r.sort().bitvec_width() == Some(POINTER_WIDTH)
+                        && POINTER_WIDTH == 64 =>
+                {
+                    let same_object = l.clone().extract(63, 32).eq(r.clone().extract(63, 32));
+                    Expr::ite(same_object, l.eq(r), nondet)
+                }
+                _ => nondet,
+            };
+            return Some(if matches!(op, BinOp::Ne) { eq.not() } else { eq });
         }
         // Part of #3875: Element-wise array equality for MIR-inlined spec_eq.
         // rustc can MIR-inline SpecArrayEq::spec_eq, turning it into a BinOp::Eq
@@ -129,6 +164,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if array_len.is_some() {
                 let lhs = self.translate_operand_with_modified(lhs_op, modified_locals)?;
                 let rhs = self.translate_operand_with_modified(rhs_op, modified_locals)?;
+                // An element whose `==` is not its encoding's (a float, a
+                // reference, a hand-written `PartialEq`) is compared exactly or
+                // not at all (`call/codegen_call_cmp_semantic.rs`).
+                let resolved_ty = self.resolve_body_ty(lhs_ty);
+                if !crate::codegen_ay::shared::compare_loops::comparison_is_faithful(
+                    crate::codegen_ay::shared::compare_loops::ComparisonCall::Eq { negated: false },
+                    resolved_ty,
+                ) {
+                    // Only a by-value array is read here; a reference's
+                    // operand term is not its referent.
+                    if !matches!(resolved_ty.kind(), TyKind::RigidTy(RigidTy::Array(..))) {
+                        return None;
+                    }
+                    let eq = crate::codegen_ay::shared::compare_loops::rust_value_eq(
+                        resolved_ty,
+                        &lhs,
+                        &rhs,
+                    )?;
+                    return Some(if matches!(op, BinOp::Ne) { eq.not() } else { eq });
+                }
                 if let Some(bool_eq) = build_spec_array_eq(&lhs, &rhs, array_len) {
                     let result: Expr =
                         if matches!(op, BinOp::Ne) { bool_eq.not() } else { bool_eq };
@@ -161,6 +216,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         let lhs = self.translate_operand_with_modified(lhs_op, modified_locals)?;
         let rhs = self.translate_operand_with_modified(rhs_op, modified_locals)?;
+        // `==` / `!=` of two raw pointers: where a far pointer's low 48 offset
+        // bits would decide it, Kani's modes disagree (heap/stack_address.rs
+        // `note_ptr_equality`).
+        if matches!(op, BinOp::Eq | BinOp::Ne)
+            && operand_is_raw_pointer(lhs_op, self.body.locals())
+            && operand_is_raw_pointer(rhs_op, self.body.locals())
+        {
+            let t64 = self
+                .wrapping_operand_t64(lhs_op, &lhs, modified_locals)
+                .zip(self.wrapping_operand_t64(rhs_op, &rhs, modified_locals));
+            self.note_raw_pointer_equality(&lhs, &rhs, t64);
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && let Some(result) = option_like_datatype_eq(&lhs, &rhs, matches!(op, BinOp::Eq))
         {
@@ -307,6 +374,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(result);
         }
 
+        // A relational comparison of two raw pointers observes their addresses,
+        // which have no order across allocations (heap/stack_address.rs).
+        let (lhs, rhs) = if raw_pointer_ordering && is_relational_ptr_op(*op) {
+            self.ptr_order_operands(lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
         match rvalue {
             Rvalue::BinaryOp(_, _, _) => {
                 self.translate_binop(*op, lhs, rhs, is_signed, int_bv_width, is_float)

@@ -1,0 +1,32 @@
+# Reconstructed transcript: the results-verification-bmc unit log this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_smoke_resume...
+[AY:PROOF] BMC verification: no violation within bound
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_smoke_resume.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: matches!(r, CoroutineState::Complete(()))"
+	 - Location: /corpus/kani/Coroutines/rustc-coroutine-tests/smoke.rs:28:5 in function check_smoke_resume
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_smoke_yield...
+[AY:UNKNOWN_QUALITY:EncodingGap:unconstrained_assignment=1]
+Check 1: check_smoke_yield.assertion.1
+	 - Status: UNDETERMINED
+	 - Description: "assertion failed: matches!(r, CoroutineState::Yielded(1))"
+	 - Location: /corpus/kani/Coroutines/rustc-coroutine-tests/smoke.rs:40:5 in function check_smoke_yield
+
+SUMMARY:
+ ** 0 of 1 failed (1 undetermined)
+
+VERIFICATION:- INCONCLUSIVE (solver undecided)
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_smoke_yield
+Complete - 1 successfully verified harnesses, 1 failures, 2 total.
+warning: pointee_synthesis_fallback: 1 raw pointer target synthesized without provenance

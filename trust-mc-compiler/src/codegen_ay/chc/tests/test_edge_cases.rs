@@ -585,7 +585,8 @@ fn test_option_is_some_struct_style() {
         let is_some = chc_ctx.option_is_some(some_val);
         assert!(is_some.sort().is_bool());
         let smt = is_some.to_string();
-        assert!(smt.contains("is_some"), "struct-style should use is_some field: {smt}");
+        // ay folds is_some over the Some constructor (8a7c063209) to `true`.
+        assert!(smt.contains("is_some") || smt == "true", "struct-style should use (or fold) is_some field: {smt}");
     });
 }
 

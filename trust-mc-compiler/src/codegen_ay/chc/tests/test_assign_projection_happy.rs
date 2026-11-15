@@ -165,7 +165,7 @@ fn find_field_index_use_on_local(
 ) -> rustc_public::mir::Place {
     for block in &body.blocks {
         for stmt in &block.statements {
-            if let StatementKind::Assign(_, Rvalue::Use(operand)) = &stmt.kind {
+            if let StatementKind::Assign(_, Rvalue::Use(operand, ..)) = &stmt.kind {
                 match operand {
                     Operand::Copy(place) | Operand::Move(place)
                         if place_has_field_index_projection(place, target_local) =>

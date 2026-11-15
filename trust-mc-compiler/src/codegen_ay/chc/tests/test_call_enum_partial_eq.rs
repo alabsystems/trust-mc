@@ -70,34 +70,38 @@ fn reset_enum_partial_eq_counters() {
     let _ = crate::codegen_ay::take_unhandled_call_by_fn();
 }
 
+/// The probe's `<MyEnum as PartialEq>::eq` is an impl of the crate under
+/// verification, so the path-text stub registry does not claim it as the
+/// primitive comparison: a callee of the local crate is walked as the code
+/// it is (walker fail-closed repair round 5, `user_type_named_like_std_dual.rs`;
+/// `shared::callee_is_local_item`), which a hand-written `eq` of the same
+/// name needs. The derived comparison still proves without fallbacks
+/// (`test_enum_partial_eq_literal_assert_eq_proves_without_fallbacks`).
 #[test]
-fn test_enum_partial_eq_call_is_detected_as_primitive_cmp_stub() {
+fn test_enum_partial_eq_call_is_not_claimed_by_the_primitive_cmp_stub() {
     with_test_ay_ctx_for_source(ENUM_PARTIAL_EQ_PROBE, |ctx| {
         for fn_name in PROBE_FN_NAMES {
             let instance = find_instance_by_suffix(ctx.tcx, fn_name);
             let body = instance.body().expect("function body");
             let chc_ctx = ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default());
-
-            let primitive_cmp_paths: Vec<_> = body
+            let eq_calls: Vec<_> = body
                 .blocks
                 .iter()
                 .filter_map(|block| match &block.terminator.kind {
-                    TerminatorKind::Call { func, .. }
-                        if chc_ctx
-                            .detect_stub_matching(func, StubKind::is_primitive_cmp)
-                            .is_some() =>
-                    {
-                        chc_ctx.resolve_callee_path(func)
-                    }
+                    TerminatorKind::Call { func, .. } => chc_ctx
+                        .resolve_callee_path(func)
+                        .filter(|path| path == "<MyEnum as std::cmp::PartialEq>::eq")
+                        .map(|_| func.clone()),
                     _ => None,
                 })
                 .collect();
-
-            assert_eq!(
-                primitive_cmp_paths,
-                vec!["<MyEnum as std::cmp::PartialEq>::eq".to_string()],
-                "{fn_name} should route derived enum PartialEq through PrimitivePartialEqEq, paths={primitive_cmp_paths:?}"
-            );
+            assert_eq!(eq_calls.len(), 1, "{fn_name} calls the derived eq once");
+            for func in &eq_calls {
+                assert!(
+                    chc_ctx.detect_stub_matching(func, StubKind::is_primitive_cmp).is_none(),
+                    "{fn_name}: a local impl is not claimed by the primitive-compare stub"
+                );
+            }
         }
     });
 }

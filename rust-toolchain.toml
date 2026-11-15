@@ -1,2 +1,5 @@
+# ALab builds with the Trust toolchain (owner directive, 2026-09-28): targo,
+# trustc, tippy, trustfmt. The lane is chosen per command by targo
+# (`targo trust <cmd>` verified, `targo --unverified <cmd>`), not by this file.
 [toolchain]
 channel = "trust"

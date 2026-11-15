@@ -19,7 +19,7 @@
 //! - `concrete_eval`: concrete BV evaluation and MIR string extraction
 //! - `range`: range-specific helpers (advance, flattened fields, signedness)
 //! - `reduce`: IterFold/IterSum reduction dispatch
-//! - `size_hint`: IterSizeHint dispatch (remaining, Some(remaining))
+//! - `size_hint`: authenticated native lower and upper bounds
 
 mod collect;
 mod collect_data;
@@ -35,13 +35,23 @@ mod size_hint;
 mod zip;
 
 use ay_bindings::Expr;
+pub(in crate::codegen_ay::chc) use range::unanimous_borrowed_local;
+pub(in crate::codegen_ay::chc) use reduce::closure_arg_may_carry_obligation;
+pub(in crate::codegen_ay::chc) use reduce::closure_ty_may_carry_obligation;
+#[cfg(test)]
+pub(in crate::codegen_ay::chc) use reduce::saturating_add;
+use rustc_public::mir::Operand;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 use std::sync::atomic::Ordering;
 
+use crate::codegen_ay::iter_closure_obligation::{
+    UNMODELED_CLOSURE_MESSAGE, ty_may_run_obligated_closure,
+};
 use crate::codegen_ay::stubs::StubKind;
+use trust_mc_core::violation::PropertyKind;
 
 use super::ChcCtx;
-use super::chc_call_context::ChcCallContext;
+use super::chc_call_context::{ChcCallContext, DispatchCallContext};
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_ctx::diagnostics::CellCounter;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
@@ -74,7 +84,115 @@ pub(in crate::codegen_ay::chc) fn get_range_spec_next_path_counts() -> RangeSpec
 
 /// Extension trait for iterator adapter call handling on `ChcCtx`.
 pub(in crate::codegen_ay::chc) trait CallIteratorAdapter {
-    fn codegen_call_iterator_adapter(&mut self, cx: &ChcCallContext<'_>);
+    /// `func` is the call's own callee operand (`None` only in unit tests that
+    /// have no call): an `Iterator::sum` is classified from it, never by its
+    /// destination place, which two sums can share.
+    fn codegen_call_iterator_adapter(&mut self, cx: &ChcCallContext<'_>, func: Option<&Operand>);
+}
+
+impl ChcCtx<'_, '_> {
+    /// Resolve identity before printed-name categories: an adapter can mention
+    /// Vec in its generic arguments and otherwise stop at Vec's exclusive route.
+    pub(in crate::codegen_ay::chc) fn try_codegen_native_iterator_size_hint(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+    ) -> bool {
+        if !self.native_iterator_size_hint_call(dcx.func) {
+            return false;
+        }
+        let Some(target) = *dcx.target else { return false };
+        let cx = ChcCallContext {
+            stub: StubKind::IterSizeHint,
+            args: dcx.args,
+            destination: dcx.destination,
+            target,
+            from_app: dcx.from_app,
+            stmt_constraints: dcx.stmt_constraints,
+            modified_locals: dcx.modified_locals,
+        };
+        self.codegen_call_iterator_adapter(&cx, Some(dcx.func));
+        true
+    }
+
+    /// Does this call run closures its stub does not encode, and may one of
+    /// them carry an obligation (`iter_closure_obligation`)?
+    ///
+    /// The `next()` stubs of std's adapters and the `fold`, `sum` and
+    /// `collect` stubs never run the closures of their receiver's adapter
+    /// chain (a `Filter`'s predicate, a `Map`'s function): the stubs of
+    /// constructors (`map`, `filter`, ...) and of `size_hint` run none.
+    fn adapter_call_may_run_obligated_closure(&self, stub: StubKind, args: &[Operand]) -> bool {
+        let runs_receiver_closures = matches!(
+            stub,
+            StubKind::MapNext
+                | StubKind::FilterNext
+                | StubKind::FilterMapNext
+                | StubKind::FlattenNext
+                | StubKind::ChainNext
+                | StubKind::ZipNext
+                | StubKind::IterFold
+                | StubKind::IterSum
+                | StubKind::IterCollect
+        );
+        if !runs_receiver_closures {
+            return false;
+        }
+        let Some(receiver) = args.first() else {
+            return false;
+        };
+        let Ok(ty) = receiver.ty(self.body.locals()) else {
+            return true;
+        };
+        ty_may_run_obligated_closure(self.tcx, self.resolve_body_ty(ty))
+    }
+
+    /// The conservative error rule for a closure the call runs and the stub
+    /// does not encode: a freed flag alone, reachable whenever the call is,
+    /// never certified Genuine (see `reduce::ReducePanicObligation`).
+    fn emit_unmodeled_closure_rule(&mut self, cx: &ChcCallContext<'_>) {
+        let flag = self.iter_conservative_flag(
+            crate::codegen_ay::chc::codegen_ctx::sound_havoc::ITER_ADAPTER_CLOSURE_UNMODELED,
+        );
+        self.emit_error_rule_for_condition_with_kind(
+            cx.from_app,
+            flag.not(),
+            cx.stmt_constraints,
+            cx.target,
+            PropertyKind::Panic,
+            Some(UNMODELED_CLOSURE_MESSAGE.to_string()),
+        );
+    }
+
+    /// The error rules of a sum's panic obligation
+    /// ([`reduce::ReducePanicObligation`]): for an integer sum one for the
+    /// replayed steps and one for the elements the replay did not check, both
+    /// "attempt to add with overflow"; for a `Sum` impl the stub does not
+    /// model, or a float sum's NaN check, one conservative rule. The
+    /// rule body is the call's pre-state, its statement constraints and the
+    /// replay's defining equalities (`acc_k = ...`), which the violation
+    /// predicates read.
+    fn emit_sum_panic_rules(
+        &mut self,
+        cx: &ChcCallContext<'_>,
+        obligation: reduce::ReducePanicObligation,
+        replay_constraints: &[Expr],
+    ) {
+        let mut body: Vec<Expr> =
+            Vec::with_capacity(cx.stmt_constraints.len() + replay_constraints.len());
+        body.extend(cx.stmt_constraints.iter().cloned());
+        body.extend(replay_constraints.iter().cloned());
+        let violations = obligation.exact.into_iter().chain(std::iter::once(obligation.unchecked));
+        for violation in violations {
+            self.emit_error_rule_for_condition_with_kind(
+                cx.from_app,
+                violation.not(),
+                &body,
+                cx.target,
+                obligation.kind,
+                Some(obligation.message.to_string()),
+            );
+        }
+    }
 }
 
 impl<'tcx, 'body> CallIteratorAdapter for ChcCtx<'tcx, 'body> {
@@ -85,11 +203,17 @@ impl<'tcx, 'body> CallIteratorAdapter for ChcCtx<'tcx, 'body> {
     /// - `RangeSpecNext`: preserve range progression (`start < end`, `start += 1`).
     /// - `IterFold` / `IterSum`: preserve empty-iterator identities.
     /// - Other adapters: symbolic over-approximation with explicit destination update.
-    fn codegen_call_iterator_adapter(&mut self, cx: &ChcCallContext<'_>) {
+    fn codegen_call_iterator_adapter(&mut self, cx: &ChcCallContext<'_>, func: Option<&Operand>) {
         let stub = cx.stub;
         let args = cx.args;
         let destination = cx.destination;
         let modified_locals = cx.modified_locals;
+
+        // Before any early return: the closures run whatever happens to the
+        // destination (AY alignment round 8, review round 5, finding 1).
+        if self.adapter_call_may_run_obligated_closure(stub, args) {
+            self.emit_unmodeled_closure_rule(cx);
+        }
 
         let dest_local: usize = destination.local;
         let Some(dest_vec_idx) = self.try_state_idx_for_local(dest_local) else {
@@ -157,16 +281,36 @@ impl<'tcx, 'body> CallIteratorAdapter for ChcCtx<'tcx, 'body> {
                 extra_constraints.extend(range_extra);
             }
             StubKind::IterFold | StubKind::IterSum => {
+                let mut panic_obligation = None;
+                let mut reduce_checks = Vec::new();
                 let (res, flat) = self.codegen_reduce_arm(
                     stub,
+                    func,
                     args,
                     modified_locals,
-                    dest_local,
+                    destination,
                     dest_vec_idx,
                     &mut extra_constraints,
+                    &mut panic_obligation,
+                    &mut reduce_checks,
                 );
                 result_expr = res;
                 flattened_result_fields = flat;
+                if let Some(obligation) = panic_obligation {
+                    self.emit_sum_panic_rules(cx, obligation, &extra_constraints);
+                }
+                // The reduction's step obligations read the chain's bound
+                // accumulators: their error rules carry its constraints.
+                if !reduce_checks.is_empty() {
+                    let mut body: Vec<Expr> = cx.stmt_constraints.to_vec();
+                    body.extend(extra_constraints.iter().cloned());
+                    self.emit_deferred_inline_checks_at(
+                        cx.from_app,
+                        &body,
+                        cx.target,
+                        reduce_checks,
+                    );
+                }
             }
             StubKind::IterMap
             | StubKind::IterFilter
@@ -190,6 +334,7 @@ impl<'tcx, 'body> CallIteratorAdapter for ChcCtx<'tcx, 'body> {
             StubKind::IterSizeHint => {
                 // Delegated to size_hint.rs — Part of #3348: precise size_hint stub.
                 self.codegen_iter_size_hint(
+                    func,
                     args,
                     modified_locals,
                     dest_local,

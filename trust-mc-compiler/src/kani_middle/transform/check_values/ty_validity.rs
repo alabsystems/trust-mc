@@ -14,6 +14,8 @@
 
 use super::{ValidValueReq, ValidityRange};
 use crate::kani_middle::transform::body::{InsertPosition, MutableBody, SourceInstruction};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
 use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape, WrappingRange};
 use rustc_public::mir::mono::Instance;
@@ -137,7 +139,7 @@ pub(crate) fn build_limits(
         ));
         let offset_const = body.new_uint_operand(req.offset as _, UintTy::Usize, span);
         let offset = move_local(body.insert_assignment(
-            Rvalue::Use(offset_const),
+            rvalue_use!(Rvalue::Use(offset_const)),
             source,
             InsertPosition::Before,
         ));

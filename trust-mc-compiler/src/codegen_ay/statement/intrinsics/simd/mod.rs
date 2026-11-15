@@ -27,6 +27,9 @@ mod ops;
 mod reduce;
 
 use crate::codegen_ay::names::struct_sort;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -124,7 +127,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         if fields.len() == 1 {
             let field = &fields[0];
-            let field_ty = field.ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(field, &args)?;
             if let TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) = field_ty.kind() {
                 let len = len_const.eval_target_usize().into_option()? as usize;
                 let elem_sort = Self::infer_simd_sort_from_ty(elem_ty)?;
@@ -136,7 +139,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut field_names = Vec::with_capacity(fields.len());
         let mut elem_sort: Option<Sort> = None;
         for field in fields {
-            let field_ty = field.ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(&field, &args)?;
             let field_sort = Self::infer_simd_sort_from_ty(field_ty)?;
             if let Some(existing) = &elem_sort {
                 if *existing != field_sort {
@@ -202,10 +205,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         layout: &SimdLayout,
         simd_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
-        let TyKind::RigidTy(RigidTy::Adt(adt_def, _)) = simd_ty.kind() else {
+        let TyKind::RigidTy(RigidTy::Adt(adt_def, args)) = simd_ty.kind() else {
             return None;
         };
-        let adt_name = adt_def.name();
+        // The SAME datatype name the type's own sort carries
+        // (`infer_sort_from_ty` -> `adt_sort_name`): naming the result by the
+        // crate-qualified path (`adt_def.name()`, `testcrate_7::U32x4`) declared a
+        // second datatype for one Rust type, so a rebuilt vector never had the
+        // sort of the operand it came from (layout_helpers'
+        // `test_simd_construct_expr_roundtrip_u32x4`).
+        let adt_name = Self::adt_sort_name(adt_def, &args);
         let cons_name = crate::codegen_ay::names::cons_name(&adt_name);
 
         match layout {
@@ -260,7 +269,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return false;
         }
         let field = &variants[0].fields()[0];
-        let field_ty = field.ty_with_args(&args);
+        let Some(field_ty) = mono_ty::field_ty(field, &args) else {
+            return false;
+        };
         match field_ty.kind() {
             TyKind::RigidTy(RigidTy::Array(elem_ty, _)) => {
                 matches!(elem_ty.kind(), TyKind::RigidTy(RigidTy::Int(_)))
@@ -282,7 +293,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return false;
         }
         let field = &variants[0].fields()[0];
-        let field_ty = field.ty_with_args(&args);
+        let Some(field_ty) = mono_ty::field_ty(field, &args) else {
+            return false;
+        };
         match field_ty.kind() {
             TyKind::RigidTy(RigidTy::Array(elem_ty, _)) => {
                 matches!(elem_ty.kind(), TyKind::RigidTy(RigidTy::Float(_)))

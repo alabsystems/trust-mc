@@ -5,6 +5,7 @@
 //! Closure and coroutine aggregate construction for CHC statement encoding.
 //! Extracted from codegen_stmt_aggregate.rs per #4057 (500 LOC threshold).
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -22,7 +23,6 @@ use ay_bindings::{Expr, Sort};
 
 use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
-use super::codegen_ctx::globals::declare_pending_var;
 use super::codegen_types::CodegenTypes;
 use super::{ChcCtx, chc_fresh_name};
 
@@ -350,7 +350,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         root_field_exprs.push(direct_expr);
         for variant in &info.variants {
             let fresh_name = chc_fresh_name("__coroutine_variant_view");
-            root_field_exprs.push(declare_pending_var(fresh_name, variant.sort.clone()));
+            root_field_exprs.push(ExactVar::unobserved(fresh_name, variant.sort.clone()));
         }
 
         let cons = crate::codegen_ay::names::resolve_ctor_name(&info.root_sort, &coro_name);

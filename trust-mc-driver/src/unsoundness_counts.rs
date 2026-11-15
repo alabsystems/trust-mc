@@ -66,7 +66,7 @@ pub(crate) const FAIL_CLOSED_CATEGORIES: [UnsoundnessCategory; 5] = [
 /// These create fresh unconstrained symbolic values or drop constraints,
 /// making the encoding strictly STRONGER (universally quantified).
 /// A PROOF under this model is always valid. Tracked for diagnostics but not demotion.
-pub(crate) const SOUND_APPROXIMATION_CATEGORIES: [UnsoundnessCategory; 12] = [
+pub(crate) const SOUND_APPROXIMATION_CATEGORIES: [UnsoundnessCategory; 13] = [
     UnsoundnessCategory::AssumeDroppedTransition,
     UnsoundnessCategory::ChcCoerceEqDrop,
     UnsoundnessCategory::ChcTranslationDrop,
@@ -83,6 +83,13 @@ pub(crate) const SOUND_APPROXIMATION_CATEGORIES: [UnsoundnessCategory; 12] = [
     UnsoundnessCategory::StaticInitIncomplete,
     UnsoundnessCategory::AggregateEncodingGap,
     UnsoundnessCategory::StubApproximation,
+    // D1 (2026-09-14): reachability abstracted a stdlib function away with no
+    // stub and no handler, so its result is a fresh unconstrained symbolic. Like
+    // `ChcSoundHavocDrop` this is a SoundApproximation that must taint a
+    // COUNTEREXAMPLE (`classify_ctrex` ⇒ OverApproximation, never `Genuine`) but
+    // is deliberately excluded from the proof-qualifying sound-fallback count in
+    // `apply_sound_fallback_fail_close` — see the soundness note there.
+    UnsoundnessCategory::UnstubbedAbstraction,
 ];
 
 // Compile-time assertion: all KaniMetadata unsoundness categories accounted for (#2973, #3715).
@@ -160,7 +167,8 @@ fn diagnostic_per_harness(
         InferablePredicate => &metadata.inferable_predicates.as_ref()?.per_harness,
         FpBitvectorEncoding => &metadata.fp_bitvector_encoding.as_ref()?.per_harness,
         RoundingAssertionBypass => &metadata.rounding_assertion_bypass.as_ref()?.per_harness,
-        AssertUntranslatable | HeapCheckUntranslatable | HeapCheckUnknownLayout => return None,
+        AssertUntranslatable => &metadata.assert_untranslatable.as_ref()?.per_harness,
+        HeapCheckUntranslatable | HeapCheckUnknownLayout => return None,
         IteratorUnsoundness => &metadata.iterator_unsoundness.as_ref()?.per_harness,
         BigIntUnsoundness => &metadata.bigint_unsoundness.as_ref()?.per_harness,
         AssumeDroppedTransition => &metadata.assume_dropped_transitions.as_ref()?.per_harness,
@@ -169,6 +177,7 @@ fn diagnostic_per_harness(
         ChcSoundHavocDrop => &metadata.chc_translation_drops.as_ref()?.sound_havoc_per_harness,
         IntoOptionDrop => &metadata.into_option_drops.as_ref()?.per_harness,
         AbstractedFallback => &metadata.abstracted_fallbacks.as_ref()?.per_harness,
+        UnstubbedAbstraction => &metadata.unstubbed_abstractions.as_ref()?.per_harness,
         VecFieldFallback => &metadata.vec_field_fallbacks.as_ref()?.per_harness,
         PointeeSynthesisFallback => &metadata.pointee_synthesis_fallbacks.as_ref()?.per_harness,
         UnhandledCalls => &metadata.unhandled_calls.as_ref()?.per_harness,
@@ -228,6 +237,10 @@ pub(crate) struct UnsoundnessCounts<'a> {
     sound_approx_per_harness: SoundApproxPerHarnessMap<'a>,
     /// Fail-closed counters (Part of #3447): injected failure for untranslatable constructs.
     assert_untranslatable: BTreeMap<&'a str, usize>,
+    /// Per-harness untranslatable-assertion counts. The crate total alone made
+    /// ONE harness's untranslatable assert demote every sibling's
+    /// counterexample in the same crate.
+    assert_untranslatable_per_harness: BTreeMap<&'a str, &'a BTreeMap<String, usize>>,
     heap_check_untranslatable: BTreeMap<&'a str, usize>,
     heap_check_unknown_layout: BTreeMap<&'a str, usize>,
     iterator_unsoundness: BTreeMap<&'a str, usize>,
@@ -303,6 +316,7 @@ impl<'a> UnsoundnessCounts<'a> {
             ),
             assert_untranslatable:
                 unsoundness_extract_fail_closed::assert_untranslatable_count_by_crate(project),
+            assert_untranslatable_per_harness: dph(project, UC::AssertUntranslatable),
             heap_check_untranslatable:
                 unsoundness_extract_fail_closed::heap_check_untranslatable_count_by_crate(project),
             heap_check_unknown_layout:
@@ -381,6 +395,7 @@ impl<'a> UnsoundnessCounts<'a> {
             sound_approx_per_harness,
             sound_approx_crate_totals,
             assert_untranslatable: c(&self.assert_untranslatable),
+            assert_untranslatable_per_harness: ph(&self.assert_untranslatable_per_harness),
             heap_check_untranslatable: c(&self.heap_check_untranslatable),
             heap_check_unknown_layout: c(&self.heap_check_unknown_layout),
             iterator_unsoundness: c(&self.iterator_unsoundness),
@@ -447,6 +462,7 @@ pub(crate) struct CrateUnsoundnessCounts {
     /// These force CTREX on untranslatable constructs — any CTREX with these
     /// nonzero is an encoding gap, not a genuine bug.
     pub(crate) assert_untranslatable: usize,
+    pub(crate) assert_untranslatable_per_harness: BTreeMap<String, usize>,
     pub(crate) heap_check_untranslatable: usize,
     pub(crate) heap_check_unknown_layout: usize,
     pub(crate) iterator_unsoundness: usize,

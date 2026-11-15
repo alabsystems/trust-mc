@@ -11,56 +11,7 @@
 // Test code: unwrap/panic are acceptable for assertions
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::collections::HashMap;
-
 use super::common::*;
-
-fn referenced_static_locals(body: &rustc_public::mir::Body) -> HashMap<String, usize> {
-    use rustc_public::mir::alloc::GlobalAlloc;
-    use rustc_public::mir::{Operand, Rvalue, StatementKind};
-    use rustc_public::ty::{ConstantKind, TyConstKind};
-
-    let mut locals = HashMap::new();
-
-    for bb in &body.blocks {
-        for stmt in &bb.statements {
-            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
-                continue;
-            };
-            let Operand::Constant(const_op) = (match rhs {
-                Rvalue::Use(op) => op,
-                _ => continue,
-            }) else {
-                continue;
-            };
-
-            let provenance = match const_op.const_.kind() {
-                ConstantKind::Allocated(alloc) if !alloc.provenance.ptrs.is_empty() => {
-                    alloc.provenance.clone()
-                }
-                ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                    TyConstKind::Value(_, alloc) if !alloc.provenance.ptrs.is_empty() => {
-                        alloc.provenance.clone()
-                    }
-                    _ => continue,
-                },
-                _ => continue,
-            };
-
-            let alloc_id = provenance.ptrs[0].1.0;
-            let GlobalAlloc::Static(static_def) = GlobalAlloc::from(alloc_id) else {
-                continue;
-            };
-            let static_name = {
-                use rustc_public::CrateDef;
-                static_def.name().clone()
-            };
-            locals.insert(static_name, lhs.local);
-        }
-    }
-
-    locals
-}
 
 fn static_state_idx_for_local(chc_ctx: &ChcCtx<'_, '_>, local: usize, name: &str) -> usize {
     chc_ctx
@@ -120,17 +71,34 @@ fn test_static_str_array_resolves_fat_ptr_provenance() {
             "STATIC init should have resolved fat-ptr elements via concat, not raw zero bytes"
         );
 
-        // There should be u8 memory inits for the "FOO" string bytes.
-        let u8_inits: Vec<_> = chc_ctx
+        // The "FOO" string's bytes are seeded in its OWN object, whole (D2,
+        // `decl::global_objects`): the string is constant memory reached
+        // through STATIC's initializer, read at `str`, so each byte is a `u8`
+        // seed at that object's offset. (Before the constant-pointer rule the
+        // static collector mirrored them into `static_memory_inits` at the
+        // address it minted for the target; the target's ONE object now
+        // carries them.)
+        let byte_at = |obj: u32, off: u64| {
+            chc_ctx.ref_resolution.const_ref_memory_inits.iter().find_map(
+                |(tk, _, value, o, at)| {
+                    (&**tk == "u8" && *o == obj && *at == off).then(|| value.to_string())
+                },
+            )
+        };
+        let string_objects: HashSet<u32> = chc_ctx
             .ref_resolution
-            .static_memory_inits
+            .const_ref_memory_inits
             .iter()
-            .filter(|(tk, _, _, _)| &**tk == "u8")
+            .filter(|(tk, _, _, _, _)| &**tk == "u8")
+            .map(|(_, _, _, obj, _)| *obj)
             .collect();
         assert!(
-            u8_inits.len() >= 3,
-            "should have at least 3 u8 memory inits for 'FOO' bytes, got {}",
-            u8_inits.len()
+            string_objects.iter().any(|&obj| {
+                byte_at(obj, 0).as_deref() == Some("#x46")
+                    && byte_at(obj, 1).as_deref() == Some("#x4f")
+                    && byte_at(obj, 2).as_deref() == Some("#x4f")
+            }),
+            "the 'FOO' bytes should be seeded at offsets 0..3 of one object, got objects {string_objects:?}"
         );
     });
 }

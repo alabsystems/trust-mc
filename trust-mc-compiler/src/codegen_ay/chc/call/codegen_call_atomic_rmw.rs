@@ -11,10 +11,10 @@
 //! Part of #3435: CHC Atomic intrinsic handlers.
 //! Part of #3452: Atomic/Stable dispatch gap.
 
+use super::codegen_call_atomic::atomic_scalar;
 use ay_bindings::Expr;
 use rustc_public::mir::BasicBlockIdx;
 use tracing::debug;
-use trust_mc_codegen_types::types::unwrap_single_field_datatype;
 
 use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
@@ -92,9 +92,9 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_compare_exchange(
     };
 
     // Unwrap repr(transparent) datatype wrappers (Part of #3452).
-    let old_value = unwrap_single_field_datatype(&old_value).unwrap_or(old_value);
-    let expected = unwrap_single_field_datatype(&expected).unwrap_or(expected);
-    let new_value = unwrap_single_field_datatype(&new_value).unwrap_or(new_value);
+    let old_value = atomic_scalar(old_value);
+    let expected = atomic_scalar(expected);
+    let new_value = atomic_scalar(new_value);
 
     // Coerce Bool↔BV for AtomicBool compare_exchange (Part of #3452).
     let (old_value, expected) = coerce_atomic_bool_sorts(old_value, expected);
@@ -200,6 +200,7 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_compare_exchange(
     }
     // Conditional store: referent = ite(success, new, old).
     if let Some((_, rv)) = ctx.resolve_destination(referent_local) {
+        let rv = atomic_scalar(rv);
         let s = rv.sort().clone();
         if let Some(eq) = ctx.make_coerced_eq_constraint(
             &rv,
@@ -253,9 +254,9 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_cxchg(
         return;
     };
     // Unwrap repr(transparent) + coerce Bool↔BV (Part of #3452).
-    let old_value = unwrap_single_field_datatype(&old_value).unwrap_or(old_value);
-    let expected = unwrap_single_field_datatype(&expected).unwrap_or(expected);
-    let new_value = unwrap_single_field_datatype(&new_value).unwrap_or(new_value);
+    let old_value = atomic_scalar(old_value);
+    let expected = atomic_scalar(expected);
+    let new_value = atomic_scalar(new_value);
     let (old_value, expected) = coerce_atomic_bool_sorts(old_value, expected);
     let (old_value, new_value) = coerce_atomic_bool_sorts(old_value, new_value);
     // Sort guard: fall back if sorts don't match after coercion.
@@ -335,6 +336,7 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_cxchg(
 
     // Conditional store: referent = ite(success, new, old).
     if let Some((_, rv)) = ctx.resolve_destination(referent_local) {
+        let rv = atomic_scalar(rv);
         let s = rv.sort().clone();
         if let Some(eq) =
             ctx.make_coerced_eq_constraint(&rv, cond_new, &s, referent_local, "atomic_cxchg_store")
@@ -439,9 +441,25 @@ pub(in crate::codegen_ay::chc) fn codegen_atomic_rmw(
     };
 
     // Unwrap repr(transparent) + coerce Bool↔BV (Part of #3452).
-    let old_value = unwrap_single_field_datatype(&old_value).unwrap_or(old_value);
-    let rhs = unwrap_single_field_datatype(&rhs).unwrap_or(rhs);
+    let old_value = atomic_scalar(old_value);
+    let rhs = atomic_scalar(rhs);
     let (old_value, rhs) = coerce_atomic_bool_sorts(old_value, rhs);
+
+    // The cell and the operand must agree on the scalar's sort; a cell read
+    // back under another sort is the write-dropping fallback above, never a
+    // `bvadd` of two widths (which panics in ay-bindings).
+    if old_value.sort() != rhs.sort() {
+        debug!(
+            ?kind,
+            old_sort = ?old_value.sort(),
+            rhs_sort = ?rhs.sort(),
+            "CHC atomic_rmw: cell and operand sorts disagree — fallback"
+        );
+        ctx.record_fallback();
+        let out = ctx.build_output_args(dcx.modified_locals, &[dest_local]);
+        ctx.emit_goto_rule(dcx.from_app, target, &out, dcx.stmt_constraints);
+        return;
+    }
 
     let new_value =
         if is_exchange { rhs } else { compute_rmw_value(&kind, old_value.clone(), rhs) };
@@ -485,6 +503,7 @@ fn emit_rmw_constraints(
     }
     // referent = new value.
     if let Some((_, rv)) = ctx.resolve_destination(referent_local) {
+        let rv = atomic_scalar(rv);
         let s = rv.sort().clone();
         if let Some(eq) =
             ctx.make_coerced_eq_constraint(&rv, new_value, &s, referent_local, "atomic_rmw_store")

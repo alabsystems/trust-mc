@@ -257,6 +257,7 @@ fn test_prune_dead_vars_keeps_per_property_error_rule_guard() {
         message: None,
         location: None,
         approximation_dependent: None,
+            discharged_at_encode: None,
     });
 
     vc.prune_dead_vars_and_constraints();
@@ -302,6 +303,7 @@ fn test_prune_dead_vars_keeps_mid_equality_chain_feeding_error_rule() {
         message: None,
         location: None,
         approximation_dependent: None,
+            discharged_at_encode: None,
     });
 
     let x = Expr::var("x", Sort::int());

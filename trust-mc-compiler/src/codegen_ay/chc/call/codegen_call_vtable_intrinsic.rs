@@ -11,6 +11,7 @@
 //!
 //! Part of #3159: DynTrait category recovery — vtable metadata constraining.
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc};
 use ay_bindings::{Expr, Sort};
 use tracing::debug;
 
@@ -71,9 +72,10 @@ impl<'tcx, 'body> CallVtableIntrinsic for ChcCtx<'tcx, 'body> {
         let (result, membership_constraint) = if let Some(vtable_arg) = vtable_arg {
             if self.vtable_type_metadata.is_empty() {
                 // No registered vtable entries — unconstrained symbolic (sound).
-                self.record_sound_fallback_reason("vtable_ite_no_entries");
+                let booked = self.record_sound_fallback_reason("vtable_ite_no_entries");
                 (
-                    super::declare_pending_var(
+                    Havoc::booked(
+                        booked,
                         super::chc_fresh_name("__vtable_meta"),
                         Sort::bitvec(POINTER_WIDTH),
                     ),
@@ -102,7 +104,7 @@ impl<'tcx, 'body> CallVtableIntrinsic for ChcCtx<'tcx, 'body> {
                 // Multiple registered types — build ITE chain with membership constraint.
                 // Part of #3794: Add disjunction that vtable_arg is one of the registered IDs.
                 // This makes the encoding exact rather than over-approximate.
-                let mut ite_result = super::declare_pending_var(
+                let mut ite_result = ExactVar::defined(
                     super::chc_fresh_name("__vtable_meta"),
                     Sort::bitvec(POINTER_WIDTH),
                 );
@@ -147,8 +149,9 @@ impl<'tcx, 'body> CallVtableIntrinsic for ChcCtx<'tcx, 'body> {
                 // Part of #3447: Multiple concrete types disagree on metadata
                 // and the vtable argument is untranslatable — unconstrained
                 // symbolic is a sound over-approximation.
-                self.record_sound_fallback_reason("vtable_noarg_disagree");
-                super::declare_pending_var(
+                let booked = self.record_sound_fallback_reason("vtable_noarg_disagree");
+                Havoc::booked(
+                    booked,
                     super::chc_fresh_name("__vtable_meta_noarg"),
                     Sort::bitvec(POINTER_WIDTH),
                 )

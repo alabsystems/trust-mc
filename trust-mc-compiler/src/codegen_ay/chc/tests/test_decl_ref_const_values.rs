@@ -22,6 +22,7 @@
 
 use super::common::*;
 use crate::codegen_ay::emit_chc;
+use crate::codegen_ay::names;
 use rustc_public::mir::{ProjectionElem, Rvalue, StatementKind};
 
 // =============================================================================
@@ -193,17 +194,31 @@ fn test_const_ref_range_inclusive_declares_datatype_sort() {
             ChcCtx::new(ctx.tcx, &body, "const_ref_range_inclusive", ChcConfig::default());
         chc_ctx.declare_block_relations();
 
-        let has_range_const_ref = chc_ctx.ref_resolution.const_ref_values.values().any(|expr| {
-            matches!(expr.sort().inner(), SortInner::Datatype(dt) if dt.name == "RangeInclusive_u32")
-        });
-        assert!(
-            has_range_const_ref,
-            "const_ref_range_inclusive should decode a promoted &RangeInclusive<u32> const_ref_value"
-        );
+        // The sort is named by the definition's path (`std_ops_RangeInclusive_u32`
+        // with std in the graph), so it is recognized by identity, not spelled.
+        let range_paths = ["std::ops::RangeInclusive", "core::ops::RangeInclusive"];
+        let const_ref_sorts: Vec<String> = chc_ctx
+            .ref_resolution
+            .const_ref_values
+            .values()
+            .filter_map(|expr| match expr.sort().inner() {
+                SortInner::Datatype(dt) => Some(dt.name.to_string()),
+                _ => None,
+            })
+            .collect();
+        let range_sort = const_ref_sorts
+            .iter()
+            .find(|name| names::adt_sort_is(name, &range_paths) && name.ends_with("_u32"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "const_ref_range_inclusive should decode a promoted &RangeInclusive<u32> \
+                     const_ref_value; datatype-sorted const refs: {const_ref_sorts:?}"
+                )
+            });
 
         let range_decl = chc_ctx.vc.decls.iter().find_map(|decl| {
             if let trust_mc_core::decl::Decl::Datatype { datatype } = decl
-                && datatype.name == "RangeInclusive_u32"
+                && *datatype.name == **range_sort
             {
                 Some(datatype)
             } else {
@@ -212,14 +227,15 @@ fn test_const_ref_range_inclusive_declares_datatype_sort() {
         });
         assert!(
             range_decl.is_some(),
-            "const_ref_range_inclusive should declare the RangeInclusive_u32 datatype sort"
+            "const_ref_range_inclusive should declare the {range_sort} datatype sort"
         );
+        let range_ctor = format!("{range_sort}_mk");
         assert!(
             range_decl.is_some_and(|datatype| datatype
                 .constructors
                 .iter()
-                .any(|ctor| ctor.name == "RangeInclusive_u32_mk")),
-            "const_ref_range_inclusive should declare the RangeInclusive_u32 constructor"
+                .any(|ctor| *ctor.name == *range_ctor)),
+            "const_ref_range_inclusive should declare the {range_sort} constructor"
         );
     });
 }
@@ -582,7 +598,7 @@ fn test_const_ref_ref_str_seeds_outer_local() {
             .find_map(|stmt| {
                 let rustc_public::mir::StatementKind::Assign(
                     lhs,
-                    rustc_public::mir::Rvalue::Use(rustc_public::mir::Operand::Constant(_)),
+                    rustc_public::mir::Rvalue::Use(rustc_public::mir::Operand::Constant(_), ..),
                 ) = &stmt.kind
                 else {
                     return None;
@@ -651,9 +667,9 @@ fn test_const_ref_memory_inits_use_distinct_promoted_slots_for_multiple_arrays()
         let mut seen = std::collections::BTreeMap::new();
         let mut conflicts = Vec::new();
 
-        for (&local, &promoted_obj_id) in &chc_ctx.ref_resolution.const_ref_promoted_obj_ids {
+        for (&local, object) in &chc_ctx.ref_resolution.const_ref_objects {
             locals_with_slots.insert(local);
-            slots.insert(promoted_obj_id);
+            slots.insert(object.obj_id);
         }
 
         for (type_key, _, value, promoted_obj_id, byte_offset) in
@@ -730,6 +746,7 @@ fn test_const_ref_value_field_single_hop() {
                 if let Rvalue::Use(
                     rustc_public::mir::Operand::Copy(place)
                     | rustc_public::mir::Operand::Move(place),
+                    ..,
                 ) = rhs
                 {
                     if place.projection.len() == 1
@@ -785,6 +802,7 @@ fn test_const_ref_value_field_transitive_copy() {
                 if let Rvalue::Use(
                     rustc_public::mir::Operand::Copy(place)
                     | rustc_public::mir::Operand::Move(place),
+                    ..,
                 ) = rhs
                 {
                     // Field projection from a const_ref_values source
@@ -821,5 +839,120 @@ fn test_const_ref_value_field_transitive_copy() {
         // The total number of resolved locals should be >= direct + field + transitive.
         let total = chc_ctx.ref_resolution.const_ref_values.len();
         assert!(total >= 1, "const_ref_values should resolve at least the tuple DT, got {total}");
+    });
+}
+
+// =============================================================================
+// Floats, and constants whose contents do not decode (T1 review, 2026-09-24)
+// =============================================================================
+
+const CONST_REF_F32_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    pub fn const_ref_f32() -> u32 {
+        let r: &f32 = &-0.0;
+        r.to_bits()
+    }
+"#;
+
+/// A promoted `&-0.0f32` decodes to its IEEE-754 bit pattern and seeds the
+/// promoted object's memory. It used to fall through to `None` while its
+/// object id and address stayed registered, so a deref read a free memory cell
+/// and a free `obj_size`: `read_f32(&-0.0f32)` was certified a Genuine
+/// memory-safety failure (and Kani proves it safe).
+#[test]
+fn test_const_ref_value_f32_collected() {
+    with_test_ay_ctx_for_source(CONST_REF_F32_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "const_ref_f32");
+        let body = instance.body().expect("body");
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "const_ref_f32", ChcConfig::default());
+        chc_ctx.declare_block_relations();
+        let neg_zero = Expr::bitvec_const(0x8000_0000u32 as u128, 32);
+        assert!(
+            chc_ctx.ref_resolution.const_ref_values.values().any(|v| *v == neg_zero),
+            "&-0.0f32 must decode to #x80000000, got {:?}",
+            chc_ctx.ref_resolution.const_ref_values
+        );
+        assert!(
+            chc_ctx.ref_resolution.const_ref_memory_inits.iter().any(|(_, _, v, _, _)| *v == neg_zero),
+            "the promoted object's memory must be seeded with the bit pattern"
+        );
+        assert_eq!(
+            chc_ctx.sound_fallback_count(),
+            0,
+            "a decoded constant records no approximation"
+        );
+    });
+}
+
+const CONST_REF_UNDECODED_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    pub fn const_ref_undecoded() -> usize {
+        let r: &[&str; 2] = &["ab", "c"];
+        r[1].len()
+    }
+"#;
+
+/// A promoted constant whose contents the extractor does not decode (an array
+/// of `&str`) keeps a registered object with free memory cells and a free
+/// `obj_size`. That is recorded (`const_ref_contents_unmodeled`, SoundHavoc),
+/// so no counterexample in the harness is certified on those free cells.
+#[test]
+fn test_const_ref_undecoded_contents_are_recorded() {
+    with_test_ay_ctx_for_source(CONST_REF_UNDECODED_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "const_ref_undecoded");
+        let body = instance.body().expect("body");
+        let has_const_ref = body.blocks.iter().flat_map(|b| &b.statements).any(|s| {
+            matches!(
+                &s.kind,
+                StatementKind::Assign(_, Rvalue::Use(rustc_public::mir::Operand::Constant(c), ..))
+                    if matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..)))
+            )
+        });
+        assert!(has_const_ref, "the fixture must assign the promoted reference to a local");
+        let mut chc_ctx =
+            ChcCtx::new(ctx.tcx, &body, "const_ref_undecoded", ChcConfig::default());
+        chc_ctx.declare_block_relations();
+        assert!(
+            chc_ctx.sound_fallback_count() >= 1,
+            "an undecoded promoted constant must record an approximation"
+        );
+    });
+}
+
+const CONST_REF_STATIC_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    static X: i32 = 12;
+
+    pub fn const_ref_static() -> i32 {
+        let r: &i32 = &X;
+        *r
+    }
+"#;
+
+/// A reference to a registered static resolves to the static's own object
+/// (`pointer_scalar_expr` reads the relocation and names the one object the
+/// table minted for the static), whose memory the entry rule seeds, so an undecoded promoted copy
+/// of it frees nothing and must not be recorded: recording it demoted
+/// tests/expected/static/main.rs and union/static_union2.rs from a certified
+/// parity to OverApproximation.
+#[test]
+fn test_const_ref_to_a_registered_static_is_not_recorded() {
+    with_test_ay_ctx_for_source(CONST_REF_STATIC_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "const_ref_static");
+        let body = instance.body().expect("body");
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "const_ref_static", ChcConfig::default());
+        chc_ctx.declare_block_relations();
+        assert!(
+            chc_ctx.ref_resolution.global_objects.keys().any(|key| key.static_def().is_some()),
+            "the fixture must register the static"
+        );
+        assert_eq!(
+            chc_ctx.sound_fallback_count(),
+            0,
+            "a reference to a registered static must not record an approximation"
+        );
     });
 }

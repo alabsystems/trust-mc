@@ -7,8 +7,8 @@
 //! Split from `collections/iter.rs` to keep core iterator state-transition logic
 //! focused on concrete iterator types while adapter over-approximation remains here.
 
-use ay_bindings::{Expr, ExprValue, Sort, SortInner};
-use rustc_public::mir::{BasicBlockIdx, Operand, Place};
+use ay_bindings::{Expr, ExprValue, Sort};
+use rustc_public::mir::{BasicBlockIdx, BinOp, Operand, Place};
 use rustc_public::ty::{RigidTy, Ty, TyKind};
 use tracing::{debug, warn};
 
@@ -28,8 +28,25 @@ use super::iter::get_bmc_iterator_unsound_skip_count;
 use crate::codegen_ay::context::{
     get_unconstrained_assignment_count, get_unsupported_construct_fallback_count,
 };
+use crate::codegen_ay::float_arithmetic::{
+    bv_float_binop, bv_float_binop_chc, bv_float_binop_generates_nan, float_width_to_eb_sb,
+};
+use crate::codegen_ay::iter_sum_summand::{SumSummand, classify_iter_sum};
 use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, bool_sort, ptr_sort};
+
+/// The description rustc gives the overflow check of `a + b`, which std's
+/// integer `Sum` performs per element.
+const ADD_OVERFLOW_MESSAGE: &str = "attempt to add with overflow";
+
+/// The one field of the datatype this lane gives a `Wrapping<T>` or
+/// `Saturating<T>` (`Saturating_u8_mk (fld_0 (_ BitVec 8))`): the sum is
+/// computed over that field and rebuilt with the constructor.
+struct SumNewtype {
+    datatype: String,
+    constructor: String,
+    field: String,
+}
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     pub(in crate::codegen_ay::statement) fn codegen_iter_map_stub(
@@ -121,6 +138,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 .advance_wrapped_iterator(&zip_iter, "fld_a")
                 .or_else(|| self.advance_wrapped_iterator(&zip_iter, "fld_iter"));
             if let Some((new_inner, inner_result)) = advance_result {
+                self.declare_inner_option_sort(&inner_result);
                 let new_zip = self.update_wrapped_iterator(&zip_iter, new_inner);
                 self.env_update(base, new_zip);
 
@@ -130,6 +148,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 {
                     let sym_name = self.ctx.fresh_name("zip_next_value");
                     let sym_value = self.ctx.declare_var(&sym_name, payload_sort);
+                    self.ctx.bmc_sound_havoc("zip_next_value");
                     let some_value = self.make_option_some(&option_sort, sym_value);
                     let none_value = self.make_option_none(&option_sort);
                     let inner_is_some = self.make_option_is_some(&inner_result);
@@ -206,15 +225,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     pub(in crate::codegen_ay::statement) fn codegen_iter_sum_stub(
         &mut self,
+        func: Option<&Operand>,
         args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        // What the call adds, from its Rust types (`iter_sum_summand`): the
+        // SMT sort alone cannot tell a float, an overflow-checked integer, a
+        // `Saturating` or a user `Sum` impl apart. Read from THIS call's
+        // callee operand: two sums can write one place.
+        let summand = func
+            .map_or(SumSummand::Unknown, |func| classify_iter_sum(self.body, func, destination));
+
         // First attempt the SOUND element-wise unroll (replays recorded
         // Filter/Map closures and sums the kept, mapped elements). Returns true
         // iff a sound result was assigned; otherwise fall through to the
         // fail-closed havoc below.
-        if self.try_iter_sum_unroll(args, destination) {
+        if self.try_iter_sum_unroll(args, destination, summand) {
             return target;
         }
 
@@ -223,12 +250,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // the iterator value, not to its address.
             && let Some(iter_expr) = self.codegen_operand(&args[0]).map(Val::of_value)
             && let Some(result_sort) = self.infer_sort_from_place(destination)
-            && let Some(zero) = Self::zero_expr_for_sort(&result_sort)
             && let Some(has_remaining) = self.iter_has_remaining_items(&iter_expr)
         {
             let sym_name = self.ctx.fresh_name("iter_sum_value");
-            let symbolic_result = self.ctx.declare_var(&sym_name, result_sort);
-            let result = Expr::ite(has_remaining.into_expr(), symbolic_result, zero);
+            let symbolic_result = self.ctx.declare_var(&sym_name, result_sort.clone());
+            // The empty sum is `Sum::sum` of no items: `0`, or `-0.0` for a
+            // float. For an impl this stub does not know, it is unknown too,
+            // so the havoc covers that case as well.
+            let result = match Self::sum_identity(summand, &result_sort) {
+                Some(identity) => Expr::ite(has_remaining.into_expr(), symbolic_result, identity),
+                None => symbolic_result,
+            };
             self.assign_value_to_place(destination, result);
             // FAIL-CLOSED: see `codegen_iter_fold_stub`. The summed values are not
             // recovered here (the map/filter closures are not threaded to the sum
@@ -242,6 +274,34 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.ctx.unsupported_with_fallback("iter_sum_unmodeled", "sum symbolic fallback");
         self.codegen_symbolic_result(destination);
         target
+    }
+
+    /// Declare the `Option` sort of an adapter's INNER `next()` result. It is
+    /// built from the element's sort (`Option_bv8`), not from the program's
+    /// `Option` type (`Option_u8`), occurs only inside the stub's terms, and
+    /// was never declared: every query that reached the solver with a `Map`,
+    /// `Filter` or `Zip` `next()` in it was rejected (`unknown constant
+    /// Some_Option_bv8`) and came out INCONCLUSIVE (AY alignment round 8,
+    /// review round 5).
+    fn declare_inner_option_sort(&mut self, inner_result: &Expr) {
+        let sort = inner_result.sort().clone();
+        self.ctx.ensure_datatype_declared(&sort);
+    }
+
+    /// The conservative check for the closures of a receiver's adapter chain
+    /// that a stub does not run (`iter_closure_obligation`): a fresh flag
+    /// alone, so the check fails whenever the call is reached, and booked as a
+    /// sound havoc so a counterexample of this harness is never certified
+    /// Genuine.
+    pub(in crate::codegen_ay::statement) fn record_unmodeled_closure_check(&mut self) {
+        let name = self.ctx.fresh_name("iter_adapter_closure_unmodeled");
+        let flag = self.ctx.declare_var(&name, bool_sort());
+        self.ctx.bmc_sound_havoc("iter_adapter_closure_unmodeled");
+        self.record_violation_guarded_with_message(
+            flag,
+            "unsupported_check",
+            Some(crate::codegen_ay::iter_closure_obligation::UNMODELED_CLOSURE_MESSAGE.to_string()),
+        );
     }
 
     pub(in crate::codegen_ay::statement) fn codegen_map_next_stub(
@@ -259,6 +319,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             && let Some((new_inner, inner_result)) =
                 self.advance_wrapped_iterator(&map_iter, "fld_iter")
         {
+            self.declare_inner_option_sort(&inner_result);
             let new_map = self.update_wrapped_iterator(&map_iter, new_inner);
             self.env_update(base, new_map);
 
@@ -267,6 +328,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             {
                 let mapped_name = self.ctx.fresh_name("map_next_value");
                 let mapped_value = self.ctx.declare_var(&mapped_name, mapped_sort);
+                self.ctx.bmc_sound_havoc("map_next_value");
                 let some_value = self.make_option_some(&option_sort, mapped_value);
                 let none_value = self.make_option_none(&option_sort);
                 let inner_is_some = self.make_option_is_some(&inner_result);
@@ -295,6 +357,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             && let Some((new_inner, inner_result)) =
                 self.advance_wrapped_iterator(&filter_iter, "fld_iter")
         {
+            self.declare_inner_option_sort(&inner_result);
             let new_filter = self.update_wrapped_iterator(&filter_iter, new_inner);
             self.env_update(base, new_filter);
 
@@ -305,6 +368,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let item_value = self.ctx.declare_var(&item_name, item_sort);
                 let keep_name = self.ctx.fresh_name("filter_next_keep");
                 let keep_item = self.ctx.declare_var(&keep_name, bool_sort());
+                self.ctx.bmc_sound_havoc("filter_next_value");
                 let some_value = self.make_option_some(&option_sort, item_value);
                 let none_value = self.make_option_none(&option_sort);
                 let when_inner_some = Expr::ite(keep_item, some_value, none_value.clone());
@@ -623,6 +687,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 Some(std::sync::Arc::from(self.ssa_base_name(place).as_str()))
             }
             Operand::Constant(_) => None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         };
         let mut chain = recv_chain;
         chain.push(AdapterStage { kind, closure_ty, closure_value, closure_arg_base });
@@ -682,10 +748,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut cur = expr.clone();
         for _ in 0..8 {
             let Some(dt) = cur.sort().datatype_sort() else { break };
-            let name_ok = dt.name == "Copied"
-                || dt.name == "Cloned"
-                || dt.name.starts_with("Copied_")
-                || dt.name.starts_with("Cloned_");
+            let name_ok = crate::codegen_ay::names::is_copied_or_cloned_sort_name(&dt.name);
             if !name_ok || dt.constructors.len() != 1 {
                 break;
             }
@@ -886,17 +949,161 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Some(out)
     }
 
+    /// `collect` into a `Vec` over a `map` chain on a concrete slice
+    /// iterator (by its MIR type: `filter_map` records a `Map` stage too, and
+    /// its elements are `Option`s, `is_map_chain_over_slice_iter`): the
+    /// mapped elements, each closure replayed in order as Kani runs it (its
+    /// checks included), and the count as the length.
+    /// `[1u8, 2, 3].iter().map(|v| { assert!(*v < 200); *v }).collect()`
+    /// failed closed (`iter_collect_adapter_unmodeled`, walker fail-closed
+    /// review 6 round 3) where main proved it by collecting the unmapped
+    /// elements, which dropped the closure's assert and missed its bug twin
+    /// (walker fail-closed repair round 5,
+    /// `closure_helper_obligation_dual.rs` `h05`). `None` (the caller fails
+    /// closed) for a chain with a `filter`, an element the replay cannot
+    /// resolve, no element, or a declared unwind bound the loop over the
+    /// elements reaches: `SpecFromIter` for a `TrustedLen` `Map` extends
+    /// through `for_each`, the inner iterator's `fold`, one pass per element
+    /// (`reduce_loop_rule`: a slice iterator's do-while fails past `U`
+    /// passes; three elements under `unwind(3)` pass on Kani).
+    pub(in crate::codegen_ay::statement) fn try_collect_map_chain(
+        &mut self,
+        recv: &Operand,
+        destination: &Place,
+    ) -> Option<Expr> {
+        if !is_map_chain_over_slice_iter(recv.ty(self.body.locals()).into_option()?) {
+            return None;
+        }
+        // The `Vec<T>` the elements must be `T`s of.
+        let dest_ty = destination.ty(self.body.locals()).into_option()?;
+        let TyKind::RigidTy(RigidTy::Adt(dest_def, dest_args)) = dest_ty.kind() else {
+            return None;
+        };
+        if !rustc_public::CrateDef::name(&dest_def).ends_with("vec::Vec") {
+            return None;
+        }
+        let dest_elem = dest_args.0.iter().find_map(|arg| match arg {
+            rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+            _ => None,
+        })?;
+        let dest_elem_sort = Self::infer_sort_from_ty(dest_elem)?;
+        let elements = self.resolve_adapter_elements(recv, "iter_collect_adapter_unmodeled")?;
+        if elements
+            .iter()
+            .any(|(keep, _)| !matches!(keep.value(), ay_bindings::ExprValue::BoolConst(true)))
+        {
+            return None;
+        }
+        let count = elements.len() as u64;
+        let config = &self.ctx.config;
+        if config.has_explicit_unwind && config.unwinding_assertions {
+            use crate::codegen_ay::reduce_loop_rule::{ReduceLoopRule, reduce_loop_rule};
+            let rule = recv.ty(self.body.locals()).into_option().and_then(reduce_loop_rule);
+            if ReduceLoopRule::fails_at(rule, count, u64::from(config.unwind_depth)) {
+                return None;
+            }
+        }
+        let elem_sort = dest_elem_sort;
+        if elements.iter().any(|(_, value)| *value.sort() != elem_sort) {
+            return None;
+        }
+        let data_sort = ay_bindings::Sort::array(ptr_sort(), elem_sort.clone());
+        let base_name = self.ctx.fresh_name("collect_map_data");
+        let base = self.ctx.declare_var(&base_name, data_sort);
+        let data = elements.into_iter().enumerate().fold(base, |data, (i, (_, value))| {
+            data.store(Expr::bitvec_const(i as u64, POINTER_WIDTH), value)
+        });
+        debug!(count, "IterCollect: collected a map chain element by element");
+        // The loop over the elements stays within a declared bound (checked
+        // above): no generic modelled-call check after this stub.
+        self.stub_stated_unwinding = true;
+        Some(self.make_vec_from_parts(elem_sort, Expr::bitvec_const(count, POINTER_WIDTH), data))
+    }
+
+    /// Kani's unwinding assertion on the std loop a reduction runs, for the
+    /// element-wise unroll over `count` elements (a concrete range), under a
+    /// declared unwind bound with unwinding assertions on. The unroll replays
+    /// every element and stated nothing about the loop, so `sum` over five
+    /// elements under `#[kani::unwind(4)]` verified clean where Kani fails
+    /// (walker fail-closed review 6 round 2, finding 8). Where the receiver's
+    /// rule was measured (`reduce_loop_rule`), a loop that fails is a
+    /// violation, "unwinding assertion loop 0", under the path condition;
+    /// for any other shape, and for `try_fold` (whose loop can also stop
+    /// early), a loop that can fail (`count >= U`) fails closed.
+    fn record_reduce_unwinding(
+        &mut self,
+        args: &[Operand],
+        count: u64,
+        label: &'static str,
+        try_fold: bool,
+    ) {
+        use crate::codegen_ay::reduce_loop_rule::{ReduceLoopRule, reduce_loop_rule};
+        let config = &self.ctx.config;
+        if !config.has_explicit_unwind || !config.unwinding_assertions {
+            return;
+        }
+        let unwind = u64::from(config.unwind_depth);
+        let rule = if try_fold {
+            None
+        } else {
+            args.first()
+                .and_then(|receiver| receiver.ty(self.body.locals()).into_option())
+                .and_then(reduce_loop_rule)
+        };
+        if !ReduceLoopRule::fails_at(rule, count, unwind) {
+            return;
+        }
+        if rule.is_some() {
+            self.record_violation_guarded_with_message(
+                Expr::bool_const(true),
+                "unwind_assert",
+                Some("unwinding assertion loop 0".to_string()),
+            );
+        } else {
+            self.ctx.unsupported_with_fallback(
+                label,
+                "reduction loop may fail its unwinding assertion (unmeasured iterator shape)",
+            );
+        }
+    }
+
     /// Sound element-wise unroll of `Iterator::sum` over a recorded
     /// `Filter`/`Map` chain (the missing closure side of `codegen_iter_sum_stub`).
     /// Returns `true` iff a sound `sum` value was assigned to `destination`.
-    fn try_iter_sum_unroll(&mut self, args: &[Operand], destination: &Place) -> bool {
-        if args.is_empty() {
+    ///
+    /// The arithmetic is std's `Sum` impl for the call's Rust types
+    /// (`summand`), never a guess from the sort:
+    ///
+    /// * an integer adds with `bvadd` and, per kept element, records the
+    ///   "attempt to add with overflow" check std's `a + b` carries under
+    ///   `#[rustc_inherit_overflow_checks]` (filtered under
+    ///   `--no-overflow-checks` like every overflow check);
+    /// * `Wrapping<int>` adds with `bvadd` and never panics;
+    /// * `Saturating<uN>` adds with `bvadd` and saturates to all ones on a
+    ///   carry (`uN::saturating_add`); it never panics. `Wrapping` and
+    ///   `Saturating` have a one-field datatype sort here, so the sum is taken
+    ///   over that field ([`SumNewtype`]);
+    /// * a float starts from `-0.0` and adds kept elements with IEEE 754
+    ///   `fp.add` (RNE) over the bit patterns. A dropped element is SKIPPED, not
+    ///   added as zero: `-0.0 + +0.0` is `+0.0`, so adding a zero for it would
+    ///   change the sign of the result;
+    /// * anything else is not unrolled (the caller havocs it).
+    fn try_iter_sum_unroll(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        summand: SumSummand,
+    ) -> bool {
+        if args.is_empty() || summand == SumSummand::Unknown {
             return false;
         }
         let Some(result_sort) = self.infer_sort_from_place(destination) else {
             return false;
         };
-        let Some(zero) = Self::zero_expr_for_sort(&result_sort) else {
+        let Some((scalar_sort, newtype)) = Self::sum_scalar_layout(summand, &result_sort) else {
+            return false;
+        };
+        let Some(zero) = Self::sum_identity(summand, &scalar_sort) else {
             return false;
         };
         let Some(elements) = self.resolve_adapter_elements(&args[0], "iter_sum_unmodeled") else {
@@ -907,17 +1114,242 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if !elements.iter().all(|(_, v)| v.sort() == &result_sort) {
             return false;
         }
-        let mut acc = zero.clone();
-        for (keep, v) in elements {
-            let contrib = Expr::ite(keep, v, zero.clone());
-            let Some(next) = Self::add_for_sort(acc, contrib, &result_sort) else {
-                return false;
-            };
-            acc = next;
+        let count = elements.len() as u64;
+        let nan_checks = self.ctx.config.nan_checks;
+        if matches!(summand, SumSummand::Float { .. })
+            && !nan_checks
+            && local_is_never_read(self.body, destination)
+        {
+            // Nothing reads the float sum, and without `--nan-check` std's
+            // `a + b` carries no check: its value is unobservable, so a fresh
+            // value is exact. The `fp.add` chain it replaces is not: ay
+            // `d80d17a90` answers `unknown` for every query that carries one
+            // over symbolic operands beside the iterator's datatypes, so a
+            // harness whose real bug lies elsewhere was INCONCLUSIVE where
+            // main reported it FAILED Genuine (AY alignment round 8, review
+            // round 5, finding 2). The adapter closures above were still
+            // replayed for their checks.
+            let name = self.ctx.fresh_name("iter_sum_unread");
+            let value = self.ctx.declare_var(&name, result_sort);
+            self.record_reduce_unwinding(args, count, "iter_sum_unmodeled", false);
+            self.assign_value_to_place(destination, value);
+            return true;
         }
-        debug!("try_iter_sum_unroll: SOUND filter/map/sum unroll emitted");
-        self.assign_value_to_place(destination, acc);
+        let mut acc = zero;
+        // The accumulator is a NaN (a fresh NaN-constrained value, below).
+        let mut acc_is_nan = false;
+        for (keep, v) in elements {
+            let v = match &newtype {
+                Some(newtype) => {
+                    v.field_select(&newtype.datatype, &newtype.field, scalar_sort.clone())
+                }
+                None => v,
+            };
+            acc = match summand {
+                SumSummand::Int { width, signed } => {
+                    // A dropped element contributes `0`, which never overflows,
+                    // so the check needs no `keep` guard of its own.
+                    let contrib = Expr::ite(keep, v, Expr::bitvec_const(0u128, width));
+                    if let Some((no_overflow, label)) =
+                        self.overflow_check(BinOp::Add, &acc, &contrib, signed)
+                    {
+                        self.record_violation_guarded_with_message(
+                            no_overflow.not(),
+                            label,
+                            Some(ADD_OVERFLOW_MESSAGE.to_string()),
+                        );
+                    }
+                    acc.bvadd(contrib)
+                }
+                SumSummand::WrappingInt { width } => {
+                    acc.bvadd(Expr::ite(keep, v, Expr::bitvec_const(0u128, width)))
+                }
+                SumSummand::SaturatingUint { width } => {
+                    let sum =
+                        acc.clone().bvadd(Expr::ite(keep, v, Expr::bitvec_const(0u128, width)));
+                    // An unsigned add carries out exactly when its wrapped
+                    // result is below an operand.
+                    let carry = sum.clone().bvult(acc);
+                    let max = Expr::bitvec_const(!0u128 >> (128 - width), width);
+                    // One SSA name per step: the accumulator occurs twice in
+                    // the step, so an inline term would double with each element.
+                    let name = self.ctx.fresh_name("iter_sum_acc");
+                    let var = self.ctx.declare_var(&name, scalar_sort.clone());
+                    self.ctx.assert(var.clone().eq(Expr::ite(carry, max, sum)));
+                    var
+                }
+                SumSummand::Float { width } => {
+                    // Kani's "NaN on addition" (CBMC `--nan-check`) on std's
+                    // `a + b`, for a kept element: the sum carried none, so
+                    // `[f32::INFINITY, f32::NEG_INFINITY].iter().sum()` passed
+                    // under the flag (AY alignment round 8, review round 5).
+                    if nan_checks {
+                        match bv_float_binop_generates_nan(BinOp::Add, &acc, &v, width) {
+                            Some(generates_nan) => self.record_violation_guarded(
+                                keep.clone().and(generates_nan),
+                                "nan_check_add",
+                            ),
+                            None => {
+                                self.record_violation_guarded(keep.clone(), "unsupported_check")
+                            }
+                        }
+                    }
+                    // Concrete operands fold on the host, which adds in IEEE 754
+                    // binary32/binary64 with round-to-nearest-even, the
+                    // semantics the program has. A NaN result's bit pattern is
+                    // not determined, so it is a fresh value constrained to be
+                    // a NaN, in bit-vectors: an `fp.add` term of constants
+                    // would leave ay `d80d17a90` answering `unknown` beside the
+                    // iterator's datatypes. NaN plus anything is a NaN.
+                    let host_nan = acc_is_nan || Self::float_add_folds_to_nan(&acc, &v, width);
+                    match (keep.value(), Self::fold_float_add(&acc, &v, width)) {
+                        (ExprValue::BoolConst(false), _) => acc,
+                        (ExprValue::BoolConst(true), Some(folded)) if !acc_is_nan => folded,
+                        _ if host_nan => {
+                            let Some(nan) = self.fresh_float_nan(width, &scalar_sort) else {
+                                return false;
+                            };
+                            // A dropped element leaves the accumulator, which
+                            // is a NaN only if it already was one.
+                            match keep.value() {
+                                ExprValue::BoolConst(true) => {
+                                    acc_is_nan = true;
+                                    nan
+                                }
+                                _ => {
+                                    let name = self.ctx.fresh_name("iter_sum_acc");
+                                    let var = self.ctx.declare_var(&name, scalar_sort.clone());
+                                    self.ctx.assert(var.clone().eq(Expr::ite(keep, nan, acc)));
+                                    var
+                                }
+                            }
+                        }
+                        // A filtered element of a constant sum: the folded sum
+                        // or the accumulator, in bit-vectors.
+                        (_, Some(folded)) => {
+                            let name = self.ctx.fresh_name("iter_sum_acc");
+                            let var = self.ctx.declare_var(&name, scalar_sort.clone());
+                            self.ctx.assert(var.clone().eq(Expr::ite(keep, folded, acc)));
+                            var
+                        }
+                        _ => {
+                            let Some(added) = bv_float_binop(BinOp::Add, acc.clone(), v, width)
+                            else {
+                                return false;
+                            };
+                            // One SSA name per step: the accumulator occurs twice
+                            // in `ite(keep, acc + v, acc)`, so an inline term
+                            // would double in size with every element.
+                            let step = Expr::ite(keep, added, acc);
+                            let name = self.ctx.fresh_name("iter_sum_acc");
+                            let var = self.ctx.declare_var(&name, scalar_sort.clone());
+                            self.ctx.assert(var.clone().eq(step));
+                            var
+                        }
+                    }
+                }
+                SumSummand::Unknown => return false,
+            };
+        }
+        self.record_reduce_unwinding(args, count, "iter_sum_unmodeled", false);
+        debug!(?summand, "try_iter_sum_unroll: SOUND filter/map/sum unroll emitted");
+        let result = match newtype {
+            Some(newtype) => Expr::datatype_constructor(
+                newtype.datatype,
+                newtype.constructor,
+                vec![acc],
+                result_sort,
+            ),
+            None => acc,
+        };
+        self.assign_value_to_place(destination, result);
         true
+    }
+
+    /// The bitvector `summand` adds at the destination sort `sort`, and the
+    /// newtype it is wrapped in there: `sort` itself when it is that
+    /// bitvector, or the one field of a one-constructor datatype for std's
+    /// `Wrapping` and `Saturating` (which are `struct Wrapping<T>(pub T)`).
+    /// `None` when the sort fits neither.
+    fn sum_scalar_layout(summand: SumSummand, sort: &Sort) -> Option<(Sort, Option<SumNewtype>)> {
+        let width = summand.width()?;
+        if sort.bitvec_width() == Some(width) {
+            return Some((sort.clone(), None));
+        }
+        if !matches!(summand, SumSummand::WrappingInt { .. } | SumSummand::SaturatingUint { .. }) {
+            return None;
+        }
+        let datatype = sort.datatype_sort()?;
+        let [constructor] = datatype.constructors.as_slice() else {
+            return None;
+        };
+        let [field] = constructor.fields.as_slice() else {
+            return None;
+        };
+        if field.sort.bitvec_width() != Some(width) {
+            return None;
+        }
+        Some((
+            field.sort.clone(),
+            Some(SumNewtype {
+                datatype: datatype.name.clone(),
+                constructor: constructor.name.clone(),
+                field: field.name.clone(),
+            }),
+        ))
+    }
+
+    /// `a + b` of two concrete float bit patterns, folded exactly; `None` when
+    /// either is not a constant, the width has no host type, or the sum is NaN.
+    fn fold_float_add(a: &Expr, b: &Expr, width: u32) -> Option<Expr> {
+        let folded = bv_float_binop_chc(BinOp::Add, a.clone(), b.clone(), width)?;
+        let ExprValue::BitVecConst { value, .. } = folded.value() else {
+            return None;
+        };
+        let bits = u128::try_from(value).ok()?;
+        let (eb, sb) = float_width_to_eb_sb(width)?;
+        let exponent_mask = ((1u128 << eb) - 1) << (sb - 1);
+        let significand_mask = (1u128 << (sb - 1)) - 1;
+        let is_nan = bits & exponent_mask == exponent_mask && bits & significand_mask != 0;
+        (!is_nan).then_some(folded)
+    }
+
+    /// Do `a` and `b` both fold to constants whose host sum is a NaN?
+    fn float_add_folds_to_nan(a: &Expr, b: &Expr, width: u32) -> bool {
+        let Some(folded) = bv_float_binop_chc(BinOp::Add, a.clone(), b.clone(), width) else {
+            return false;
+        };
+        let ExprValue::BitVecConst { value, .. } = folded.value() else {
+            return false;
+        };
+        let (Ok(bits), Some((eb, sb))) = (u128::try_from(value), float_width_to_eb_sb(width))
+        else {
+            return false;
+        };
+        let exponent_mask = ((1u128 << eb) - 1) << (sb - 1);
+        let significand_mask = (1u128 << (sb - 1)) - 1;
+        bits & exponent_mask == exponent_mask && bits & significand_mask != 0
+    }
+
+    /// A fresh float of `width` bits constrained to be a NaN (exponent all
+    /// ones, significand nonzero): any NaN the operation may produce.
+    fn fresh_float_nan(&mut self, width: u32, sort: &Sort) -> Option<Expr> {
+        let (eb, sb) = float_width_to_eb_sb(width)?;
+        let name = self.ctx.fresh_name("iter_sum_nan");
+        let var = self.ctx.declare_var(&name, sort.clone());
+        let mantissa = sb - 1;
+        let exponent_all_ones =
+            var.clone().extract(width - 2, mantissa).eq(Expr::bitvec_const((1u128 << eb) - 1, eb));
+        let significand_nonzero =
+            var.clone().extract(mantissa - 1, 0).eq(Expr::bitvec_const(0u128, mantissa)).not();
+        self.ctx.assert(exponent_all_ones.and(significand_nonzero));
+        Some(var)
+    }
+
+    /// The empty sum of `summand` as an expression of `sort`, when known.
+    fn sum_identity(summand: SumSummand, sort: &Sort) -> Option<Expr> {
+        let (bits, width) = summand.identity_bits()?;
+        (sort.bitvec_width() == Some(width)).then(|| Expr::bitvec_const(bits, width))
     }
 
     /// Sound element-wise unroll of `Iterator::fold` / `Iterator::try_fold` over a
@@ -1028,6 +1460,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let snapshot_fb = get_unsupported_construct_fallback_count();
         let snapshot_skip = get_bmc_iterator_unsound_skip_count();
+        let count = elements.len() as u64;
+        let is_try_fold = try_fold_parts.is_some();
 
         let final_value = match &try_fold_parts {
             // Plain fold: acc' = ite(keep, closure(acc, item), acc).
@@ -1096,6 +1530,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return false;
         }
 
+        self.record_reduce_unwinding(args, count, "iter_fold_unmodeled", is_try_fold);
         debug!("try_iter_fold_unroll: SOUND filter/map/fold unroll emitted");
         self.assign_value_to_place(destination, final_value);
         true
@@ -1143,16 +1578,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     self.build_inline_arg_for_value("fold_args", tuple_value, tuple_ty);
                 self.inline_instance_value(instance, &[recv_param, tuple_param])
             }
-        }
-    }
-
-    /// Add two values of a numeric `sort` (`BitVec`/`Int`). `None` for sorts
-    /// without a defined addition (e.g. `Bool`, datatypes).
-    fn add_for_sort(a: Expr, b: Expr, sort: &Sort) -> Option<Expr> {
-        match sort.inner() {
-            SortInner::BitVec(_) => Some(a.bvadd(b)),
-            SortInner::Int => Some(a.int_add(b)),
-            _ => None,
         }
     }
 
@@ -1260,7 +1685,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// `(sel_i (mk a..)) = a_i` datatype axiom. Bounded structural recursion;
     /// fails closed (returns the best partial resolution, leaving a non-constant
     /// that `concrete_bv_u64` rejects) on any miss.
-    fn deep_resolve_value(&self, expr: &Expr) -> Expr {
+    pub(in crate::codegen_ay::statement) fn deep_resolve_value(&self, expr: &Expr) -> Expr {
         self.deep_resolve_value_bounded(expr, 0)
     }
 
@@ -1274,6 +1699,39 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let inner = self.deep_resolve_value_bounded(inner, depth + 1);
             if let Some(field) = Self::ctor_field(&inner, selector_name) {
                 return self.deep_resolve_value_bounded(&field, depth + 1);
+            }
+        }
+        // Bounded const-fold of Ite when condition folds to a concrete Bool
+        // (e.g. `Vec::pop` sets `fld_len` to `ite(bvugt(old_len, 0), bvsub(old_len, 1), 0)`).
+        if let ExprValue::Ite { cond, then_expr, else_expr } = cur.value() {
+            let cond_val = match cond.value() {
+                ExprValue::BoolConst(b) => Some(*b),
+                ExprValue::BvUGt(a, b) | ExprValue::BvULt(a, b) | ExprValue::Eq(a, b) => {
+                    let ra = self.deep_resolve_value_bounded(a, depth + 1);
+                    let rb = self.deep_resolve_value_bounded(b, depth + 1);
+                    if let (
+                        ExprValue::BitVecConst { value: va, width: wa },
+                        ExprValue::BitVecConst { value: vb, width: wb },
+                    ) = (ra.value(), rb.value())
+                        && wa == wb
+                        && *wa <= 64
+                        && let (Ok(ua), Ok(ub)) =
+                            (u64::try_from(va.clone()), u64::try_from(vb.clone()))
+                    {
+                        Some(match cond.value() {
+                            ExprValue::BvUGt(..) => ua > ub,
+                            ExprValue::BvULt(..) => ua < ub,
+                            _ => ua == ub,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(b) = cond_val {
+                let chosen = if b { then_expr } else { else_expr };
+                return self.deep_resolve_value_bounded(chosen, depth + 1);
             }
         }
         // Bounded const-fold of BvAdd/BvSub: a push-built `Vec`'s `fld_len` is
@@ -1366,7 +1824,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Fails closed (`None`) unless `expr` is a `DatatypeConstructor` whose declared
     /// sort is a single-constructor datatype containing `field_name` at an index
     /// present in the value's argument list — never returns a wrong field.
-    fn ctor_field(expr: &Expr, field_name: &str) -> Option<Expr> {
+    pub(in crate::codegen_ay::statement) fn ctor_field(
+        expr: &Expr,
+        field_name: &str,
+    ) -> Option<Expr> {
         let ExprValue::DatatypeConstructor { args, .. } = expr.value() else {
             return None;
         };
@@ -1380,7 +1841,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     }
 
     /// Extract a concrete `u64` from a bitvector-constant expression.
-    fn concrete_bv_u64(e: &Expr) -> Option<u64> {
+    pub(in crate::codegen_ay::statement) fn concrete_bv_u64(e: &Expr) -> Option<u64> {
         match e.value() {
             ExprValue::BitVecConst { value, .. } => u64::try_from(value.clone()).ok(),
             _ => None,
@@ -1484,8 +1945,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// The zero of a sort. Test-only since review round 2: the sum stub reads
+    /// its identity from the call's Rust types (`SumSummand::identity_bits`).
+    #[cfg(test)]
     #[must_use]
     fn zero_expr_for_sort(sort: &Sort) -> Option<Expr> {
+        use ay_bindings::SortInner;
         match sort.inner() {
             SortInner::Bool => Some(Expr::bool_const(false)),
             SortInner::BitVec(bv) => Some(Expr::bitvec_const(0, bv.width)),
@@ -1500,6 +1965,65 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             _ => None,
         }
     }
+}
+
+/// Is `place` a bare local of `body` that nothing reads? It may be written by
+/// calls (the one being encoded, or another arm's call into the same local),
+/// and otherwise appear only in storage markers and the no-op `PlaceMention`
+/// and `FakeRead` statements. Any other mention, a borrow included, is a read;
+/// so is the return place and every argument local.
+fn local_is_never_read(body: &rustc_public::mir::Body, place: &Place) -> bool {
+    use rustc_public::mir::visit::{
+        Location, MirVisitor, PlaceContext, statement_location, terminator_location,
+    };
+    use rustc_public::mir::{Local, Statement, StatementKind, TerminatorKind};
+
+    struct Reads {
+        local: Local,
+        read: bool,
+    }
+    impl MirVisitor for Reads {
+        fn visit_statement(&mut self, stmt: &Statement, location: Location) {
+            match &stmt.kind {
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::PlaceMention(_)
+                | StatementKind::FakeRead(..) => {}
+                _ => self.super_statement(stmt, location),
+            }
+        }
+        fn visit_local(&mut self, local: &Local, _ptx: PlaceContext, _location: Location) {
+            if *local == self.local {
+                self.read = true;
+            }
+        }
+    }
+
+    if !place.projection.is_empty() || place.local == 0 || place.local <= body.arg_locals().len() {
+        return false;
+    }
+    let mut reads = Reads { local: place.local, read: false };
+    for (bb, block) in body.blocks.iter().enumerate() {
+        for (idx, stmt) in block.statements.iter().enumerate() {
+            reads.visit_statement(stmt, statement_location(body, &bb, idx));
+        }
+        let location = terminator_location(body, &bb);
+        match &block.terminator.kind {
+            TerminatorKind::Call { func, args, destination, .. }
+                if destination.local == place.local && destination.projection.is_empty() =>
+            {
+                reads.visit_operand(func, location);
+                for arg in args {
+                    reads.visit_operand(arg, location);
+                }
+            }
+            _ => reads.visit_terminator(&block.terminator, location),
+        }
+        if reads.read {
+            return false;
+        }
+    }
+    !reads.read
 }
 
 #[cfg(test)]
@@ -1642,4 +2166,36 @@ mod tests {
         let dt_sort = option_sort();
         assert!(SC::zero_expr_for_sort(&dt_sort).is_none());
     }
+}
+
+/// Is `ty` a chain of core's `Map` adapters (and the value-preserving
+/// `Copied` / `Cloned`) over a slice iterator, with at least one `Map`? Read
+/// from the MIR type, not the recorded stages: `filter_map` is recorded as a
+/// `Map` stage (`IterFilterMap` shares `codegen_iter_map_stub`).
+fn is_map_chain_over_slice_iter(ty: Ty) -> bool {
+    use rustc_public::CrateDef;
+    let mut ty = ty;
+    let mut maps = 0usize;
+    for _ in 0..16 {
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
+            return false;
+        };
+        let name = def.name();
+        let last = name.rsplit("::").next().unwrap_or(&name);
+        let core_iter = name.starts_with("core::iter::") || name.starts_with("std::iter::");
+        match last {
+            "Map" if core_iter => maps += 1,
+            "Copied" | "Cloned" if core_iter => {}
+            "Iter" if name.contains("slice") => return maps > 0,
+            _ => return false,
+        }
+        let Some(inner) = args.0.iter().find_map(|arg| match arg {
+            rustc_public::ty::GenericArgKind::Type(inner) => Some(*inner),
+            _ => None,
+        }) else {
+            return false;
+        };
+        ty = inner;
+    }
+    false
 }

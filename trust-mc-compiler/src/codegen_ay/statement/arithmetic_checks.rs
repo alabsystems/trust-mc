@@ -13,6 +13,7 @@ use rustc_public::mir::BinOp;
 use tracing::{debug, warn};
 
 use super::StatementCodegen;
+use crate::codegen_ay::float_arithmetic::bv_float_binop_generates_nan;
 use crate::codegen_ay::provenance::{Loc, Val, is_value_widened_into_address};
 use crate::codegen_ay::ptr_repr::PtrRepr;
 
@@ -54,11 +55,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.record_violation_guarded(is_zero, label);
     }
 
-    /// Emit shift distance check for unchecked shift operations.
+    /// Emit shift distance check for unchecked shift operations
+    /// (`BinOp::ShlUnchecked`/`ShrUnchecked` and the intercepted
+    /// `<int>::unchecked_shl`/`unchecked_shr` methods).
     ///
     /// Unchecked shifts have undefined behavior when:
     /// - Shift distance >= bit width of value (excessive shift)
     /// - Shift distance < 0 (negative shift, only for signed shift amounts)
+    ///
+    /// The labels are the unchecked ones: UB, Kani's `arithmetic_overflow`
+    /// class, kept whatever `--no-overflow-checks` says
+    /// (`label_to_property_kind`), never the MIR `Assert`'s panic.
     ///
     /// REQUIRES: value.sort().is_bitvec() && distance.sort().is_bitvec()
     /// ENSURES: Adds violation assertion for excessive shift distance
@@ -69,11 +76,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         distance: &Expr,
         distance_signed: Option<bool>,
     ) {
-        self.emit_shift_distance_check_msgs(value, distance, distance_signed, None, None);
+        let Some((excessive, negative)) =
+            Self::shift_distance_violations(value, distance, distance_signed)
+        else {
+            return;
+        };
+        self.record_violation_guarded(excessive, "unchecked_shift_distance_check");
+        if let Some(negative) = negative {
+            self.record_violation_guarded(negative, "unchecked_shift_distance_check_negative");
+        }
     }
 
     /// Kani's op-specific wording for the SIMD lane checks: "attempt {op}
-    /// with excessive/negative shift distance".
+    /// with excessive/negative shift distance". Kani's compiler writes these
+    /// assertions itself (they are not CBMC instrumentation), so no check flag
+    /// removes them: [`CheckGate::Always`].
+    ///
+    /// [`CheckGate::Always`]: crate::codegen_ay::context::CheckGate::Always
     pub(super) fn emit_shift_distance_check_named(
         &mut self,
         value: &Expr,
@@ -81,42 +100,63 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         distance_signed: Option<bool>,
         op_name: Option<&str>,
     ) {
+        let Some((excessive, negative)) =
+            Self::shift_distance_violations(value, distance, distance_signed)
+        else {
+            return;
+        };
         let exc = op_name.map(|op| format!("attempt {op} with excessive shift distance"));
-        let neg = op_name.map(|op| format!("attempt {op} with negative shift distance"));
-        self.emit_shift_distance_check_msgs(value, distance, distance_signed, exc, neg);
+        self.record_violation_guarded_ungated(excessive, "shift_distance_check", exc);
+        if let Some(negative) = negative {
+            let neg = op_name.map(|op| format!("attempt {op} with negative shift distance"));
+            self.record_violation_guarded_ungated(negative, "shift_distance_check_negative", neg);
+        }
     }
 
-    /// One Kani-identical description applied to BOTH sub-checks: rustc's
-    /// `Assert { msg: Overflow(Shl|Shr, ..) }` is ONE obligation worded
-    /// "attempt to shift {left,right} with overflow"; we encode it as two
-    /// conjunct sub-checks (excessive, negative), so both quote that message.
-    pub(super) fn emit_shift_distance_check_with_message(
+    /// rustc's `Assert { msg: Overflow(Shl|Shr, ..) }`: ONE obligation worded
+    /// "attempt to shift {left,right} with overflow", encoded as two conjunct
+    /// sub-checks (excessive, negative) that both quote that message. A MIR
+    /// `Assert`, so [`CheckGate::Always`]: the terminator keeps its edge
+    /// condition, and a dropped check would prune the panicking executions.
+    ///
+    /// [`CheckGate::Always`]: crate::codegen_ay::context::CheckGate::Always
+    pub(super) fn emit_mir_assert_shift_distance_check(
         &mut self,
         value: &Expr,
         distance: &Expr,
         distance_signed: Option<bool>,
-        message: Option<&str>,
+        message: &str,
     ) {
-        let m = message.map(str::to_owned);
-        self.emit_shift_distance_check_msgs(value, distance, distance_signed, m.clone(), m);
+        let Some((excessive, negative)) =
+            Self::shift_distance_violations(value, distance, distance_signed)
+        else {
+            return;
+        };
+        self.record_violation_guarded_ungated(
+            excessive,
+            "shift_distance_check",
+            Some(message.to_owned()),
+        );
+        if let Some(negative) = negative {
+            self.record_violation_guarded_ungated(
+                negative,
+                "shift_distance_check_negative",
+                Some(message.to_owned()),
+            );
+        }
     }
 
-    /// The core: distinct optional descriptions for the excessive and
-    /// negative sub-checks. `None` keeps the generic taxonomy wording.
-    fn emit_shift_distance_check_msgs(
-        &mut self,
+    /// The violation predicates of a shift by `distance` on `value`: the
+    /// distance reaches the value's width, and, for a signed distance
+    /// (`distance_signed == Some(true)`), it is negative. `None` when either
+    /// operand is not a bitvector.
+    fn shift_distance_violations(
         value: &Expr,
         distance: &Expr,
         distance_signed: Option<bool>,
-        excessive_msg: Option<String>,
-        negative_msg: Option<String>,
-    ) {
-        let Some(value_width) = value.sort().bitvec_width() else {
-            return;
-        };
-        let Some(distance_width) = distance.sort().bitvec_width() else {
-            return;
-        };
+    ) -> Option<(Expr, Option<Expr>)> {
+        let value_width = value.sort().bitvec_width()?;
+        let distance_width = distance.sort().bitvec_width()?;
 
         // Check: distance < value_width (excessive shift check)
         // We compare in the wider of the two widths to avoid truncation losing high bits.
@@ -124,24 +164,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let compare_width = std::cmp::max(value_width, distance_width);
         let distance_coerced = Self::coerce_to_width_typed(distance.clone(), compare_width, false);
         let width_const = Expr::bitvec_const(value_width as u128, compare_width);
-        let valid_distance = distance_coerced.bvult(width_const);
-        self.record_violation_guarded_with_message(
-            valid_distance.not(),
-            "shift_distance_check",
-            excessive_msg,
-        );
+        let excessive = distance_coerced.bvult(width_const).not();
 
-        if distance_signed == Some(true) {
+        let negative = (distance_signed == Some(true)).then(|| {
             let distance_signed =
                 Self::coerce_to_width_typed(distance.clone(), compare_width, true);
-            let zero = Expr::bitvec_const(0u128, compare_width);
-            let negative_distance = distance_signed.bvslt(zero);
-            self.record_violation_guarded_with_message(
-                negative_distance,
-                "shift_distance_check_negative",
-                negative_msg,
-            );
-        }
+            distance_signed.bvslt(Expr::bitvec_const(0u128, compare_width))
+        });
+        Some((excessive, negative))
     }
 
     /// Establishes that `expr` — the term the encoder produced for an operand
@@ -330,25 +360,50 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let (lhs, rhs) = Self::coerce_to_match_widths_typed(lhs.clone(), rhs.clone(), is_signed);
 
         match (op, is_signed) {
-            // Unchecked operations use the same overflow checks as regular operations.
-            // They emit assertions that overflow does not occur (UB if it does).
-            (BinOp::Add | BinOp::AddUnchecked, true) => {
-                Some((lhs.bvadd_no_overflow_signed(rhs), "overflow_check_add"))
-            }
-            (BinOp::Add | BinOp::AddUnchecked, false) => {
+            // The safe operators: rustc's `Assert { Overflow(..) }`, which a Rust
+            // program panics on ("attempt to add with overflow").
+            (BinOp::Add, true) => Some((lhs.bvadd_no_overflow_signed(rhs), "overflow_check_add")),
+            (BinOp::Add, false) => {
                 Some((lhs.bvadd_no_overflow_unsigned(rhs), "overflow_check_add"))
             }
-            (BinOp::Sub | BinOp::SubUnchecked, true) => {
-                Some((lhs.bvsub_no_overflow_signed(rhs), "overflow_check_sub"))
-            }
-            (BinOp::Sub | BinOp::SubUnchecked, false) => {
+            (BinOp::Sub, true) => Some((lhs.bvsub_no_overflow_signed(rhs), "overflow_check_sub")),
+            (BinOp::Sub, false) => {
                 Some((lhs.bvsub_no_underflow_unsigned(rhs), "overflow_check_sub"))
             }
-            (BinOp::Mul | BinOp::MulUnchecked, true) => {
-                Some((lhs.bvmul_no_overflow_signed(rhs), "overflow_check_mul"))
-            }
-            (BinOp::Mul | BinOp::MulUnchecked, false) => {
+            (BinOp::Mul, true) => Some((lhs.bvmul_no_overflow_signed(rhs), "overflow_check_mul")),
+            (BinOp::Mul, false) => {
                 Some((lhs.bvmul_no_overflow_unsigned(rhs), "overflow_check_mul"))
+            }
+            // `intrinsics::unchecked_{add,sub,mul}` (LowerIntrinsics makes them
+            // `BinOp::*Unchecked`; `codegen_unchecked_arith` maps the intercepted
+            // `<int>::unchecked_*` methods here too). Same predicate, but the
+            // overflow is UB of an unsafe intrinsic, never a panic: Kani asserts
+            // it as `PropertyClass::ArithmeticOverflow`, "attempt to compute
+            // `unchecked_add` which would overflow", whatever
+            // `--no-overflow-checks` says. On the safe labels it took the
+            // driver's `overflow` panic class (a should_panic harness banked the
+            // UB) and the overflow-checks gate, which dropped the only check of
+            // this UB (core's `ub_checks` are compiled false). Not spelled
+            // `overflow_check_*`: the driver's `starts_with("overflow")` fallback
+            // would file a missing arm under that panic class without tripping
+            // the label drift guard.
+            (BinOp::AddUnchecked, true) => {
+                Some((lhs.bvadd_no_overflow_signed(rhs), "unchecked_add_overflow"))
+            }
+            (BinOp::AddUnchecked, false) => {
+                Some((lhs.bvadd_no_overflow_unsigned(rhs), "unchecked_add_overflow"))
+            }
+            (BinOp::SubUnchecked, true) => {
+                Some((lhs.bvsub_no_overflow_signed(rhs), "unchecked_sub_overflow"))
+            }
+            (BinOp::SubUnchecked, false) => {
+                Some((lhs.bvsub_no_underflow_unsigned(rhs), "unchecked_sub_overflow"))
+            }
+            (BinOp::MulUnchecked, true) => {
+                Some((lhs.bvmul_no_overflow_signed(rhs), "unchecked_mul_overflow"))
+            }
+            (BinOp::MulUnchecked, false) => {
+                Some((lhs.bvmul_no_overflow_unsigned(rhs), "unchecked_mul_overflow"))
             }
             // Signed division/remainder overflows when: lhs == INT_MIN && rhs == -1
             // Because |INT_MIN| > INT_MAX (e.g., -(-128i8) = 128 but i8::MAX = 127)
@@ -402,6 +457,49 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let no_overflow = operand.clone().bvneg_no_overflow();
         self.record_violation_guarded(no_overflow.not(), "overflow_check_neg");
     }
+
+    /// Emit the NaN-generation obligation for a float value binop (Kani
+    /// `--nan-check`, reported as class `NaN`, "NaN on <op>"). The caller
+    /// gates on `config.nan_checks`: producing a NaN is DEFINED behaviour in
+    /// Rust, so this is an opt-in property, not a safety check.
+    ///
+    /// The violation is the exact IEEE 754 invalid-operation predicate on the
+    /// operand bits (`bv_float_binop_generates_nan`), so the solver decides it
+    /// with full precision — no syntactic discharge is involved. Fails CLOSED:
+    /// an op or width the predicate cannot describe records an
+    /// `unsupported_check` instead of silently dropping the obligation.
+    ///
+    /// REQUIRES: `lhs` and `rhs` are BV-encoded floats of `width` bits
+    /// ENSURES: records `pc ∧ generates_nan(op, lhs, rhs)` under `nan_check_<op>`
+    pub(super) fn emit_float_nan_check(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, width: u32) {
+        match Self::float_nan_check(op, lhs, rhs, width) {
+            Some((generates_nan, label)) => self.record_violation_guarded(generates_nan, label),
+            None => {
+                warn!(?op, width, "--nan-check: no NaN-generation predicate; failing closed");
+                self.record_violation_guarded(Expr::bool_const(true), "unsupported_check");
+            }
+        }
+    }
+
+    /// The `(violation, label)` pair behind `emit_float_nan_check`. The labels
+    /// are classified by the driver (`classify_violation`) as class `NaN`.
+    fn float_nan_check(
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        width: u32,
+    ) -> Option<(Expr, &'static str)> {
+        let generates_nan = bv_float_binop_generates_nan(op, lhs, rhs, width)?;
+        match op {
+            BinOp::Add | BinOp::AddUnchecked => Some((generates_nan, "nan_check_add")),
+            BinOp::Sub | BinOp::SubUnchecked => Some((generates_nan, "nan_check_sub")),
+            BinOp::Mul | BinOp::MulUnchecked => Some((generates_nan, "nan_check_mul")),
+            BinOp::Div => Some((generates_nan, "nan_check_div")),
+            BinOp::Rem => Some((generates_nan, "nan_check_rem")),
+            // Comparison, bitwise, shift and offset ops carry no NaN obligation.
+            _ => None,
+        }
+    }
 }
 
 /// Tests for [`StatementCodegen::establish_pointer_base_address`].
@@ -414,7 +512,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 ///
 /// They live inline rather than in `statement/tests/` because that whole module
 /// is `#[cfg(feature = "compiler-corpus-tests")]` and would not run in the
-/// default `cargo test -p trust-mc-compiler --bins` gate.
+/// default `cargo test -p trust-mc-engine --lib` gate.
 #[cfg(test)]
 mod establish_pointer_base_address_tests {
     use super::StatementCodegen;

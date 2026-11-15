@@ -5,6 +5,7 @@
 //! Saturating float-to-int cast helpers for Rust `as` semantics.
 
 use ay_bindings::Expr;
+use num_bigint::BigInt;
 
 use super::float_predicates::{build_float_to_int_expr, ieee754_params};
 use crate::codegen_ay::float_arithmetic::{int_max_bits, int_min_bits, unsigned_max_bits};
@@ -45,8 +46,8 @@ pub(in crate::codegen_ay) fn build_float_to_int_saturating_expr(
         exp_wide.bvsge(Expr::bitvec_const(overflow_threshold as u128, work_width));
 
     let zero = Expr::bitvec_const(0u128, target_width);
-    let int_min = Expr::bitvec_const(int_min_bits(target_width, is_signed), target_width);
-    let int_max = Expr::bitvec_const(int_max_bits(target_width, is_signed), target_width);
+    let int_min = int_bound_const(target_width, is_signed, false);
+    let int_max = int_bound_const(target_width, is_signed, true);
 
     Some(Expr::ite(
         is_nan,
@@ -65,6 +66,30 @@ pub(in crate::codegen_ay) fn build_float_to_int_saturating_expr(
             ),
         ),
     ))
+}
+
+/// `Int::MIN` (`max = false`) or `Int::MAX` (`max = true`) of a `width`-bit
+/// integer, as a bitvector constant.
+///
+/// `int_min_bits` / `int_max_bits` return `u128` and cannot hold a wider bound:
+/// `1u128 << 129` wraps to `2` in a release build (overflow checks off).
+/// `kani_float::float_to_int_in_range_expr` saturates at `int_width + 2` bits,
+/// so for a 128-bit `Int` the wrapped bounds saturated `1e300` to `1` and
+/// `float_to_int_in_range::<f64, i128>(1e300)` evaluated `true` — a clean proof
+/// of a false claim. Wider bounds are built from `BigInt`.
+fn int_bound_const(width: u32, signed: bool, max: bool) -> Expr {
+    if width <= 128 {
+        let bits = if max { int_max_bits(width, signed) } else { int_min_bits(width, signed) };
+        return Expr::bitvec_const(bits, width);
+    }
+    let one = BigInt::from(1u8);
+    let value = match (signed, max) {
+        (false, false) => BigInt::from(0u8),
+        (false, true) => (&one << width as usize) - &one,
+        (true, false) => &one << (width - 1) as usize,
+        (true, true) => (&one << (width - 1) as usize) - &one,
+    };
+    Expr::bitvec_const(value, width)
 }
 
 /// Build the UB-free (safe) precondition for `float_to_int_unchecked::<Float, Int>`.
@@ -408,6 +433,41 @@ mod tests {
             build_float_to_int_saturating_expr(&Expr::bitvec_const(0xC2C7_CCCD_u64, 32), 8, true)
                 .expect("f32→i8 saturating builder");
         assert_bv_expr_eq(result, Expr::bitvec_const((-99i8) as i128, 8));
+    }
+
+    /// The in-range predicate saturates at `int_width + 2` bits; for a 128-bit
+    /// `Int` that is 130, whose bounds do not fit `u128`.
+    #[test]
+    fn test_build_float_to_int_saturating_expr_bounds_wider_than_u128() {
+        let one = BigInt::from(1u8);
+        let signed_max = (&one << 129usize) - &one;
+        let signed_min = &one << 129usize;
+        let unsigned_max = (&one << 130usize) - &one;
+        let huge = 1e300f64.to_bits();
+        let neg_huge = (-1e300f64).to_bits();
+        for (bits, signed, expected) in [
+            (huge, true, signed_max.clone()),
+            (neg_huge, true, signed_min.clone()),
+            (f64::INFINITY.to_bits(), true, signed_max),
+            (f64::NEG_INFINITY.to_bits(), true, signed_min),
+            (huge, false, unsigned_max),
+            (neg_huge, false, BigInt::from(0u8)),
+            (f64::NAN.to_bits(), true, BigInt::from(0u8)),
+        ] {
+            let result =
+                build_float_to_int_saturating_expr(&Expr::bitvec_const(bits, 64), 130, signed)
+                    .expect("f64 -> 130-bit saturating builder");
+            assert_bv_expr_eq(result, Expr::bitvec_const(expected, 130));
+        }
+        // An in-range value still truncates exactly at the wide width.
+        let result = build_float_to_int_saturating_expr(
+            &Expr::bitvec_const((-12345.75f64).to_bits(), 64),
+            130,
+            true,
+        )
+        .expect("f64 -> 130-bit saturating builder");
+        let expected = (&one << 130usize) - BigInt::from(12345u32);
+        assert_bv_expr_eq(result, Expr::bitvec_const(expected, 130));
     }
 
     fn ub_free_f32(bits: u32, target_width: u32, is_signed: bool) -> bool {

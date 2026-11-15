@@ -89,6 +89,32 @@ const CLEANUP_BRANCHY_DROP_ASSERT_SOURCE: &str = r#"
     }
 "#;
 
+// A `Drop::drop` body that compares a REFERENCE-HOLDING field. `PartialEq` on
+// `Option<&u32>` compares referents; the walker holds addresses for them, so
+// the comparison is left unconstrained (`cmp_value_holds_reference`) rather
+// than decided on addresses. The assertion's panic arm then sits behind an
+// unconstrained `SwitchInt` discriminant: it must still reach `error`.
+const DROP_COMPARES_REFERENTS_SOURCE: &str = r#"
+    #![allow(dead_code)]
+
+    struct RefHolder<'a>(Option<&'a u32>);
+
+    impl Drop for RefHolder<'_> {
+        fn drop(&mut self) {
+            let five = 5u32;
+            // The referents are equal (both 5), so `!=` is false and this
+            // assertion FAILS in Rust. Only an address comparison proves it.
+            assert!(self.0 != Some(&five));
+        }
+    }
+
+    pub fn probe_drop_compares_referents(x: u32) {
+        if x == 5 {
+            let _holder = RefHolder(Some(&x));
+        }
+    }
+"#;
+
 const EXPLICIT_RC_DROP_IN_PLACE_SOURCE: &str = r#"
     #![allow(dead_code)]
 
@@ -275,8 +301,11 @@ fn test_cleanup_drop_branchy_assert_emits_error_rule() {
 
         let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
         let cleanup_rel = format!("{fn_name}__bb{cleanup_bb}");
+        // BSEM-18: a check's head is its per-property `error_p{id}` relation
+        // (bridged into the aggregate `error`); the bare `error` head survives
+        // only past MAX_CHC_PROPERTIES. Either is the error rule this asserts.
         let has_cleanup_error = vc.rules.iter().any(|rule| {
-            rule.head.name == "error"
+            rule.head.name.starts_with("error")
                 && matches!(rule.body.relation.as_ref(), Some(rel) if rel.name == cleanup_rel)
         });
         let cleanup_rules: Vec<String> = vc
@@ -295,6 +324,56 @@ fn test_cleanup_drop_branchy_assert_emits_error_rule() {
             "cleanup bb{cleanup_bb} must emit an error rule for nested inline Drop asserts; \
              cleanup_rules={cleanup_rules:?}; drop_fallback_reasons={drop_fallback_reasons:?}"
         );
+    });
+}
+
+/// The inlined drop body's assertion compares referents through an
+/// unconstrained discriminant: the panic arm is an obligation (error rule), and
+/// the referent comparison is not decided on addresses (the failure stays
+/// reachable). Pins the cleanup-drop regression and the joined-reference hazard
+/// together: weakening either side re-opens one of them.
+#[test]
+fn test_drop_assert_on_reference_holding_field_emits_error_rule_and_keeps_failure_reachable() {
+    let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_test_ay_ctx_for_source(DROP_COMPARES_REFERENTS_SOURCE, |ctx| {
+        let fn_name = "probe_drop_compares_referents";
+        let instance = find_instance_by_suffix(ctx.tcx, fn_name);
+        let body = instance.body().expect("body");
+        let drop_rels: Vec<String> = body
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, bb)| {
+                matches!(bb.terminator.kind, rustc_public::mir::TerminatorKind::Drop { .. })
+            })
+            .map(|(idx, _)| format!("{fn_name}__bb{idx}"))
+            .collect();
+        assert!(!drop_rels.is_empty(), "{fn_name} must drop the holder through a Drop terminator");
+
+        let _ = crate::codegen_ay::chc::codegen_ctx::take_drop_fallback_reasons_by_fn();
+        let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
+        let drop_fallback_reasons =
+            crate::codegen_ay::chc::codegen_ctx::take_drop_fallback_reasons_by_fn();
+        assert!(
+            !drop_fallback_reasons.contains_key(fn_name),
+            "{fn_name}: the Drop body must be inlined, not skipped; reasons={drop_fallback_reasons:?}"
+        );
+        let has_drop_error = vc.rules.iter().any(|rule| {
+            rule.head.name.starts_with("error")
+                && matches!(rule.body.relation.as_ref(), Some(rel) if drop_rels.iter().any(|r| rel.name == *r))
+        });
+        assert!(
+            has_drop_error,
+            "{fn_name}: the inlined drop assertion must emit an error rule from {drop_rels:?};              rules={:?}",
+            vc.rules.iter().map(|rule| format!("{rule:?}")).collect::<Vec<_>>()
+        );
+        // `Some(&x) != Some(&five)` with `x == five == 5` is false: the assertion
+        // fails in Rust, so the error must stay reachable. A proof here would be
+        // the address comparison of
+        // tools/soundness-duals/negative/option_ref_partial_eq_referents.rs.
+        assert_z3_result(&crate::codegen_ay::emit_chc(&vc).to_string(), "sat");
     });
 }
 

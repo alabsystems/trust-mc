@@ -7,12 +7,15 @@
 //! Extracted from `memory_impl_layout.rs` — Part of #4206.
 
 use crate::kani_middle::abi::LayoutOf;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::rustc_internal;
 use rustc_public::ty::{FloatTy, IntTy, RigidTy, TyKind, UintTy};
 use tracing::{debug, warn};
 
 use super::ChcCtx;
-use super::memory_impl_layout::{ty_has_unresolved_non_region_params, unwrap_heap_transparent_ty};
+use super::memory_impl_layout::unwrap_heap_transparent_ty;
+use crate::codegen_ay::shared::mono_ty;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Gets the size in bytes of a type.
@@ -25,7 +28,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // (e.g., `MaybeUninit<[u8; BYTES/#0]>` from PointerGenerator<const BYTES>).
         // Lifetime-only params should still use rustc layout because they do not
         // change size, alignment, or field offsets.
-        if ty_has_unresolved_non_region_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return None;
         }
         if ty.layout().is_ok() {
@@ -129,7 +132,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<u64> {
         let ty = unwrap_heap_transparent_ty(self.resolve_body_ty(ty));
         // Part of #3942: Bail out only for unresolved type/const params.
-        if ty_has_unresolved_non_region_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return None;
         }
         if ty.layout().is_ok() {
@@ -234,7 +237,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if variants.len() != 1 || variants[0].fields().len() != 1 {
             return None;
         }
-        let field_ty = variants[0].fields()[0].ty_with_args(&args);
+        let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
         matches!(field_ty.kind(), TyKind::RigidTy(RigidTy::Array(..))).then_some(field_ty)
     }
 
@@ -254,7 +257,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if variants.len() != 1 || variants[0].fields().len() != 1 {
                     return None;
                 }
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 match field_ty.kind() {
                     TyKind::RigidTy(RigidTy::Array(elem_ty, _)) => Some(elem_ty),
                     _ => None,
@@ -281,7 +284,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if variants.len() != 1 || variants[0].fields().len() != 1 {
                     return None;
                 }
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 match field_ty.kind() {
                     TyKind::RigidTy(RigidTy::Array(_, cl)) => {
                         cl.eval_target_usize().ok().map(|l| l as usize)

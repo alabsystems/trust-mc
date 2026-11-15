@@ -37,6 +37,16 @@ pub(in crate::codegen_ay::chc) fn propagate_inline_vtable(
     locals: &[LocalDecl],
     inline_vtable_ids: &mut HashMap<usize, Expr>,
 ) {
+    // A `dyn` -> `dyn` unsize takes its id from the source's (`dyn_to_dyn.rs`).
+    // Handled first: every lane below would copy the SOURCE's id, which
+    // indexes the source principal's candidate list, into the target.
+    if let Some(vtable_expr) =
+        inline_dyn_to_dyn_vtable(ctx, rvalue, local_exprs, resolver, locals, inline_vtable_ids)
+    {
+        inline_vtable_ids.insert(dst_local, vtable_expr);
+        return;
+    }
+
     // Capture vtable from Dyn_Trait Datatype expressions.
     if let ay_bindings::SortInner::Datatype(dt) = dst_expr.sort().inner() {
         if let Some(cons) = dt.constructors.first() {
@@ -91,7 +101,7 @@ pub(in crate::codegen_ay::chc) fn propagate_inline_vtable(
 
     // Propagate from source local for identity-like rvalues.
     let src_local = match rvalue {
-        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p.local),
+        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p.local),
         Rvalue::Ref(_, _, place) | Rvalue::CopyForDeref(place) => Some(place.local),
         Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(p.local),
         _ => None,
@@ -101,6 +111,43 @@ pub(in crate::codegen_ay::chc) fn propagate_inline_vtable(
             inline_vtable_ids.insert(dst_local, vtable);
         }
     }
+}
+
+/// The target id of a `dyn` -> `dyn` `Unsize` cast in a walked body, from
+/// whatever this walk knows of the source's id. `None` when the cast is not
+/// one, or keeps the principal and the source's id is unknown (the lanes
+/// after it can then only copy what they find, which is exact).
+fn inline_dyn_to_dyn_vtable(
+    ctx: &mut ChcCtx<'_, '_>,
+    rvalue: &Rvalue,
+    local_exprs: &HashMap<usize, Expr>,
+    resolver: &PlaceResolver<'_>,
+    locals: &[LocalDecl],
+    inline_vtable_ids: &HashMap<usize, Expr>,
+) -> Option<Expr> {
+    let Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize), operand, target_ty) =
+        rvalue
+    else {
+        return None;
+    };
+    let src_ty = operand.ty(locals).ok()?;
+    let cast = crate::codegen_ay::chc::dyn_to_dyn::dyn_to_dyn_unsize(ctx, src_ty, *target_ty)?;
+    let source = match operand {
+        Operand::Copy(src) | Operand::Move(src) if src.projection.is_empty() => {
+            inline_vtable_ids.get(&src.local).cloned().or_else(|| {
+                local_exprs
+                    .get(&src.local)
+                    .and_then(|expr| ctx.extract_embedded_vtable_expr(expr))
+                    .map(Val::into_expr)
+            })
+        }
+        Operand::Copy(_) | Operand::Move(_) => {
+            projected_source_vtable(ctx, rvalue, local_exprs, resolver, locals)
+                .or_else(|| projected_heap_forward_vtable(ctx, rvalue, local_exprs))
+        }
+        _ => None,
+    };
+    crate::codegen_ay::chc::dyn_to_dyn::dyn_to_dyn_vtable(ctx, &cast, source)
 }
 
 fn inline_raw_ptr_dyn_metadata_vtable(
@@ -279,6 +326,16 @@ pub(in crate::codegen_ay::chc) fn propagate_vtable_through_call(
     }
 }
 
+/// The spawn-scheduler bridge: a call to core's `Option::as_mut`/`Option::take`
+/// on a task slot (`Option<Pin<Box<dyn Future>>>`) inside the scheduler model
+/// gets the vtable of the task the schedule polls, and `take` empties the slot.
+///
+/// The callee is identified by its def path (`core_option_state_method`),
+/// never by its name: a user method called `take` on the slot type has a body
+/// of its own, and what its walk established stands (no fill of `self`, no
+/// vtable, no step of the schedule). For core's `take`, whose body always
+/// stores `None` into `*self`, an update of `self` the walk left empty is
+/// filled with `None`; an update the walk made is kept.
 pub(in crate::codegen_ay::chc) fn attach_spawn_task_slot_vtable(
     ctx: &mut ChcCtx<'_, '_>,
     callee_path: Option<&str>,
@@ -289,18 +346,13 @@ pub(in crate::codegen_ay::chc) fn attach_spawn_task_slot_vtable(
     if result.vtable.is_some() {
         return;
     }
-    let Some(callee_path) = callee_path else {
+    let Some(method) = callee_path.and_then(super::core_option_state_method) else {
         return;
     };
-    if !callee_path.contains("Option")
-        || (!callee_path.ends_with("::as_mut") && !callee_path.ends_with("::take"))
-    {
-        return;
-    }
     if !destination_is_spawn_task_slot_option(ctx, destination, body) {
         return;
     }
-    let take_none_expr = callee_path.ends_with("::take").then(|| {
+    let take_none_expr = (method == super::CoreOptionStateMethod::Take).then(|| {
         destination
             .ty(body.locals())
             .ok()
@@ -311,7 +363,7 @@ pub(in crate::codegen_ay::chc) fn attach_spawn_task_slot_vtable(
     let Some(model) = ctx.spawn_scheduler_vtable_model.as_mut() else {
         return;
     };
-    let vtable = if callee_path.ends_with("::as_mut") {
+    let vtable = if method == super::CoreOptionStateMethod::AsMut {
         model.next_vtable_expr()
     } else {
         let current = model.current_vtable_expr();

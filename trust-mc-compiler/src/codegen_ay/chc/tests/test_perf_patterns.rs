@@ -130,7 +130,7 @@ fn test_declare_relations_many_blocks_consistent_sorts() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_many_blocks");
         let body = instance.body().expect("function body");
 
-        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_many_blocks", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_many_blocks", ChcConfig { frame_narrowing: false, ..ChcConfig::default() });
         chc_ctx.declare_block_relations();
 
         // Every block should have a relation declared
@@ -243,7 +243,7 @@ fn test_ref_target_multiple_independent_chains() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_multi_chain");
         let body = instance.body().expect("function body");
 
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_multi_chain", ChcConfig::default());
+        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_multi_chain", ChcConfig { frame_narrowing: false, ..ChcConfig::default() });
 
         let (vc, _) = chc_ctx.translate();
         assert_vc_structure(&vc, "probe_multi_chain", body.blocks.len());

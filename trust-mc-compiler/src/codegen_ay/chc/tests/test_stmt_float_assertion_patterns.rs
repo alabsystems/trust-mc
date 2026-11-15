@@ -19,7 +19,7 @@ fn assert_no_fp_theory_tokens(smt: &str, context: &str) {
 
 fn has_f32_finite_error_rule(smt: &str) -> bool {
     smt.lines().any(|line| {
-        line.starts_with("(rule") && line.contains(" error))") && line.contains("extract 30 23")
+        line.starts_with("(rule") && (line.contains(" error))") || line.contains(" error_p")) && line.contains("extract 30 23")
     })
 }
 

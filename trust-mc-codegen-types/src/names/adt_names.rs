@@ -18,14 +18,21 @@ const Z3_RESERVED_SORT_NAMES: &[&str] = &["Array", "Bool", "Int", "Real", "Strin
 
 /// Build a unique SMT sort name for a generic ADT.
 ///
-/// This prevents collisions between different instantiations like `Option<u32>` and `Option<u64>`.
+/// The base is the definition's PATH ([`adt_sort_base`]), so two definitions
+/// that share a last segment get two names. It used to be `trimmed_name()`, and
+/// `std::collections::HashMap<i32, i32, RandomState, Global>` and the
+/// `hashbrown::HashMap` it wraps, instantiated at the same arguments, were one
+/// name with two definitions, which ay refuses (`conflicting datatype
+/// definitions under one name`; design trust-mc-reds-final §7.2, T3-2). The
+/// arguments then separate the instantiations of one definition.
 ///
 /// REQUIRES: `def` is a valid ADT definition.
 /// ENSURES: Returned name is a valid SMT identifier (no spaces or special chars).
-/// ENSURES: Different generic instantiations produce different names.
+/// ENSURES: Different generic instantiations produce different names, across
+/// definitions too, up to the sanitization limit [`adt_sort_base`] states.
 /// ENSURES: Name does not collide with Z3 built-in sort names (#3348).
 pub fn adt_sort_name(def: AdtDef, args: &GenericArgs) -> String {
-    let base = def.trimmed_name();
+    let base = adt_sort_base(def);
     let name = adt_sort_name_from_base(&base, args);
     // Prefix with "Adt_" if the name collides with a Z3 built-in sort.
     // User-defined `struct Array` produces sort name "Array" which conflicts
@@ -39,6 +46,52 @@ pub fn adt_sort_name(def: AdtDef, args: &GenericArgs) -> String {
     } else {
         name
     }
+}
+
+/// The base of an ADT's sort name: its definition path as rustc prints it
+/// untrimmed (`CrateDef::name()`: `std::collections::HashMap`,
+/// `hashbrown::HashMap`, `testcrate_3::Point`), sanitized to an SMT
+/// identifier (`std_collections_HashMap`).
+///
+/// Sanitizing maps `::` and `_` alike to `_`, so two paths that differ only in
+/// where a separator falls (`a::b_c` and `a_b::c`) share a base. Rust's own
+/// paths do not do that within one crate graph in practice; a name built from
+/// two such paths would be refused by ay, never merged silently.
+pub fn adt_sort_base(def: AdtDef) -> String {
+    sanitize_def_path(&def.name())
+}
+
+/// [`adt_sort_base`] of a definition path given as text (`std::option::Option`).
+pub fn sanitize_def_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    sanitize_adt_suffix_into(path, &mut out);
+    out
+}
+
+/// Whether `dt_name` is the sort of an instantiation of a definition whose path
+/// is one of `def_paths` (rustc's untrimmed spelling, as [`adt_sort_base`]
+/// reads it): the name is the sanitized path, or the sanitized path followed by
+/// `_` and the arguments. This is the definition's identity, not a substring
+/// guess: [`adt_sort_name`] puts the whole path first.
+pub fn adt_sort_is(dt_name: &str, def_paths: &[&str]) -> bool {
+    def_paths.iter().any(|path| {
+        let base = sanitize_def_path(path);
+        dt_name
+            .strip_prefix(base.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    })
+}
+
+/// Definition paths of the ADTs the encoders recognize by sort, as rustc prints
+/// them with and without `std` in the crate graph. [`adt_sort_is`] reads them.
+pub mod known_adt {
+    pub const OPTION: &[&str] = &["std::option::Option", "core::option::Option"];
+    pub const RESULT: &[&str] = &["std::result::Result", "core::result::Result"];
+    pub const COPIED: &[&str] = &["std::iter::Copied", "core::iter::Copied"];
+    pub const CLONED: &[&str] = &["std::iter::Cloned", "core::iter::Cloned"];
+    pub const TYPE_ID: &[&str] = &["std::any::TypeId", "core::any::TypeId"];
+    pub const CHARS: &[&str] = &["std::str::Chars", "core::str::Chars"];
+    pub const ALLOC_ERROR: &[&str] = &["std::alloc::AllocError", "core::alloc::AllocError"];
 }
 
 fn adt_sort_name_from_base(base: &str, args: &GenericArgs) -> String {

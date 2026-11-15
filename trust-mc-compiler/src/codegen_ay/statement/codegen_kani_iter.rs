@@ -19,8 +19,11 @@
 
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::names::struct_sort;
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::statement::dispatch::CallDispatchOutcome;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::{Instance, InstanceKind};
@@ -85,7 +88,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Check for InstanceKind::Intrinsic - direct calls to core::intrinsics::*
         if let Some(instance) = instance_opt
             && matches!(instance.kind, InstanceKind::Intrinsic)
-            && let Some(intrinsic_name) = instance.intrinsic_name()
+            && let Some(intrinsic_name) = crate::intrinsics::intrinsic_model_name(instance)
         {
             debug!("AY codegen: handling InstanceKind::Intrinsic: {}", intrinsic_name);
             // Compile-time type-validity assertions (assert_inhabited /
@@ -112,6 +115,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if fn_name.contains("kani::") && fn_name.contains("Arbitrary") && fn_name.contains("::any")
         {
             debug!("AY codegen: handling Arbitrary::any impl {}", fn_name);
+            self.bmc_kani_any_unwinding_check(destination);
             self.codegen_kani_any_raw(destination);
             return CallDispatchOutcome::from_handled_target(target);
         }
@@ -135,10 +139,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
 
-        // Handle std library intrinsics
-        let outcome = self.try_codegen_std_intrinsic(fn_name, args, destination, target);
-        if !matches!(outcome, CallDispatchOutcome::Miss) {
-            return outcome;
+        // Handle std library intrinsics. They are matched by NAME, so a
+        // function of the crate under verification is never one of them: a
+        // user `fn my_wrapping_add` (or a `#[kani::stub]` replacement named
+        // after what it stubs) was modelled as `wrapping_add` and its body,
+        // assertions included, was dropped
+        // (tools/soundness-duals/user_fn_std_helper_name_dual.rs).
+        let callee_is_local = func.ty(self.body.locals()).into_option().is_some_and(|ty| {
+            matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnDef(def, _)) if def.krate().is_local)
+        });
+        if !callee_is_local {
+            let outcome = self.try_codegen_std_intrinsic(fn_name, args, destination, target);
+            if !matches!(outcome, CallDispatchOutcome::Miss) {
+                return outcome;
+            }
         }
 
         // #468: Handle iterator functions for arrays with known bounds.
@@ -287,9 +301,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     && let TyKind::RigidTy(RigidTy::Ref(_, inner, _)) = intoiter_ty.kind()
                     && let TyKind::RigidTy(RigidTy::Adt(def, args)) = inner.kind()
                 {
-                    let adt_name = Self::adt_sort_name(def, &args);
+                    // The field is read under the name of the sort the value has.
+                    let adt_name = crate::codegen_ay::names::constructor_datatype_name(
+                        intoiter_expr.sort(),
+                        &Self::adt_sort_name(def, &args),
+                    );
                     if let Some(concrete_ty) =
-                        Self::resolve_generic_ty(def.variants()[0].fields()[0].ty(), &args)
+                        mono_ty::field_ty(&def.variants()[0].fields()[0], &args)
                         && let Some(inner_sort) = Self::infer_sort_from_ty(concrete_ty)
                     {
                         if intoiter_expr.sort().is_datatype() {
@@ -446,7 +464,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Part of #3317: namespace guard — Option is in core::option.
         if fn_name.contains("core::") && fn_name.contains("Option") && fn_name.contains("::map") {
             debug!("AY codegen: handling Option::map");
-            return CallDispatchOutcome::from_handled_target(self.codegen_option_map(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_option_map(
                 args,
                 destination,
                 target,

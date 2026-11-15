@@ -39,10 +39,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let bb_idx = specialized.blocks.len();
                 specialized.blocks.push(rustc_public::mir::BasicBlock {
                     statements: Vec::new(),
-                    terminator: rustc_public::mir::Terminator {
-                        kind: TerminatorKind::Unreachable,
-                        span: body.blocks[0].terminator.span,
-                    },
+                    terminator: crate::rustc_compat::mir_terminator(
+                        TerminatorKind::Unreachable,
+                        mir_span!(body.blocks[0].terminator),
+                    ),
                 });
                 bb_idx
             });

@@ -79,6 +79,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #3305: Selectively retains heap safety checks for non-stack addresses.
     /// Stack-local addresses have redundant checks (always valid within function scope).
     /// Real heap addresses need their checks preserved for use-after-free/bounds detection.
+    ///
+    /// Returns `false` when an operand is still an ADDRESS of a referent that
+    /// `PartialEq` would compare (a reference level that could not be loaded).
+    /// Comparing it with SMT equality compares pointers, so the caller must not
+    /// decide the comparison from these terms.
     pub(super) fn deref_cmp_operands_if_needed(
         &mut self,
         lhs: &mut Expr,
@@ -87,9 +92,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
         lhs_is_own_pointer: bool,
         rhs_is_own_pointer: bool,
-    ) {
+    ) -> bool {
         if self.track_level < ChcTrackLevel::Mem {
-            return;
+            return true;
         }
         if *lhs.sort() == ptr_sort() && *rhs.sort() == ptr_sort() {
             // Part of #3994: Try double-ref `&&T` first (#3270), then single-ref `&T`.
@@ -100,7 +105,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let Some(pointee_ty) = extract_ref_pointee_from_cmp_arg(&args[0], self.body.locals())
                 .or_else(|| extract_single_ref_pointee(&args[0], self.body.locals()))
             else {
-                return;
+                return true;
             };
             // Part of #4030: Raw pointer comparisons (`<*const T as Ord>::cmp`)
             // pass `&*const T` args. Do NOT dereference through the raw pointer —
@@ -109,20 +114,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Note: double-ref `&&*const T` (blanket impls) handled by
             // resolve_double_ref_raw_ptr_cmp in codegen_call_primitive_cmp_stub.
             if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))) {
-                return;
+                return true;
             }
-            // Resolve each operand, selectively retaining heap safety checks.
-            if let Some(lhs_val) = self.resolve_cmp_deref_operand(lhs, pointee_ty, modified_locals)
-            {
-                debug!("[#3270] cmp deref lhs: ptr -> {:?}", lhs_val.sort());
-                *lhs = lhs_val;
-            }
-            if let Some(rhs_val) = self.resolve_cmp_deref_operand(rhs, pointee_ty, modified_locals)
-            {
-                debug!("[#3270] cmp deref rhs: ptr -> {:?}", rhs_val.sort());
-                *rhs = rhs_val;
-            }
-            return;
+            // Resolve each operand through EVERY reference level `PartialEq`
+            // compares through: `<&A as PartialEq<&B>>::eq` is `*self == *other`,
+            // so for `A = &Option<u8>` (a generic `same::<&Option<u8>>(&r, &s)`,
+            // or `&&o == &&c`) one load still yields the address of the Option,
+            // and comparing that proved `!same(&r, &s)` with `*r == *s`.
+            // Heap safety checks are retained per level for non-stack addresses.
+            let lhs_ok = self.deref_cmp_operand_to_value(lhs, pointee_ty, modified_locals, "lhs");
+            let rhs_ok = self.deref_cmp_operand_to_value(rhs, pointee_ty, modified_locals, "rhs");
+            return lhs_ok && rhs_ok;
         }
 
         // Asymmetric case: the referent cascade resolved ONE side through the
@@ -143,12 +145,50 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // own `Referent` tag, not from a width test: at POINTER_WIDTH an
         // address and a bv64 datum are indistinguishable, and only the
         // resolving tier knows which it returned.
+        let mut resolved = true;
         if lhs_is_own_pointer && *lhs.sort() == ptr_sort() {
-            self.deref_single_cmp_operand(lhs, &args[0], modified_locals);
+            resolved &= self.deref_single_cmp_operand(lhs, &args[0], modified_locals);
         }
         if rhs_is_own_pointer && *rhs.sort() == ptr_sort() {
-            self.deref_single_cmp_operand(rhs, &args[1], modified_locals);
+            resolved &= self.deref_single_cmp_operand(rhs, &args[1], modified_locals);
         }
+        resolved
+    }
+
+    /// Load `expr`, an address whose pointee has type `pointee_ty`, down to a
+    /// value that is not itself an address `PartialEq` compares through.
+    ///
+    /// Stops at a raw pointer (compared by address). Returns `false`, leaving
+    /// `expr` at the last level reached, when a level cannot be loaded.
+    fn deref_cmp_operand_to_value(
+        &mut self,
+        expr: &mut Expr,
+        pointee_ty: rustc_public::ty::Ty,
+        modified_locals: &HashSet<usize>,
+        side: &'static str,
+    ) -> bool {
+        let mut pointee_ty = pointee_ty;
+        for _ in 0..8 {
+            let Some(val) = self.resolve_cmp_deref_operand(expr, pointee_ty, modified_locals)
+            else {
+                debug!(side, ?pointee_ty, "[#3270] cmp deref: level not loadable");
+                return false;
+            };
+            debug!(side, "[#3270] cmp deref: ptr -> {:?}", val.sort());
+            *expr = val;
+            match self.resolve_body_ty(pointee_ty).kind() {
+                TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
+                    if *expr.sort() != ptr_sort() {
+                        // A reference-typed pointee whose load is not an
+                        // address slot: nothing further this lane can load.
+                        return false;
+                    }
+                    pointee_ty = inner;
+                }
+                _ => return true,
+            }
+        }
+        false
     }
 
     /// Dereference ONE comparison operand that is still the reference's own
@@ -164,19 +204,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         expr: &mut Expr,
         arg: &Operand,
         modified_locals: &HashSet<usize>,
-    ) {
+    ) -> bool {
         let Some(pointee_ty) = extract_ref_pointee_from_cmp_arg(arg, self.body.locals())
             .or_else(|| extract_single_ref_pointee(arg, self.body.locals()))
         else {
-            return;
+            return true;
         };
         if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))) {
-            return;
+            return true;
         }
-        if let Some(val) = self.resolve_cmp_deref_operand(expr, pointee_ty, modified_locals) {
-            debug!(?pointee_ty, "cmp deref (asymmetric): ptr -> {:?}", val.sort());
-            *expr = val;
-        }
+        self.deref_cmp_operand_to_value(expr, pointee_ty, modified_locals, "asymmetric")
     }
 
     /// Part of #3792/#3806: recover fixed-array operands from `&&[T; N]` and
@@ -392,7 +429,7 @@ pub(super) fn extract_slice_array_data(expr: &Expr) -> Option<Expr> {
         return None;
     }
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let cons = &dt.constructors[0];

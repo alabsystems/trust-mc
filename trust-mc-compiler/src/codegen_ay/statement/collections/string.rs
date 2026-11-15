@@ -128,8 +128,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         use StubKind::{
             CowToString, DisplayToString, FmtFormat, IntParse, StrFromUtf8, StringAsStr,
             StringClear, StringClone, StringContains, StringEndsWith, StringEq, StringFrom,
-            StringFromUtf8Lossy, StringIntoBoxedStr, StringIsAscii, StringIsEmpty, StringLen,
-            StringNew, StringPush, StringPushStr, StringStartsWith, StringTruncate,
+            StringFromUtf8, StringFromUtf8Lossy, StringIntoBoxedStr, StringIntoBytes,
+            StringIsAscii, StringIsEmpty, StringLen, StringNew, StringPush, StringPushStr,
+            StringStartsWith, StringTruncate,
         };
 
         debug!(?stub_kind, %callee_path, "codegen_string_stub");
@@ -163,6 +164,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
                 let data_name = self.ctx.fresh_name("string_data");
                 let data = self.ctx.declare_var(&data_name, array_sort);
+                self.ctx.bmc_sound_havoc("string_from");
 
                 let len_name = self.ctx.fresh_name("string_len");
                 let cap_name = self.ctx.fresh_name("string_cap");
@@ -193,11 +195,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     } else {
                         let name = self.ctx.fresh_name("string_len");
                         let len = self.ctx.declare_var(&name, ptr_sort());
+                        self.ctx.bmc_sound_havoc("string_len");
                         self.assign_value_to_place(destination, len);
                     }
                 } else {
                     let name = self.ctx.fresh_name("string_len");
                     let len = self.ctx.declare_var(&name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("string_len");
                     self.assign_value_to_place(destination, len);
                 }
                 target
@@ -218,11 +222,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     } else {
                         let name = self.ctx.fresh_name("string_is_empty");
                         let is_empty = self.ctx.declare_var(&name, bool_sort());
+                        self.ctx.bmc_sound_havoc("string_is_empty");
                         self.assign_value_to_place(destination, is_empty);
                     }
                 } else {
                     let name = self.ctx.fresh_name("string_is_empty");
                     let is_empty = self.ctx.declare_var(&name, bool_sort());
+                    self.ctx.bmc_sound_havoc("string_is_empty");
                     self.assign_value_to_place(destination, is_empty);
                 }
                 target
@@ -247,6 +253,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 };
                 let name = self.ctx.fresh_name(prefix);
                 let result = self.ctx.declare_var(&name, bool_sort());
+                self.ctx.bmc_sound_havoc("string_predicate");
                 self.assign_value_to_place(destination, result);
                 target
             }
@@ -272,6 +279,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Use nondet increment constrained to >= 1 for push, >= 0 for push_str
                     let inc_name = self.ctx.fresh_name("string_push_len");
                     let increment = self.ctx.declare_var(&inc_name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("string_push");
                     if stub_kind == StringPush {
                         // char is 1-4 bytes in UTF-8
                         let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
@@ -408,6 +416,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let cap = self.ctx.declare_var(&cap_name, ptr_sort());
                 let data_name = self.ctx.fresh_name("utf8_data");
                 let data = self.ctx.declare_var(&data_name, array_sort);
+                self.ctx.bmc_sound_havoc("string_from_utf8_lossy");
 
                 // Constraint: cap >= len (standard invariant)
                 // cap and len used again in vec below — clone for assert
@@ -497,6 +506,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             StrFromUtf8 => self.codegen_str_from_utf8_stub(args, destination, target),
+
+            // String::from_utf8(Vec<u8>) / String::into_bytes(self) — string_utf8.rs.
+            // Both fail CLOSED on an unresolvable receiver (fallback demotion +
+            // symbolic destination), never `None`: the STRING_STUBS router maps
+            // `None` to `Diverge`, which would prune the path.
+            StringFromUtf8 => self.codegen_string_from_utf8_stub(args, destination, target),
+            StringIntoBytes => self.codegen_string_into_bytes_stub(args, destination, target),
 
             IntParse => {
                 // <integer as FromStr>::from_str(&str) -> Result<T, ParseIntError> (#3676)

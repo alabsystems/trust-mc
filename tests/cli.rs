@@ -6,9 +6,9 @@
 //!
 //! Everything in the first group runs with nothing installed: help, explain,
 //! example, version, usage errors. The second group needs a built engine
-//! (`cargo build-dev`) and the `ay` solver on PATH, and skips itself — loudly —
-//! when they are absent, so `cargo test -p trust-mc` is green on a bare
-//! checkout and meaningful on a working one.
+//! (`targo --unverified build-dev`) and the `ay` solver on PATH, and skips
+//! itself — loudly — when they are absent, so `targo --unverified test -p
+//! trust-mc` is green on a bare checkout and meaningful on a working one.
 
 #![allow(
     clippy::unwrap_used,
@@ -402,7 +402,7 @@ fn installation_ready() -> bool {
     if !ready {
         eprintln!(
             "SKIPPED: no working trust-mc installation (`trust-mc doctor` is not ready); \
-             build one with `cargo build-dev --release` and put `ay` on PATH"
+             build one with `targo --unverified build-dev --release` and put `ay` on PATH"
         );
     }
     ready
@@ -537,14 +537,20 @@ fn a_harness_with_contradictory_assumptions_is_vacuous_not_proved() {
 }
 
 #[test]
-fn a_harness_with_no_checks_is_inconclusive_not_proved() {
+fn a_harness_with_no_checks_is_never_a_clean_proof() {
     if !installation_ready() {
         return;
     }
     let dir = scratch("no-checks");
     // A harness with no assertions and no fallible operation genuinely has
     // nothing to discharge. Zero obligations discharged is not a proof of
-    // anything, so it must never be SUCCESSFUL.
+    // anything, so it must never be a CLEAN success. D16 (second step) splits
+    // the empty obligation set by the compiler's certificate:
+    //
+    // * NOT certified — the walk could not see every reachable site (here:
+    //   `kani::any()` in the BMC lane resolves to a hook the walk refuses),
+    //   so an obligation may have been dropped: INCONCLUSIVE (no checks),
+    //   exit 1, as before.
     fs::write(
         dir.join("nochecks.rs"),
         "#[kani::proof]\n\
@@ -557,37 +563,68 @@ fn a_harness_with_no_checks_is_inconclusive_not_proved() {
 
     let out = trust_mc_in(&dir, &["--timeout", "30s", "nochecks.rs"]);
     let text = stdout(&out);
-    assert_eq!(code(&out), 1, "zero checks must not exit 0:\n{text}");
+    assert_eq!(code(&out), 1, "uncertified zero checks must not exit 0:\n{text}");
     assert!(text.contains("INCONCLUSIVE (no checks)"), "{text}");
     assert!(text.contains("[AY:VACUOUS:no-checks]"), "{text}");
+    assert!(text.contains("may have been dropped"), "{text}");
 
-    // The README promises "a harness that produced no obligations is
-    // INCONCLUSIVE (no checks)" without qualifying the mode, and the CHC lane
-    // broke that promise: it fabricated a synthetic Success property whenever
-    // the artifact registered none, so the V4b gate could never fire and the
-    // run reported SUCCESSFUL — a clean proof of nothing.
+    // * CERTIFIED — the walk proved every reachable statement and terminator
+    //   carries no obligation, so nothing was dropped and nothing could
+    //   fail. Exit 0, as Kani reports this shape, but VISIBLY: the marker,
+    //   a qualified verdict line and a non-clean proof qualifier. Never a
+    //   bare `VERIFICATION:- SUCCESSFUL`, never `[AY:PROOF_QUALIFIERS:clean]`.
     //
-    // A different body from the BMC case above, deliberately. `kani::any()`
-    // does emit obligations under CHC (three, measured) even though BMC emits
-    // none for the same harness, and CHC discharging them is a real if trivial
-    // proof — not the case this gate is about. A harness with no symbolic
-    // input at all produces nothing to check in EITHER mode, which is the
-    // claim being tested.
+    // The README once promised "a harness that produced no obligations is
+    // INCONCLUSIVE (no checks)" without qualifying the mode, and the CHC lane
+    // broke it by fabricating a synthetic Success property whenever the
+    // artifact registered none — a clean proof of nothing. A harness with no
+    // symbolic input at all produces nothing to check in EITHER mode, which
+    // is the claim being tested: one claim, both modes.
     fs::write(
         dir.join("empty.rs"),
         "#[kani::proof]\nfn nothing_at_all() {\n\x20   let _x: u8 = 3;\n}\n",
     )
     .unwrap();
-    let chc = trust_mc_in(&dir, &["--ay-chc", "--timeout", "240s", "empty.rs"]);
-    let chc_text = stdout(&chc);
-    assert_ne!(code(&chc), 0, "a CHC proof of zero obligations must not exit 0:\n{chc_text}");
-    assert!(chc_text.contains("INCONCLUSIVE (no checks)"), "{chc_text}");
-    assert!(chc_text.contains("[AY:VACUOUS:no-checks]"), "{chc_text}");
+    for (label, args) in [
+        ("chc", &["--ay-chc", "--timeout", "240s", "empty.rs"][..]),
+        ("bmc", &["--timeout", "60s", "empty.rs"][..]),
+    ] {
+        let run = trust_mc_in(&dir, args);
+        let text = stdout(&run);
+        assert_eq!(code(&run), 0, "{label}: a certified empty set exits 0:\n{text}");
+        assert!(text.contains("[AY:VACUOUS:no-checks]"), "{label}: {text}");
+        assert!(
+            text.contains("VERIFICATION:- SUCCESSFUL (no checks — compiler-certified obligation-free)"),
+            "{label}: the verdict line must say what it is:\n{text}"
+        );
+        assert!(
+            text.contains("[AY:PROOF_QUALIFIERS:no_checks=compiler_certified_obligation_free]"),
+            "{label}: {text}"
+        );
+        assert!(!text.contains("[AY:PROOF_QUALIFIERS:clean]"), "{label}: never clean:\n{text}");
+        assert!(!text.contains("VERIFICATION:- SUCCESSFUL\n"), "{label}: never bare:\n{text}");
+        assert!(!text.contains("INCONCLUSIVE"), "{label}: {text}");
+    }
 
-    // BMC must say the same thing about the same file: one claim, both modes.
-    let bmc_empty = trust_mc_in(&dir, &["--timeout", "60s", "empty.rs"]);
-    assert_eq!(code(&bmc_empty), 1, "{}", stdout(&bmc_empty));
-    assert!(stdout(&bmc_empty).contains("INCONCLUSIVE (no checks)"), "{}", stdout(&bmc_empty));
+    // * The same empty set, UNCERTIFIED because the walk cannot see through
+    //   `black_box` (a body-less intrinsic), stays INCONCLUSIVE with exit 1 in
+    //   both lanes. The certificate, not the table, is what moved.
+    fs::write(
+        dir.join("opaque.rs"),
+        "#[kani::proof]\nfn opaque() {\n\x20   let _x = std::hint::black_box(3u8);\n}\n",
+    )
+    .unwrap();
+    for (label, args) in [
+        ("chc", &["--ay-chc", "--timeout", "240s", "opaque.rs"][..]),
+        ("bmc", &["--timeout", "60s", "opaque.rs"][..]),
+    ] {
+        let run = trust_mc_in(&dir, args);
+        let text = stdout(&run);
+        assert_eq!(code(&run), 1, "{label}: an uncertified empty set must not exit 0:\n{text}");
+        assert!(text.contains("INCONCLUSIVE (no checks)"), "{label}: {text}");
+        assert!(text.contains("[AY:VACUOUS:no-checks]"), "{label}: {text}");
+        assert!(!text.contains("[AY:PROOF_QUALIFIERS:"), "{label}: {text}");
+    }
 
     // ...and a harness that DOES have obligations still proves under CHC, so
     // the gate cannot be satisfied by reporting everything inconclusive.
@@ -934,28 +971,44 @@ fn a_failing_harness_always_leaves_a_sarif_finding() {
     // property failing -- a vacuous proof, or one that compiled to zero
     // obligations -- and the report used to come back with zero results while
     // the process exited non-zero. To code scanning that is a clean file.
+    //
+    // The one exit-0 shape with no property behind it — a compiler-certified
+    // obligation-free harness (D16) — leaves a NOTE under the same no-checks
+    // id, so a file that had nothing to check does not read as a file whose
+    // checks were all proved.
     let dir = scratch("sarif-vacuous");
-    let cases: [(&str, &str, &str); 2] = [
+    let cases: [(&str, &str, &str, i32, &str); 3] = [
         (
             "vacuous.rs",
             "#[kani::proof]\nfn v() {\n\x20   let x: u32 = kani::any();\n\
              \x20   kani::assume(x > 10);\n\x20   kani::assume(x < 5);\n\
              \x20   assert!(x == 0);\n}\n",
             "trust_mc.harness.vacuous",
+            1,
+            "error",
         ),
         (
             "nochecks.rs",
             "#[kani::proof]\nfn n() {\n\x20   let x: u32 = kani::any();\n\x20   let _ = x;\n}\n",
             "trust_mc.harness.no_checks",
+            1,
+            "error",
+        ),
+        (
+            "certified.rs",
+            "#[kani::proof]\nfn c() {\n\x20   let _x: u8 = 3;\n}\n",
+            "trust_mc.harness.no_checks",
+            0,
+            "note",
         ),
     ];
 
-    for (file, body, expected_rule) in cases {
+    for (file, body, expected_rule, expected_exit, expected_level) in cases {
         fs::write(dir.join(file), body).unwrap();
         let report = format!("{file}.sarif");
         let out = trust_mc_in(&dir, &["--sarif", &report, "--timeout", "30s", file]);
         let text = stdout(&out);
-        assert_eq!(code(&out), 1, "{file} must not exit 0:\n{text}");
+        assert_eq!(code(&out), expected_exit, "{file}:\n{text}");
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join(&report)).unwrap()).unwrap();
@@ -970,7 +1023,7 @@ fn a_failing_harness_always_leaves_a_sarif_finding() {
             expected_rule,
             "unexpected rule for {file}"
         );
-        assert_eq!(results[0]["level"].as_str().unwrap(), "error");
+        assert_eq!(results[0]["level"].as_str().unwrap(), expected_level, "{file}");
         assert!(
             !results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
                 .as_str()
@@ -1252,11 +1305,15 @@ fn an_undecided_solver_is_not_reported_as_an_empty_harness() {
     );
     assert!(text.contains("--ay-chc"), "and name the flag that decides this shape:\n{text}");
 
-    // A genuinely empty harness must still get the other diagnosis.
+    // A genuinely empty harness must still get the other diagnosis — here
+    // the uncertified one (the walk refuses `kani::any()`'s hook), so it is
+    // still INCONCLUSIVE; a certified one would say `(no checks —
+    // compiler-certified obligation-free)`. Neither is "solver undecided".
     fs::write(dir.join("empty.rs"), "#[kani::proof]\nfn h() {\n\x20   let x: u32 = kani::any();\n\x20   let _ = x;\n}\n")
         .unwrap();
     let out = trust_mc_in(&dir, &["--output-format", "terse", "--timeout", "60s", "empty.rs"]);
     let text = stdout(&out);
+    assert!(text.contains("[AY:VACUOUS:no-checks]"), "{text}");
     assert!(text.contains("INCONCLUSIVE (no checks)"), "{text}");
     assert!(!text.contains("solver undecided"), "{text}");
     let _ = fs::remove_dir_all(&dir);
@@ -1307,7 +1364,9 @@ fn the_readme_examples_do_what_the_readme_says() {
     assert!(text.contains("VERIFICATION:- SUCCESSFUL"), "{text}");
 
     // 3. The counter-claim the README makes about it: dropping the `+` is not a
-    //    proof, and must not exit 0.
+    //    proof, and trust-mc says so. This harness reads `kani::any()`, whose
+    //    hook the walk refuses, so the empty set is UNCERTIFIED: INCONCLUSIVE
+    //    (no checks), exit 1, and the marker names the reason.
     fs::write(
         dir.join("nothing.rs"),
         "fn add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n#[kani::proof]\n\
@@ -1317,8 +1376,10 @@ fn the_readme_examples_do_what_the_readme_says() {
     .unwrap();
     let out = trust_mc_in(&dir, &["--output-format", "terse", "--timeout", "60s", "nothing.rs"]);
     let text = stdout(&out);
-    assert_eq!(code(&out), 1, "zero obligations must not go green:\n{text}");
+    assert_eq!(code(&out), 1, "uncertified zero obligations must not go green:\n{text}");
     assert!(text.contains("INCONCLUSIVE (no checks)"), "{text}");
+    assert!(text.contains("[AY:VACUOUS:no-checks]"), "{text}");
+    assert!(!text.contains("[AY:PROOF_QUALIFIERS:clean]"), "{text}");
 
     // 4. The exit-code contract the CI section states.
     assert!(readme.contains("**0** every selected harness verified"), "README exit-code table");
@@ -1341,7 +1402,7 @@ fn an_ordinary_run_prints_no_internal_tracing() {
     // at warn! level fired on every cast and reached the default output:
     //
     //     Checking harness h...
-    //     WARN trust_mc_compiler::codegen_ay::statement::cast ENTRY
+    //     WARN trust_mc_engine::codegen_ay::statement::cast ENTRY
     //          codegen_cast_with_kind, kind=IntToInt
     //     ...
     //
@@ -1368,10 +1429,14 @@ fn an_ordinary_run_prints_no_internal_tracing() {
         "a raw eprintln! debug print reached the user:\n{text}"
     );
     for line in text.lines() {
-        assert!(
-            !line.contains("trust_mc_compiler::"),
-            "internal module tracing reached the default output:\n  {line}"
-        );
+        // tracing's default target is module_path!(): the engine's modules
+        // have been `trust_mc_engine::` since the engine split.
+        for prefix in ["trust_mc_engine::", "trust_mc_compiler::"] {
+            assert!(
+                !line.contains(prefix),
+                "internal module tracing reached the default output:\n  {line}"
+            );
+        }
         assert!(
             !line.contains("ENTRY "),
             "an entry trace reached the default output:\n  {line}"
@@ -2085,29 +2150,53 @@ fn sarif_separates_an_undecided_harness_from_an_empty_one() {
         return;
     }
     let dir = scratch("sarif-undecided");
-    let rules = |name: &str, src: &str| -> String {
+    // Every (ruleId, level, verdict) triple the report carries, plus the exit code.
+    let findings = |name: &str, src: &str| -> (i32, Vec<(String, String, String)>) {
         fs::write(dir.join(name), src).unwrap();
         let sarif = format!("{name}.sarif");
-        let _ = trust_mc_in(&dir, &["--sarif", &sarif, "--timeout", "60s", name]);
-        let text = fs::read_to_string(dir.join(&sarif)).unwrap_or_default();
-        text.split("\"ruleId\"")
-            .skip(1)
-            .filter_map(|c| c.split('"').nth(1).map(str::to_string))
-            .collect::<Vec<_>>()
-            .join(",")
+        let out = trust_mc_in(&dir, &["--sarif", &sarif, "--timeout", "60s", name]);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(&sarif)).unwrap_or_default())
+                .unwrap_or_default();
+        let rows = json["runs"][0]["results"]
+            .as_array()
+            .map(|rs| {
+                rs.iter()
+                    .map(|r| {
+                        (
+                            r["ruleId"].as_str().unwrap_or_default().to_string(),
+                            r["level"].as_str().unwrap_or_default().to_string(),
+                            r["properties"]["verdict"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (code(&out), rows)
     };
 
     // Genuinely nothing to verify: no symbolic input, no fallible operation.
-    let empty = rules("empty.rs", "#[kani::proof]
+    // The compiler certifies it obligation-free, so (D16) it exits 0 — and the
+    // report says so with a NOTE, not an error, and not with silence.
+    let (exit, empty) = findings("empty.rs", "#[kani::proof]
 fn h() {
     let _x: u8 = 3;
 }
 ");
-    assert!(empty.contains("trust_mc.harness.no_checks"), "empty harness: {empty}");
+    assert_eq!(exit, 0, "a certified empty harness exits 0: {empty:?}");
+    assert_eq!(
+        empty,
+        vec![(
+            "trust_mc.harness.no_checks".to_string(),
+            "note".to_string(),
+            "successful_no_checks".to_string()
+        )],
+        "empty harness"
+    );
 
     // Real obligations the solver cannot settle — a map lookup, which the
     // encoding declines rather than answers.
-    let undecided = rules(
+    let (_, undecided) = findings(
         "undecided.rs",
         "use std::collections::HashMap;
 #[kani::proof]
@@ -2119,8 +2208,8 @@ fn h() {
 ",
     );
     assert!(
-        !undecided.contains("trust_mc.harness.no_checks"),
-        "an undecided harness is not an empty one: {undecided}"
+        !undecided.iter().any(|(rule, _, _)| rule == "trust_mc.harness.no_checks"),
+        "an undecided harness is not an empty one: {undecided:?}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2230,10 +2319,42 @@ fn a_raw_pointer_store_reaches_the_value_it_points_at() {
     }
 
     // With no listed limitation violating it, the page's fail-closed promise
-    // stands again — and must not be quietly re-broken.
+    // stands again for every entry under "Known limitations" — and must not be
+    // quietly re-broken. Defects that DO give false proofs are listed apart,
+    // under a "Known UNSOUND" heading, and each one must be a known-red row of
+    // the soundness dual gate. That section is currently ABSENT: its only entry
+    // was joined `==` (tools/soundness-duals/negative/
+    // eq_joined_option_false_proof.rs), fixed by `m3/chc-joined-option-eq` and
+    // re-measured 2026-09-14. It may come back; it must not grow without this
+    // pin moving with it.
     let page = stdout(&trust_mc(&["explain", "limits"]));
     assert!(page.contains("never a false proof"), "{page}");
-    assert!(!page.contains("UNSOUND"), "no limitation should be unsound now:\n{page}");
+    // The body of a top-level `Known ...` section: up to the next heading at
+    // column 0 (entries and prose inside a section are indented).
+    let section = |heading: &str| -> Option<String> {
+        let (_, rest) = page.split_once(&format!("\n{heading}\n"))?;
+        Some(
+            rest.lines()
+                .take_while(|l| l.is_empty() || l.starts_with(' '))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    let limitations = section("Known limitations")
+        .unwrap_or_else(|| panic!("the page has no Known limitations section:\n{page}"));
+    assert!(!limitations.contains("UNSOUND"), "no limitation should be unsound now:\n{page}");
+    if let Some(unsound) = section("Known UNSOUND") {
+        let entries: Vec<&str> = unsound
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .filter_map(|l| l.trim_start().split("  ").next())
+            .collect();
+        assert_eq!(
+            entries,
+            ["joined =="],
+            "Known UNSOUND must list only defects tracked known-red by the soundness dual gate:\n{page}"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -2666,17 +2787,60 @@ fn h() {
         trust_mc_in(&dir, &["--ay-chc", "--output-format", "terse", "--timeout", "300s", "vec_elem_bad.rs"]);
     assert_ne!(code(&ve_bad), 0, "a false claim about a Vec element must fail:\n{}", stdout(&ve_bad));
 
-    // `?` on a statically-known None: demoted under BMC, settled by --ay-chc.
+    // `?` on a statically-known None: demoted under BMC, PROVED by --ay-chc.
+    // The `.is_none()` on `f(None)` reads an Option that two branches of the
+    // inlined `f` assigned, through a reference; --ay-chc used to lose that
+    // read's referent and decline (call_dispatch_fallback), and the
+    // joined-`==` referent fixes gave it back (re-measured 2026-09-14). The BMC
+    // outcome is pinned with its label, because a limitation may never be sold
+    // as the user's bug.
     fs::write(
         dir.join("qmark_none.rs"),
         "fn f(x: Option<u8>) -> Option<u8> {\n\x20   let v = x?;\n\x20   Some(v + 1)\n}\n\
          #[kani::proof]\nfn h() {\n\x20   assert!(f(None).is_none());\n}\n",
     )
     .unwrap();
-    let qm = trust_mc_in(&dir, &["--ay-chc", "--output-format", "terse", "--timeout", "300s", "qmark_none.rs"]);
-    assert_eq!(code(&qm), 0, "explain limits says --ay-chc settles `?` on a constant None:\n{}", stdout(&qm));
+    let qm_bmc = trust_mc_in(&dir, &["--timeout", "120s", "qmark_none.rs"]);
+    assert_ne!(code(&qm_bmc), 0, "explain limits says BMC demotes `?` on a constant None:\n{}", stdout(&qm_bmc));
+    assert!(
+        stdout(&qm_bmc).contains("unconstrained_assignment"),
+        "`?` on a constant None under BMC demotes on the dead-arm reason:\n{}",
+        stdout(&qm_bmc)
+    );
+    assert!(
+        !stdout(&qm_bmc).contains("[AY:CTREX_CAT:Genuine]"),
+        "a limitation must never be reported as a genuine counterexample:\n{}",
+        stdout(&qm_bmc)
+    );
+    let qm = trust_mc_in(&dir, &["--ay-chc", "--timeout", "300s", "qmark_none.rs"]);
+    assert_eq!(
+        code(&qm),
+        0,
+        "explain limits says --ay-chc proves `?` on a constant None:\n{}",
+        stdout(&qm)
+    );
+    assert!(
+        stdout(&qm).contains("[AY:PROOF_QUALIFIERS:clean]"),
+        "the --ay-chc proof of `?` on a constant None is clean:\n{}",
+        stdout(&qm)
+    );
+    // …and it is a proof, not a vanished obligation: the FALSE twin is refuted
+    // as the user's bug.
+    fs::write(
+        dir.join("qmark_none_neg.rs"),
+        "fn f(x: Option<u8>) -> Option<u8> {\n\x20   let v = x?;\n\x20   Some(v + 1)\n}\n\
+         #[kani::proof]\nfn h() {\n\x20   assert!(f(None).is_some());\n}\n",
+    )
+    .unwrap();
+    let qm_neg = trust_mc_in(&dir, &["--ay-chc", "--timeout", "300s", "qmark_none_neg.rs"]);
+    assert_ne!(code(&qm_neg), 0, "the FALSE `?`-on-None twin must fail:\n{}", stdout(&qm_neg));
+    assert!(
+        stdout(&qm_neg).contains("[AY:CTREX_CAT:Genuine]"),
+        "the FALSE `?`-on-None twin is a genuine violation:\n{}",
+        stdout(&qm_neg)
+    );
 
-    // The page says a SYMBOLIC Option is fine in EITHER mode.
+    // The page says a SYMBOLIC Option through `x?` proves in BOTH lanes.
     fs::write(
         dir.join("qmark_sym.rs"),
         "fn f(x: Option<u8>) -> Option<u8> {\n\x20   let v = x?;\n\
@@ -2685,12 +2849,15 @@ fn h() {
          \x20   if o.is_none() {\n\x20       assert!(f(o).is_none());\n\x20   }\n}\n",
     )
     .unwrap();
-    for mode in [vec!["--output-format", "terse", "--timeout", "120s"], vec!["--ay-chc", "--output-format", "terse", "--timeout", "300s"]] {
-        let mut a = mode.clone();
-        a.push("qmark_sym.rs");
-        let sym = trust_mc_in(&dir, &a);
-        assert_eq!(code(&sym), 0, "a symbolic Option must verify ({mode:?}):\n{}", stdout(&sym));
-    }
+    let sym_bmc = trust_mc_in(&dir, &["--output-format", "terse", "--timeout", "120s", "qmark_sym.rs"]);
+    assert_eq!(code(&sym_bmc), 0, "a symbolic Option through `x?` must verify under BMC:\n{}", stdout(&sym_bmc));
+    let sym_chc = trust_mc_in(&dir, &["--ay-chc", "--timeout", "300s", "qmark_sym.rs"]);
+    assert_eq!(
+        code(&sym_chc),
+        0,
+        "explain limits says --ay-chc proves a symbolic Option through `x?`:\n{}",
+        stdout(&sym_chc)
+    );
 
     // The page says --ay-chc settles a recursive call with a CONSTANT argument
     // and that a SYMBOLIC one still fails. Both halves are pinned, because the
@@ -2858,13 +3025,22 @@ fn the_playback_hint_waits_for_an_actual_verdict() {
 // `explain limits`: the dead-`Some`-arm entry, measured in both lanes
 // ---------------------------------------------------------------------------
 
-/// The entry used to claim `--ay-chc` settled `None.map(..)`. It does not.
+/// `--ay-chc` proves every dead-`Some`-arm form on a statically-known None:
+/// `if let`, `match`, `x?`, `None.map(..)` and `and_then(..)`. BMC demotes all
+/// five on `unconstrained_assignment`.
 ///
-/// Measured, both lanes: the dead-arm cases (`if let`, `match`, `?`) ARE
-/// settled by `--ay-chc`, but `None.map(..)` still fails there — on
-/// `chc_fallback`, not `unconstrained_assignment`. The blocker is the closure,
-/// which is why `unwrap_or` (no closure) proves in both modes and a bare
-/// closure with no Option in sight fails under `--ay-chc` too.
+/// Re-measured 2026-09-14, after the `m3/chc-joined-option-eq` referent fixes.
+/// The 2026-09-11 measurement recorded here before them had `map`, `and_then`
+/// and `x?` DECLINING with `call_dispatch_fallback`: the `.is_none()` stub read
+/// an Option that more than one branch assigned, through a reference whose
+/// points-at edge was cleared as path-insensitive metadata, so the stub was
+/// left holding the pointer. Giving that read its referent is what turned the
+/// three into clean proofs; each FALSE variant is still refuted `Genuine`, so
+/// they are proofs and not vanished obligations.
+///
+/// What still declines under `--ay-chc` is a closure inside a stdlib ITERATOR
+/// chain (`a.iter().map(..).sum()`, chc_translation_drop), which BMC proves —
+/// so neither lane dominates the other here.
 ///
 /// If any of these flip, the page is wrong again and must be re-measured.
 #[test]
@@ -2879,7 +3055,23 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
     );
     assert!(
         !page.contains("STILL fails under"),
-        "the page must not still claim None.map(..) fails under --ay-chc:\n{page}"
+        "the page must not revive the old closure-boundary wording:\n{page}"
+    );
+    assert!(
+        page.contains("it proves every one of those five"),
+        "the page must say --ay-chc proves the five dead-arm forms:\n{page}"
+    );
+    // The false proof that used to sit next to this entry — under --ay-chc,
+    // `!(Some(3).map(|x| x + 1) == Some(4))` PROVED while the true `== Some(4)`
+    // came back Genuine — is FIXED (`m3/chc-joined-option-eq`; the dual
+    // `tools/soundness-duals/negative/eq_joined_option_false_proof.rs` and its
+    // manifest entry record it). Re-measured 2026-09-14: the negation is FAILED
+    // Genuine and the true comparison SUCCESSFUL, in BOTH lanes. So the page
+    // must no longer carry that warning — a page that warns about a defect it
+    // no longer has sends people to a workaround they do not need.
+    assert!(
+        !page.contains("assert!(!(Some(3).map(|x| x + 1) == Some(4)))"),
+        "the joined-`==` false proof is fixed; the page must not still warn about it:\n{page}"
     );
 
     let dir = scratch("limits-dead-arm");
@@ -2887,7 +3079,7 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
     let chc = ["--ay-chc", "--output-format", "terse", "--timeout", "120s"];
 
     // (file, body, proves under BMC, proves under --ay-chc)
-    let cases: [(&str, &str, bool, bool); 6] = [
+    let cases: [(&str, &str, bool, bool); 9] = [
         // A dead `Some` arm on a statically-known None: BMC demotes, CHC proves.
         (
             "iflet.rs",
@@ -2905,13 +3097,31 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
             false,
             true,
         ),
-        // Was mislisted as failing in both lanes. --ay-chc proves it now:
-        // the closure is dead on a statically-known None and folds away.
-        // Verified discriminating, not vacuous — asserting `is_some()` on the
-        // same body comes back FAILED.
+        // --ay-chc PROVES this one. It used to decline with
+        // call_dispatch_fallback on the `.is_none()`, which read the Option back
+        // through a reference that lost its referent; the joined-`==` referent
+        // fixes gave the read its referent. Re-measured 2026-09-14: SUCCESSFUL
+        // and CLEAN, with the FALSE variant (`is_some()`) refuted Genuine.
+        // BMC still demotes (unconstrained_assignment).
         (
             "map.rs",
             "let o: Option<u8> = None;\n\x20   assert!(o.map(|x| x + 1).is_none());",
+            false,
+            true,
+        ),
+        // `and_then` proves under --ay-chc for the same reason.
+        (
+            "and_then.rs",
+            "let o: Option<u8> = None;\n\x20   assert!(o.and_then(|x| x.checked_add(1)).is_none());",
+            false,
+            true,
+        ),
+        // The same value read WITHOUT a reference: --ay-chc proves it. This is
+        // the case that shows the closure is not the blocker, and it is the
+        // workaround the page names. Its FALSE variant is pinned below.
+        (
+            "map_matches.rs",
+            "let o: Option<u8> = None;\n\x20   assert!(matches!(o.map(|x| x + 1), None));",
             false,
             true,
         ),
@@ -2929,6 +3139,15 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
         (
             "closure.rs",
             "let f = |x: u8| x / 2;\n\x20   let n: u8 = kani::any();\n\x20   assert!(f(n) <= n);",
+            true,
+            true,
+        ),
+        // An FnMut that mutates its capture proves in both lanes; the page
+        // names it. (`c == 4` on the same body fails in both, Genuine.)
+        (
+            "fn_mut.rs",
+            "let mut c = 0u8;\n\x20   let mut inc = |d: u8| { c = c.wrapping_add(d); };\n\
+             \x20   inc(1);\n\x20   inc(2);\n\x20   assert!(c == 3);",
             true,
             true,
         ),
@@ -2972,23 +3191,26 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
         stdout(&map_bmc)
     );
 
-    // --ay-chc now PROVES it, cleanly, with the old closure fallback gone.
+    // --ay-chc PROVES it, CLEAN. It used to decline with call_dispatch_fallback
+    // on the `.is_none()` read; the joined-`==` referent fixes gave that read
+    // its referent (re-measured 2026-09-14).
     let map_chc = trust_mc_in(&dir, &["--ay-chc", "--timeout", "120s", "map.rs"]);
-    assert!(
-        !stdout(&map_chc).contains("chc_fallback"),
-        "--ay-chc no longer falls back on the closure here:\n{}",
+    assert_eq!(
+        code(&map_chc),
+        0,
+        "None.map(..) under --ay-chc proves:\n{}",
         stdout(&map_chc)
     );
     assert!(
-        stdout(&map_chc).contains("PROOF_QUALIFIERS:clean"),
-        "the --ay-chc proof must be clean, not qualified:\n{}",
+        stdout(&map_chc).contains("[AY:PROOF_QUALIFIERS:clean]"),
+        "the --ay-chc proof of None.map(..) is clean, not qualified:\n{}",
         stdout(&map_chc)
     );
 
-    // The control that makes the line above worth anything. A proof of a TRUE
-    // statement is indistinguishable from a vanished obligation unless the
-    // FALSE statement still fails, so assert the negation is caught. Without
-    // this, an obligation silently dropped in codegen would read as a pass.
+    // The control that makes it worth anything: a proof of a TRUE statement is
+    // indistinguishable from a vanished obligation unless the FALSE statement
+    // still fails — and fails as the USER's bug, which is the stronger claim
+    // the old declining behaviour could not make.
     fs::write(
         dir.join("map_neg.rs"),
         "#[kani::proof]\nfn h() {\n\x20   let o: Option<u8> = None;\n         \x20   assert!(o.map(|x| x + 1).is_some());\n}\n",
@@ -3002,19 +3224,40 @@ fn explain_limits_tells_the_truth_about_none_map_and_dead_arms() {
          obligation is gone rather than discharged:\n{}",
         stdout(&map_neg)
     );
-
-    // The FALSE variant is a real violation, so it SHOULD be reported as the
-    // user's bug. Pinning that direction too keeps the refutation above
-    // honest: a refutation that came back EncodingGap would mean --ay-chc
-    // rejected the negation for its own reasons rather than on the semantics.
     assert!(
         stdout(&map_neg).contains("[AY:CTREX_CAT:Genuine]"),
         "the FALSE variant is a genuine violation and must be reported as one:\n{}",
         stdout(&map_neg)
     );
 
-    // The two LIMITATION outcomes are never sold as the user's bug.
-    for text in [stdout(&map_bmc), stdout(&map_chc)] {
+    // The control that makes `map_matches.rs` proving worth anything. A proof
+    // of a TRUE statement is indistinguishable from a vanished obligation
+    // unless the FALSE statement still fails — and fails as the user's bug: a
+    // refutation that came back EncodingGap would mean --ay-chc rejected the
+    // negation for its own reasons rather than on the semantics.
+    fs::write(
+        dir.join("map_matches_neg.rs"),
+        "#[kani::proof]\nfn h() {\n\x20   let o: Option<u8> = None;\n\
+         \x20   assert!(matches!(o.map(|x| x + 1), Some(_)));\n}\n",
+    )
+    .unwrap();
+    let mm_neg = trust_mc_in(&dir, &["--ay-chc", "--timeout", "120s", "map_matches_neg.rs"]);
+    assert_ne!(
+        code(&mm_neg),
+        0,
+        "--ay-chc must refute the FALSE `matches!` variant; if it proves both, the \
+         obligation is gone rather than discharged:\n{}",
+        stdout(&mm_neg)
+    );
+    assert!(
+        stdout(&mm_neg).contains("[AY:CTREX_CAT:Genuine]"),
+        "the FALSE `matches!` variant is a genuine violation and must be reported as one:\n{}",
+        stdout(&mm_neg)
+    );
+
+    // The BMC LIMITATION outcome is never sold as the user's bug. (--ay-chc no
+    // longer has a limitation outcome here at all: it proves the harness.)
+    for text in [stdout(&map_bmc)] {
         assert!(
             !text.contains("[AY:CTREX_CAT:Genuine]"),
             "a limitation must never be reported as a genuine counterexample:\n{text}"
@@ -4459,5 +4702,555 @@ fn a_dereference_must_stay_inside_its_object() {
         );
     }
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The external `ay` must be the pinned AY revision
+// ---------------------------------------------------------------------------
+//
+// These need only the engine built beside the front door (`targo --unverified
+// build -p trust-mc-driver`), not a working installation: the engine resolves and
+// pin-checks `ay` while it constructs a session, before it compiles anything, so
+// a sysroot holding just the driver and empty library directories reaches the
+// check. The solvers are shell scripts that answer `--version` and never solve,
+// except the `--trust-vc-bundle` test's stand-in, which also answers its query.
+
+const OFF_PIN_AY_COMMIT: &str = "dd4de9e94e0bb94a458641c7e5aa814c8aeadf59";
+
+/// The AY commit this workspace pins: `rev` of `ay` in `[workspace.dependencies]`.
+fn workspace_ay_pin() -> String {
+    let manifest =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    let line = manifest
+        .lines()
+        .find(|l| l.starts_with("ay = {") && l.contains("rev = \""))
+        .expect("the root manifest pins `ay` by rev");
+    let rev = line.split("rev = \"").nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(rev.len(), 40, "{line}");
+    rev.to_string()
+}
+
+fn ay_version_line(commit: &str) -> String {
+    format!("ay 0.26.0+build.9281.{commit}@2026-09-11T02:47:31Z")
+}
+
+/// Write `<dir>/ay`, answering `--version` with `version_line` and refusing
+/// anything else; `delegate` hands every other invocation to a real solver.
+#[cfg(unix)]
+fn stand_in_ay(dir: &Path, version_line: &str, delegate: Option<&Path>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).unwrap();
+    let ay = dir.join("ay");
+    let otherwise = match delegate {
+        Some(real) => format!("exec '{}' \"$@\"\n", real.display()),
+        None => "echo 'stand-in ay: this test never solves' >&2\nexit 97\n".to_string(),
+    };
+    fs::write(
+        &ay,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{version_line}'\n  exit 0\nfi\n\
+             {otherwise}"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ay, fs::Permissions::from_mode(0o755)).unwrap();
+    ay
+}
+
+/// A sysroot holding only the engine built beside this front door.
+#[cfg(unix)]
+fn driver_only_sysroot(dir: &Path) -> Option<PathBuf> {
+    let Some(driver) = sibling_binary("trust-mc-driver") else {
+        eprintln!(
+            "SKIPPED: trust-mc-driver is not built beside the front door; \
+             run `targo --unverified build -p trust-mc-driver` first"
+        );
+        return None;
+    };
+    let sysroot = dir.join("sysroot");
+    for sub in ["bin", "lib", "no_core/lib", "playback/lib"] {
+        fs::create_dir_all(sysroot.join(sub)).unwrap();
+    }
+    std::os::unix::fs::symlink(driver, sysroot.join("bin").join("trust-mc-driver")).unwrap();
+    Some(sysroot)
+}
+
+/// Run the front door with `path_first` ahead of `PATH`, both solver variables
+/// cleared unless `envs` sets them, and `sysroot` as the engine when given.
+fn trust_mc_with_solver(
+    dir: &Path,
+    sysroot: Option<&Path>,
+    path_first: &Path,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> Output {
+    let path = env::join_paths(
+        std::iter::once(path_first.to_path_buf())
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("PATH", path)
+        .env_remove("TRUST_MC_AY_BIN")
+        .env_remove("TRUST_MC_ALLOW_UNPINNED_AY");
+    if let Some(sysroot) = sysroot {
+        cmd.env("TRUST_MC_SYSROOT", sysroot);
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("could not run trust-mc")
+}
+
+fn both(out: &Output) -> String {
+    format!("{}{}", stdout(out), stderr(out))
+}
+
+const REFUSAL: &str = "not the AY revision this trust-mc build pins";
+/// What a driver-only sysroot prints once the solver was accepted: the next
+/// thing the run needs is the compiler, which is not there.
+const PAST_THE_PIN_CHECK: &str = "Unable to find trust-mc-compiler";
+
+#[cfg(unix)]
+#[test]
+fn an_off_pin_ay_is_refused_before_anything_is_compiled() {
+    let dir = scratch("ay-pin-refused");
+    let Some(sysroot) = driver_only_sysroot(&dir) else {
+        return;
+    };
+    let pin = workspace_ay_pin();
+    let off_pin = stand_in_ay(&dir.join("off-pin"), &ay_version_line(OFF_PIN_AY_COMMIT), None);
+    let off_pin_dir = off_pin.parent().unwrap();
+    fs::write(dir.join("demo.rs"), stdout(&trust_mc(&["example"]))).unwrap();
+
+    let out = trust_mc_with_solver(&dir, Some(&sysroot), off_pin_dir, &[], &["demo.rs"]);
+    let refusal = both(&out);
+    assert_ne!(code(&out), 0, "{refusal}");
+    for needle in [
+        REFUSAL,
+        &format!("{} (found on PATH)", off_pin.display()),
+        &ay_version_line(OFF_PIN_AY_COMMIT),
+        &format!("pinned:   {pin}"),
+        &format!("built from AY commit {OFF_PIN_AY_COMMIT}"),
+        &format!("git -C <ay checkout> checkout {pin}"),
+        "export TRUST_MC_AY_BIN=<ay checkout>/target/release/ay",
+        "--allow-unpinned-ay",
+        "TRUST_MC_ALLOW_UNPINNED_AY=1",
+    ] {
+        assert!(refusal.contains(needle), "the refusal is missing {needle:?}:\n{refusal}");
+    }
+    assert!(
+        !refusal.contains("Checking harness") && !refusal.contains("VERIFICATION:-"),
+        "an off-pin solver must be refused before any harness runs:\n{refusal}"
+    );
+    assert!(!refusal.contains("SOLVER_PIN_MISMATCH"), "refused, not allowed:\n{refusal}");
+
+    // No build stamp: the commit cannot be checked, so that is refused too.
+    let unstamped = stand_in_ay(&dir.join("unstamped"), "ay 0.26.0", None);
+    let out =
+        trust_mc_with_solver(&dir, Some(&sysroot), unstamped.parent().unwrap(), &[], &["demo.rs"]);
+    assert_ne!(code(&out), 0, "{}", both(&out));
+    assert!(both(&out).contains("carries no `+build.<n>.<commit>` stamp"), "{}", both(&out));
+
+    // Only `1` opens the escape hatch.
+    let out = trust_mc_with_solver(
+        &dir,
+        Some(&sysroot),
+        off_pin_dir,
+        &[("TRUST_MC_ALLOW_UNPINNED_AY", "0")],
+        &["demo.rs"],
+    );
+    assert!(both(&out).contains(REFUSAL), "{}", both(&out));
+
+    // doctor: not ready, and the fix is the one the engine printed, word for word.
+    let doctor = trust_mc_with_solver(&dir, Some(&sysroot), off_pin_dir, &[], &["doctor"]);
+    let report = stdout(&doctor);
+    assert_eq!(code(&doctor), 3, "{report}");
+    assert!(report.contains("not ready. To fix:"), "{report}");
+    assert!(report.contains(&format!("off-pin: it was built from AY commit {OFF_PIN_AY_COMMIT}")));
+    let fix_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| l.contains("<ay checkout>") || l.contains("allow-unpinned-ay"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(fix_lines(&refusal).len(), 4, "{refusal}");
+    assert_eq!(fix_lines(&report), fix_lines(&refusal), "doctor:\n{report}\nengine:\n{refusal}");
+
+    // doctor with no engine at all still knows the pin and still says not ready.
+    let bare = scratch("ay-pin-no-engine");
+    let doctor = trust_mc_with_solver(
+        &bare,
+        None,
+        off_pin_dir,
+        &[("KANI_HOME", "/nonexistent")],
+        &["doctor"],
+    );
+    let report = stdout(&doctor);
+    if report.contains("using: none found") {
+        assert!(
+            report.contains(&format!("the pin is {pin} (pinned by this front door's Cargo.toml)"))
+        );
+        assert_eq!(fix_lines(&report), fix_lines(&refusal), "{report}");
+    }
+    let _ = fs::remove_dir_all(&bare);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_mc_ay_bin_is_used_instead_of_path() {
+    let dir = scratch("ay-pin-override");
+    let Some(sysroot) = driver_only_sysroot(&dir) else {
+        return;
+    };
+    let pin = workspace_ay_pin();
+    let pinned = stand_in_ay(&dir.join("pinned"), &ay_version_line(&pin), None);
+    let off_pin = stand_in_ay(&dir.join("off-pin"), &ay_version_line(OFF_PIN_AY_COMMIT), None);
+    fs::write(dir.join("demo.rs"), stdout(&trust_mc(&["example"]))).unwrap();
+    let pinned_str = pinned.display().to_string();
+    let off_pin_str = off_pin.display().to_string();
+
+    // Pinned on PATH, off-pin named by TRUST_MC_AY_BIN: refused, naming the override.
+    let out = trust_mc_with_solver(
+        &dir,
+        Some(&sysroot),
+        pinned.parent().unwrap(),
+        &[("TRUST_MC_AY_BIN", &off_pin_str)],
+        &["demo.rs"],
+    );
+    let text = both(&out);
+    assert_ne!(code(&out), 0, "{text}");
+    assert!(text.contains(REFUSAL), "{text}");
+    assert!(text.contains(&format!("{off_pin_str} (from $TRUST_MC_AY_BIN)")), "{text}");
+
+    // Off-pin on PATH, pinned named by TRUST_MC_AY_BIN: accepted. The run then
+    // stops for lack of a compiler in this sysroot -- never for the pin.
+    let out = trust_mc_with_solver(
+        &dir,
+        Some(&sysroot),
+        off_pin.parent().unwrap(),
+        &[("TRUST_MC_AY_BIN", &pinned_str)],
+        &["demo.rs"],
+    );
+    let text = both(&out);
+    assert!(!text.contains(REFUSAL), "the pinned override must be accepted:\n{text}");
+    assert!(!text.contains("SOLVER_PIN_MISMATCH"), "{text}");
+    // Not refused is not enough: the run has to reach the step after the pin
+    // check, or a run that died earlier for any reason would pass this test.
+    assert!(text.contains(PAST_THE_PIN_CHECK), "the run stopped before the pin check:\n{text}");
+
+    // An override that is not an executable is an error by name, not a PATH lookup.
+    let missing = dir.join("no-such-ay").display().to_string();
+    let out = trust_mc_with_solver(
+        &dir,
+        Some(&sysroot),
+        pinned.parent().unwrap(),
+        &[("TRUST_MC_AY_BIN", &missing)],
+        &["demo.rs"],
+    );
+    let text = both(&out);
+    assert_ne!(code(&out), 0, "{text}");
+    assert!(
+        text.contains(&format!("TRUST_MC_AY_BIN={missing} is not an executable file")),
+        "{text}"
+    );
+
+    // doctor reports the binary the engine will actually run.
+    let doctor = trust_mc_with_solver(
+        &dir,
+        Some(&sysroot),
+        off_pin.parent().unwrap(),
+        &[("TRUST_MC_AY_BIN", &pinned_str)],
+        &["doctor"],
+    );
+    let report = stdout(&doctor);
+    assert!(report.contains(&format!("{pinned_str} (from $TRUST_MC_AY_BIN)")), "{report}");
+    assert!(report.contains("the binary is the pinned AY commit"), "{report}");
+    assert!(!report.contains("off-pin:"), "{report}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_allowed_off_pin_ay_warns_and_marks_the_run() {
+    let dir = scratch("ay-pin-allowed");
+    let Some(sysroot) = driver_only_sysroot(&dir) else {
+        return;
+    };
+    let pin = workspace_ay_pin();
+    let off_pin = stand_in_ay(&dir.join("off-pin"), &ay_version_line(OFF_PIN_AY_COMMIT), None);
+    fs::write(dir.join("demo.rs"), stdout(&trust_mc(&["example"]))).unwrap();
+    let marker = format!("[AY:SOLVER_PIN_MISMATCH:found={OFF_PIN_AY_COMMIT}:pin={pin}]");
+
+    for (spelling, envs, args) in [
+        ("--allow-unpinned-ay", &[][..], &["--allow-unpinned-ay", "demo.rs"][..]),
+        (
+            "TRUST_MC_ALLOW_UNPINNED_AY=1",
+            &[("TRUST_MC_ALLOW_UNPINNED_AY", "1")][..],
+            &["demo.rs"][..],
+        ),
+    ] {
+        let out = trust_mc_with_solver(&dir, Some(&sysroot), off_pin.parent().unwrap(), envs, args);
+        let text = both(&out);
+        assert!(!text.contains(REFUSAL), "{spelling} must not be refused:\n{text}");
+        assert!(text.contains(&marker), "{spelling} must print {marker}:\n{text}");
+        assert!(text.contains(&format!("because {spelling} is set")), "{text}");
+        assert!(text.contains("each is SUCCESSFUL (UNVALIDATED)"), "{text}");
+        assert!(text.contains(PAST_THE_PIN_CHECK), "{spelling} did not proceed:\n{text}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// End to end on a real installation: wrap the working solver so it reports
+/// another commit, allow it, and check that no harness prints a clean
+/// SUCCESSFUL. Skips without an installation whose `ay` is the pinned one.
+#[cfg(unix)]
+#[test]
+fn an_allowed_off_pin_ay_never_prints_a_clean_successful() {
+    if !installation_ready() {
+        return;
+    }
+    let doctor: serde_json::Value =
+        serde_json::from_str(&stdout(&trust_mc(&["doctor", "--json"]))).unwrap();
+    let real = PathBuf::from(doctor["solver"].as_str().expect("a ready doctor names its solver"));
+    let dir = scratch("ay-pin-allowed-e2e");
+    let wrapper =
+        stand_in_ay(&dir.join("wrapper"), &ay_version_line(OFF_PIN_AY_COMMIT), Some(&real));
+    let wrapper_str = wrapper.display().to_string();
+    fs::write(dir.join("demo.rs"), stdout(&trust_mc(&["example"]))).unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--allow-unpinned-ay"];
+        args.extend_from_slice(extra);
+        args.push("demo.rs");
+        let mut cmd = Command::new(BIN);
+        cmd.args(&args).current_dir(&dir).env("TRUST_MC_AY_BIN", &wrapper_str);
+        cmd.output().unwrap()
+    };
+
+    let out = run(&[]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "stdout:\n{text}\nstderr:\n{}", stderr(&out));
+    assert_eq!(text.matches("VERIFICATION:- SUCCESSFUL (UNVALIDATED)").count(), 2, "{text}");
+    assert_eq!(text.matches("VERIFICATION:- SUCCESSFUL\n").count(), 0, "{text}");
+    assert_eq!(text.matches("[AY:SOLVER_PIN_MISMATCH:").count(), 2, "one per harness:\n{text}");
+
+    let strict = run(&["--fail-on-unvalidated-success"]);
+    assert_eq!(code(&strict), 1, "{}", stdout(&strict));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// trust-vc's checked-in representative MergeBundle v3 obligation
+/// (`crates/trust-vc-merge-contract/fixtures/merge_bundle/representative_obligation_v3.json`
+/// at the pinned trust-vc rev): `sum_n = zext(n)` implies `sum_n >= zext(n)`, so
+/// its one synthetic harness proves.
+const REPRESENTATIVE_TRUST_VC_BUNDLE: &str = r#"{
+  "bundle_version": 3,
+  "expression_format": "smt_lib2_term_v1",
+  "source_id": "trust_vc::examples::arith::lemma_sum_nonneg",
+  "variables": [
+    {
+      "name": "n",
+      "sort": {
+        "kind": "bit_vector",
+        "width": 32,
+        "signed": false
+      }
+    },
+    {
+      "name": "sum_n",
+      "sort": {
+        "kind": "bit_vector",
+        "width": 64,
+        "signed": false
+      }
+    }
+  ],
+  "assumptions": [
+    {
+      "expr": "(= sum_n ((_ zero_extend 32) n))",
+      "sort": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "expr": "(bvuge sum_n ((_ zero_extend 32) n))",
+      "sort": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "decreases": [
+    {
+      "obligation_id": "lemma_sum_nonneg",
+      "measures": [
+        {
+          "expr": "n",
+          "sort": {
+            "kind": "bit_vector",
+            "width": 32,
+            "signed": false
+          }
+        }
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "obligation_id": "lemma_sum_nonneg",
+      "patterns": [
+        {
+          "expr": "(sum n)",
+          "sort": {
+            "kind": "bit_vector",
+            "width": 64,
+            "signed": false
+          }
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "capabilities": "decreases,triggers",
+    "source_backend": "ay",
+    "source_repo": "trust_vc"
+  }
+}"#;
+
+/// Write `<dir>/ay`, a stand-in that answers `--version` with `version_line`
+/// and actually answers queries: the main verification query (the one that
+/// asks `(get-value ...)`) is `unsat`, anything else (the harness reachability
+/// probe) is `sat`. Each answer is appended to `<dir>/queries.log`.
+#[cfg(unix)]
+fn solving_stand_in_ay(dir: &Path, version_line: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).unwrap();
+    let ay = dir.join("ay");
+    let log = dir.join("queries.log");
+    fs::write(
+        &ay,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n  echo '{version_line}'\n  exit 0\nfi\n\
+             query=''\n\
+             for arg in \"$@\"; do\n  if [ -f \"$arg\" ]; then query=\"$arg\"; break; fi\ndone\n\
+             if [ -z \"$query\" ]; then echo 'stand-in ay: no query file' >&2; exit 97; fi\n\
+             if grep -q '(get-value' \"$query\"; then answer=unsat; else answer=sat; fi\n\
+             echo \"$answer $query\" >> '{}'\n\
+             echo \"$answer\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ay, fs::Permissions::from_mode(0o755)).unwrap();
+    ay
+}
+
+/// The allow path's per-harness wiring, end to end on this host: the
+/// `--trust-vc-bundle` lane runs one synthetic harness through the engine's
+/// subprocess solver path with no compiler, so an off-pin stand-in `ay` that
+/// really answers the query exercises the pin check, the acceptance, the
+/// per-harness marker, the demotion and the exit code.
+#[cfg(unix)]
+#[test]
+fn an_allowed_off_pin_ay_marks_and_demotes_each_trust_vc_bundle_verdict() {
+    let dir = scratch("ay-pin-bundle");
+    let Some(sysroot) = driver_only_sysroot(&dir) else {
+        return;
+    };
+    let driver = sibling_binary("trust-mc-driver").expect("driver_only_sysroot found it");
+    let pin = workspace_ay_pin();
+    let bundle = dir.join("bundle.json");
+    fs::write(&bundle, REPRESENTATIVE_TRUST_VC_BUNDLE).unwrap();
+    let off_pin = solving_stand_in_ay(&dir.join("off-pin"), &ay_version_line(OFF_PIN_AY_COMMIT));
+    let pinned = solving_stand_in_ay(&dir.join("pinned"), &ay_version_line(&pin));
+    let run = |solver: &Path, envs: &[(&str, &str)], args: &[&str]| -> Output {
+        let mut cmd = Command::new(&driver);
+        cmd.args(args)
+            .arg("--trust-vc-bundle")
+            .arg(&bundle)
+            .current_dir(&dir)
+            .env("TRUST_MC_SYSROOT", &sysroot)
+            .env("TRUST_MC_AY_BIN", solver)
+            .env_remove("TRUST_MC_ALLOW_UNPINNED_AY");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("could not run trust-mc-driver")
+    };
+    let queries = |solver: &Path| {
+        fs::read_to_string(solver.with_file_name("queries.log")).unwrap_or_default()
+    };
+
+    // Control: at the pin the same bundle is a clean proof, answered by the
+    // stand-in, so any demotion below is the solver pin and nothing else.
+    let out = run(&pinned, &[], &[]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "stdout:\n{text}\nstderr:\n{}", stderr(&out));
+    assert_eq!(text.matches("VERIFICATION:- SUCCESSFUL\n").count(), 1, "{text}");
+    assert!(!both(&out).contains("SOLVER_PIN_MISMATCH"), "{}", both(&out));
+    assert!(
+        queries(&pinned).lines().any(|l| l.starts_with("unsat ")),
+        "the pinned stand-in never answered the verification query: {:?}\n{}",
+        queries(&pinned),
+        both(&out)
+    );
+
+    // Off-pin without the switch: refused before any query or verdict.
+    let out = run(&off_pin, &[], &[]);
+    let text = both(&out);
+    assert_ne!(code(&out), 0, "{text}");
+    assert!(text.contains(REFUSAL), "{text}");
+    assert!(!text.contains("VERIFICATION:-"), "{text}");
+    assert_eq!(queries(&off_pin), "", "a refused solver was asked a query:\n{text}");
+
+    let marker = format!("[AY:SOLVER_PIN_MISMATCH:found={OFF_PIN_AY_COMMIT}:pin={pin}]");
+    for (spelling, envs, args) in [
+        ("--allow-unpinned-ay", &[][..], &["--allow-unpinned-ay"][..]),
+        ("TRUST_MC_ALLOW_UNPINNED_AY=1", &[("TRUST_MC_ALLOW_UNPINNED_AY", "1")][..], &[][..]),
+    ] {
+        let out = run(&off_pin, envs, args);
+        let text = stdout(&out);
+        assert_eq!(code(&out), 0, "{spelling}: stdout:\n{text}\nstderr:\n{}", stderr(&out));
+        assert!(both(&out).contains(&format!("because {spelling} is set")), "{}", both(&out));
+        assert_eq!(
+            text.matches(marker.as_str()).count(),
+            1,
+            "{spelling}: one marker per harness:\n{text}"
+        );
+        assert_eq!(
+            text.matches("VERIFICATION:- SUCCESSFUL (UNVALIDATED)").count(),
+            1,
+            "{spelling}:\n{text}"
+        );
+        assert_eq!(
+            text.matches("VERIFICATION:- SUCCESSFUL\n").count(),
+            0,
+            "{spelling}: a clean SUCCESSFUL from an off-pin solver:\n{text}"
+        );
+        let (marker_at, verdict_at) =
+            (text.find(marker.as_str()), text.find("VERIFICATION:- SUCCESSFUL (UNVALIDATED)"));
+        assert!(marker_at < verdict_at, "{spelling}: the marker must precede the verdict:\n{text}");
+    }
+    assert!(
+        queries(&off_pin).lines().any(|l| l.starts_with("unsat ")),
+        "the demoted verdict did not come from the off-pin stand-in: {:?}",
+        queries(&off_pin)
+    );
+
+    // --fail-on-unvalidated-success turns the demoted success into exit 1.
+    let strict = run(&off_pin, &[], &["--allow-unpinned-ay", "--fail-on-unvalidated-success"]);
+    assert_eq!(code(&strict), 1, "{}", both(&strict));
+    assert!(
+        stdout(&strict).contains("VERIFICATION:- SUCCESSFUL (UNVALIDATED)"),
+        "{}",
+        both(&strict)
+    );
     let _ = fs::remove_dir_all(&dir);
 }

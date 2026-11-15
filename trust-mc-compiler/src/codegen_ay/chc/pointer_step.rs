@@ -34,6 +34,17 @@ pub(in crate::codegen_ay::chc) struct PointerStep {
 /// to the offset lane only, and recombines. Surfaces a `same_object_ok` predicate
 /// for the carry/overflow case.
 ///
+/// # Exactness
+///
+/// The lane result drops the byte offset's high 32 bits and the carry out of
+/// the low lane, so it is a NARROWING of the exact address `ptr + byte_offset`
+/// (mod 2^64). `same_object_ok` is exactly the condition under which the
+/// narrowing is exact: the result equals `ptr.bvadd(byte_offset)` if and only
+/// if `same_object_ok` holds. That is only a sound model for the in-bounds
+/// family (`offset`, `add`, `sub`), where a step that leaves its allocation is
+/// UB and a caller must check `same_object_ok`; the wrapping family must use
+/// [`step_wrapping_pointer`].
+///
 /// For non-64-bit pointers, falls back to whole-pointer `bvadd`.
 pub(in crate::codegen_ay::chc) fn step_split_pointer(ptr: Expr, byte_offset: Expr) -> PointerStep {
     let ptr_width = ptr.sort().bitvec_width();
@@ -77,8 +88,12 @@ pub(in crate::codegen_ay::chc) fn step_split_pointer(ptr: Expr, byte_offset: Exp
     let no_carry = new_offset.clone().bvuge(offset.clone());
     let high_zero = byte_offset.clone().extract(63, 32).eq(Expr::bitvec_const(0u128, 32));
 
-    // Negative path: no underflow (new <= old), upper bits = 0xFFFFFFFF (sign extension).
-    let no_underflow = new_offset.bvule(offset);
+    // Negative path: no underflow, upper bits = 0xFFFFFFFF (sign extension).
+    // STRICT `new < old`: the only negative offset with a zero low lane is
+    // exactly -2^32, whose lane step leaves the offset unchanged (`new == old`)
+    // while the exact address moves down one whole lane. Every other negative
+    // offset in range moves the lane strictly down when it does not underflow.
+    let no_underflow = new_offset.bvult(offset);
     let high_ffff = byte_offset.extract(63, 32).eq(Expr::bitvec_const(0xFFFF_FFFFu128, 32));
 
     let same_object_ok =
@@ -121,9 +136,71 @@ pub(in crate::codegen_ay::chc) fn step_split_pointer_sub(
     PointerStep { result, same_object_ok: Some(same_object_ok) }
 }
 
+/// Element-address step for an unsigned INDEX: `ptr + idx * elem_size` in the
+/// split-pointer lane model, with the condition under which that lane result
+/// is the exact address.
+///
+/// Slice element loads step the data pointer by `idx * size_of::<T>()` with
+/// [`step_split_pointer`], which keeps only the low 32 bits of the byte offset
+/// and drops the carry out of the lane. The index bounds check compares `idx`
+/// against the slice's CLAIMED length, which is not the allocation extent
+/// (`from_raw_parts(p, 1 << 33)`), so an index at or past `2^32` bytes used to
+/// fold back onto a low element: the allocation bound was checked against the
+/// truncated address, passed, and `s[1 << 32] == s[0]` was proven.
+///
+/// The returned `same_object_ok` is `idx * size` not overflowing `usize`, the
+/// byte offset fitting the lane (high half zero, so non-negative), and no carry
+/// out of the lane. It holds for every in-bounds access of an allocation that
+/// fits the lane, and it is false exactly when the lane result is not the
+/// exact address, which is an out-of-bounds access. Callers emit it as a
+/// memory-safety check.
+pub(in crate::codegen_ay::chc) fn step_split_pointer_index(
+    ptr: Expr,
+    idx: Expr,
+    elem_size: u64,
+) -> PointerStep {
+    let width = idx.sort().bitvec_width().unwrap_or(POINTER_WIDTH);
+    let (byte_offset, mul_ok) = if elem_size <= 1 {
+        (idx, None)
+    } else {
+        let size = Expr::bitvec_const(elem_size as u128, width);
+        (idx.clone().bvmul(size.clone()), Some(idx.bvmul_no_overflow_unsigned(size)))
+    };
+    let step = step_split_pointer(ptr, byte_offset.clone());
+    let Some(lane_ok) = step.same_object_ok else {
+        return step;
+    };
+    let non_negative = if width == 64 {
+        Some(byte_offset.extract(63, 63).eq(Expr::bitvec_const(0u128, 1)))
+    } else {
+        None
+    };
+    let exact = [mul_ok, non_negative].into_iter().flatten().fold(lane_ok, Expr::and);
+    let exact = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&exact).unwrap_or(exact);
+    PointerStep { result: step.result, same_object_ok: Some(exact) }
+}
+
+/// The address view of an identity term, and back (the map is its own
+/// inverse): the identity `concat(h16, object16, offset32)` — `h16` the high
+/// part of a 48-bit offset — is read as `concat(object16, h16, offset32)`,
+/// Kani's `object << 48 | offset48`. `ChcCtx::ptr_to_int_value` maps the object
+/// field to its address region on top of this.
+pub(in crate::codegen_ay::chc) fn identity_address_view(ptr: Expr) -> Expr {
+    ptr.clone().extract(47, 32).concat(ptr.clone().extract(63, 48)).concat(ptr.extract(31, 0))
+}
+
+/// [`identity_address_view`] on a constant.
+fn identity_address_view_value(value: &BigInt) -> BigInt {
+    let mask16: BigInt = (BigInt::from(1u8) << 16u32) - 1u8;
+    let mask32: BigInt = (BigInt::from(1u8) << 32u32) - 1u8;
+    let object = (value >> 32u32) & &mask16;
+    let high = (value >> 48u32) & &mask16;
+    (object << 48u32) | (high << 32u32) | (value & &mask32)
+}
+
 /// Exact-address pointer step for the WRAPPING family (`wrapping_offset`,
 /// `wrapping_byte_offset`, `wrapping_add`, `wrapping_sub`, `wrapping_byte_add`,
-/// `wrapping_byte_sub`).
+/// `wrapping_byte_sub`, and `with_addr`, which is a wrapping byte offset).
 ///
 /// # Why the wrapping family cannot use the split step
 ///
@@ -131,46 +208,58 @@ pub(in crate::codegen_ay::chc) fn step_split_pointer_sub(
 /// byte offset with `extract(31, 0)` and dropping any carry out of that lane.
 /// The offset's high 32 bits are DISCARDED, so every offset that is a nonzero
 /// multiple of 2^32 encodes as a no-op: `p.wrapping_byte_offset(1 << 32) == p`
-/// is derivable in the lane model but FALSE in Z/2^64, where no nonzero element
-/// is an additive identity. That is Kani's #1150 shape, and here it did not
-/// merely produce a spurious counterexample — the encoder folded the truncated
-/// step to a literal and STATICALLY DISCHARGED the false assertion, i.e. proved
-/// it.
+/// is derivable in the lane model but FALSE in Z/2^64. That is Kani's #1150
+/// shape, and here the encoder folded the truncated step to a literal and
+/// STATICALLY DISCHARGED the false assertion, i.e. proved it. For `offset` /
+/// `add` / `sub` leaving the allocation is UB, so the lane model is a sound
+/// approximation there; the wrapping family is DEFINED out of bounds.
 ///
-/// This is NOT a defect in [`step_split_pointer`]. For `offset`/`add`/`sub`,
-/// leaving the allocation is UB, so the lane model is a sound approximation
-/// there, and its constant-foldable `obj_id` lane is what lets
-/// `const_obj_id_u32` resolve the allocation and discharge heap bounds checks
-/// (#3921). The `wrapping_*` family is different: it is DEFINED out of bounds
-/// and wraps the whole address space, so an offset that leaves the lane MUST
-/// change the object-id bits.
+/// # The address the step moves
+///
+/// The step is address arithmetic mod 2^64 on the ADDRESS VIEW of the identity
+/// term ([`identity_address_view`]): Kani's `object << 48 | offset48`. A carry
+/// out of the 32-bit offset lands in the lane's high 16 bits, the high part of
+/// a 48-bit offset, and leaves the object field alone, as Kani's object bits
+/// stay put until an offset passes 2^48.
+///
+/// The previous step was mod 2^64 on the identity term itself, whose object
+/// field sits right above the 32-bit offset. Object ids are small and dense,
+/// so a step of 2^32 bytes carried into the NEXT OBJECT: `a.as_ptr()
+/// .wrapping_byte_add(1 << 32)` was a pointer into `b`, a dereference of it
+/// read `b` in bounds (a clean proof where Kani reports a pointer outside
+/// object bounds) and `p != b.as_ptr()` was refuted by a certified
+/// counterexample (fourth review of fix/chc-false-certificates, 2026-09-28:
+/// `bs_wrapping_2p32_bug`, `bs_heap_2p32_bug`, `bs_ptr_eq_2p32_safe`). A
+/// stepped pointer whose high offset bits are set names no object: its lane
+/// is no allocation's, so a dereference fails the validity check and it
+/// equals no other object's pointer.
 ///
 /// # One model per family — no hybrid
 ///
-/// An earlier version of this function kept the lane model whenever the
-/// offset's high lane folded to zero, on the theory that the lane model then
-/// answers the zero/nonzero question exactly. It does not, and mixing the two
-/// models within a single chain is actively wrong: the lane step also drops the
-/// CARRY out of the low lane, so after an exact step leaves the pointer near
-/// the top of its lane, a following lane step loses the carry. That is exactly
-/// `check_wrap_around_ptr` in `expected/offset-wraps-around` —
-/// `p.wrapping_byte_add(usize::MAX).wrapping_byte_add(1)` must return `p`,
-/// and the hybrid returned `concat(obj_id - 1, 0)`. The wrapping family
-/// therefore gets ONE model, exact mod 2^64, end to end.
+/// Mixing the lane model with an exact step within one chain is wrong: the
+/// lane step drops the carry, so after an exact step leaves the pointer near
+/// the top of its lane, a following lane step loses it
+/// (`check_wrap_around_ptr` in `expected/offset-wraps-around`:
+/// `p.wrapping_byte_add(usize::MAX).wrapping_byte_add(1)` must return `p`).
+/// The wrapping family therefore gets ONE model, exact mod 2^64 on the address
+/// view, end to end, and constant operands fold to a literal of it.
 ///
-/// The constant fast-path is kept because it is already exact: `const_fold_step`
-/// folds in-lane steps to a literal and out-of-lane steps with full 64-bit
-/// wrapping arithmetic (#72), so it agrees with `bvadd`/`bvsub` on every input
-/// while preserving the literal form that memory scalarization wants.
-///
-/// # Cost
+/// This free function is the step when no address region is remapped: an
+/// untracked object's region is its id. `ChcCtx::step_wrapping_address` is the
+/// step callers use; it adds the region map of tracked locals when a step can
+/// change region.
 ///
 /// For a symbolic offset the `obj_id` lane stops folding, so a later deref of
-/// the result gets a symbolic `obj_valid` select from `heap_access_checks`
-/// rather than a resolved allocation bound. That costs precision, never
-/// soundness: the symbolic select is strictly MORE conservative, so this
-/// direction can only add counterexamples, never suppress a check. Provenance
-/// is unaffected — `offset_walk_identity_callee` already resolves the
+/// the result gets symbolic `obj_valid` and `obj_size` selects from
+/// `heap_access_checks` rather than a resolved allocation bound. The bounds
+/// half of that check used to be SKIPPED for a symbolic lane, so a read past
+/// a `Box` through `p.wrapping_add(2)` verified clean (review of
+/// fix/chc-lost-writes, lostwrite round 1, finding 4); it is now the size of
+/// the object the lane names, one certified check over a choice of the objects
+/// whose size the encoder records (`symbolic_lane_bounds`: address-taken stack
+/// slots, heap allocations, statics and the global objects the harness reads),
+/// and a lane naming an object with no recorded size stays unbounded. Provenance is
+/// unaffected — `offset_walk_identity_callee` already resolves the
 /// allocation through the whole `wrapping_*` family via the `known_alloc_ids`
 /// side-channel, which is keyed by local rather than by expression shape.
 pub(in crate::codegen_ay::chc) fn step_wrapping_pointer(
@@ -178,15 +267,94 @@ pub(in crate::codegen_ay::chc) fn step_wrapping_pointer(
     byte_offset: Expr,
     is_sub: bool,
 ) -> Expr {
-    // Fully-constant steps: already exact, and keep the literal form.
-    if ptr.sort().bitvec_width() == Some(POINTER_WIDTH)
-        && POINTER_WIDTH == 64
-        && let Some(step) = const_fold_step(&ptr, &byte_offset, is_sub)
-    {
-        return step.result;
+    if ptr.sort().bitvec_width() != Some(POINTER_WIDTH) || POINTER_WIDTH != 64 {
+        return if is_sub { ptr.bvsub(byte_offset) } else { ptr.bvadd(byte_offset) };
     }
+    if let Some(result) = const_fold_wrapping_step(&ptr, &byte_offset, is_sub) {
+        return result;
+    }
+    let view = identity_address_view(ptr);
+    let moved = if is_sub { view.bvsub(byte_offset) } else { view.bvadd(byte_offset) };
+    identity_address_view(moved)
+}
 
-    if is_sub { ptr.bvsub(byte_offset) } else { ptr.bvadd(byte_offset) }
+/// The wrapping step on constants: a zero offset returns `ptr` itself (memory
+/// scalarization and select-over-store matching rely on the expression
+/// identity), and a constant pointer and offset fold to a literal.
+fn const_fold_wrapping_step(ptr: &Expr, byte_offset: &Expr, is_sub: bool) -> Option<Expr> {
+    let folded_off = trust_mc_core::chc_const_prop::eval::try_eval_to_const(byte_offset);
+    let byte_offset = folded_off.as_ref().unwrap_or(byte_offset);
+    let (off_v, off_w) = const_bv_value(byte_offset)?;
+    if off_w != 64 {
+        return None;
+    }
+    if off_v == BigInt::from(0u8) {
+        return Some(ptr.clone());
+    }
+    let folded_ptr = trust_mc_core::chc_const_prop::eval::try_eval_to_const(ptr);
+    let ptr = folded_ptr.as_ref().unwrap_or(ptr);
+    let (ptr_v, ptr_w) = const_bv_value(ptr)?;
+    if ptr_w != 64 {
+        return None;
+    }
+    let modulus: BigInt = BigInt::from(1u8) << 64u32;
+    let view = identity_address_view_value(&ptr_v);
+    let moved = if is_sub { view - off_v } else { view + off_v };
+    let moved = ((moved % &modulus) + &modulus) % &modulus;
+    Some(Expr::bitvec_const(identity_address_view_value(&moved), 64))
+}
+
+/// Whether a constant wrapping step keeps its pointer's address region (the
+/// top 16 bits of the address view): `None` when an operand is not constant.
+pub(in crate::codegen_ay::chc) fn wrapping_step_keeps_region(
+    ptr: &Expr,
+    byte_offset: &Expr,
+    is_sub: bool,
+) -> Option<bool> {
+    let folded_off = trust_mc_core::chc_const_prop::eval::try_eval_to_const(byte_offset);
+    let (off_v, _) = const_bv_value(folded_off.as_ref().unwrap_or(byte_offset))?;
+    let folded_ptr = trust_mc_core::chc_const_prop::eval::try_eval_to_const(ptr);
+    let (ptr_v, _) = const_bv_value(folded_ptr.as_ref().unwrap_or(ptr))?;
+    let modulus: BigInt = BigInt::from(1u8) << 64u32;
+    let view = identity_address_view_value(&ptr_v);
+    let moved = if is_sub { &view - off_v } else { &view + off_v };
+    let moved = ((moved % &modulus) + &modulus) % &modulus;
+    Some((view >> 48u32) == (moved >> 48u32))
+}
+
+/// Byte-step a pointer that may be WIDE, keeping a slice/str/dyn pointer's
+/// metadata.
+///
+/// `<*const [T]>::wrapping_byte_add(n)` is
+/// `self.cast::<u8>().wrapping_add(n).with_metadata_of(self)`: the data word
+/// moves and the metadata does not. The byte-step stubs used to coerce the
+/// operand to `POINTER_WIDTH` first, which for a `bv128` fat pointer keeps the
+/// data word and DROPS the length. The destination slot then held a widened
+/// thin pointer whose high half `PtrMetadata` reads back as a fabricated `0`,
+/// so `ptr.wrapping_byte_add(k).wrapping_byte_sub(k)` lost `len()` and a true
+/// `val.len() == data.len()` was refuted as a Genuine counterexample
+/// (tests/expected/ptr_to_ref_cast/slice/test.rs, check_with_byte_add_sub_pass).
+///
+/// `step` is the family's own data-word step, applied to a `POINTER_WIDTH`
+/// address, so the thin behaviour is unchanged. Only a structurally FAT operand
+/// (`PtrRepr::Fat`) keeps its metadata half; a widened thin pointer has none to
+/// keep, and every other shape takes the pre-existing coercion inside `step`.
+pub(in crate::codegen_ay::chc) fn step_pointer_data_keep_metadata(
+    ptr: Expr,
+    step: impl FnOnce(Expr) -> Option<Expr>,
+) -> Option<Expr> {
+    use crate::codegen_ay::provenance::Loc;
+    use crate::codegen_ay::ptr_repr::PtrRepr;
+    match PtrRepr::classify(&ptr) {
+        Some(PtrRepr::Fat { data, meta }) => {
+            let stepped = step(data.into_expr())?;
+            if stepped.sort().bitvec_width() != Some(POINTER_WIDTH) {
+                return None;
+            }
+            PtrRepr::from_declared_roles(Loc::of_address(stepped), meta).into_packed()
+        }
+        _ => step(ptr),
+    }
 }
 
 /// Constant fast-path for the split-pointer step: when both the pointer and
@@ -244,8 +412,10 @@ fn const_fold_step(ptr: &Expr, byte_offset: &Expr, is_sub: bool) -> Option<Point
         let carried = sum >= lane;
         let new_lo: BigInt = &sum & &lane_mask;
         let is_negative = (&off_v >> 63u32) == BigInt::from(1u8);
+        // Strict for the negative path, as in `step_split_pointer`: `-2^32`
+        // leaves the low lane unchanged but is a whole-lane move.
         let ok = if is_negative {
-            new_lo <= lo && off_hi == lane_mask
+            new_lo < lo && off_hi == lane_mask
         } else {
             !carried && off_hi == zero
         };
@@ -300,8 +470,13 @@ mod tests {
             split.to_string().contains("extract"),
             "split step should truncate the offset to the low lane: {split}"
         );
-        // The wrapping step keeps the whole 64-bit offset.
-        assert_eq!(wrapping, ptr.bvadd(sym_offset), "wrapping step must be a full-width bvadd");
+        // The wrapping step keeps the whole 64-bit offset, added to the address
+        // view of the identity term.
+        assert_eq!(
+            wrapping,
+            identity_address_view(identity_address_view(ptr).bvadd(sym_offset)),
+            "wrapping step must be a full-width add on the address view"
+        );
     }
 
     /// A constant step of exactly 2^32 must MOVE the pointer. Under the lane
@@ -315,7 +490,32 @@ mod tests {
         let moved = step_wrapping_pointer(ptr.clone(), two_pow_32, false);
 
         assert_ne!(moved, ptr, "a 2^32 step must not fold back to the base pointer");
+        // The carry lands in the high offset bits, not in the object field: the
+        // result is object 2 at offset 2^32, not object 3 (fourth review of
+        // fix/chc-false-certificates: `bs_wrapping_2p32_bug`).
+        assert_eq!(moved, Expr::bitvec_const(0x0001_0002_0000_0000u128, 64));
+    }
+
+    /// A step that carries past a 48-bit offset moves to the next address
+    /// region (Kani's object bits), and the reverse step comes back.
+    #[test]
+    fn test_wrapping_step_carries_into_the_object_field_only_past_2_pow_48() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0000u128, 64);
+        let two_pow_48 = Expr::bitvec_const(1u128 << 48, 64);
+        let moved = step_wrapping_pointer(ptr.clone(), two_pow_48.clone(), false);
         assert_eq!(moved, Expr::bitvec_const(0x0000_0003_0000_0000u128, 64));
+        assert_eq!(step_wrapping_pointer(moved, two_pow_48, true), ptr);
+    }
+
+    /// One byte below offset 0 is the top of the previous region: its lane is
+    /// no object's, and one byte up is the pointer again.
+    #[test]
+    fn test_wrapping_step_below_offset_zero_names_no_object() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0000u128, 64);
+        let one = Expr::bitvec_const(1u128, 64);
+        let below = step_wrapping_pointer(ptr.clone(), one.clone(), true);
+        assert_eq!(below, Expr::bitvec_const(0xFFFF_0001_FFFF_FFFFu128, 64));
+        assert_eq!(step_wrapping_pointer(below, one, false), ptr);
     }
 
     /// Chained wrapping steps must compose exactly: `+usize::MAX` then `+1` is a
@@ -332,7 +532,24 @@ mod tests {
         let step2 = step_wrapping_pointer(step1, one.clone(), false);
 
         // Both hops stay in the same (full-width) model, so the carry survives.
-        assert_eq!(step2, ptr.bvadd(Expr::bitvec_const(u64::MAX as u128, 64)).bvadd(one));
+        let view = identity_address_view(ptr);
+        let step1_expected = identity_address_view(
+            view.bvadd(Expr::bitvec_const(u64::MAX as u128, 64)),
+        );
+        assert_eq!(
+            step2,
+            identity_address_view(identity_address_view(step1_expected).bvadd(one))
+        );
+    }
+
+    /// The constant chain folds back to the base literal.
+    #[test]
+    fn test_wrapping_step_constant_chain_wraps_around_to_base() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0010u128, 64);
+        let usize_max = Expr::bitvec_const(u64::MAX as u128, 64);
+        let one = Expr::bitvec_const(1u128, 64);
+        let step1 = step_wrapping_pointer(ptr.clone(), usize_max, false);
+        assert_eq!(step_wrapping_pointer(step1, one, false), ptr);
     }
 
     /// A zero step is the identity in the wrapping model too.
@@ -485,5 +702,95 @@ mod tests {
             Expr::bool_const(false),
             "lane carry must not count as same-object"
         );
+    }
+
+    /// An index step of exactly `2^32` bytes lands on the base lane offset;
+    /// its exactness condition must not hold.
+    #[test]
+    fn test_index_step_two_pow_32_is_not_exact() {
+        let ptr = Expr::var("p", Sort::bitvec(64));
+        let idx = Expr::bitvec_const(1u128 << 32, 64);
+        let step = step_split_pointer_index(ptr, idx, 1);
+        let exact = step.same_object_ok.expect("64-bit index step surfaces exactness");
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&exact);
+        assert!(
+            folded.is_none_or(|v| v == Expr::bool_const(false)),
+            "a 2^32-byte index step is not lane-exact: {exact}"
+        );
+    }
+
+    /// A small constant index step on a constant in-lane pointer is exact and
+    /// folds to `true`, so fully concrete accesses add no obligation.
+    #[test]
+    fn test_index_step_small_const_is_exact_and_folds() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0010u128, 64);
+        let idx = Expr::bitvec_const(3u128, 64);
+        let step = step_split_pointer_index(ptr, idx, 4);
+        assert_eq!(step.result, Expr::bitvec_const(0x0000_0002_0000_001Cu128, 64));
+        // The exactness condition conjoins lane_ok (which folds to true), the
+        // `idx * size` overflow check and the sign-bit test. `try_eval_to_const`
+        // has arms for BvAddNoOverflowUnsigned and BvSubNoUnderflowUnsigned but
+        // NOT for BvMulNoOverflowUnsigned, so for constants the conjunction does
+        // not collapse to a literal `true`. Assert what actually holds -- the step
+        // is exact, i.e. its exactness condition never folds to false -- using the
+        // same idiom as the sibling tests below.
+        let exact = step.same_object_ok.expect("index step surfaces exactness");
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&exact);
+        assert!(
+            folded.is_none_or(|v| v == Expr::bool_const(true)),
+            "a small in-lane constant index step is exact: {exact}"
+        );
+    }
+
+    /// `idx * size` overflowing usize is an out-of-bounds index, not an exact
+    /// step: `2^62 * 4 == 0 (mod 2^64)` would alias the base element.
+    #[test]
+    fn test_index_step_multiplication_overflow_is_not_exact() {
+        let ptr = Expr::bitvec_const(0x0000_0002_0000_0010u128, 64);
+        let idx = Expr::bitvec_const(1u128 << 62, 64);
+        let step = step_split_pointer_index(ptr, idx, 4);
+        let exact = step.same_object_ok.expect("index step surfaces exactness");
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&exact);
+        assert!(
+            folded.is_none_or(|v| v == Expr::bool_const(false)),
+            "an overflowing index product is not exact: {exact}"
+        );
+    }
+
+    /// `-2^32` has a zero low lane, so the lane step leaves the offset lane
+    /// unchanged; the exact address moves down one whole lane. The constant
+    /// fold must take the full-width path, not report a same-object no-op.
+    #[test]
+    fn test_split_pointer_step_minus_two_pow_32_is_not_same_object_const() {
+        let ptr = Expr::bitvec_const(0x0000_0042_0000_0100u128, 64);
+        let minus_two_pow_32 = Expr::bitvec_const(0xFFFF_FFFF_0000_0000u128, 64);
+
+        let step = step_split_pointer(ptr, minus_two_pow_32);
+
+        assert_eq!(step.result, Expr::bitvec_const(0x0000_0041_0000_0100u128, 64));
+        assert_eq!(
+            step.same_object_ok.expect("const fold must surface same_object_ok"),
+            Expr::bool_const(false),
+        );
+    }
+
+    /// Symbolic twin of the constant `-2^32` case: `same_object_ok` must be
+    /// false for that offset whatever the pointer is, because the lane result
+    /// (`ptr` unchanged) is not the exact address `ptr - 2^32`.
+    #[test]
+    fn test_split_pointer_step_minus_two_pow_32_is_not_same_object_symbolic() {
+        let ptr = Expr::var("p", Sort::bitvec(64));
+        let minus_two_pow_32 = Expr::bitvec_const(0xFFFF_FFFF_0000_0000u128, 64);
+
+        let step = step_split_pointer(ptr, minus_two_pow_32);
+        let same_object_ok = step.same_object_ok.expect("symbolic step surfaces same_object_ok");
+
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&same_object_ok);
+        assert!(
+            folded.is_none_or(|v| v == Expr::bool_const(false)),
+            "same_object_ok must not fold to true for -2^32: {same_object_ok}"
+        );
+        let rendered = same_object_ok.to_string();
+        assert!(rendered.contains("bvult"), "negative path must be strict: {rendered}");
     }
 }

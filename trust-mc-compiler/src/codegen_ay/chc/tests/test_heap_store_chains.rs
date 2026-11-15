@@ -315,9 +315,10 @@ fn test_filter_superseded_no_out_in_bridge_returns_none() {
             .store(Expr::bitvec_const(0u64, 64), Expr::bitvec_const(1u64, 32))),
     ];
     // Bridge has a non-store constraint (no __out variable).
-    let bridge_constraints = vec![Expr::bitvec_const(1u64, 64).eq(Expr::bitvec_const(1u64, 64))];
+    let mut bridge_constraints =
+        vec![Expr::bitvec_const(1u64, 64).eq(Expr::bitvec_const(1u64, 64))];
 
-    let result = filter_superseded_store_chains(&stmt_constraints, &bridge_constraints);
+    let result = filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints);
     assert!(result.is_none(), "no __out in bridge → no filtering");
 }
 
@@ -332,12 +333,12 @@ fn test_filter_superseded_no_overlap_returns_none() {
             .store(Expr::bitvec_const(0u64, 64), Expr::bitvec_const(1u64, 32))),
     ];
     // Bridge targets a different type array.
-    let bridge_constraints = vec![
+    let mut bridge_constraints = vec![
         Expr::var("mem_u64__out", u64_arr.clone()).eq(Expr::var("mem_u64", u64_arr)
             .store(Expr::bitvec_const(8u64, 64), Expr::bitvec_const(2u64, 64))),
     ];
 
-    let result = filter_superseded_store_chains(&stmt_constraints, &bridge_constraints);
+    let result = filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints);
     assert!(result.is_none(), "no overlap → no filtering");
 }
 
@@ -358,9 +359,9 @@ fn test_filter_superseded_removes_conflicting_constraint() {
     let bridge_store = Expr::var("mem_i32__out", i32_arr.clone()).eq(Expr::var("mem_i32", i32_arr)
         .store(Expr::bitvec_const(0u64, 64), Expr::bitvec_const(1u64, 32))
         .store(Expr::bitvec_const(8u64, 64), Expr::bitvec_const(2u64, 32)));
-    let bridge_constraints = vec![bridge_store];
+    let mut bridge_constraints = vec![bridge_store];
 
-    let result = filter_superseded_store_chains(&stmt_constraints, &bridge_constraints);
+    let result = filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints);
     let filtered = result.expect("should return Some when conflicts exist");
 
     assert_eq!(filtered.len(), 1, "should remove the conflicting mem_i32__out constraint");
@@ -385,14 +386,15 @@ fn test_filter_superseded_removes_multiple_conflicts() {
         // Non-store constraint preserved.
         Expr::var("x__out", Sort::bitvec(64)).eq(Expr::bitvec_const(99u64, 64)),
     ];
-    let bridge_constraints = vec![
+    let mut bridge_constraints = vec![
         Expr::var("mem_i32__out", i32_arr.clone()).eq(Expr::var("mem_i32", i32_arr)
             .store(Expr::bitvec_const(0u64, 64), Expr::bitvec_const(10u64, 32))),
         Expr::var("mem_u64__out", u64_arr.clone()).eq(Expr::var("mem_u64", u64_arr)
             .store(Expr::bitvec_const(0u64, 64), Expr::bitvec_const(10u64, 64))),
     ];
 
-    let filtered = filter_superseded_store_chains(&stmt_constraints, &bridge_constraints).unwrap();
+    let filtered =
+        filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints).unwrap();
     assert_eq!(
         filtered.len(),
         1,
@@ -403,6 +405,66 @@ fn test_filter_superseded_removes_multiple_conflicts() {
 /// Returns None when both inputs are empty.
 #[test]
 fn test_filter_superseded_empty_inputs_returns_none() {
-    let result = filter_superseded_store_chains(&[], &[]);
+    let result = filter_superseded_store_chains(&[], &mut Vec::new());
     assert!(result.is_none(), "empty inputs → no filtering");
+}
+
+/// A heap metadata write is composed, not dropped: a statement's
+/// integer-to-pointer invalidation (`obj_valid__out = store(obj_valid, k,
+/// false)`) followed by an allocating call's `obj_valid__out = store(obj_valid,
+/// 42, true)` keeps both (lostwrite track round 2, finding 5). Before the
+/// composition the bridge definition stood alone and the invalidation was lost.
+#[test]
+fn test_filter_superseded_composes_heap_metadata_definitions() {
+    let valid_sort = Sort::array(Sort::bitvec(32), Sort::bool());
+    let lane = Expr::var("k", Sort::bitvec(32));
+    let invalidation = Expr::var("obj_valid__out", valid_sort.clone()).eq(Expr::var(
+        "obj_valid",
+        valid_sort.clone(),
+    )
+    .store(lane.clone(), Expr::bool_const(false)));
+    let stmt_constraints = vec![invalidation];
+    let allocation = Expr::var("obj_valid__out", valid_sort.clone()).eq(Expr::var(
+        "obj_valid",
+        valid_sort.clone(),
+    )
+    .store(Expr::bitvec_const(42u64, 32), Expr::bool_const(true)));
+    let mut bridge_constraints = vec![allocation];
+
+    let filtered = filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints)
+        .expect("the statement's definition is superseded");
+    assert!(filtered.is_empty(), "the statement's definition moves into the bridge's");
+    let expected = Expr::var("obj_valid__out", valid_sort.clone()).eq(Expr::var(
+        "obj_valid",
+        valid_sort,
+    )
+    .store(lane, Expr::bool_const(false))
+    .store(Expr::bitvec_const(42u64, 32), Expr::bool_const(true)));
+    assert_eq!(bridge_constraints.len(), 1);
+    assert_eq!(bridge_constraints[0].to_string(), expected.to_string());
+}
+
+/// A bridge definition built on `current_obj_valid_array()` (the output name)
+/// is composed onto the block's definition too, and two bridge definitions
+/// leave one.
+#[test]
+fn test_filter_superseded_composes_self_referential_and_repeated_definitions() {
+    let valid_sort = Sort::array(Sort::bitvec(32), Sort::bool());
+    let out = || Expr::var("obj_valid__out", valid_sort.clone());
+    let input = || Expr::var("obj_valid", valid_sort.clone());
+    let at = |k: u64| Expr::bitvec_const(k, 32);
+    let stmt_constraints = vec![out().eq(input().store(at(1), Expr::bool_const(false)))];
+    let mut bridge_constraints = vec![
+        out().eq(out().store(at(2), Expr::bool_const(false))),
+        out().eq(input().store(at(3), Expr::bool_const(true))),
+    ];
+    let filtered =
+        filter_superseded_store_chains(&stmt_constraints, &mut bridge_constraints).unwrap();
+    assert!(filtered.is_empty());
+    let expected = out().eq(input()
+        .store(at(1), Expr::bool_const(false))
+        .store(at(2), Expr::bool_const(false))
+        .store(at(3), Expr::bool_const(true)));
+    assert_eq!(bridge_constraints.len(), 1);
+    assert_eq!(bridge_constraints[0].to_string(), expected.to_string());
 }

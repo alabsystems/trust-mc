@@ -701,6 +701,7 @@ fn test_helper_wrapped_bit_intrinsics_emit_no_unhandled_calls() {
         let fallback_counts = get_chc_fallback_counts();
         let unhandled_calls = crate::codegen_ay::take_unhandled_call_by_fn();
         let translation_drops = take_translation_drop_by_fn();
+        let translation_drop_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
         let unsupported = crate::codegen_ay::take_unsupported_construct_fallback_count();
 
         assert_eq!(
@@ -721,10 +722,30 @@ fn test_helper_wrapped_bit_intrinsics_emit_no_unhandled_calls() {
                 "{fn_name} should not increment unhandled_call, map={unhandled_calls:?}"
             );
 
-            let translation_drop_count = translation_drops.get(fn_name).copied().unwrap_or(0);
-            assert_eq!(
-                translation_drop_count, 0,
-                "{fn_name} should not drop inline translation sites, map={translation_drops:?}"
+            // Design 2 Phase 0 (call/inline_walk_guard.rs): the helper's `for i in
+            // 0..BITS` loop re-reads the range after the previous iteration's
+            // write to it, which fails closed by design. No OTHER fail-closed
+            // drop (a blessed SoundHavoc such as switchint_branch_overapprox
+            // never counted as one).
+            let phase0 = crate::codegen_ay::chc::call::inline_walk_guard::PHASE0_REASONS;
+            let other: Vec<String> = translation_drop_sites
+                .get(fn_name)
+                .map(|reasons| {
+                    reasons
+                        .keys()
+                        .filter(|r| {
+                            !phase0.contains(&r.as_str())
+                                && crate::codegen_ay::chc::codegen_ctx::fallback_soundness(r)
+                                    == crate::codegen_ay::chc::codegen_ctx::FallbackSoundness::FailClose
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                other.is_empty(),
+                "{fn_name} should drop no inline translation site beyond Phase 0's, \
+                 map={translation_drops:?}, sites={translation_drop_sites:?}"
             );
         }
     });

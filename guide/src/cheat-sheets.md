@@ -12,15 +12,15 @@ development purposes.
 # Error "'rustc' panicked at 'failed to lookup `SourceFile` in new context'"
 # or similar error? Cleaning artifacts might help.
 # Otherwise, comment the line below.
-cargo clean
-cargo build-dev
+targo clean
+targo --unverified build-dev
 ```
 
 ### Test
 
 ```bash
 # Rust units and fail-closed AY corpus gates
-cargo test --workspace --no-fail-fast
+targo --unverified test --workspace --no-fail-fast
 ./scripts/ay-compiletest.sh expected
 ./scripts/ay-soundness-gate.sh
 ```
@@ -37,8 +37,8 @@ rm -r build/x86_64-apple-darwin/tests/
 
 ```bash
 # Test suite run (we can only run one at a time)
-# cargo run -p compiletest -- --suite ${suite} --mode ${mode}
-cargo run -p compiletest -- --suite expected --mode expected
+# targo --unverified run -p compiletest -- --suite ${suite} --mode ${mode}
+targo --unverified run -p compiletest -- --suite expected --mode expected
 ```
 
 ```bash

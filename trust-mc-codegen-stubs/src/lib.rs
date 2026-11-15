@@ -70,6 +70,15 @@ impl StubRegistry {
         stubs.insert("core::panicking::assert_failed", StubKind::PanicError);
         stubs.insert("core::ub_checks::check_language_ub", StubKind::UbCheckLanguageUb);
         stubs.insert("core::intrinsics::precondition_check", StubKind::PreconditionCheck);
+        // `hint::unreachable_unchecked`: reaching it is UB, so it is an obligation,
+        // not a value — the same `→ error()` lane as a panic entry (the
+        // obligation-free walk already classes it as one). Kept as a Call by the
+        // inline pass; inlined, its `assert_unsafe_precondition!` expansion
+        // dragged `panic_nounwind_fmt::runtime` / `Location::caller` into the
+        // body and the solver came back UNDECIDED on a trivially reachable UB.
+        // This is what `Result::unwrap_unchecked` on `Err` lowers to.
+        stubs.insert("core::hint::unreachable_unchecked", StubKind::PanicError);
+        stubs.insert("std::hint::unreachable_unchecked", StubKind::PanicError);
 
         Self::register_mem_intrinsics(&mut stubs);
         // kani::mem helpers (Part of #1229, #3470): predicates + wrapper functions

@@ -8,7 +8,7 @@
 //! This module contains all first-time setup code done as part of `cargo kani setup`.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -17,6 +17,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::cmd::AutoRun;
 use crate::os_hacks;
+
+// Share the exact Trust/frozen-oracle identity policy with the driver build.
+mod build_frontend {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/build_frontend.rs"));
+}
 
 /// Comes from our Cargo.toml manifest file. Must correspond to our release verion.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -140,44 +145,127 @@ pub(crate) fn get_rustc_version_from_build(kani_dir: &Path) -> Result<String> {
         .context("Reading release bundle rustc-version")
 }
 
-/// Timeout for rustup toolchain install operations (10 minutes).
-const RUSTUP_TIMEOUT: Duration = Duration::from_secs(600);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupToolchain {
+    Trust,
+    FrozenOracle,
+}
 
-/// Install the Rust toolchain version we require
-fn setup_rust_toolchain(kani_dir: &Path, use_local_toolchain: Option<OsString>) -> Result<String> {
-    // Currently this means we require the bundle to have been unpacked first!
-    let toolchain_version = get_rust_toolchain_version(kani_dir)?;
-    let rustc_version = get_rustc_version_from_build(kani_dir)?.trim().to_string();
-
-    // Symlink to a local toolchain if the user explicitly requests
-    if let Some(local_toolchain_path) = use_local_toolchain {
-        let toolchain_path = Path::new(&local_toolchain_path);
-
-        let custom_toolchain_rustc_version =
-            get_rustc_version_from_local_toolchain(local_toolchain_path.clone())?;
-
-        if rustc_version == custom_toolchain_rustc_version {
-            symlink_rust_toolchain(toolchain_path, kani_dir)?;
-            println!(
-                "[3/5] Installing rust toolchain from path provided: {}",
-                toolchain_path.to_string_lossy()
-            );
-            return Ok(toolchain_version);
+fn setup_toolchain_policy(
+    channel: &str,
+    has_local_toolchain: bool,
+    oracle_reason: Option<&OsStr>,
+) -> Result<SetupToolchain> {
+    let channel = channel.trim();
+    let frozen = "nightly-2025-12-03";
+    let mode = if channel == "trust" {
+        SetupToolchain::Trust
+    } else if channel == frozen || channel == format!("{frozen}-{TARGET}") {
+        if oracle_reason.is_none_or(|reason| reason.to_string_lossy().trim().is_empty()) {
+            bail!("the frozen Kani oracle requires a nonblank ATERM_STOCK_REASON");
         }
+        SetupToolchain::FrozenOracle
+    } else {
         bail!(
-            "The toolchain with rustc {:?} being used to setup is not the same as the one trust-mc used in its release bundle {:?}. Try to setup with the same version as the bundle.",
-            custom_toolchain_rustc_version,
-            rustc_version,
+            "bundle toolchain {channel:?} is not Trust or the explicitly authorized frozen Kani oracle"
+        );
+    };
+    if !has_local_toolchain {
+        bail!(
+            "setup does not install compiler toolchains; name an already installed matching \
+             toolchain with trust-mc setup --use-local-toolchain <toolchain directory>"
         );
     }
+    Ok(mode)
+}
 
-    // This is the default behaviour when no explicit path to a toolchain is mentioned
-    println!("[3/5] Installing rust toolchain version: {}", toolchain_version);
-    Command::new("rustup")
-        .args(["toolchain", "install", &toolchain_version])
-        .run_with_timeout(RUSTUP_TIMEOUT)?;
-    let toolchain = home::rustup_home()?.join("toolchains").join(&toolchain_version);
-    symlink_rust_toolchain(&toolchain, kani_dir)?;
+fn require_local_tools(toolchain: &Path, mode: SetupToolchain) -> Result<()> {
+    let names: &[&str] = match mode {
+        // rustc is the existing read-only producer/consumer version comparison.
+        SetupToolchain::Trust => &["targo", "trustc", "rustc"],
+        SetupToolchain::FrozenOracle => &["cargo", "rustc"],
+    };
+    for name in names {
+        let path = toolchain.join("bin").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if !path.is_file() {
+            bail!("local toolchain is incomplete: {} is missing", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn local_compiler_output(toolchain: &Path, args: &[&str]) -> Result<String> {
+    let rustc = toolchain.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let output = Command::new(&rustc)
+        .args(args)
+        .output()
+        .with_context(|| format!("cannot probe local compiler {}", rustc.display()))?;
+    if !output.status.success() {
+        bail!("local compiler probe {} {:?} failed", rustc.display(), args);
+    }
+    String::from_utf8(output.stdout).context("local compiler probe printed non-UTF-8")
+}
+
+fn require_frozen_local_identity(toolchain: &Path, channel: &str) -> Result<()> {
+    let verbose = local_compiler_output(toolchain, &["-vV"])?;
+    let reported = local_compiler_output(toolchain, &["--print", "sysroot"])?;
+    let sysroot = Path::new(reported.trim())
+        .canonicalize()
+        .context("local frozen compiler reported an unavailable sysroot")?;
+    if sysroot != toolchain {
+        bail!(
+            "local frozen compiler reports sysroot {}, not the selected {}",
+            sysroot.display(),
+            toolchain.display()
+        );
+    }
+    if build_frontend::classify(&verbose, Some(channel.trim()), TARGET, Some(&sysroot))
+        != "frozen-kani-oracle"
+    {
+        bail!("local toolchain is not the exact frozen Kani oracle nightly-2025-12-03");
+    }
+    Ok(())
+}
+
+/// Link a matching installed toolchain; setup never downloads a compiler.
+fn setup_rust_toolchain(kani_dir: &Path, use_local_toolchain: Option<OsString>) -> Result<String> {
+    setup_rust_toolchain_on(
+        kani_dir,
+        use_local_toolchain,
+        std::env::var_os("ATERM_STOCK_REASON").as_deref(),
+    )
+}
+
+fn setup_rust_toolchain_on(
+    kani_dir: &Path,
+    use_local_toolchain: Option<OsString>,
+    oracle_reason: Option<&OsStr>,
+) -> Result<String> {
+    let toolchain_version = get_rust_toolchain_version(kani_dir)?;
+    let rustc_version = get_rustc_version_from_build(kani_dir)?.trim().to_string();
+    let mode =
+        setup_toolchain_policy(&toolchain_version, use_local_toolchain.is_some(), oracle_reason)?;
+    let toolchain_path =
+        PathBuf::from(use_local_toolchain.expect("policy requires a local toolchain"))
+            .canonicalize()
+            .context("local toolchain directory does not exist")?;
+    // Validate before reading version metadata or changing an existing link.
+    require_local_tools(&toolchain_path, mode)?;
+    if mode == SetupToolchain::FrozenOracle {
+        require_frozen_local_identity(&toolchain_path, &toolchain_version)?;
+    }
+    let local_version =
+        get_rustc_version_from_local_toolchain(toolchain_path.clone().into_os_string())?;
+    if rustc_version != local_version {
+        bail!(
+            "The local compiler version {:?} differs from the release bundle {:?}; \
+             use the matching installed toolchain.",
+            local_version,
+            rustc_version
+        );
+    }
+    symlink_rust_toolchain(&toolchain_path, kani_dir)?;
+    println!("[3/5] Linking installed toolchain: {}", toolchain_path.display());
     Ok(toolchain_version)
 }
 
@@ -192,23 +280,7 @@ fn download_filename() -> String {
 
 /// Get the version of rustc that is being used to setup kani by the user
 fn get_rustc_version_from_local_toolchain(path: OsString) -> Result<String> {
-    let path = Path::new(&path);
-    let rustc_path = path.join("bin").join("rustc");
-
-    let output = Command::new(rustc_path).arg("--version").output();
-
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                Ok(String::from_utf8(output.stdout).map(|s| s.trim().to_string())?)
-            } else {
-                bail!(
-                    "Could not parse rustc version string. Toolchain installation likely invalid. "
-                );
-            }
-        }
-        Err(_) => bail!("Could not get rustc version. Toolchain installation likely invalid"),
-    }
+    Ok(local_compiler_output(Path::new(&path), &["--version"])?.trim().to_string())
 }
 
 /// The download URL for this version of Kani
@@ -251,6 +323,181 @@ fn symlink_rust_toolchain(toolchain: &Path, kani_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn scratch(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/setup-toolchain-tests").join(
+                format!("{name}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)),
+            );
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn fixture_bundle(root: &Path, channel: &str, version: &str) -> PathBuf {
+        let bundle = root.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("rust-toolchain-version"), channel).unwrap();
+        std::fs::write(bundle.join("rustc-version"), version).unwrap();
+        bundle
+    }
+
+    #[cfg(unix)]
+    fn fake_rustc(path: &Path, version: &str, verbose: &str, sysroot: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n\
+             --version) printf '%s\\n' {} ;;\n\
+             -vV) printf '%s\\n' {} ;;\n\
+             --print) test \"$2\" = sysroot || exit 2; printf '%s\\n' {} ;;\n\
+             *) exit 3 ;;\nesac\n",
+            quote(version),
+            quote(verbose),
+            quote(sysroot.to_str().unwrap())
+        );
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn setup_requires_an_installed_local_toolchain_in_every_lane() {
+        for channel in ["trust", "nightly-2025-12-03"] {
+            let error = setup_toolchain_policy(channel, false, Some(OsStr::new("oracle check")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("does not install compiler toolchains"), "{error}");
+        }
+        for channel in ["stable", "nightly-2025-12-04", "nightly-2025-12-03-wrong-host"] {
+            let error = setup_toolchain_policy(channel, true, Some(OsStr::new("not an exemption")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not Trust"), "{error}");
+        }
+    }
+
+    #[test]
+    fn only_the_frozen_local_oracle_requires_a_nonblank_reason() {
+        for reason in [None, Some(OsStr::new("")), Some(OsStr::new(" \n\t"))] {
+            let error =
+                setup_toolchain_policy("nightly-2025-12-03", true, reason).unwrap_err().to_string();
+            assert!(error.contains("ATERM_STOCK_REASON"), "{error}");
+        }
+        assert_eq!(setup_toolchain_policy("trust", true, None).unwrap(), SetupToolchain::Trust);
+        assert_eq!(
+            setup_toolchain_policy("nightly-2025-12-03", true, Some(OsStr::new("oracle check")))
+                .unwrap(),
+            SetupToolchain::FrozenOracle
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_setup_checks_every_required_tool_before_replacing_the_link() {
+        for missing in ["targo", "trustc", "rustc"] {
+            let root = scratch(&format!("missing-{missing}"));
+            let bundle = fixture_bundle(&root, "trust", "matching version");
+            let old = root.join("old toolchain");
+            std::fs::create_dir_all(&old).unwrap();
+            std::os::unix::fs::symlink(&old, bundle.join("toolchain")).unwrap();
+            let local = root.join("local toolchain");
+            std::fs::create_dir_all(local.join("bin")).unwrap();
+            for name in ["targo", "trustc", "rustc"] {
+                if name != missing {
+                    std::fs::write(local.join("bin").join(name), "must not be executed").unwrap();
+                }
+            }
+            let error = setup_rust_toolchain_on(&bundle, Some(local.into_os_string()), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("bin/{missing}")), "{error}");
+            assert_eq!(std::fs::read_link(bundle.join("toolchain")).unwrap(), old);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_setup_keeps_the_legacy_version_probe_and_holds_a_canonical_local_path() {
+        let root = scratch("matching-trust");
+        let version = "rustc matching version without the trustc persona suffix";
+        let bundle = fixture_bundle(&root, "trust", version);
+        let local = root.join("local toolchain with spaces");
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        for name in ["targo", "trustc"] {
+            std::fs::write(local.join("bin").join(name), "canonical tool presence").unwrap();
+        }
+        fake_rustc(&local.join("bin/rustc"), version, "unused", &local);
+        let current = std::env::current_dir().unwrap();
+        let relative = local.strip_prefix(&current).unwrap().to_path_buf();
+        setup_rust_toolchain_on(&bundle, Some(relative.into_os_string()), None).unwrap();
+        let linked = std::fs::read_link(bundle.join("toolchain")).unwrap();
+        assert!(linked.is_absolute());
+        assert_eq!(linked, local.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    fn frozen_fixture(name: &str, verbose: &str) -> (PathBuf, PathBuf) {
+        let root = scratch(name);
+        let version = "rustc 1.93.0-nightly (646a3f8c1 2025-12-02)";
+        let bundle = fixture_bundle(&root, "nightly-2025-12-03", version);
+        let local = root.join(format!("nightly-2025-12-03-{TARGET}"));
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        std::fs::write(local.join("bin/cargo"), "oracle frontend presence only").unwrap();
+        fake_rustc(&local.join("bin/rustc"), version, verbose, &local.canonicalize().unwrap());
+        (bundle, local)
+    }
+
+    #[cfg(unix)]
+    fn frozen_verbose() -> String {
+        format!(
+            "binary: rustc\nrelease: 1.93.0-nightly\nhost: {TARGET}\n\
+             commit-hash: 646a3f8c15baefb98dc6e0c1c1ba3356db702d2a\n"
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_frozen_local_setup_checks_the_actual_identity() {
+        let (bundle, local) = frozen_fixture("frozen-match", &frozen_verbose());
+        setup_rust_toolchain_on(
+            &bundle,
+            Some(local.clone().into_os_string()),
+            Some(OsStr::new("frozen oracle qualification")),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(bundle.join("toolchain")).unwrap(),
+            local.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_matching_banner_cannot_hide_wrong_frozen_compiler_facts() {
+        for verbose in [
+            frozen_verbose().replace("646a3f8c15baefb98dc6e0c1c1ba3356db702d2a", &"0".repeat(40)),
+            frozen_verbose().replace(TARGET, "wrong-host"),
+            format!("{}trust:\n", frozen_verbose()),
+        ] {
+            let (bundle, local) = frozen_fixture("frozen-mismatch", &verbose);
+            let old = bundle.parent().unwrap().join("old toolchain");
+            std::fs::create_dir_all(&old).unwrap();
+            std::os::unix::fs::symlink(&old, bundle.join("toolchain")).unwrap();
+            let error = setup_rust_toolchain_on(
+                &bundle,
+                Some(local.into_os_string()),
+                Some(OsStr::new("frozen oracle qualification")),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("not the exact frozen Kani oracle"), "{error}");
+            assert_eq!(std::fs::read_link(bundle.join("toolchain")).unwrap(), old);
+        }
+    }
 
     #[test]
     fn release_bundle_filename_uses_trust_mc_archive_name() {

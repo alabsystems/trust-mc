@@ -75,12 +75,21 @@ printf '\\n' >> "$AY_CANARY_CAPTURE"
             sysroot_bin = root / "trust-sysroot" / "bin"
             sysroot_bin.mkdir(parents=True)
             write_executable(fake_bin / "cargo", "#!/bin/sh\nexit 99\n")
-            write_executable(sysroot_bin / "cargo", "#!/bin/sh\nexit 0\n")
-            write_executable(sysroot_bin / "targo", "#!/bin/sh\nexit 0\n")
+            frontends = root / "frontend-calls.txt"
+            write_executable(
+                sysroot_bin / "cargo",
+                f'#!/bin/sh\nprintf "cargo %s\\n" "$*" >> "{frontends}"\nexit 0\n',
+            )
+            write_executable(
+                sysroot_bin / "targo",
+                f'#!/bin/sh\nprintf "targo %s\\n" "$*" >> "{frontends}"\nexit 0\n',
+            )
             write_executable(
                 sysroot_bin / "rustc",
                 '#!/bin/sh\nprintf "%s\\n" "$FAKE_TRUST_SYSROOT"\n',
             )
+            # A seal ships its compiler as `trustc` too; the resolver requires it.
+            write_executable(sysroot_bin / "trustc", "#!/bin/sh\nexit 0\n")
             write_executable(
                 fake_bin / "rustup",
                 '#!/bin/sh\nprintf "%s\\n" "$FAKE_PINNED_RUSTC"\n',
@@ -107,6 +116,8 @@ printf '%s\\n' 1111111111111111111111111111111111111111
                     "TRUST_MC_RUSTUP": str(fake_bin / "rustup"),
                 }
             )
+            # An exported Trust toolchain override would bypass the fake rustup.
+            environment.pop("TRUST_MC_TRUST_TOOLCHAIN", None)
             result = subprocess.run(
                 ["bash", "scripts/ay-bump-canary.sh"],
                 cwd=root,
@@ -120,6 +131,19 @@ printf '%s\\n' 1111111111111111111111111111111111111111
                 result.returncode,
                 0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+            # Every compile gate runs the Trust driver with an explicit lane;
+            # the sysroot's stock-cargo frontend is never reached.
+            frontend_calls = frontends.read_text().splitlines()
+            self.assertEqual(
+                [c.split(" ")[:3] for c in frontend_calls],
+                [
+                    ["targo", "--unverified", "check"],
+                    ["targo", "--unverified", "check"],
+                    ["targo", "--unverified", "build-dev"],
+                ],
+                msg="\n".join(frontend_calls),
             )
 
             calls = [line.split("\t") for line in capture.read_text().splitlines()]

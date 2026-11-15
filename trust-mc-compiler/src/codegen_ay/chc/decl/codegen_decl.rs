@@ -76,6 +76,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // First, collect state variable sorts from locals
         self.collect_state_vars();
 
+        // D1 (`decl::global_objects`): ONE object per global allocation the
+        // harness body's constants reach, transitively, minted before anything
+        // translates a constant pointer (the static collector below looks its
+        // statics up here instead of minting them).
+        self.collect_global_objects();
+
         // Phase 1.4: Collect state variables for `static mut` references (#428).
         // Must run after collect_state_vars (locals defined) and before
         // collect_numeric_ref_targets (which populates ref_targets).
@@ -86,6 +92,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // the memory init constraints. Scanning upfront ensures the entry rule
         // constrains all reachable static memory arrays.
         self.prescan_callee_statics();
+        // A preserved default array comparison walks its admitted element Eq
+        // body instead of the direct callee. Its read types must be discovered
+        // before promoted-object memory is seeded and the entry rule closes.
+        self.prescan_array_semantic_eq(self.body);
 
         // Phase 1.5: Collect BigInt/BigRational reference targets for stub resolution (#734, #911)
         self.collect_numeric_ref_targets();
@@ -95,13 +105,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.track_level >= ChcTrackLevel::Mem {
             self.collect_deref_type_arrays();
             self.collect_local_type_arrays(); // #2258: pre-declare for local assignments
-            self.predeclare_pointer_wrapper_alias_arrays(); // #2967: alias arrays for NonNull/Unique
         }
         // Part of #3841 / #3994: const-ref memory arrays must be pre-declared at
         // every track level because the entry rule emits const_ref_memory_inits
         // regardless of track level. Ptr+ still needs the extra stub/internal and
         // static-memory arrays for size/alloc checks, but promoted-const array
         // registration can no longer wait for Ptr or Mem.
+        // D2: seed every fixed object whole at the types it is read at, before
+        // its typed-memory arrays are declared.
+        self.seed_global_objects();
         self.predeclare_const_ref_type_arrays(); // #3222, #3994: promoted constant memory arrays
         if self.track_level >= ChcTrackLevel::Ptr {
             self.predeclare_stub_internal_type_arrays(); // #2982: stub-internal types (Option<usize>, Layout)
@@ -134,7 +146,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `assert_eq!` temporaries like `&0usize` and `&None::<&T>`). Re-run the
         // const-ref predeclaration once the late passes have finished so entry-rule
         // memory seeds do not hit `const_ref_array_unregistered`.
+        self.seed_global_objects();
         self.predeclare_const_ref_type_arrays();
+        // The seeds are final: a fixed-object read noted from here on (an
+        // inlined callee, a translation-time decoder) fails closed.
+        self.close_object_seeding();
 
         // Part of #3930: Promoted const refs can still carry datatype expressions
         // (for example `&RangeInclusive<u32>`) even when no state variable uses

@@ -13,6 +13,8 @@
 //! Part of #2016: test coverage for untested codegen_ay modules.
 
 use super::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Expression-level IndexRange tests
@@ -935,7 +937,7 @@ fn test_get_ref_pointee_sort_constant_returns_none() {
         // Search MIR for a Constant operand and test get_ref_pointee_sort on it
         for bb in &body.blocks {
             for stmt in &bb.statements {
-                if let StatementKind::Assign(_, Rvalue::Use(ref op @ Operand::Constant(_))) =
+                if let StatementKind::Assign(_, Rvalue::Use(ref op @ Operand::Constant(_), ..)) =
                     stmt.kind
                 {
                     let result = codegen.get_ref_pointee_sort(op);
@@ -1042,7 +1044,7 @@ fn test_iter_base_from_operand_constant_returns_none() {
         // Find a Constant operand in the MIR
         for bb in &body.blocks {
             for stmt in &bb.statements {
-                if let StatementKind::Assign(_, Rvalue::Use(ref op @ Operand::Constant(_))) =
+                if let StatementKind::Assign(_, Rvalue::Use(ref op @ Operand::Constant(_), ..)) =
                     stmt.kind
                 {
                     let result = codegen.iter_base_from_operand(Some(op));
@@ -1090,7 +1092,7 @@ fn test_polymorphic_iter_len_via_alive_field_extraction() {
             idx_sort.clone(),
         );
         let data = Expr::var("arr", Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(32)));
-        let iter_sort = polymorphic_iter_sort(POINTER_WIDTH);
+        let iter_sort = polymorphic_iter_sort(32);
         let iter_cons =
             iter_sort.datatype_default_constructor().unwrap_or("PolymorphicIter_mk").to_string();
         let iter_expr =

@@ -1,0 +1,174 @@
+# Reconstructed transcript: the chc-m1 unit log (trust-mc 04d4e4e67, --ay-chc) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_f32_to_i8_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f32_to_i8_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as i8) == i8::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:20:9 in function check_f32_to_i8_saturation
+
+Check 2: check_f32_to_i8_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f32::NAN as i8) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:21:9 in function check_f32_to_i8_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f32_to_u8_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f32_to_u8_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as u8) == u8::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:28:9 in function check_f32_to_u8_saturation
+
+Check 2: check_f32_to_u8_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f32::NAN as u8) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:29:9 in function check_f32_to_u8_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f32_to_i32_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f32_to_i32_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as i32) == i32::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:36:9 in function check_f32_to_i32_saturation
+
+Check 2: check_f32_to_i32_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f32::NAN as i32) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:37:9 in function check_f32_to_i32_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f32_to_u128_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f32_to_u128_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as u128) == u128::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:44:9 in function check_f32_to_u128_saturation
+
+Check 2: check_f32_to_u128_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f32::NAN as u128) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:45:9 in function check_f32_to_u128_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f64_to_i16_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f64_to_i16_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as i16) == i16::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:52:9 in function check_f64_to_i16_saturation
+
+Check 2: check_f64_to_i16_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f64::NAN as i16) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:53:9 in function check_f64_to_i16_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f64_to_i64_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f64_to_i64_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as i64) == i64::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:60:9 in function check_f64_to_i64_saturation
+
+Check 2: check_f64_to_i64_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f64::NAN as i64) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:61:9 in function check_f64_to_i64_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f64_to_i128_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f64_to_i128_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as i128) == i128::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:68:9 in function check_f64_to_i128_saturation
+
+Check 2: check_f64_to_i128_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f64::NAN as i128) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:69:9 in function check_f64_to_i128_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_f64_to_u128_saturation...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_f64_to_u128_saturation.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as u128) == u128::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:76:9 in function check_f64_to_u128_saturation
+
+Check 2: check_f64_to_u128_saturation.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f64::NAN as u128) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:77:9 in function check_f64_to_u128_saturation
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_issue_4536_f32_to_u8...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_issue_4536_f32_to_u8.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (x as u8) == u8::MAX"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:84:9 in function check_issue_4536_f32_to_u8
+
+Check 2: check_issue_4536_f32_to_u8.assertion.2
+	 - Status: SUCCESS
+	 - Description: "assertion failed: (f32::NAN as u8) == 0"
+	 - Location: /corpus/kani/Cast/float_to_int_saturating.rs:85:9 in function check_issue_4536_f32_to_u8
+
+SUMMARY:
+ ** 0 of 2 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Complete - 9 successfully verified harnesses, 0 failures, 9 total.

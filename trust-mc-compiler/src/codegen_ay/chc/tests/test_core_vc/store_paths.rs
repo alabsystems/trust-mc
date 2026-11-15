@@ -138,12 +138,20 @@ fn test_mir_to_chc_mem_level_deref_store() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_deref_store");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: `*ptr = 42` is never read
+        // back, so write-only array elimination (85da41dad) removes the heap Store and its
+        // Array column from the translated VC.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_deref_store",
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         let bb_count = body.blocks.len();
         assert_vc_structure(&vc, "probe_deref_store", bb_count);

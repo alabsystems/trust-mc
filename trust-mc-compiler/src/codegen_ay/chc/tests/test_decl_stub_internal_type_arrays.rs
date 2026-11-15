@@ -69,9 +69,10 @@ fn test_predeclare_spawn_runtime_support_type_arrays() {
             "spawn predeclare should register scheduling-plan state. keys: {keys:?}"
         );
         for contains_key in [
+            // No `&LocalWaker` / `ExtData` key: those locals exist only inside
+            // ContextBuilder::from_waker / build, which the walked bodies call but do not
+            // contain at opt-level 0 (Context::from_waker is not MIR-inlined there).
             "ref_std_task_Waker",
-            "ref_std_task_LocalWaker",
-            "std_panic_AssertUnwindSafe_core_task_wake_ExtData",
             "ptr",
             "std_boxed_Box_u8_std_alloc_Global",
         ] {
@@ -94,19 +95,23 @@ fn test_predeclare_spawn_runtime_support_type_arrays() {
             "SchedulingAssumption",
             "AtomicI64",
             "std_task_Waker",
-            "std_task_LocalWaker",
-            "core_task_wake_ExtData",
             "std_boxed_Box_u8_std_alloc_Global",
         ] {
-            let (type_key, (_, elem_sort)) = chc_ctx
+            // type_arrays is a HashMap and several keys can contain the fragment (YieldNow and
+            // Pin<&mut YieldNow>, whose key keeps the opaque fallback), so `find` picked one in
+            // random order. Require that some key for the fragment carries a MIR-derived sort.
+            let matching: Vec<_> = chc_ctx
                 .heap_state
                 .type_arrays
                 .iter()
-                .find(|(type_key, _)| type_key.contains(contains_key))
-                .unwrap_or_else(|| panic!("missing spawn support key containing {contains_key}"));
-            assert_ne!(
-                *elem_sort, opaque_fallback,
-                "spawn predeclare should use MIR-derived sort for {type_key}, not opaque fallback"
+                .filter(|(type_key, _)| type_key.contains(contains_key))
+                .map(|(type_key, (_, elem_sort))| (type_key.to_string(), elem_sort.clone()))
+                .collect();
+            assert!(!matching.is_empty(), "missing spawn support key containing {contains_key}");
+            assert!(
+                matching.iter().any(|(_, elem_sort)| *elem_sort != opaque_fallback),
+                "spawn predeclare should use a MIR-derived sort for a key containing {contains_key}, \
+                 not only the opaque fallback: {matching:?}"
             );
         }
     });

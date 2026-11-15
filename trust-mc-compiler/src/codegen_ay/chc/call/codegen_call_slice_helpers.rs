@@ -7,6 +7,7 @@
 //! Extracted from codegen_call_slice.rs per #3348 (file size limit).
 //! Contains type inspection, operand splitting, and IndexMut tracking.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -19,7 +20,6 @@ use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, ptr_sort};
 
 use super::codegen_call_misc::CallMisc;
-use super::codegen_ctx::globals::declare_pending_var;
 use super::stubs_option_helpers::OptionHelpers;
 use super::{ChcCtx, chc_fresh_name};
 
@@ -297,13 +297,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
-        let base = if let Some(promoted_obj_id) =
-            self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
+        let base = if let Some(object) =
+            self.ref_resolution.const_ref_objects.get(&place.local).copied()
         {
-            // ALLOCATION: `promoted_const_address_for` is literally
-            // `concat(obj_id const, 0)` — the split-pointer base of a promoted
-            // constant object, an address by construction.
-            Loc::of_address(self.heap_state.promoted_const_address_for(promoted_obj_id))
+            // ALLOCATION: the constant pointer's object base PLUS its offset
+            // (D4) — an address by construction. The base alone placed a
+            // pointer into the middle of an allocation at its start.
+            Loc::of_address(object.address())
         } else if let Some(ref_target) = self.ref_resolution.ref_targets.get(&place.local).cloned()
         {
             let target_place = rustc_public::mir::Place {
@@ -364,9 +364,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !has_nonzero_offset
             && let Some(obj_id) = self
                 .ref_resolution
-                .const_ref_promoted_obj_ids
+                .const_ref_objects
                 .get(&src_local)
-                .copied()
+                .map(|object| object.obj_id)
                 .or_else(|| self.known_alloc_ids.get(&src_local).copied())
         {
             self.known_alloc_ids.insert(dest_local, obj_id);
@@ -408,7 +408,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.ref_resolution.call_forwarded_raw_ptrs.remove(&dest_local);
         self.ref_resolution.const_ref_values.remove(&dest_local);
         self.ref_resolution.const_ref_slice_views.remove(&dest_local);
-        self.ref_resolution.const_ref_promoted_obj_ids.remove(&dest_local);
+        self.ref_resolution.const_ref_objects.remove(&dest_local);
         self.ref_resolution.subslice_offset.remove(&dest_local);
         self.ref_resolution.subslice_len.remove(&dest_local);
     }
@@ -616,7 +616,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         return None;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                             if src.projection.is_empty() =>
                         {
@@ -678,7 +678,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(data.clone());
         }
 
-        let mut rebased = declare_pending_var(chc_fresh_name(fresh_prefix), target_sort.clone());
+        let mut rebased = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
+            chc_fresh_name(fresh_prefix),
+            target_sort.clone(),
+        );
         for i in 0..max_elems {
             let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
             let src_idx = Self::slice_rebase_source_index(offset, idx.clone(), i);
@@ -747,19 +752,78 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
+        Some(Self::slice_eq_formula(lhs, rhs))
+    }
+
+    /// Largest constant length the slice equality is expanded for instead of
+    /// being stated with a quantifier.
+    pub(in crate::codegen_ay::chc) const SLICE_EQ_EXPAND_MAX_ELEMS: usize = 16;
+
+    /// `len_l == len_r && forall i < len_l . lhs[off_l + i] == rhs[off_r + i]`.
+    ///
+    /// When either length is a constant `k <= SLICE_EQ_EXPAND_MAX_ELEMS`, the
+    /// quantifier is replaced by the finite conjunction over `i` in `0..k`. The
+    /// two are EQUIVALENT, not an approximation: the length equality is part of
+    /// the same conjunction, so on every model `len_l == k` and the bound
+    /// `i < len_l` ranges over exactly `0..k`. A quantifier over array selects is
+    /// what left PDR undecided on `assert_eq!(v, [72, 105])`
+    /// (kani/Vectors/vector_extend_bytes.rs: budget-exhausted at 15 s).
+    pub(in crate::codegen_ay::chc) fn slice_eq_formula(
+        lhs: &ResolvedSliceBacking,
+        rhs: &ResolvedSliceBacking,
+    ) -> Expr {
+        Self::slice_eq_formula_with(lhs, rhs, &|x, y| Some(x.eq(y)), None, true)
+            .expect("invariant: the encoding comparator always answers")
+    }
+
+    /// [`Self::slice_eq_formula`] with `elem_eq` deciding two elements'
+    /// `==` (Rust's, for an element whose `==` is not its encoding's; see
+    /// `shared::compare_loops::rust_value_eq`). `None` when `elem_eq` cannot
+    /// decide an element. `const_len` is a constant length known for both
+    /// sides beyond the backings' own; without a constant length the
+    /// equality is a quantifier, stated only when `allow_forall` (a
+    /// quantifier over an element comparison other than bit equality was
+    /// measured to give certified wrong counterexamples on ay `d80d17a90`:
+    /// `!(vec![1.0f32][..] == vec![2.0f32][..])`, walker fail-closed review,
+    /// round 3 of the repair after the merge with main).
+    pub(in crate::codegen_ay::chc) fn slice_eq_formula_with(
+        lhs: &ResolvedSliceBacking,
+        rhs: &ResolvedSliceBacking,
+        elem_eq: &dyn Fn(Expr, Expr) -> Option<Expr>,
+        const_len: Option<usize>,
+        allow_forall: bool,
+    ) -> Option<Expr> {
+        let len_eq = lhs.len.as_expr().clone().eq(rhs.len.as_expr().clone());
+        let elem_eq_at = |idx: Expr| {
+            let lhs_idx = lhs.offset.as_expr().clone().bvadd(idx.clone());
+            let rhs_idx = rhs.offset.as_expr().clone().bvadd(idx);
+            elem_eq(
+                lhs.data.as_expr().clone().select(lhs_idx),
+                rhs.data.as_expr().clone().select(rhs_idx),
+            )
+        };
+        let constant_len = Self::const_usize_from_expr(lhs.len.as_expr())
+            .or_else(|| Self::const_usize_from_expr(rhs.len.as_expr()))
+            .or(const_len)
+            .filter(|k| *k <= Self::SLICE_EQ_EXPAND_MAX_ELEMS);
+        if let Some(k) = constant_len {
+            let mut content_eq = Expr::bool_const(true);
+            for i in 0..k {
+                content_eq =
+                    content_eq.and(elem_eq_at(Expr::bitvec_const(i as u64, POINTER_WIDTH))?);
+            }
+            return Some(len_eq.and(content_eq));
+        }
+        if !allow_forall {
+            return None;
+        }
         let idx_name = chc_fresh_name("slice_eq_idx");
         let idx_sort = ptr_sort();
         let idx = Expr::var(&idx_name, idx_sort.clone());
-        let lhs_idx = lhs.offset.as_expr().clone().bvadd(idx.clone());
-        let rhs_idx = rhs.offset.as_expr().clone().bvadd(idx.clone());
-        let elems_eq = lhs.data.as_expr().clone().select(lhs_idx).eq(rhs
-            .data
-            .as_expr()
-            .clone()
-            .select(rhs_idx));
-        let in_bounds = idx.bvult(lhs.len.as_expr().clone());
-        let content_eq = Expr::forall(vec![(idx_name, idx_sort)], in_bounds.implies(elems_eq));
-        Some(lhs.len.as_expr().clone().eq(rhs.len.as_expr().clone()).and(content_eq))
+        let in_bounds = idx.clone().bvult(lhs.len.as_expr().clone());
+        let content_eq =
+            Expr::forall(vec![(idx_name, idx_sort)], in_bounds.implies(elem_eq_at(idx)?));
+        Some(len_eq.and(content_eq))
     }
 
     /// Part of #4179 (fix): Trace backward through MIR to find a sized array
@@ -815,7 +879,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         return None;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _) => {
                             if src.projection.is_empty() { Some(src.local) } else { None }
                         }
@@ -847,7 +911,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// after unsized coercion is `&[u16]` (no length info). This method walks
     /// backward from the coerced local to find the original `&[T; N]` or
     /// `Box<[T; N]>` type and extract N.
-    fn trace_static_array_len_through_casts(&self, local: usize) -> Option<Expr> {
+    pub(in crate::codegen_ay::chc) fn trace_static_array_len_through_casts(
+        &self,
+        local: usize,
+    ) -> Option<Expr> {
         let mut current = local;
         let mut seen = HashSet::new();
         for _ in 0..8 {
@@ -883,6 +950,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
                 }
             }
+            // Check if current local is assigned via Cast(Unsize) from a Constant `&[T; N]`
+            // (e.g., `let s: &[u8] = b"ab";`).
+            for block in &self.body.blocks {
+                for stmt in &block.statements {
+                    if let StatementKind::Assign(
+                        lhs,
+                        Rvalue::Cast(_, Operand::Constant(const_op), _),
+                    ) = &stmt.kind
+                        && lhs.local == current
+                        && lhs.projection.is_empty()
+                        && let Some(len) = Self::extract_array_len_from_ref(
+                            self.resolve_body_ty(const_op.ty()),
+                        )
+                    {
+                        return Some(Expr::bitvec_const(len as u128, POINTER_WIDTH));
+                    }
+                }
+            }
             // Follow Cast/Copy/Move/Ref chains backward to find the source local.
             let next =
                 self.body.blocks.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
@@ -893,9 +978,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         return None;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _) => {
-                            if src.projection.is_empty() { Some(src.local) } else { None }
+                            if src.projection.is_empty() {
+                                Some(src.local)
+                            } else if src.projection.as_slice() == [ProjectionElem::Deref] {
+                                self.ref_resolution
+                                    .ref_targets
+                                    .get(&src.local)
+                                    .filter(|rt| rt.projections.is_empty())
+                                    .map(|rt| rt.local)
+                            } else {
+                                None
+                            }
                         }
                         Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
                             if place.projection.is_empty()
@@ -916,5 +1011,74 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod slice_eq_formula_tests {
+    use ay_bindings::{Expr, ExprValue, Sort};
+
+    use super::{ChcCtx, ResolvedSliceBacking};
+    use crate::codegen_ay::provenance::Val;
+    use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
+
+    fn backing(name: &str, len: Expr) -> ResolvedSliceBacking {
+        ResolvedSliceBacking {
+            data: Val::of_value(Expr::var(name, Sort::array(ptr_sort(), Sort::bitvec(8)))),
+            len: Val::of_value(len),
+            offset: Val::of_value(Expr::bitvec_const(0u64, POINTER_WIDTH)),
+        }
+    }
+
+    fn has_forall(e: &Expr) -> bool {
+        matches!(e.value(), ExprValue::Forall { .. }) || e.children().any(has_forall)
+    }
+
+    #[test]
+    fn constant_length_expands_without_a_quantifier() {
+        let two = Expr::bitvec_const(2u64, POINTER_WIDTH);
+        let lhs = backing("lhs_data", Expr::var("lhs_len", ptr_sort()));
+        let rhs = backing("rhs_data", two);
+        let f = ChcCtx::slice_eq_formula(&lhs, &rhs);
+        assert!(!has_forall(&f), "a constant-length slice equality must be quantifier-free: {f}");
+    }
+
+    #[test]
+    fn symbolic_length_keeps_the_quantifier() {
+        let lhs = backing("lhs_data", Expr::var("lhs_len", ptr_sort()));
+        let rhs = backing("rhs_data", Expr::var("rhs_len", ptr_sort()));
+        let f = ChcCtx::slice_eq_formula(&lhs, &rhs);
+        assert!(has_forall(&f), "symbolic lengths must keep the universal statement: {f}");
+    }
+
+    /// True when some `select` in `e` reads an index whose subtree carries the constant `i`.
+    fn reads_constant_index(e: &Expr, i: usize) -> bool {
+        fn mentions(e: &Expr, i: usize) -> bool {
+            ChcCtx::const_usize_from_expr(e) == Some(i) || e.children().any(|c| mentions(c, i))
+        }
+        match e.value() {
+            ExprValue::Select { index, .. } if mentions(index, i) => true,
+            _ => e.children().any(|c| reads_constant_index(c, i)),
+        }
+    }
+
+    /// Past the bound trust-mc does not take its own constant expansion; it builds the
+    /// universal statement. AY since 10bc4b185 (f226697349, c34d29a0a0) normalizes a
+    /// bounded exact array quantifier inside `Expr::forall` into its ground equalities,
+    /// exactly and in either polarity, so the term that comes back may carry no `Forall`
+    /// node. Either representation is correct; a truncated conjunction is not, so without
+    /// a quantifier every index `0..len` must be read.
+    #[test]
+    fn length_past_the_expansion_bound_keeps_the_quantifier() {
+        let len = ChcCtx::SLICE_EQ_EXPAND_MAX_ELEMS + 1;
+        let big = Expr::bitvec_const(len as u64, POINTER_WIDTH);
+        let lhs = backing("lhs_data", big.clone());
+        let rhs = backing("rhs_data", big);
+        let f = ChcCtx::slice_eq_formula(&lhs, &rhs);
+        if !has_forall(&f) {
+            for i in 0..len {
+                assert!(reads_constant_index(&f, i), "index {i} of {len} is missing: {f}");
+            }
+        }
     }
 }

@@ -4,6 +4,9 @@
 
 //! Unit-aware multi-constructor enum flattening helpers.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::rustc_internal;
@@ -57,7 +60,7 @@ pub(in crate::codegen_ay::chc) fn unit_aware_multi_ctor_enum_layout<'tcx, 'body>
         let mut field_slots = Vec::new();
         let mut ctor_leaves = Vec::new();
         for field in variant.fields() {
-            let field_ty = field.ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(&field, &args)?;
             // Part of #3994: detect ALL zero-sized types, not just `()`.
             // Empty structs like `struct ZeroSized;` are ZST but don't match
             // the empty-tuple pattern. Use the layout to check size == 0.

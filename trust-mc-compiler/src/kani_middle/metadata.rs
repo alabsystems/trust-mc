@@ -20,6 +20,17 @@ use trust_mc_metadata::{ArtifactType, HarnessAttributes, HarnessKind, HarnessMet
 
 use sha1_checked::Sha1;
 
+/// Bind mutation/playback to the compiler's source path before Cargo returns
+/// control to a driver that may have been launched from another directory.
+fn harness_source_file(tcx: TyCtxt, filename: &str) -> String {
+    std::path::absolute(filename)
+        .unwrap_or_else(|error| {
+            tcx.dcx().fatal(format!("cannot resolve harness source file `{filename}`: {error}"))
+        })
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Create the harness metadata for a proof harness for a given function.
 pub(crate) fn gen_proof_metadata(
     tcx: TyCtxt,
@@ -28,7 +39,8 @@ pub(crate) fn gen_proof_metadata(
 ) -> HarnessMetadata {
     let def = instance.def;
     let kani_attributes = KaniAttributes::for_instance(tcx, instance);
-    let pretty_name = instance.name();
+    // The name Kani reports and `--harness` matches: crate-relative on both toolchains.
+    let pretty_name = crate::rustc_compat::instance_name(tcx, instance);
     let mangled_name = instance.mangled_name();
 
     // We get the body span to include the entire function definition.
@@ -43,7 +55,7 @@ pub(crate) fn gen_proof_metadata(
         pretty_name,
         mangled_name,
         crate_name: def.krate().name,
-        original_file: loc.filename,
+        original_file: harness_source_file(tcx, &loc.filename),
         original_start_line: loc.start_line,
         original_end_line: loc.end_line,
         attributes: kani_attributes.harness_attributes(),
@@ -68,7 +80,7 @@ pub(crate) fn gen_contracts_metadata(
     let mut fn_to_data: HashMap<DefId, ContractedFunction> = HashMap::new();
 
     for item in crate_items {
-        let function = item.name();
+        let function = crate::rustc_compat::def_name(tcx, &item);
         let file = SourceLocation::new(item.span()).filename;
         let attributes = KaniAttributes::for_def_id(tcx, item.def_id());
 
@@ -86,7 +98,7 @@ pub(crate) fn gen_contracts_metadata(
                     ContractedFunction {
                         // Note that we use the item's fully qualified-name, rather than the target name specified in the attribute.
                         // This is necessary for the automatic contract harness lookup, see below.
-                        function: item.name(),
+                        function: crate::rustc_compat::def_name(tcx, &item),
                         file,
                         harnesses: vec![function],
                     },
@@ -114,7 +126,7 @@ pub(crate) fn gen_contracts_metadata(
                 let def_id = name_to_def_id
                     .get(target_fn)
                     .expect("target function should be in contracted functions map");
-                Some((*def_id, harness.name()))
+                Some((*def_id, crate::rustc_compat::instance_name(tcx, *harness)))
             } else {
                 None
             }
@@ -142,7 +154,7 @@ pub(crate) fn gen_automatic_proof_metadata(
     harness_mangled_name: String,
 ) -> HarnessMetadata {
     let def = fn_to_verify.def;
-    let pretty_name = fn_to_verify.name();
+    let pretty_name = crate::rustc_compat::instance_name(tcx, *fn_to_verify);
     let mangled_name = fn_to_verify.mangled_name();
 
     // Leave the concrete playback instrumentation for now, but this feature does not actually support concrete playback.
@@ -168,7 +180,7 @@ pub(crate) fn gen_automatic_proof_metadata(
         // The mangled name selects the entry point — must be the mangled name of the automatic harness intrinsic
         mangled_name: harness_mangled_name,
         crate_name: def.krate().name,
-        original_file: loc.filename,
+        original_file: harness_source_file(tcx, &loc.filename),
         original_start_line: loc.start_line,
         original_end_line: loc.end_line,
         attributes: HarnessAttributes::new(harness_kind),

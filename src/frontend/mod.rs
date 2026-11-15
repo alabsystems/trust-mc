@@ -26,7 +26,8 @@
 //!   ([`args`]). Flags trust-mc cannot honor are rejected by name.
 //!
 //! The same engine discovery serves `cargo-trust-mc` / `targo-trust-mc`
-//! ([`cargo_proxy`]), so a local `cargo build-dev` works for both entry points.
+//! ([`cargo_proxy`]), so a local `targo --unverified build-dev` works for both
+//! entry points.
 
 mod args;
 mod cancel;
@@ -52,7 +53,7 @@ pub(crate) const DRIVER: &str = "trust-mc-driver";
 pub(crate) const COMPILER: &str = "trust-mc-compiler";
 
 /// The exact command that builds the engine plus its library sysroot in place.
-pub(crate) const BUILD_CMD: &str = "cargo run --release -p build-trust-mc -- build-dev --release";
+pub(crate) const BUILD_CMD: &str = "targo --unverified build-dev --release";
 
 /// Exit code for a usage error (bad or unsupported flag, missing input).
 pub(crate) const EXIT_USAGE: u8 = 2;
@@ -523,7 +524,8 @@ fn unknown_command(word: &str) -> Fail {
         msg.push_str(&format!("       did you mean `trust-mc {near}`?\n"));
     }
     msg.push_str(&format!(
-        "\n{}Commands: {}.\nA file to verify must end in `.rs`; to verify a Cargo package use `cargo trust-mc`.",
+        "\n{}Commands: {}.\nA file to verify must end in `.rs`; to verify a Cargo package use `targo trust-mc`\n\
+         (`cargo trust-mc` with stock Rust).",
         help::usage_lines(),
         COMMANDS.join(", ")
     ));

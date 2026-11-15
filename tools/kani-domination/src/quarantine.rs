@@ -131,6 +131,120 @@ pub fn oracle_fixup(suite: &str, rel: &str) -> Option<&'static OracleFixup> {
     ORACLE_FIXUPS.iter().find(|e| e.suite == suite && e.rel == rel)
 }
 
+/// A verdict-indeterminate expected file that quotes only the MESSAGE of a
+/// compile-time diagnostic, without the `error` level that
+/// `discover::compile_fail_basis` recognises lexically — so nothing in the
+/// file itself says "this is a compile error". Membership is an explicit
+/// allowlist with the upstream evidence, and it applies only while the
+/// expected file still contains `expected_quote`.
+pub struct CompileFailOracle {
+    pub suite: &'static str,
+    pub rel: &'static str,
+    /// Text the expected file must still contain for the entry to apply.
+    pub expected_quote: &'static str,
+    /// Upstream's diagnostic IS a compiler panic that carries the quoted
+    /// message, so a panic in trust-mc's output does not disqualify the match.
+    pub upstream_ice: bool,
+    pub evidence: &'static str,
+}
+
+/// Measured 2026-09-14 from upstream Kani built at the pinned corpus rev
+/// (`kani-src`, reporting `kani 0.67.0`; the `results-verification-kanisrc`
+/// run's unit logs): every entry exits 1 with no `VERIFICATION:-` verdict, and
+/// the quoted message is part of a compile-time diagnostic (or, for the two
+/// `offset-invalid-args` units, of kani-compiler's panic).
+pub const COMPILE_FAIL_ORACLES: &[CompileFailOracle] = &[
+    CompileFailOracle {
+        suite: "expected",
+        rel: "assert-arg-error/test.rs",
+        expected_quote: "cannot find value `foo` in this scope",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error[E0425]: cannot find value `foo` in this scope`, \
+                   `error: aborting due to 1 previous error`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "async_proof/main.rs",
+        expected_quote: "cannot be applied to async functions that take arguments for now",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error: `foo` is not a valid option for `#[kani::proof]`.`, \
+                   `error: `#[kani::proof]` cannot be applied to async functions that take arguments for now`, \
+                   `error: aborting due to 2 previous errors`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "function-contract/history/ui/noncopy_ignore.rs",
+        expected_quote: "use of moved value: `ptr`",
+        upstream_ice: false,
+        evidence: "a `ui` compile-fail test (E0382 message); kani-compiler exits 101 with \
+                   `error[E0614]: type `u32` cannot be dereferenced` instead, so Kani's own run \
+                   misses the quoted line; no verdict, exit 1. Upstream-ignored (`ignore` in the path)",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "function-contract/history/ui/old_result.rs",
+        expected_quote: "cannot find value `result` in this scope",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error[E0425]: cannot find value `result` in this scope`, \
+                   `error: aborting due to 1 previous error`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "offset-invalid-args/invalid_offset_ty.rs",
+        expected_quote: "Cannot offset by non-isize type u32",
+        upstream_ice: true,
+        evidence: "kani-compiler exits 101 during codegen: `error: internal compiler error: … broken MIR`, \
+                   the message `Cannot offset by non-isize type u32`, `Kani unexpectedly panicked during \
+                   compilation.`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "offset-invalid-args/non_ptr_arg.rs",
+        expected_quote: "Cannot offset non-pointer type",
+        upstream_ice: true,
+        evidence: "kani-compiler exits 101 during codegen: `error: internal compiler error: … broken MIR`, \
+                   the message `Cannot offset non-pointer type &'{erased} [i32; 1_usize]`, `Kani unexpectedly \
+                   panicked during compilation.`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "stub-set-cycle/main.rs",
+        expected_quote: "circular stub set reference: `set_a`",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error: circular stub set reference: `set_a``, \
+                   `error: aborting due to 1 previous error; 1 warning emitted`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "stub-set-invalid-entry/main.rs",
+        expected_quote: "unknown entry in stub set:",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error: unknown entry in stub set: `unknown_entry (real_fn , mock_fn)`. \
+                   Expected `stub(...)` or `use_stub_set(...)``; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "stub-set-not-a-stub-set/main.rs",
+        expected_quote: "is not a stub set (missing `kani::stub_set!` definition)",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error: `NOT_A_STUB_SET` is not a stub set (missing \
+                   `kani::stub_set!` definition)`; no verdict, exit 1",
+    },
+    CompileFailOracle {
+        suite: "expected",
+        rel: "stubbing-type-mismatch-after-rename/main.rs",
+        expected_quote: "Cannot stub `original` by `wrong_return_type`",
+        upstream_ice: false,
+        evidence: "kani-compiler exits 101: `error: Cannot stub `original` by `wrong_return_type`.` with \
+                   `- Expected return type `T`, but found `bool``; no verdict, exit 1",
+    },
+];
+
+/// The compile-fail oracle entry for a test, if it is manifest-listed.
+pub fn compile_fail_oracle(suite: &str, rel: &str) -> Option<&'static CompileFailOracle> {
+    COMPILE_FAIL_ORACLES.iter().find(|e| e.suite == suite && e.rel == rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +297,21 @@ mod tests {
                 e.rel
             );
         }
+    }
+
+    /// The compile-fail manifest names each unit once, with a non-empty quote
+    /// and evidence, and looks up only what it lists.
+    #[test]
+    fn compile_fail_manifest_is_unique_and_quoted() {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in COMPILE_FAIL_ORACLES {
+            assert!(seen.insert((e.suite, e.rel)), "{}/{} listed twice", e.suite, e.rel);
+            assert!(!e.expected_quote.trim().is_empty() && e.evidence.contains("exit"), "{}/{}", e.suite, e.rel);
+            assert!(compile_fail_oracle(e.suite, e.rel).is_some());
+            assert_eq!(e.upstream_ice, e.evidence.contains("panicked"), "{}/{}: the ICE flag must match its evidence", e.suite, e.rel);
+        }
+        assert!(compile_fail_oracle("expected", "assert-arg-error/other.rs").is_none());
+        assert!(compile_fail_oracle("kani", "assert-arg-error/test.rs").is_none());
     }
 
     #[test]

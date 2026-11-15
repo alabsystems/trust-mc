@@ -249,7 +249,7 @@ fn test_mir_intrinsic_copy_with_offset_preserves_ref_targets_into_copy_dst() {
                 }
                 match rhs {
                     Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => Some(src.local),
+                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => Some(src.local),
                     _ => None,
                 }
             })
@@ -486,18 +486,25 @@ fn test_copy_nonoverlapping_avoids_self_referential_out_store() {
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_copy_with_preinit", ChcConfig::default());
         let (vc, _) = chc_ctx.translate();
         let smt = emit_chc(&vc).to_string();
+        // `translate()` scalarizes the copy's constant-index store chain (7faa74cf9, 948cc5d4e), so
+        // the stores are checked on the pre-pass VC, and both VCs are scanned for self-reference.
+        let pre_pass_ctx =
+            ChcCtx::new(ctx.tcx, &body, "probe_copy_with_preinit", ChcConfig::default());
+        let pre_pass_smt = emit_chc(&pre_pass_vc(pre_pass_ctx)).to_string();
 
         let mut self_referential_eq = Vec::new();
-        for segment in smt.split("(= ") {
-            let Some((lhs, _rest)): Option<(&str, &str)> = segment.split_once(' ') else {
-                continue;
-            };
-            if !lhs.contains("probe_copy_with_preinit") || !lhs.contains("__out") {
-                continue;
-            }
-            let needle = format!("(= {lhs} (store {lhs}");
-            if smt.contains(&needle) {
-                self_referential_eq.push(needle);
+        for text in [&smt, &pre_pass_smt] {
+            for segment in text.split("(= ") {
+                let Some((lhs, _rest)): Option<(&str, &str)> = segment.split_once(' ') else {
+                    continue;
+                };
+                if !lhs.contains("probe_copy_with_preinit") || !lhs.contains("__out") {
+                    continue;
+                }
+                let needle = format!("(= {lhs} (store {lhs}");
+                if text.contains(&needle) {
+                    self_referential_eq.push(needle);
+                }
             }
         }
 
@@ -506,7 +513,7 @@ fn test_copy_nonoverlapping_avoids_self_referential_out_store() {
             "copy_nonoverlapping generated self-referential __out store constraints: {self_referential_eq:?}"
         );
         assert!(
-            smt.contains("(store"),
+            pre_pass_smt.contains("(store"),
             "copy_nonoverlapping should still generate store constraints"
         );
     });
@@ -608,7 +615,9 @@ fn test_raw_ptr_cast_copy_no_fallback() {
 
         let chc_ctx =
             ChcCtx::new(ctx.tcx, &body, "probe_copy_raw_ptr_cast_fb", ChcConfig::default());
-        let (vc, _) = chc_ctx.translate();
+        // Pre-pass VC: `dst` is never read, so write-only array elimination (85da41dad)
+        // removes the copy's stores from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
 
         // The VC should have non-empty relations and rules.
         assert!(!vc.relations.is_empty(), "VC should have relations");
@@ -730,8 +739,15 @@ fn test_raw_ptr_cast_copy_with_assert_fallback_site() {
             ChcCtx::new(ctx.tcx, &body, "probe_copy_raw_ptr_cast_assert", ChcConfig::default());
         let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
-        // Check for store constraints (copy encoding worked).
-        let smt = emit_chc(&vc).to_string();
+        // Check for store constraints (copy encoding worked) on the pre-pass VC: `dst` is
+        // read at constant indices, so `translate()` scalarizes the store chain (7faa74cf9).
+        let pre_pass = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_copy_raw_ptr_cast_assert",
+            ChcConfig::default(),
+        ));
+        let smt = emit_chc(&pre_pass).to_string();
         assert!(smt.contains("(store"), "copy encoding should produce store constraints");
 
         // The compiletest harness shows sound_fallback_count=1.

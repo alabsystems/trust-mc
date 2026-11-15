@@ -13,9 +13,25 @@ use crate::kani_middle::kani_functions::{
 use rustc_public::ty::FnDef;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     pub(crate) static QUERY_DB: RefCell<QueryDb> = RefCell::new(QueryDb::default());
+}
+
+/// Whether `check_crate_items` has already run in this process.
+static CRATE_ITEMS_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Claim this process's single `check_crate_items` run: `true` for the first
+/// caller only.
+///
+/// The check runs from the top of `codegen_crate`, which the embedded binary
+/// and the trustc-hosted dylib share. The binary's `after_analysis` claims it
+/// only when the session will not reach `codegen_crate` (`-Z no-codegen`, or no
+/// output that needs codegen), so neither path runs it twice. `codegen_crate`
+/// makes a lost claim fatal rather than generating VCs unchecked.
+pub(crate) fn claim_crate_items_check() -> bool {
+    !CRATE_ITEMS_CHECKED.swap(true, Ordering::SeqCst)
 }
 
 /// This structure is only accessed via thread_local storage to ensure thread safety.
@@ -33,6 +49,11 @@ pub(crate) struct QueryDb {
 impl QueryDb {
     pub(crate) fn set_args(&mut self, args: Arguments) {
         self.args = Some(args);
+    }
+
+    /// Whether this database already carries the engine arguments.
+    pub(crate) fn has_args(&self) -> bool {
+        self.args.is_some()
     }
 
     pub(crate) fn args(&self) -> &Arguments {

@@ -15,12 +15,15 @@ use tracing::debug;
 
 use crate::codegen_ay::chc::ChcCtx;
 use crate::codegen_ay::chc::call::inline_body::{
-    extract_inline_assert_guard, translate_inline_body,
+    extract_inline_assert_guard, translate_inline_body, walk_drop_body,
 };
 
 use super::super::{CodegenRules, TransitionContext};
 use super::baseline::restore_dyn_drop_d2_candidate_baseline;
-use super::dyn_dispatch::seed_box_new_payload_vtable;
+use super::dyn_dispatch::{DynDropBody, DynDropCandidate};
+use super::effects::{
+    compose_box_deallocation_updates, compose_host_drop_constraints, metadata_observers_are_inputs,
+};
 use super::emit_helpers::{emit_inline_guard_error, vtable_guard};
 
 /// Resolve the vtable discriminant expression for D2 multi-impl dispatch.
@@ -62,27 +65,7 @@ fn resolve_d2_vtable_disc_general(
     } else {
         ctx.try_extract_vtable_discriminant(&[], receiver_local)
     };
-    // Part of #3793: If the discriminant resolved to a vtable state var's
-    // OUTPUT name, replace with the INPUT name.
-    let disc_str = format!("{disc}");
-    if disc_str.ends_with("__out") {
-        let in_candidate = &disc_str[..disc_str.len() - 5];
-        if ctx.state_var_index_by_name(in_candidate).is_some() {
-            debug!(
-                disc_out = %disc_str,
-                disc_in = %in_candidate,
-                "Drop(dyn) D2: rewrote vtable disc from __out to INPUT (#3793)"
-            );
-            Expr::var(
-                in_candidate,
-                ay_bindings::Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
-            )
-        } else {
-            disc
-        }
-    } else {
-        disc
-    }
+    disc
 }
 
 /// Execute D2 multi-impl dispatch: emit one guarded CHC rule per candidate.
@@ -97,7 +80,7 @@ pub(super) fn dispatch_d2_multi_impl(
     place: &rustc_public::mir::Place,
     self_expr: &Expr,
     vtable_disc: &Expr,
-    drop_bodies: &[(u64, rustc_public::mir::Body, rustc_public::mir::mono::Instance)],
+    drop_bodies: &[DynDropCandidate],
     target: usize,
     tctx: &TransitionContext<'_>,
     dealloc_extras: &[Expr],
@@ -111,31 +94,97 @@ pub(super) fn dispatch_d2_multi_impl(
     );
     let mut any_inlined = false;
 
-    for (vtable_id, body, drop_instance) in drop_bodies {
+    // Phase 0 (call/inline_walk_guard.rs): one write mark over the candidate
+    // loop. Each candidate here starts from the restored baseline and emits its
+    // own guarded rule, so the mark only makes the rule uniform with the other
+    // multi-walk front doors.
+    let saved_mark = ctx.inline_walk_write_mark;
+    if saved_mark.is_none() {
+        ctx.inline_walk_write_mark = Some(ctx.heap_state.write_mark());
+    }
+    let constant = match vtable_disc.value() {
+        ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).ok(),
+        _ => None,
+    };
+    for candidate in drop_bodies {
+        let vtable_id = &candidate.vtable;
+        if constant.is_some_and(|value| value != *vtable_id) {
+            continue;
+        }
+        restore_dyn_drop_d2_candidate_baseline(ctx, &baseline_modified, &baseline_heap);
+        let (body, drop_instance) = match &candidate.body {
+            DynDropBody::Empty => {
+                emit_d2_inlined_candidate(
+                    ctx,
+                    vtable_disc,
+                    *vtable_id,
+                    &Expr::bool_const(true),
+                    &[],
+                    target,
+                    tctx,
+                    dealloc_extras,
+                );
+                any_inlined = true;
+                continue;
+            }
+            DynDropBody::Unsupported => {
+                emit_d2_fallback_candidate(
+                    ctx,
+                    vtable_disc,
+                    *vtable_id,
+                    target,
+                    tctx,
+                    dealloc_extras,
+                );
+                any_inlined = true;
+                continue;
+            }
+            DynDropBody::Body(body, instance) => (body, instance),
+        };
         restore_dyn_drop_d2_candidate_baseline(ctx, &baseline_modified, &baseline_heap);
 
         let params = [self_expr.clone()];
         // Part of #4097: Register callee statics before inlining.
-        ctx.register_callee_body_statics(body);
+        ctx.register_callee_body_consts(body);
         ctx.mark_inline_field_reads(body, &params, tctx.bb_idx);
         let mut caller_vtable_ids = std::collections::HashMap::new();
         caller_vtable_ids.insert(1, vtable_disc.clone());
-        seed_box_new_payload_vtable(ctx, place.local, body, &mut caller_vtable_ids);
-        let inline_result = translate_inline_body(
-            ctx,
-            body,
-            &params,
-            tctx.bb_idx,
-            &caller_vtable_ids,
-            Some(*drop_instance),
-            0,
-        );
+        let inline_result = walk_drop_body(ctx, |ctx| {
+            translate_inline_body(
+                ctx,
+                body,
+                &params,
+                tctx.bb_idx,
+                &caller_vtable_ids,
+                Some(*drop_instance),
+                0,
+            )
+        });
         if let Some(inline_result) = inline_result {
+            // The candidate's side-channel checks hold under its own dispatch
+            // condition (`disc == id`, the guard its transition carries).
+            let candidate_guard = vtable_guard(vtable_disc, *vtable_id);
+            ctx.emit_deferred_inline_checks_at(
+                tctx.from_app,
+                &tctx.shared_constraints[..],
+                tctx.bb_idx,
+                inline_result
+                    .deferred_checks
+                    .iter()
+                    .cloned()
+                    .map(|check| check.weaken_by_guard(&candidate_guard))
+                    .collect(),
+            );
             emit_d2_inlined_candidate(
                 ctx,
                 vtable_disc,
                 *vtable_id,
                 &inline_result.value,
+                &inline_result
+                    .deferred_checks
+                    .iter()
+                    .map(|check| check.check.clone())
+                    .collect::<Vec<_>>(),
                 target,
                 tctx,
                 dealloc_extras,
@@ -162,6 +211,29 @@ pub(super) fn dispatch_d2_multi_impl(
         }
     }
 
+    if constant.is_none_or(|value| !drop_bodies.iter().any(|candidate| candidate.vtable == value)) {
+        // Preserve the successor for unknown metadata, retaining explicit debt
+        // rather than assuming a complete vtable universe or pruning the arm.
+        restore_dyn_drop_d2_candidate_baseline(ctx, &baseline_modified, &baseline_heap);
+        let covered = drop_bodies.iter().fold(Expr::bool_const(false), |acc, candidate| {
+            acc.or(vtable_guard(vtable_disc, candidate.vtable))
+        });
+        let mut constraints = vec![covered.not()];
+        if let Some(updates) = compose_box_deallocation_updates(ctx, dealloc_extras) {
+            constraints.extend(updates);
+        }
+        let outputs = ctx.build_block_output_args(tctx.modified_locals, None);
+        ctx.emit_goto_rule_shared_extra(
+            tctx.from_app,
+            target,
+            &outputs,
+            tctx.shared_constraints,
+            constraints,
+        );
+        ctx.record_sound_fallback_reason("dyn_drop_vtable_coverage_unproven");
+        any_inlined = true;
+    }
+    ctx.inline_walk_write_mark = saved_mark;
     restore_dyn_drop_d2_candidate_baseline(ctx, &baseline_modified, &baseline_heap);
     any_inlined
 }
@@ -172,22 +244,54 @@ fn emit_d2_inlined_candidate(
     vtable_disc: &Expr,
     vtable_id: u64,
     inline_value: &Expr,
+    deferred_checks: &[Expr],
     target: usize,
     tctx: &TransitionContext<'_>,
     dealloc_extras: &[Expr],
 ) {
+    let candidate_guard = vtable_guard(vtable_disc, vtable_id);
     let inline_guard = extract_inline_assert_guard(inline_value);
+    if !dealloc_extras.is_empty()
+        && !metadata_observers_are_inputs(
+            ctx,
+            &deferred_checks.iter().cloned().chain(inline_guard.clone()).collect::<Vec<_>>(),
+        )
+    {
+        ctx.emit_goto_rule_shared_extra(
+            tctx.from_app,
+            target,
+            tctx.output_args,
+            tctx.shared_constraints,
+            vec![candidate_guard],
+        );
+        return;
+    }
+    let updates = if dealloc_extras.is_empty() {
+        Some(Vec::new())
+    } else {
+        compose_box_deallocation_updates(ctx, dealloc_extras)
+    };
+    let updates = updates.unwrap_or_default();
+    let guarded_inline =
+        inline_guard.as_ref().map(|guard| candidate_guard.clone().implies(guard.clone()));
     emit_inline_guard_error(
         ctx,
         tctx.from_app,
         tctx.shared_constraints,
         tctx.bb_idx,
-        inline_guard.as_ref(),
+        guarded_inline.as_ref(),
     );
-    for check in ctx.heap_state.pending_checks.drain(..).collect::<Vec<_>>() {
+    let pending_checks = ctx.heap_state.pending_checks.drain(..).collect::<Vec<_>>();
+    let observed = deferred_checks
+        .iter()
+        .cloned()
+        .chain(pending_checks.iter().cloned())
+        .chain(inline_guard.clone())
+        .collect::<Vec<_>>();
+    for check in pending_checks {
         ctx.emit_error_rule_for_condition_shared(
             tctx.from_app,
-            check,
+            candidate_guard.clone().implies(check),
             tctx.shared_constraints,
             tctx.bb_idx,
         );
@@ -195,15 +299,25 @@ fn emit_d2_inlined_candidate(
     let mut extra_constraints = Vec::new();
     extra_constraints.append(&mut ctx.heap_state.pending_updates);
     extra_constraints.append(&mut ctx.heap_state.drain_store_chains(&ctx.diagnostics));
-    extra_constraints.extend(inline_guard);
+    extra_constraints.extend(inline_guard.clone());
     extra_constraints.push(vtable_guard(vtable_disc, vtable_id));
-    extra_constraints.extend_from_slice(dealloc_extras);
+    extra_constraints.extend(updates);
+    let Some(shared) = compose_host_drop_constraints(
+        ctx,
+        &tctx.shared_constraints[..],
+        &extra_constraints,
+        &observed,
+    ) else {
+        ctx.emit_goto_rule_shared(tctx.from_app, target, tctx.output_args, tctx.shared_constraints);
+        return;
+    };
+    let shared = std::sync::Arc::from(shared);
     let new_output_args = ctx.build_block_output_args(tctx.modified_locals, None);
     ctx.emit_goto_rule_shared_extra(
         tctx.from_app,
         target,
         &new_output_args,
-        tctx.shared_constraints,
+        &shared,
         extra_constraints,
     );
 }
@@ -222,8 +336,14 @@ fn emit_d2_fallback_candidate(
     dealloc_extras: &[Expr],
 ) {
     let mut fallback_constraints = Vec::new();
+    let updates = if dealloc_extras.is_empty() {
+        Some(Vec::new())
+    } else {
+        compose_box_deallocation_updates(ctx, dealloc_extras)
+    };
+    fallback_constraints.extend(updates.unwrap_or_default());
     fallback_constraints.push(vtable_guard(vtable_disc, vtable_id));
-    fallback_constraints.extend_from_slice(dealloc_extras);
+
     ctx.emit_goto_rule_shared_extra(
         tctx.from_app,
         target,

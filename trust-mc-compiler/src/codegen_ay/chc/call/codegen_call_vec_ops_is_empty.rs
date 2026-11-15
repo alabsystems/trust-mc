@@ -337,6 +337,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if !projs_match {
                     continue;
                 }
+                // Only a field that holds a REFERENCE to the Vec (a closure's
+                // captured `&Vec`): a tracked local whose target is a by-value
+                // Vec field is a borrow taken at some earlier point, and its
+                // length was propagated when it was taken. `s.v = vec![1, 2]`
+                // after a drop-glue reborrow of the old `s.v` left that
+                // reborrow's length at 0, and `s.v.len() == 0` verified clean
+                // where Kani fails (walker fail-closed repair round 4,
+                // finding 7's class, `r6_bmc_field_stale.rs`
+                // `s3_vec_field_direct_store_bug`). A by-value field is read
+                // where it lives (the struct-embedded path below).
+                if !Self::field_projection_holds_reference(rt.projections.last()) {
+                    continue;
+                }
                 // Bucket A (#4046, #4057): accept when tracked local is Vec-shaped
                 // OR when the field projection type is &Vec<T>.
                 if !self.local_is_vec_shaped(tracked_local, modified_locals) {

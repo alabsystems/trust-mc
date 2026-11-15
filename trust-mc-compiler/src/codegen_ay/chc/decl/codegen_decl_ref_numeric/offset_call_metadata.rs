@@ -132,7 +132,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         values: &HashMap<usize, i128>,
     ) -> Option<i128> {
         match rhs {
-            Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+            Rvalue::Use(operand, ..) | Rvalue::Cast(_, operand, _) => {
                 self.resolve_decl_const_isize_operand(operand, values)
             }
             Rvalue::BinaryOp(op, lhs, rhs) => {

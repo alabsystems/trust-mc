@@ -103,7 +103,7 @@ fn bmc_reachability_verdict(smt: &str) -> String {
 /// An error rule whose constraints reference an equality against a bv64 zero
 /// constant — the shape of the negated `ptr != 0` obligation.
 fn has_null_check_error_rule(vc: &trust_mc_core::chc::ChcVc) -> bool {
-    vc.rules.iter().filter(|rule| rule.head.name == "error").any(|rule| {
+    vc.rules.iter().filter(|rule| is_error_check_rule(rule)).any(|rule| {
         rule.body.constraints.iter().any(|c| {
             constraint_tree_contains(c, &|expr| {
                 if let ExprValue::Eq(lhs, rhs) = expr.value() {

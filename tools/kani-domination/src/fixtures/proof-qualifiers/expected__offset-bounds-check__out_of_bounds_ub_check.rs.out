@@ -1,0 +1,50 @@
+# Reconstructed transcript: the chc-m1 unit log (trust-mc 04d4e4e67, --ay-chc) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness test_offset_overflow...
+[AY:CTREX_CAT:Genuine]
+Check 1: test_offset_overflow.offset.1
+	 - Status: FAILURE
+	 - Description: "Offset result and original pointer must point to the same allocation"
+	 - Location: /corpus/expected/offset-bounds-check/out_of_bounds_ub_check.rs:12:23 in function test_offset_overflow
+
+SUMMARY:
+ ** 1 of 1 failed
+Failed Checks: Offset result and original pointer must point to the same allocation
+ File: /corpus/expected/offset-bounds-check/out_of_bounds_ub_check.rs, line 12, in test_offset_overflow
+
+VERIFICATION:- FAILED
+Verification Time: 0.4s
+
+Checking harness check_ptr_oob...
+[AY:CTREX_CAT:Genuine]
+Check 1: check_ptr_oob.offset.1
+	 - Status: FAILURE
+	 - Description: "Offset result and original pointer must point to the same allocation"
+	 - Location: /corpus/expected/offset-bounds-check/out_of_bounds_ub_check.rs:21:23 in function check_ptr_oob
+
+SUMMARY:
+ ** 1 of 1 failed
+Failed Checks: Offset result and original pointer must point to the same allocation
+ File: /corpus/expected/offset-bounds-check/out_of_bounds_ub_check.rs, line 21, in check_ptr_oob
+
+VERIFICATION:- FAILED
+Verification Time: 0.4s
+
+Checking harness check_ptr_end...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_ptr_end.offset.1
+	 - Status: SUCCESS
+	 - Description: "Offset result and original pointer must point to the same allocation"
+	 - Location: /corpus/expected/offset-bounds-check/out_of_bounds_ub_check.rs:30:23 in function check_ptr_end
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - test_offset_overflow
+Verification failed for - check_ptr_oob
+Complete - 1 successfully verified harnesses, 2 failures, 3 total.
+CTREX breakdown: 0 EncodingGap, 0 OverApproximation, 2 Genuine, 0 Unknown

@@ -24,6 +24,9 @@ use tracing::{debug, debug_span, trace};
 
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashSet;
+#[cfg(trust_toolchain)]
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+#[cfg(not(trust_toolchain))]
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_middle::ty::{TyCtxt, VtblEntry};
 use rustc_public::CrateItem;
@@ -50,6 +53,7 @@ use std::{
 use crate::kani_middle::coercion;
 use crate::kani_middle::coercion::CoercionBase;
 use crate::kani_middle::is_anon_static;
+use crate::kani_middle::std_abstraction::{Abstraction, StdAbstraction};
 use crate::kani_middle::transform::BodyTransformation;
 
 pub(crate) trait AbstractionBoundary {
@@ -58,6 +62,57 @@ pub(crate) trait AbstractionBoundary {
     /// operations) even without an explicit stub in `StubRegistry`. (Part of #3777)
     fn has_handler_backed_abstraction(&self, path: &str) -> bool;
     fn record_unstubbed_abstraction(&self, path: &str);
+    fn begin_inventory(&self) {}
+    fn finish_inventory(&self) {}
+    fn record_reachable_body(&self, _caller: Instance, _body: &Body) {}
+    /// A direct call observed by this collector, not a path-based approximation.
+    fn record_unstubbed_call(
+        &self,
+        path: &str,
+        _callee: Instance,
+        _site: Option<AbstractionCallsite<'_>>,
+        _identity_established: bool,
+    ) {
+        self.record_unstubbed_abstraction(path);
+    }
+}
+
+/// Compiler-owned custody of a direct call in a reachable body.
+#[derive(Clone, Copy)]
+pub(crate) struct AbstractionCallsite<'a> {
+    pub caller: Instance,
+    pub body: &'a Body,
+    pub block: usize,
+}
+
+/// Where reachability stops: the backend's stubs, the standard-library
+/// abstraction set, and the unit's harness stub map, consulted first.
+///
+/// `#[kani::stub(std::fs::read, mock_read)]` makes `FnStubPass` hand reachability
+/// `mock_read`'s body for `std::fs::read`. Deciding by `std::fs` before the stub map
+/// was consulted abstracted the call anyway: `mock_read` was never collected, the
+/// call stayed an unconstrained `fs` pre-route, and the harness checked a different
+/// program than the one Kani checks.
+struct Boundary<'a> {
+    backend: &'a dyn AbstractionBoundary,
+    stubs: crate::kani_middle::codegen_units::Stubs,
+    std: StdAbstraction,
+}
+
+/// Whether `FnStubPass` replaces `instance`'s body under `stubs`.
+///
+/// Mirrors that pass's own filter: only a `from -> to` pair where BOTH sides have a body is
+/// a body replacement. Every call site naming a stubbed function is rewritten to the stub by
+/// `CallSiteStubPass`, so an extern original is never reached through this instance and the
+/// boundary keeps deciding it.
+pub(crate) fn harness_stub_replaces_body(
+    stubs: &crate::kani_middle::codegen_units::Stubs,
+    instance: Instance,
+) -> bool {
+    let TyKind::RigidTy(RigidTy::FnDef(from, _)) = instance.ty().kind() else {
+        return false;
+    };
+    stubs.get(&from).is_some_and(|to| from.body().is_some() && to.body().is_some())
 }
 
 /// Collect all reachable items starting from the given starting points.
@@ -67,12 +122,25 @@ pub(crate) fn collect_reachable_items(
     starting_points: &[MonoItem],
     abstraction_boundary: &dyn AbstractionBoundary,
 ) -> (Vec<MonoItem>, CallGraph) {
+    abstraction_boundary.begin_inventory();
     // For each harness, collect items using the same collector.
     // I.e.: This will return any item that is reachable from one or more of the starting points.
-    let mut collector = MonoItemsCollector::new(tcx, transformer, abstraction_boundary);
+    let boundary = Boundary {
+        backend: abstraction_boundary,
+        stubs: transformer.stub_map_for_walk(),
+        std: StdAbstraction::resolve(tcx),
+    };
+    let mut collector = MonoItemsCollector::new(tcx, transformer, &boundary);
+    crate::kani_middle::dyn_universe::begin_collection();
     for item in starting_points {
         collector.collect(item);
     }
+    collector.call_graph.dyn_universe = crate::kani_middle::dyn_universe::end_collection();
+    // Design 5 backstop (`loop_contract_reach.rs`): which reachable functions
+    // can reach a loop contract, for the CHC harness-body prescan.
+    let loop_contract_reach =
+        collector.call_graph.loop_contract_reach(&collector.collected, &collector.opaque);
+    collector.call_graph.dyn_universe.set_loop_contract_reach(loop_contract_reach);
 
     #[cfg(debug_assertions)]
     collector
@@ -100,6 +168,7 @@ pub(crate) fn collect_reachable_items(
     // order of the errors and warnings is stable.
     let mut sorted_items: Vec<_> = collector.collected.into_iter().collect();
     sorted_items.sort_by_cached_key(|item| to_fingerprint(tcx, item));
+    abstraction_boundary.finish_inventory();
     (sorted_items, collector.call_graph)
 }
 
@@ -152,28 +221,33 @@ struct MonoItemsCollector<'tcx, 'a> {
     collected: FxHashSet<MonoItem>,
     /// Functions that were abstracted at the reachability boundary.
     abstracted: FxHashSet<MonoItem>,
+    /// Visited functions whose body calls (or has a vtable method that is) a
+    /// function abstracted at the boundary, whose body was never followed
+    /// (design 5, `loop_contract_reach.rs`).
+    opaque: FxHashSet<MonoItem>,
     /// Items enqueued for visiting.
     queue: Vec<MonoItem>,
     /// Call graph used for dataflow analysis.
     call_graph: CallGraph,
-    /// Backend-specific abstraction/stub policy.
-    abstraction_boundary: &'a dyn AbstractionBoundary,
+    /// Where reachability stops.
+    boundary: &'a Boundary<'a>,
 }
 
 impl<'tcx, 'a> MonoItemsCollector<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
         transformer: &'a mut BodyTransformation,
-        abstraction_boundary: &'a dyn AbstractionBoundary,
+        boundary: &'a Boundary<'a>,
     ) -> Self {
         MonoItemsCollector {
             tcx,
             collected: FxHashSet::default(),
             abstracted: FxHashSet::default(),
+            opaque: FxHashSet::default(),
             queue: vec![],
             call_graph: CallGraph::default(),
             transformer,
-            abstraction_boundary,
+            boundary,
         }
     }
 
@@ -193,8 +267,7 @@ impl<'tcx, 'a> MonoItemsCollector<'tcx, 'a> {
             }
             if matches!(
                 &to_visit,
-                MonoItem::Fn(instance)
-                    if is_abstract_function(self.tcx, *instance, self.abstraction_boundary)
+                MonoItem::Fn(instance) if self.boundary.abstracts(self.tcx, *instance)
             ) {
                 trace!(?to_visit, "reachable_items: abstract stub boundary");
                 self.abstracted.insert(to_visit);
@@ -225,18 +298,30 @@ impl<'tcx, 'a> MonoItemsCollector<'tcx, 'a> {
     /// Visit a function and collect all mono-items reachable from its instructions.
     fn visit_fn(&mut self, instance: Instance) -> Vec<CollectedItem> {
         let _guard = debug_span!("visit_fn", function=?instance).entered();
-        if is_abstract_function(self.tcx, instance, self.abstraction_boundary) {
+        if self.boundary.abstracts(self.tcx, instance) {
             trace!(?instance, "visit_fn: abstract stub boundary");
             return vec![];
         }
         let body = self.transformer.body_ref(self.tcx, instance);
+        self.boundary.backend.record_reachable_body(instance, body);
         let mut collector = MonoItemsFnCollector {
             tcx: self.tcx,
             collected: FxHashSet::default(),
-            abstraction_boundary: self.abstraction_boundary,
+            boundary: self.boundary,
             body,
+            caller: instance,
+            terminator_blocks: body
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(bb, block)| (&block.terminator as *const Terminator as usize, bb))
+                .collect(),
+            calls_abstract: false,
         };
         collector.visit_body(body);
+        if collector.calls_abstract {
+            self.opaque.insert(MonoItem::Fn(instance));
+        }
         collector.collected.into_iter().collect()
     }
 
@@ -263,7 +348,7 @@ impl<'tcx, 'a> MonoItemsCollector<'tcx, 'a> {
                 debug!(?alloc, "visit_static: initializer");
                 for (_, prov) in alloc.provenance.ptrs {
                     next_items.extend(
-                        collect_alloc_items(self.tcx, prov.0, self.abstraction_boundary)
+                        collect_alloc_items(self.tcx, prov.0, self.boundary)
                             .into_iter()
                             .map(|item| CollectedItem { item, reason: CollectionReason::Static }),
                     );
@@ -283,8 +368,13 @@ impl<'tcx, 'a> MonoItemsCollector<'tcx, 'a> {
 struct MonoItemsFnCollector<'collector, 'body, 'tcx> {
     tcx: TyCtxt<'tcx>,
     collected: FxHashSet<CollectedItem>,
-    abstraction_boundary: &'collector dyn AbstractionBoundary,
+    boundary: &'collector Boundary<'collector>,
     body: &'body Body,
+    caller: Instance,
+    terminator_blocks: HashMap<usize, usize>,
+    /// The body names a function abstracted at the boundary (a call, a drop,
+    /// a reification or a vtable method), which is never collected.
+    calls_abstract: bool,
 }
 
 impl MonoItemsFnCollector<'_, '_, '_> {
@@ -319,9 +409,14 @@ impl MonoItemsFnCollector<'_, '_, '_> {
                     }
                     VtblEntry::Method(instance) => {
                         let instance = rustc_internal::stable(instance);
-                        (should_codegen_locally(&instance)
-                            && !is_abstract_function(self.tcx, instance, self.abstraction_boundary))
-                        .then_some(MonoItem::Fn(instance))
+                        if !should_codegen_locally(&instance) {
+                            return None;
+                        }
+                        if self.boundary.abstracts(self.tcx, instance) {
+                            self.calls_abstract = true;
+                            return None;
+                        }
+                        Some(MonoItem::Fn(instance))
                     }
                 })
                 .collect::<Vec<_>>();
@@ -340,11 +435,33 @@ impl MonoItemsFnCollector<'_, '_, '_> {
 
     /// Collect an instance depending on how it is used (invoked directly or via fn_ptr).
     fn collect_instance(&mut self, instance: Instance, is_direct_call: bool) {
-        if is_abstract_function(self.tcx, instance, self.abstraction_boundary) {
+        self.collect_instance_at(instance, is_direct_call, None);
+    }
+
+    fn collect_instance_at(
+        &mut self,
+        instance: Instance,
+        is_direct_call: bool,
+        terminator: Option<&Terminator>,
+    ) {
+        if self.boundary.abstracts_at(self.tcx, instance, || {
+            let terminator = terminator?;
+            self.terminator_blocks
+                .get(&(terminator as *const Terminator as usize))
+                .copied()
+                .map(|block| AbstractionCallsite { caller: self.caller, body: self.body, block })
+        }) {
             trace!(?instance, "collect_instance: abstract stub boundary");
+            self.calls_abstract = true;
             return;
         }
         let should_collect = match instance.kind {
+            #[cfg(all(trust_toolchain, version("1.101")))]
+            InstanceKind::LlvmIntrinsic => self.tcx.dcx().fatal(format!(
+                "trust-mc cannot verify LLVM intrinsic `{}`: no Rust fallback body or \
+                 verification encoding is available",
+                instance.name(),
+            )),
             InstanceKind::Virtual { .. } => {
                 // Instance definition has no body.
                 assert!(is_direct_call, "Expected direct call {instance:?}");
@@ -380,7 +497,7 @@ impl MonoItemsFnCollector<'_, '_, '_> {
         debug!(?alloc, "collect_allocation");
         for (_, id) in &alloc.provenance.ptrs {
             self.collected.extend(
-                collect_alloc_items(self.tcx, id.0, self.abstraction_boundary)
+                collect_alloc_items(self.tcx, id.0, self.boundary)
                     .into_iter()
                     .map(|item| CollectedItem { item, reason: CollectionReason::Static }),
             );
@@ -425,15 +542,30 @@ impl MirVisitor for MonoItemsFnCollector<'_, '_, '_> {
                 let (src_ty, dst_ty) = extract_unsize_coercion(self.tcx, source_ty, target_ty);
                 if !src_ty.kind().is_trait() && dst_ty.kind().is_trait() {
                     debug!(?src_ty, ?dst_ty, "collect_vtable_methods");
+                    // Every runtime type a `dyn` receiver can have (design 3, D2).
+                    crate::kani_middle::dyn_universe::note_coercion(
+                        src_ty,
+                        dst_ty.kind().trait_principal().as_ref(),
+                    );
                     self.collect_vtable_methods(src_ty, dst_ty);
+                } else if src_ty.kind().is_trait() && dst_ty.kind().is_trait() {
+                    // A `dyn` -> `dyn` unsize (trait upcasting): the target's
+                    // runtime types include the source's (design 3, D2).
+                    crate::kani_middle::dyn_universe::note_dyn_to_dyn(
+                        src_ty.kind().trait_principal().as_ref(),
+                        dst_ty.kind().trait_principal().as_ref(),
+                    );
                 }
             }
             Rvalue::Cast(
-                CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
+                CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer { .. }),
                 ref operand,
-                _,
+                target,
             ) => {
-                let fn_kind = operand.ty(self.body.locals()).expect("reify operand type").kind();
+                let operand_ty = operand.ty(self.body.locals()).expect("reify operand type");
+                // Every function a harness can call through a pointer (design 3).
+                crate::kani_middle::dyn_universe::note_fn_ptr_reification(operand_ty, target);
+                let fn_kind = operand_ty.kind();
                 if let RigidTy::FnDef(fn_def, args) = fn_kind.rigid().expect("rigid fn type") {
                     let instance =
                         Instance::resolve_for_fn_ptr(*fn_def, args).expect("resolve fn ptr");
@@ -445,9 +577,10 @@ impl MirVisitor for MonoItemsFnCollector<'_, '_, '_> {
             Rvalue::Cast(
                 CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_)),
                 ref operand,
-                _,
+                target,
             ) => {
                 let source_ty = operand.ty(self.body.locals()).expect("closure operand type");
+                crate::kani_middle::dyn_universe::note_fn_ptr_reification(source_ty, target);
                 match source_ty.kind().rigid().expect("rigid closure type") {
                     RigidTy::Closure(def_id, args) => {
                         let instance =
@@ -457,6 +590,12 @@ impl MirVisitor for MonoItemsFnCollector<'_, '_, '_> {
                     }
                     _ => unreachable!("Unexpected type: {:?}", source_ty), // external enum: RigidTy
                 }
+            }
+            // A fn pointer a transmute produces may hold any value (design 3).
+            Rvalue::Cast(CastKind::Transmute, _, target)
+                if matches!(target.kind(), TyKind::RigidTy(RigidTy::FnPtr(..))) =>
+            {
+                crate::kani_middle::dyn_universe::note_fn_ptr_transmute(target);
             }
             Rvalue::ThreadLocalRef(item) => {
                 trace!(?item, "visit_rvalue thread_local");
@@ -500,7 +639,7 @@ impl MirVisitor for MonoItemsFnCollector<'_, '_, '_> {
                 let fn_ty = func.ty(self.body.locals()).expect("call func type");
                 if let TyKind::RigidTy(RigidTy::FnDef(fn_def, args)) = fn_ty.kind() {
                     let instance = Instance::resolve(fn_def, &args).expect("resolve call instance");
-                    self.collect_instance(instance, true);
+                    self.collect_instance_at(instance, true, Some(terminator));
                 } else if let TyKind::RigidTy(RigidTy::Closure(def_id, args)) = fn_ty.kind() {
                     // Direct closure-typed calls: emitted by the loop-contracts
                     // `decreases` instrumentation (measure closure evaluated at
@@ -570,289 +709,88 @@ fn extract_unsize_coercion(tcx: TyCtxt, orig_ty: Ty, dst_trait: Ty) -> (Ty, Ty) 
 fn to_fingerprint(tcx: TyCtxt, item: &MonoItem) -> Fingerprint {
     tcx.with_stable_hashing_context(|mut hcx| {
         let mut hasher = StableHasher::new();
+        #[cfg(not(trust_toolchain))]
         rustc_internal::internal(tcx, item).hash_stable(&mut hcx, &mut hasher);
+        // Trust renamed `HashStable::hash_stable` to `StableHash::stable_hash`.
+        #[cfg(trust_toolchain)]
+        rustc_internal::internal(tcx, item).stable_hash(&mut hcx, &mut hasher);
         hasher.finish()
     })
 }
-
-/// Functions that should be abstracted rather than analyzed.
-/// Bodies are NOT collected; codegen emits SMT stubs instead.
-///
-/// Per designs/archive/2026-02-01-reachability-intercept-fix.md:
-/// The root cause of collection test failures is that stubs intercept at codegen time,
-/// but the reachability collector has already fetched all internal function bodies.
-/// We intercept at reachability level using prefix matching to prevent internal
-/// bodies (node::NodeRef, search::search_tree, etc.) from being collected.
-const ABSTRACT_FUNCTION_PREFIXES: &[&str] = &[
-    // Collections - modeled as SMT arrays (Part of #1659)
-    "std::collections::BTreeSet::",
-    "std::collections::BTreeMap::",
-    "std::collections::HashMap::",
-    "std::collections::HashSet::",
-    // Module-level paths for HashMap/HashSet iterator types (Part of #3057).
-    // Iterator types live in std::collections::hash_map/hash_set modules, not on
-    // the type path. Without these, IntoIter::next/Iter::next get inlined,
-    // exposing hashbrown internals (Bucket::read, ControlFlow) that CHC can't handle.
-    "std::collections::hash_map::",
-    "std::collections::hash_set::",
-    // hashbrown internals — HashMap/HashSet delegate to hashbrown internally.
-    // Inlining hashbrown functions exposes raw pointer ops and internal types
-    // (RawTable, Bucket, RawIter) that have no CHC stubs.
-    "hashbrown::",
-    "std::collections::btree_map::",
-    "std::collections::btree_set::",
-    "alloc::collections::btree_set::BTreeSet::",
-    "alloc::collections::btree_map::BTreeMap::",
-    "alloc::collections::btree::", // Internal BTree modules (node, search, etc.)
-    // Vec/String - modeled as SMT sequences or arrays
-    "alloc::vec::Vec::",
-    "alloc::vec::into_iter::", // IntoIter internals — without this, rustc inlines next() into raw ptr ops (#2876 RC2)
-    "std::vec::Vec::", // std re-export of alloc::vec::Vec — def_path_str() returns this form (#2967)
-    "std::vec::IntoIter::", // std re-export of alloc::vec::into_iter::IntoIter (#2967)
-    "alloc::string::String::",
-    "std::string::String::", // std re-export of alloc::string::String (#2967)
-    // Cow<str> - collapse to String (#1691)
-    // from_utf8_lossy returns Cow<str> but we model as String
-    "std::borrow::Cow::",
-    "alloc::borrow::Cow::",
-    // UTF-8 lossy conversion internals - Utf8Chunks iterator
-    // from_utf8_lossy internally uses Utf8Chunks which we don't need to model
-    "core::str::lossy::", // Utf8Chunks, Utf8Chunk implementation
-    "core::str::Utf8Chunk::",
-    "core::str::Utf8Chunks::",
-    "alloc::str::Utf8Chunk::",
-    "alloc::str::Utf8Chunks::",
-    "std::str::Utf8Chunk::",
-    "std::str::Utf8Chunks::",
-    // Allocation internals - already stubbed, prevent body collection (#1691)
-    // RawVec is Vec's internal buffer manager - MIR bodies cause codegen explosion
-    "alloc::raw_vec::", // RawVec, RawVecInner
-    // Global allocator inherent methods (not trait impls - those use <Global as Allocator>::...)
-    // This matches paths like std::alloc::Global::alloc_impl
-    "std::alloc::Global::",
-    // Slice conversion internals — vec![...] macro expansion path (#2967)
-    // <[T]>::into_vec / alloc::slice::hack::into_vec converts Box<[T]> to Vec<T>.
-    // Without this, into_vec body gets inlined, introducing concrete MIR with obj_valid
-    // checks that create dual-model mismatch with abstract Vec stubs.
-    "alloc::slice::",
-    // Slice module — covers both method impls (<[T]>::iter, iter_mut) and iterator internals
-    // (core::slice::iter::Iter::next, IterMut::next). The broad core::slice:: prefix
-    // subsumes the more specific core::slice::iter:: (#3012). Blocking body collection
-    // forces Call preservation for VecIter/VecIterMut stub dispatch. Also covers stubs:
-    // SlicePartialEqEqual, SliceIndexIndex, PtrCast.
-    "core::slice::",
-    // std re-export of core::slice — Instance::name() may return std::slice:: for some
-    // resolved instances (#3012). Subsumes std::slice::iter::.
-    "std::slice::",
-    // VecDeque — ring buffer backed by RawVec. MIR bodies involve raw pointer arithmetic
-    // for head/tail wrapping that the solver cannot reason about. Test harness:
-    // tests/expected/vecdq/main.rs uses stdlib VecDeque directly. (Part of #2984)
-    "std::collections::VecDeque::",
-    "std::collections::vec_deque::", // Internal VecDeque module (iter, drain, etc.)
-    "alloc::collections::vec_deque::", // alloc-level VecDeque path
-    // LinkedList — doubly-linked with raw NonNull pointers. Test harness:
-    // tests/expected/object-bits/insufficient/main.rs uses stdlib LinkedList.
-    // MIR bodies are pointer-heavy and cause state explosion. (Part of #2984)
-    "std::collections::LinkedList::",
-    "std::collections::linked_list::", // Internal LinkedList module
-    "alloc::collections::linked_list::", // alloc-level LinkedList path
-    // Range iterator internals — spec_next is the CHC-stubbed entry point (#3002)
-    // Without this, the inline pass inlines spec_next's body. At Reg level the inlined
-    // MIR happens to work, but at Mem level the field accesses through &mut self require
-    // memory model resolution that fails for flattened Range locals. By preventing
-    // inlining, the Call terminator for spec_next is preserved for CHC dispatch as
-    // RangeSpecNext, which produces correct flattened-field constraints.
-    // Path: <std::ops::Range<T> as std::iter::range::RangeIteratorImpl>::spec_next
-    "core::iter::range::RangeIteratorImpl::",
-    "std::iter::range::RangeIteratorImpl::",
-    // Atomic types — stable API wrappers add MIR complexity that defeats PDR.
-    // Raw intrinsic calls (atomic_load, atomic_xadd, etc.) are already handled
-    // by try_dispatch_call_atomic. Stable wrappers (AtomicBool::load, etc.)
-    // produce Ordering enum match + compiler_fence + field access wrapper MIR
-    // that inflates CHC clause count 3-5x vs bare intrinsic encoding.
-    // Abstraction boundary prevents this inflation — the Call terminator is
-    // preserved for CHC dispatch as a stable atomic stub. (Part of #3452)
-    "core::sync::atomic::",
-    "std::sync::atomic::",
-    // Mutex/RwLock — transparent wrappers in single-threaded verification (Part of #4067).
-    // MIR bodies contain pthread foreign calls that create unconstrained memory.
-    // inline_known_calls handles new/into_inner/get_mut as identity;
-    // generic_preroutes handles lock/read/write as always-Ok.
-    // Drop is a no-op (transparent wrapper drop = drop inner T only).
-    "std::sync::Mutex::",
-    "std::sync::RwLock::",
-    "std::sync::MutexGuard::",
-    "std::sync::RwLockReadGuard::",
-    "std::sync::RwLockWriteGuard::",
-    // Filesystem operations — pure OS side effects with no verification semantics.
-    // Without this, remove_file inlines run_with_cstr → unlink, producing
-    // recursion unwinding assertions from platform abstraction layer internals.
-    // Part of #4134.
-    "std::fs::",
-];
-
-/// Method name fragments exempted from prefix abstraction.
-///
-/// These methods have complex control flow (loops, closures) that requires MIR body
-/// collection for correct CHC encoding. Inner calls to other abstracted methods
-/// (e.g., `load`, `compare_exchange_weak`) are still caught by their respective
-/// CHC stubs when the exempted method's body is inlined.
-///
-/// Matched via `path.contains(fragment)` so generic monomorphizations like
-/// `AtomicPtr::<i32>::fetch_update::<{closure@...}>` still match.
-///
-/// Part of #3516: `fetch_update` contains a CAS loop with a closure call.
-/// In the sequential model the loop always succeeds on the first iteration,
-/// but the closure must be dispatched normally — no CHC stub can evaluate it.
-const ABSTRACT_PREFIX_EXCEPTIONS: &[&str] = &["::fetch_update"];
-
-/// Check whether a function path matches the prefix-based abstraction list.
-///
-/// This is the core reachability-boundary logic: functions matching these prefixes
-/// have their bodies skipped during collection (codegen emits SMT stubs instead).
-///
-/// For trait impl paths like `<alloc::raw_vec::RawVec<T, A> as std::ops::Drop>::drop`,
-/// we use `contains()` since they don't start with the module path.
-/// For Cow<str> matching, we strip trailing `::` from prefixes since generic params
-/// come before `::` (e.g., `std::borrow::Cow::` should match `std::borrow::Cow<str>`).
-pub(crate) fn is_prefix_abstracted(path: &str) -> bool {
-    // Exception: specific methods need body collection for MIR inlining even
-    // though their containing module is abstracted. Monomorphized paths include
-    // type parameters after the method name (e.g., `::fetch_update::<{closure@...}>`),
-    // so we use `contains()` instead of exact-match on the last segment. (Part of #3516)
-    if ABSTRACT_PREFIX_EXCEPTIONS.iter().any(|frag| path.contains(frag)) {
-        return false;
-    }
-    // Normalize duplicated `std::` prefix from MIR re-exports (Part of #4231).
-    // `def_path_str()` can produce `std::std::fs::remove_file` when std re-exports
-    // items from itself. Collapse repeated leading `std::` before matching.
-    let normalized = normalize_std_prefix(path);
-    ABSTRACT_FUNCTION_PREFIXES.iter().any(|prefix| {
-        if normalized.starts_with(prefix) {
-            return true;
-        }
-        if normalized.starts_with('<') {
-            let prefix_base = prefix.strip_suffix("::").unwrap_or(prefix);
-            return normalized.contains(prefix_base);
-        }
-        false
-    })
-}
-
-/// Normalize paths with duplicated `std::` prefix from MIR re-exports.
-///
-/// After MIR inlining or std re-exports, `def_path_str()` can produce paths like
-/// `std::std::fs::remove_file` where the `std::` prefix is doubled.
-/// This collapses repeated leading `std::` segments into a single one.
-fn normalize_std_prefix(path: &str) -> &str {
-    let mut s = path;
-    while s.starts_with("std::std::") {
-        s = &s[5..]; // strip one "std::" (5 bytes)
-    }
-    s
-}
-
-/// Known stdlib type keywords that the prefix list MUST cover. Used for runtime
-/// drift detection (Part of #2984): if `def_path_str()` returns a path containing
-/// one of these keywords in a stdlib context, `is_prefix_abstracted()` SHOULD match it.
-/// When a mismatch is detected, a diagnostic warning is emitted so toolchain-induced
-/// path format changes are caught rather than causing silent state explosion.
-///
-/// Each entry is (path_fragment, label). A path matches if it contains the fragment.
-///
-/// NOTE: BinaryHeap is intentionally excluded — it is tree-based like BTreeMap
-/// and would need stubs, but no test harness currently uses it. Adding it here
-/// without stubs would cause unconstrained-result warnings without benefit.
-const KNOWN_ABSTRACTED_TYPE_KEYWORDS: &[(&str, &str)] = &[
-    ("alloc::vec::Vec", "Vec"),
-    ("alloc::string::String", "String"),
-    ("alloc::borrow::Cow", "Cow"),
-    ("alloc::raw_vec::RawVec", "RawVec"),
-    ("alloc::collections::btree_map::BTreeMap", "BTreeMap"),
-    ("alloc::collections::btree_set::BTreeSet", "BTreeSet"),
-    ("std::collections::HashMap", "HashMap"),
-    ("std::collections::HashSet", "HashSet"),
-    ("std::collections::VecDeque", "VecDeque"),
-    ("std::collections::LinkedList", "LinkedList"),
-    ("alloc::slice::", "slice"),
-    ("core::slice::", "slice"),
-    ("core::str::lossy::", "Utf8Chunks"),
-    ("core::sync::atomic::", "Atomic"),
-];
 
 /// Track functions that have already been warned about to avoid duplicate warnings.
 /// Per designs/archive/2026-02-01-stub-coverage-validation.md: warning deduplication
 static WARNED_UNSTUBBED_FUNCTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// Track drift-detection warnings to avoid duplicates (Part of #2984).
-static WARNED_DRIFT_FUNCTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn is_abstract_function(
-    tcx: TyCtxt,
-    instance: Instance,
-    abstraction_boundary: &dyn AbstractionBoundary,
-) -> bool {
-    let def_id = instance.def.def_id();
-    let internal_def_id = rustc_internal::internal(tcx, def_id);
-    let path = tcx.def_path_str(internal_def_id);
-
-    let has_stub = abstraction_boundary.has_explicit_stub(&path);
-
-    let is_prefix_match = is_prefix_abstracted(&path);
-
-    if is_prefix_match {
-        trace!(?path, "is_abstract_function: prefix match -> abstracted");
-
-        // Handler-backed abstractions (e.g., stable atomic ops) have CHC handlers
-        // even without explicit stubs — no warning needed. (Part of #3777)
-        let has_handler = abstraction_boundary.has_handler_backed_abstraction(&path);
-
-        // Emit warning if prefix-abstracted without stub AND not handler-backed
-        // Per designs/archive/2026-02-01-stub-coverage-validation.md
-        if !has_stub && !has_handler {
-            // Track unstubbed abstraction for summary (Part of #1685)
-            abstraction_boundary.record_unstubbed_abstraction(&path);
-
-            let warned_set = WARNED_UNSTUBBED_FUNCTIONS.get_or_init(|| Mutex::new(HashSet::new()));
-            let mut warned = warned_set.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Check contains first to avoid String allocation when already warned
-            if !warned.contains(&path) {
-                tcx.dcx().warn(format!(
-                    "Function `{}` is abstracted but has no stub; result will be unconstrained.",
-                    path
-                ));
-                warned.insert(path); // No clone needed - path not used after
-            }
-        }
-        return true;
+impl Boundary<'_> {
+    /// Is `instance`'s body behind the boundary, so that it is not collected?
+    fn abstracts(&self, tcx: TyCtxt, instance: Instance) -> bool {
+        self.abstracts_at(tcx, instance, || None)
     }
 
-    // Drift detection (Part of #2984): if this function's path contains a known
-    // type keyword but was NOT caught by is_prefix_abstracted(), the prefix list
-    // may have drifted from def_path_str() output. This catches toolchain bumps
-    // that silently change canonical paths without updating the prefix list.
-    if !has_stub {
-        for &(fragment, label) in KNOWN_ABSTRACTED_TYPE_KEYWORDS {
-            if path.contains(fragment) {
-                let drift_set = WARNED_DRIFT_FUNCTIONS.get_or_init(|| Mutex::new(HashSet::new()));
+    fn abstracts_at<'a>(
+        &self,
+        tcx: TyCtxt,
+        instance: Instance,
+        site: impl FnOnce() -> Option<AbstractionCallsite<'a>>,
+    ) -> bool {
+        // The harness stub map decides first: a body `FnStubPass` replaces is the
+        // user's stub, and the standard-library set must not hide it.
+        if harness_stub_replaces_body(&self.stubs, instance) {
+            trace!(?instance, "abstracts: harness stub replaces body -> collected");
+            return false;
+        }
+        let def_id = rustc_internal::internal(tcx, instance.def.def_id());
+        let path = tcx.def_path_str(def_id);
+
+        let has_stub = self.backend.has_explicit_stub(&path);
+
+        let abstraction = self.std.decide_definition(tcx, def_id);
+
+        if abstraction.is_abstracted() {
+            trace!(?path, ?abstraction, "abstracts: standard-library abstraction set");
+
+            // Handler-backed abstractions (e.g., stable atomic ops) have CHC handlers
+            // even without explicit stubs — no warning needed. (Part of #3777)
+            let has_handler = self.backend.has_handler_backed_abstraction(&path);
+
+            let unstubbed = !has_stub && !has_handler;
+            // An item abstracted only by an anchor that failed closed on this
+            // sysroot is recorded whatever the stub registry says: that its
+            // stubs still describe the item is not established either (the
+            // session's warning names the anchor).
+            if unstubbed || abstraction == Abstraction::FailClosed {
+                // Track unstubbed abstraction for summary (Part of #1685)
+                self.backend.record_unstubbed_call(
+                    &path,
+                    instance,
+                    site(),
+                    abstraction != Abstraction::FailClosed,
+                );
+            }
+
+            // Emit warning if abstracted without stub AND not handler-backed
+            // Per designs/archive/2026-02-01-stub-coverage-validation.md
+            if unstubbed {
+                let warned_set =
+                    WARNED_UNSTUBBED_FUNCTIONS.get_or_init(|| Mutex::new(HashSet::new()));
                 let mut warned =
-                    drift_set.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    warned_set.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Check contains first to avoid String allocation when already warned
                 if !warned.contains(&path) {
-                    debug!(
-                        ?path,
-                        label,
-                        "drift detection: stdlib function collected \
-                         (not caught by ABSTRACT_FUNCTION_PREFIXES)"
-                    );
+                    tcx.dcx().warn(format!(
+                        "Function `{}` is abstracted but has no stub; exact callsite modeling is checked during codegen.",
+                        path
+                    ));
                     warned.insert(path);
                 }
-                break;
             }
+            return true;
         }
-    }
 
-    // Fall back to exact stub matching for other stubbed functions
-    has_stub
+        // Fall back to exact stub matching for other stubbed functions
+        has_stub
+    }
 }
 
 /// Return whether we should include the item into codegen.
@@ -860,11 +798,7 @@ fn should_codegen_locally(instance: &Instance) -> bool {
     !instance.is_foreign_item()
 }
 
-fn collect_alloc_items(
-    tcx: TyCtxt,
-    alloc_id: AllocId,
-    abstraction_boundary: &dyn AbstractionBoundary,
-) -> Vec<MonoItem> {
+fn collect_alloc_items(tcx: TyCtxt, alloc_id: AllocId, boundary: &Boundary<'_>) -> Vec<MonoItem> {
     trace!(?alloc_id, "collect_alloc_items");
     let mut items = vec![];
     match GlobalAlloc::from(alloc_id) {
@@ -875,9 +809,13 @@ fn collect_alloc_items(
                 // in practice this guard never fires — it only fails closed.
                 if !tcx.is_foreign_item(rustc_internal::internal(tcx, def.def_id())) {
                     let alloc = def.eval_initializer().expect("anon static initializer");
-                    items.extend(alloc.provenance.ptrs.iter().flat_map(|(_, prov)| {
-                        collect_alloc_items(tcx, prov.0, abstraction_boundary)
-                    }));
+                    items.extend(
+                        alloc
+                            .provenance
+                            .ptrs
+                            .iter()
+                            .flat_map(|(_, prov)| collect_alloc_items(tcx, prov.0, boundary)),
+                    );
                 }
             } else {
                 // This differ from rustc's collector since rustc does not include static from
@@ -887,9 +825,9 @@ fn collect_alloc_items(
             }
         }
         GlobalAlloc::Function(instance) => {
-            if should_codegen_locally(&instance)
-                && !is_abstract_function(tcx, instance, abstraction_boundary)
-            {
+            // A fn pointer in a constant or static value (design 3).
+            crate::kani_middle::dyn_universe::note_fn_ptr_in_allocation();
+            if should_codegen_locally(&instance) && !boundary.abstracts(tcx, instance) {
                 items.push(MonoItem::from(instance));
             }
         }
@@ -899,12 +837,19 @@ fn collect_alloc_items(
                     .provenance
                     .ptrs
                     .iter()
-                    .flat_map(|(_, prov)| collect_alloc_items(tcx, prov.0, abstraction_boundary)),
+                    .flat_map(|(_, prov)| collect_alloc_items(tcx, prov.0, boundary)),
             );
         }
         vtable_alloc @ GlobalAlloc::VTable(..) => {
+            // A vtable a constant or static holds creates `dyn` values of its
+            // type without any `Unsize` in a body (design 3, D2).
+            if let GlobalAlloc::VTable(concrete, principal) = &vtable_alloc {
+                crate::kani_middle::dyn_universe::note_coercion(*concrete, principal.as_ref());
+            }
             let vtable_id = vtable_alloc.vtable_allocation().expect("vtable allocation");
-            items = collect_alloc_items(tcx, vtable_id, abstraction_boundary);
+            items = crate::kani_middle::dyn_universe::inside_vtable(|| {
+                collect_alloc_items(tcx, vtable_id, boundary)
+            });
         }
         GlobalAlloc::TypeId { ty: _ } => {}
     }
@@ -914,6 +859,9 @@ fn collect_alloc_items(
 /// Call graph with edges annotated with the reason why they were added to the graph.
 #[derive(Debug, Default)]
 pub(crate) struct CallGraph {
+    /// Every dyn coercion reachable from the starting points (design 3, D2:
+    /// `dyn_universe.rs`).
+    pub(crate) dyn_universe: crate::kani_middle::dyn_universe::DynUniverse,
     /// Nodes of the graph.
     nodes: HashSet<Node>,
     /// Edges of the graph.
@@ -929,6 +877,73 @@ struct Node(pub MonoItem);
 struct CollectedNode(pub CollectedItem);
 
 impl CallGraph {
+    /// Design 5 backstop (`loop_contract_reach.rs`): which functions have a
+    /// path to a loop-contract register instance, which visited functions can
+    /// reach no function the collector abstracted (`opaque` seeds the rest),
+    /// and which functions are the target of an edge that is not a direct call
+    /// (a fn-pointer reification, a vtable method, a pointer in an allocation).
+    fn loop_contract_reach(
+        &self,
+        collected: &FxHashSet<MonoItem>,
+        opaque: &FxHashSet<MonoItem>,
+    ) -> crate::kani_middle::loop_contract_reach::LoopContractReach {
+        use crate::kani_middle::loop_contract_reach::{LoopContractReach, is_register_instance};
+        let registers = self
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(node.0, MonoItem::Fn(instance) if is_register_instance(instance)),
+            )
+            .map(|node| node.0.clone());
+        let reaching = self.callers_closure(registers);
+        let opaque = self.callers_closure(opaque.iter().cloned());
+        let fns = |items: &mut dyn Iterator<Item = &MonoItem>| -> HashSet<Instance> {
+            items
+                .filter_map(|item| match item {
+                    MonoItem::Fn(instance) => Some(*instance),
+                    _ => None, // external enum: MonoItem
+                })
+                .collect()
+        };
+        let address_taken = fns(&mut self
+            .edges
+            .values()
+            .flatten()
+            .filter(|succ| succ.0.reason != CollectionReason::DirectCall)
+            .map(|succ| &succ.0.item));
+        debug!(
+            reaching = reaching.len(),
+            opaque = opaque.len(),
+            address_taken = address_taken.len(),
+            "loop-contract reach"
+        );
+        let visited = fns(&mut collected.iter());
+        let clear = visited
+            .into_iter()
+            .filter(|instance| {
+                let item = MonoItem::Fn(*instance);
+                !reaching.contains(&item) && !opaque.contains(&item)
+            })
+            .collect();
+        LoopContractReach::new(fns(&mut reaching.iter()), clear, address_taken)
+    }
+
+    /// `seeds` and every item with a path to one of them.
+    fn callers_closure(&self, seeds: impl Iterator<Item = MonoItem>) -> HashSet<MonoItem> {
+        let mut queue: Vec<MonoItem> = seeds.collect();
+        let mut closure: HashSet<MonoItem> = HashSet::new();
+        while let Some(item) = queue.pop() {
+            if closure.contains(&item) {
+                continue;
+            }
+            if let Some(callers) = self.back_edges.get(&Node(item.clone())) {
+                queue.extend(callers.iter().map(|caller| caller.0.item.clone()));
+            }
+            closure.insert(item);
+        }
+        closure
+    }
+
     /// Add a new node into a graph. Skips edge-map init for existing nodes.
     fn add_node(&mut self, item: &MonoItem) -> Node {
         let node = Node(item.clone());
@@ -1057,607 +1072,5 @@ impl Display for CollectedNode {
 impl From<CollectedNode> for Node {
     fn from(value: CollectedNode) -> Self {
         Node(value.0.item)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_prefix_abstracted;
-
-    // --- Direct prefix matches (path starts with a prefix) ---
-
-    #[test]
-    fn test_btreeset_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::BTreeSet::insert"));
-    }
-
-    #[test]
-    fn test_btreemap_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::BTreeMap::get"));
-    }
-
-    #[test]
-    fn test_hashmap_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::HashMap::insert"));
-    }
-
-    #[test]
-    fn test_hashset_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::HashSet::contains"));
-    }
-
-    #[test]
-    fn test_alloc_btree_internal() {
-        assert!(is_prefix_abstracted("alloc::collections::btree::node::NodeRef::new"));
-    }
-
-    #[test]
-    fn test_vec_direct_method() {
-        assert!(is_prefix_abstracted("alloc::vec::Vec::push"));
-    }
-
-    #[test]
-    fn test_string_direct_method() {
-        assert!(is_prefix_abstracted("alloc::string::String::from"));
-    }
-
-    #[test]
-    fn test_cow_std_method() {
-        assert!(is_prefix_abstracted("std::borrow::Cow::into_owned"));
-    }
-
-    #[test]
-    fn test_raw_vec_internal() {
-        assert!(is_prefix_abstracted("alloc::raw_vec::RawVec::grow_amortized"));
-    }
-
-    #[test]
-    fn test_global_alloc_impl() {
-        assert!(is_prefix_abstracted("std::alloc::Global::alloc_impl"));
-    }
-
-    #[test]
-    fn test_utf8_chunks_internal() {
-        assert!(is_prefix_abstracted("core::str::lossy::Utf8Chunks::next"));
-    }
-
-    // --- Trait impl paths (angle-bracket paths use contains-based matching) ---
-
-    #[test]
-    fn test_rawvec_drop_trait_impl() {
-        assert!(is_prefix_abstracted("<alloc::raw_vec::RawVec<T, A> as std::ops::Drop>::drop"));
-    }
-
-    #[test]
-    fn test_cow_tostring_trait_impl() {
-        assert!(is_prefix_abstracted("<std::borrow::Cow<str> as ToString>::to_string"));
-    }
-
-    #[test]
-    fn test_btreemap_trait_impl() {
-        assert!(is_prefix_abstracted(
-            "<alloc::collections::btree_map::BTreeMap<K, V> as Clone>::clone"
-        ));
-    }
-
-    #[test]
-    fn test_hashmap_trait_impl() {
-        assert!(is_prefix_abstracted("<std::collections::HashMap<K, V> as Default>::default"));
-    }
-
-    #[test]
-    fn test_vec_trait_impl() {
-        assert!(is_prefix_abstracted("<alloc::vec::Vec<T> as Extend<T>>::extend"));
-    }
-
-    // --- Non-matching paths (should NOT be abstracted) ---
-
-    #[test]
-    fn test_user_function_not_abstracted() {
-        assert!(!is_prefix_abstracted("my_crate::my_module::my_function"));
-    }
-
-    #[test]
-    fn test_core_ops_not_abstracted() {
-        assert!(!is_prefix_abstracted("core::ops::Add::add"));
-    }
-
-    #[test]
-    fn test_std_io_not_abstracted() {
-        assert!(!is_prefix_abstracted("std::io::Write::write"));
-    }
-
-    #[test]
-    fn test_non_trait_angle_bracket_no_match() {
-        // Angle-bracket path that doesn't contain any abstracted prefix base
-        assert!(!is_prefix_abstracted("<i32 as core::fmt::Display>::fmt"));
-    }
-
-    #[test]
-    fn test_partial_prefix_no_false_positive() {
-        // "std::collections::BTree" without "Set::" or "Map::" suffix should not match
-        assert!(!is_prefix_abstracted("std::collections::BTree"));
-    }
-
-    #[test]
-    fn test_empty_path() {
-        assert!(!is_prefix_abstracted(""));
-    }
-
-    // --- Edge cases for the Cow/trait-impl stripping logic ---
-
-    #[test]
-    fn test_alloc_cow_trait_impl() {
-        assert!(is_prefix_abstracted("<alloc::borrow::Cow<str> as Display>::fmt"));
-    }
-
-    #[test]
-    fn test_btreeset_alloc_path() {
-        assert!(is_prefix_abstracted("alloc::collections::btree_set::BTreeSet::insert"));
-    }
-
-    #[test]
-    fn test_btree_search_internal() {
-        assert!(is_prefix_abstracted("alloc::collections::btree::search::search_tree"));
-    }
-
-    // --- Prefixes missing from initial coverage (self-audit W3-785a) ---
-
-    #[test]
-    fn test_std_btree_map_module() {
-        assert!(is_prefix_abstracted("std::collections::btree_map::OccupiedEntry::get"));
-    }
-
-    #[test]
-    fn test_std_btree_set_module() {
-        assert!(is_prefix_abstracted("std::collections::btree_set::Intersection::next"));
-    }
-
-    #[test]
-    fn test_core_str_utf8chunk() {
-        assert!(is_prefix_abstracted("core::str::Utf8Chunk::valid"));
-    }
-
-    #[test]
-    fn test_core_str_utf8chunks() {
-        assert!(is_prefix_abstracted("core::str::Utf8Chunks::next"));
-    }
-
-    #[test]
-    fn test_alloc_str_utf8chunk() {
-        assert!(is_prefix_abstracted("alloc::str::Utf8Chunk::valid"));
-    }
-
-    #[test]
-    fn test_alloc_str_utf8chunks() {
-        assert!(is_prefix_abstracted("alloc::str::Utf8Chunks::next"));
-    }
-
-    #[test]
-    fn test_std_str_utf8chunk() {
-        assert!(is_prefix_abstracted("std::str::Utf8Chunk::valid"));
-    }
-
-    #[test]
-    fn test_std_str_utf8chunks() {
-        assert!(is_prefix_abstracted("std::str::Utf8Chunks::next"));
-    }
-
-    // --- Vec IntoIter paths (#2876 RC2) ---
-
-    #[test]
-    fn test_vec_into_iter_next() {
-        assert!(is_prefix_abstracted("alloc::vec::into_iter::IntoIter::<i32>::next"));
-    }
-
-    #[test]
-    fn test_vec_into_iter_trait_impl() {
-        assert!(is_prefix_abstracted("<alloc::vec::into_iter::IntoIter<i32> as Iterator>::next"));
-    }
-
-    // --- std:: re-export paths (#2967: dual-model mismatch fix) ---
-    // def_path_str() returns std:: re-export paths for public types.
-    // Without these, concrete MIR bodies leak through the abstraction boundary,
-    // creating dual-model (abstract stub + concrete MIR) that causes spurious CTREX.
-
-    #[test]
-    fn test_std_vec_direct_method() {
-        assert!(is_prefix_abstracted("std::vec::Vec::<i32>::push"));
-    }
-
-    #[test]
-    fn test_std_vec_new() {
-        assert!(is_prefix_abstracted("std::vec::Vec::<i32>::new"));
-    }
-
-    #[test]
-    fn test_std_vec_into_iter_direct_method() {
-        assert!(is_prefix_abstracted("std::vec::IntoIter::<i32>::as_raw_mut_slice"));
-    }
-
-    #[test]
-    fn test_std_vec_into_iter_drop_trait_impl() {
-        // This is the critical path: Drop::drop for IntoIter was the primary
-        // leakage vector allowing concrete MIR (NonNull, RawVec, ManuallyDrop)
-        // into the CHC encoding alongside abstract stubs.
-        assert!(is_prefix_abstracted("<std::vec::IntoIter<T, A> as std::ops::Drop>::drop"));
-    }
-
-    #[test]
-    fn test_std_vec_into_iter_iterator_trait_impl() {
-        assert!(is_prefix_abstracted(
-            "<std::vec::IntoIter<i32> as core::iter::traits::iterator::Iterator>::next"
-        ));
-    }
-
-    #[test]
-    fn test_std_vec_into_iterator_trait_impl() {
-        assert!(is_prefix_abstracted(
-            "<std::vec::Vec<i32> as core::iter::traits::collect::IntoIterator>::into_iter"
-        ));
-    }
-
-    #[test]
-    fn test_std_string_direct_method() {
-        assert!(is_prefix_abstracted("std::string::String::from"));
-    }
-
-    #[test]
-    fn test_std_string_trait_impl() {
-        assert!(is_prefix_abstracted("<std::string::String as core::fmt::Display>::fmt"));
-    }
-
-    // --- drop_in_place shims: intentionally NOT abstracted (#2967 design) ---
-    // drop_in_place shims are compiler-generated wrappers that call <T as Drop>::drop.
-    // They are NOT in ABSTRACT_FUNCTION_PREFIXES because:
-    // 1. Their bodies are trivial (call Drop::drop + field drops)
-    // 2. The Drop::drop callee IS caught by the prefix match (contains-based)
-    // 3. Field drops for non-Box types are no-op goto rules in CHC
-    // 4. Abstracting all drop_in_place globally would break Drop semantics
-
-    #[test]
-    fn test_drop_in_place_not_abstracted() {
-        assert!(!is_prefix_abstracted("std::ptr::drop_in_place::<std::vec::IntoIter<i32>>"));
-    }
-
-    #[test]
-    fn test_core_drop_in_place_not_abstracted() {
-        assert!(!is_prefix_abstracted("core::ptr::drop_in_place::<alloc::vec::Vec<i32>>"));
-    }
-
-    // --- Pointer internals: NOT directly abstracted (#2967) ---
-    // NonNull, ManuallyDrop, RawVecInner are only excluded transitively
-    // (their callers — Vec, IntoIter, RawVec — are abstracted, so they're
-    // never reached). They are NOT in the prefix list.
-
-    #[test]
-    fn test_nonnull_not_abstracted() {
-        assert!(!is_prefix_abstracted("core::ptr::non_null::NonNull::<i32>::as_ptr"));
-    }
-
-    #[test]
-    fn test_manually_drop_not_abstracted() {
-        assert!(!is_prefix_abstracted("core::mem::ManuallyDrop::<i32>::drop"));
-    }
-
-    // --- Allocator trait impl: caught via contains-based matching ---
-    // <std::alloc::Global as Allocator>::allocate matches because
-    // "std::alloc::Global" (prefix base) is contained in the path.
-
-    #[test]
-    fn test_global_allocator_trait_impl() {
-        assert!(is_prefix_abstracted("<std::alloc::Global as core::alloc::Allocator>::allocate"));
-    }
-
-    // Note: alloc::alloc::Global (internal path) is NOT covered by the prefix
-    // list. This is safe because Global is only reached via RawVec (which IS
-    // excluded via alloc::raw_vec:: prefix). If def_path_str ever returns the
-    // internal alloc::alloc::Global path for a reachable function, this would
-    // be a gap. The test below documents this known theoretical gap.
-    #[test]
-    fn test_alloc_internal_global_not_covered() {
-        // This is a known gap — safe because Global is only reached from excluded RawVec.
-        assert!(!is_prefix_abstracted("alloc::alloc::Global::alloc_impl"));
-    }
-
-    // --- Range iterator: RangeIteratorImpl abstracted (#3002) ---
-    // spec_next is the CHC-stubbed entry point for Range for-loop encoding.
-    // Without abstraction, the inline pass inlines it, breaking Mem-level encoding.
-
-    #[test]
-    fn test_range_iterator_impl_spec_next_abstracted() {
-        assert!(is_prefix_abstracted(
-            "<std::ops::Range<u32> as std::iter::range::RangeIteratorImpl>::spec_next"
-        ));
-    }
-
-    #[test]
-    fn test_range_iterator_impl_core_path_abstracted() {
-        assert!(is_prefix_abstracted(
-            "<core::ops::range::Range<u32> as core::iter::range::RangeIteratorImpl>::spec_next"
-        ));
-    }
-
-    #[test]
-    fn test_range_next_not_abstracted() {
-        // Range::next() itself should NOT be abstracted — only spec_next.
-        // next() must be inlined so its Call to spec_next is exposed.
-        assert!(!is_prefix_abstracted(
-            "<std::ops::Range<u32> as std::iter::traits::iterator::Iterator>::next"
-        ));
-    }
-
-    // --- VecDeque paths (Part of #2984) ---
-
-    #[test]
-    fn test_vecdeque_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::VecDeque::<i32>::push_back"));
-    }
-
-    #[test]
-    fn test_vecdeque_module_internal() {
-        assert!(is_prefix_abstracted("std::collections::vec_deque::Iter::<i32>::next"));
-    }
-
-    #[test]
-    fn test_vecdeque_alloc_path() {
-        assert!(is_prefix_abstracted("alloc::collections::vec_deque::VecDeque::<i32>::pop_front"));
-    }
-
-    #[test]
-    fn test_vecdeque_trait_impl() {
-        assert!(is_prefix_abstracted(
-            "<std::collections::VecDeque<i32> as core::iter::traits::collect::IntoIterator>::into_iter"
-        ));
-    }
-
-    // --- LinkedList paths (Part of #2984) ---
-
-    #[test]
-    fn test_linked_list_direct_method() {
-        assert!(is_prefix_abstracted("std::collections::LinkedList::<i32>::push_back"));
-    }
-
-    #[test]
-    fn test_linked_list_module_internal() {
-        assert!(is_prefix_abstracted("std::collections::linked_list::Iter::<i32>::next"));
-    }
-
-    #[test]
-    fn test_linked_list_alloc_path() {
-        assert!(is_prefix_abstracted(
-            "alloc::collections::linked_list::LinkedList::<i32>::push_front"
-        ));
-    }
-
-    #[test]
-    fn test_linked_list_trait_impl() {
-        assert!(is_prefix_abstracted(
-            "<std::collections::LinkedList<i32> as core::iter::traits::collect::IntoIterator>::into_iter"
-        ));
-    }
-
-    // --- Structural validation of ABSTRACT_FUNCTION_PREFIXES (Part of #2984) ---
-    // These tests validate invariants of the prefix list itself, catching malformed
-    // entries, duplicates, and redundant entries at compile time rather than waiting
-    // for a runtime failure.
-
-    #[test]
-    fn test_all_prefixes_end_with_separator() {
-        for prefix in super::ABSTRACT_FUNCTION_PREFIXES {
-            assert!(
-                prefix.ends_with("::"),
-                "Prefix must end with '::' for correct starts_with matching: {prefix:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_all_prefixes_start_with_known_root() {
-        let valid_roots = ["std::", "alloc::", "core::", "hashbrown::"];
-        for prefix in super::ABSTRACT_FUNCTION_PREFIXES {
-            assert!(
-                valid_roots.iter().any(|root| prefix.starts_with(root)),
-                "Prefix must start with std::, alloc::, or core:: (got {prefix:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn test_no_duplicate_prefixes() {
-        let mut seen = std::collections::HashSet::new();
-        for prefix in super::ABSTRACT_FUNCTION_PREFIXES {
-            assert!(
-                seen.insert(prefix),
-                "Duplicate prefix in ABSTRACT_FUNCTION_PREFIXES: {prefix:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_no_redundant_prefixes() {
-        // A prefix is redundant if another shorter prefix already covers it.
-        // e.g., "alloc::collections::btree::" covers "alloc::collections::btree_set::"
-        // is NOT redundant (different substring), but "alloc::vec::Vec::push::" would be
-        // redundant given "alloc::vec::Vec::".
-        for (i, prefix) in super::ABSTRACT_FUNCTION_PREFIXES.iter().enumerate() {
-            for (j, other) in super::ABSTRACT_FUNCTION_PREFIXES.iter().enumerate() {
-                assert!(
-                    !(i != j && prefix.starts_with(other)),
-                    "Redundant prefix: {prefix:?} is already covered by {other:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_known_types_have_prefix_coverage() {
-        // Cross-reference: every known abstracted type keyword must match at least
-        // one prefix via is_prefix_abstracted(). This ensures KNOWN_ABSTRACTED_TYPE_KEYWORDS
-        // and ABSTRACT_FUNCTION_PREFIXES stay in sync.
-        let test_paths: &[(&str, &str)] = &[
-            ("alloc::vec::Vec::<i32>::push", "Vec"),
-            ("alloc::string::String::from", "String"),
-            ("std::borrow::Cow::<str>::into_owned", "Cow"),
-            ("alloc::raw_vec::RawVec::<i32>::grow_amortized", "RawVec"),
-            ("std::collections::BTreeMap::<i32, i32>::insert", "BTreeMap"),
-            ("std::collections::BTreeSet::<i32>::insert", "BTreeSet"),
-            ("std::collections::HashMap::<i32, i32>::insert", "HashMap"),
-            ("std::collections::HashSet::<i32>::insert", "HashSet"),
-            ("std::collections::VecDeque::<i32>::push_back", "VecDeque"),
-            ("std::collections::LinkedList::<i32>::push_back", "LinkedList"),
-            ("alloc::slice::hack::into_vec", "slice"),
-            ("core::slice::iter::Iter::<i32>::next", "slice iter"),
-            ("core::str::lossy::Utf8Chunks::next", "Utf8Chunks"),
-            ("core::iter::range::RangeIteratorImpl::spec_next", "RangeIteratorImpl"),
-            ("core::sync::atomic::AtomicBool::load", "Atomic"),
-        ];
-        for &(path, label) in test_paths {
-            assert!(
-                is_prefix_abstracted(path),
-                "Known abstracted type {label:?} not caught for path: {path:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_drift_keywords_are_reachable() {
-        // Validate that every entry in KNOWN_ABSTRACTED_TYPE_KEYWORDS would
-        // actually match a path that is_prefix_abstracted() covers. This ensures
-        // the drift detection list doesn't contain stale keywords.
-        for &(fragment, label) in super::KNOWN_ABSTRACTED_TYPE_KEYWORDS {
-            // Construct a synthetic path using the fragment
-            let test_path = if fragment.ends_with("::") {
-                format!("{fragment}SomeMethod")
-            } else {
-                format!("{fragment}::some_method")
-            };
-            assert!(
-                is_prefix_abstracted(&test_path),
-                "Drift keyword {label:?} (fragment={fragment:?}) not covered \
-                 by prefix list (test path: {test_path:?})"
-            );
-        }
-    }
-
-    // --- HashMap/HashSet module-path iterators (Part of #3057) ---
-    // Iterator types live in std::collections::hash_map/hash_set modules, not on
-    // the HashMap/HashSet type path. Without these, IntoIter::next gets inlined,
-    // exposing hashbrown internals.
-
-    #[test]
-    fn test_hashmap_into_iter_next_abstracted() {
-        assert!(is_prefix_abstracted("std::collections::hash_map::IntoIter::<i32, i32>::next"));
-    }
-
-    #[test]
-    fn test_hashmap_iter_next_trait_impl_abstracted() {
-        assert!(is_prefix_abstracted(
-            "<std::collections::hash_map::IntoIter<i32, i32> as core::iter::Iterator>::next"
-        ));
-    }
-
-    #[test]
-    fn test_hashset_into_iter_next_abstracted() {
-        assert!(is_prefix_abstracted("std::collections::hash_set::IntoIter::<i32>::next"));
-    }
-
-    #[test]
-    fn test_hashbrown_raw_table_abstracted() {
-        assert!(is_prefix_abstracted("hashbrown::raw::RawTable::<(i32, i32)>::find"));
-    }
-
-    #[test]
-    fn test_hashbrown_bucket_read_abstracted() {
-        assert!(is_prefix_abstracted("hashbrown::raw::Bucket::<(i32, i32)>::read"));
-    }
-
-    // --- BinaryHeap: intentionally NOT abstracted (Part of #2984 assessment) ---
-    // BinaryHeap is absent because:
-    // 1. No test harness currently uses std::collections::BinaryHeap
-    // 2. Adding a prefix without corresponding stubs would suppress MIR collection
-    //    but produce unconstrained results — worse than state explosion
-    // 3. If a future harness needs BinaryHeap, add both stubs and prefix entries
-    #[test]
-    fn test_binary_heap_intentionally_not_abstracted() {
-        assert!(!is_prefix_abstracted("std::collections::BinaryHeap::<i32>::push"));
-    }
-
-    // --- Stable atomic API: abstracted to prevent wrapper MIR inflation (Part of #3452) ---
-
-    #[test]
-    fn test_atomic_bool_load_abstracted() {
-        assert!(is_prefix_abstracted("core::sync::atomic::AtomicBool::load"));
-    }
-
-    #[test]
-    fn test_atomic_isize_fetch_add_abstracted() {
-        assert!(is_prefix_abstracted("std::sync::atomic::AtomicIsize::fetch_add"));
-    }
-
-    #[test]
-    fn test_atomic_u32_store_abstracted() {
-        assert!(is_prefix_abstracted("core::sync::atomic::AtomicU32::store"));
-    }
-
-    #[test]
-    fn test_atomic_fence_abstracted() {
-        assert!(is_prefix_abstracted("std::sync::atomic::fence"));
-    }
-
-    #[test]
-    fn test_atomic_trait_impl_abstracted() {
-        assert!(is_prefix_abstracted("<std::sync::atomic::AtomicBool as core::fmt::Debug>::fmt"));
-    }
-
-    // --- Double std:: prefix normalization (#4231) ---
-    // MIR inlining / re-exports can produce paths with duplicated `std::` prefix.
-    // is_prefix_abstracted must normalize these before matching.
-
-    #[test]
-    fn test_double_std_fs_remove_file() {
-        assert!(is_prefix_abstracted("std::std::fs::remove_file"));
-    }
-
-    #[test]
-    fn test_double_std_fs_write() {
-        assert!(is_prefix_abstracted("std::std::fs::write"));
-    }
-
-    #[test]
-    fn test_double_std_collections_vec() {
-        assert!(is_prefix_abstracted("std::std::vec::Vec::<i32>::push"));
-    }
-
-    #[test]
-    fn test_triple_std_prefix() {
-        // Even triple-std prefix should be collapsed
-        assert!(is_prefix_abstracted("std::std::std::fs::remove_file"));
-    }
-
-    #[test]
-    fn test_normalize_std_prefix_identity() {
-        assert_eq!(super::normalize_std_prefix("std::fs::remove_file"), "std::fs::remove_file");
-    }
-
-    #[test]
-    fn test_normalize_std_prefix_double() {
-        assert_eq!(
-            super::normalize_std_prefix("std::std::fs::remove_file"),
-            "std::fs::remove_file"
-        );
-    }
-
-    #[test]
-    fn test_normalize_std_prefix_triple() {
-        assert_eq!(
-            super::normalize_std_prefix("std::std::std::fs::remove_file"),
-            "std::fs::remove_file"
-        );
-    }
-
-    #[test]
-    fn test_normalize_std_prefix_non_std() {
-        assert_eq!(super::normalize_std_prefix("core::fs::remove_file"), "core::fs::remove_file");
     }
 }

@@ -41,9 +41,13 @@ fn collect_encoding_gap_reasons(
         .map(|(category, count)| format!("{category}={count}"))
         .collect();
 
-    if counts.assert_untranslatable > 0 {
-        reasons.push(format!("assert_untranslatable={}", counts.assert_untranslatable));
-    }
+    push_fail_closed_trigger(
+        &mut reasons,
+        "assert_untranslatable",
+        counts.assert_untranslatable,
+        &counts.assert_untranslatable_per_harness,
+        harness,
+    );
     if counts.heap_check_untranslatable > 0 {
         reasons.push(format!("heap_check_untranslatable={}", counts.heap_check_untranslatable));
     }

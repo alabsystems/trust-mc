@@ -261,49 +261,79 @@ impl ExprMapper {
             .iter()
             .map(|arg| self.lower_term(arg, None, source))
             .collect::<Result<Vec<_>, _>>()?;
-        match (name, indices, lowered.as_slice()) {
-            (literal, [Index::Numeral(width)], [])
-                if literal.strip_prefix("bv").is_some_and(|value| {
-                    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
-                }) =>
-            {
-                let value = parse_bigint(&literal[2..], source)?;
-                let width = parse_u32(width, source, "bitvector literal width")?;
-                if width == 0 {
-                    return Err(IngestError::ExpressionParse {
-                        expr: source.to_string(),
-                        reason: "bitvector literal width must be greater than zero".to_string(),
-                    });
+        let unsupported = || IngestError::UnsupportedExpression {
+            expr: source.to_string(),
+            reason: format!(
+                "unsupported indexed application `{name}` with {} indices and {} operands",
+                indices.len(),
+                args.len()
+            ),
+        };
+        // Dispatch on each slice's shape on its own, never on a tuple of
+        // slices: every operand and index is bound by the length test that
+        // selects its arm, and the literal's digits come from `strip_prefix`
+        // rather than a re-slice of `name`.
+        match indices {
+            [Index::Numeral(width)] => match lowered.as_slice() {
+                [] => {
+                    let Some(digits) = bitvector_literal_digits(name) else {
+                        return Err(unsupported());
+                    };
+                    let value = parse_bigint(digits, source)?;
+                    let width = parse_u32(width, source, "bitvector literal width")?;
+                    if width == 0 {
+                        return Err(IngestError::ExpressionParse {
+                            expr: source.to_string(),
+                            reason: "bitvector literal width must be greater than zero".to_string(),
+                        });
+                    }
+                    Ok(Expr::bitvec_const(value, width))
                 }
-                Ok(Expr::bitvec_const(value, width))
+                [expr] => match name {
+                    "int2bv" => {
+                        let width = parse_u32(width, source, "int2bv width")?;
+                        expr.clone()
+                            .try_int2bv(width)
+                            .map_err(|err| indexed_sort_error(source, err))
+                    }
+                    "zero_extend" => {
+                        let extra = parse_u32(width, source, "zero_extend width")?;
+                        expr.clone()
+                            .try_zero_extend(extra)
+                            .map_err(|err| indexed_sort_error(source, err))
+                    }
+                    "sign_extend" => {
+                        let extra = parse_u32(width, source, "sign_extend width")?;
+                        expr.clone()
+                            .try_sign_extend(extra)
+                            .map_err(|err| indexed_sort_error(source, err))
+                    }
+                    _ => Err(unsupported()),
+                },
+                _ => Err(unsupported()),
+            },
+            [Index::Numeral(high), Index::Numeral(low)] if name == "extract" => {
+                match lowered.as_slice() {
+                    [expr] => {
+                        let high = parse_u32(high, source, "extract high")?;
+                        let low = parse_u32(low, source, "extract low")?;
+                        expr.clone()
+                            .try_extract(high, low)
+                            .map_err(|err| indexed_sort_error(source, err))
+                    }
+                    _ => Err(unsupported()),
+                }
             }
-            ("int2bv", [Index::Numeral(width)], [expr]) => {
-                let width = parse_u32(width, source, "int2bv width")?;
-                expr.clone().try_int2bv(width).map_err(|err| indexed_sort_error(source, err))
-            }
-            ("zero_extend", [Index::Numeral(extra)], [expr]) => {
-                let extra = parse_u32(extra, source, "zero_extend width")?;
-                expr.clone().try_zero_extend(extra).map_err(|err| indexed_sort_error(source, err))
-            }
-            ("sign_extend", [Index::Numeral(extra)], [expr]) => {
-                let extra = parse_u32(extra, source, "sign_extend width")?;
-                expr.clone().try_sign_extend(extra).map_err(|err| indexed_sort_error(source, err))
-            }
-            ("extract", [Index::Numeral(high), Index::Numeral(low)], [expr]) => {
-                let high = parse_u32(high, source, "extract high")?;
-                let low = parse_u32(low, source, "extract low")?;
-                expr.clone().try_extract(high, low).map_err(|err| indexed_sort_error(source, err))
-            }
-            _ => Err(IngestError::UnsupportedExpression {
-                expr: source.to_string(),
-                reason: format!(
-                    "unsupported indexed application `{name}` with {} indices and {} operands",
-                    indices.len(),
-                    args.len()
-                ),
-            }),
+            _ => Err(unsupported()),
         }
     }
+}
+
+/// The decimal digits of an SMT-LIB `bv<digits>` literal name, or `None` when
+/// `name` is not one.
+fn bitvector_literal_digits(name: &str) -> Option<&str> {
+    name.strip_prefix("bv")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn binary(
@@ -395,6 +425,35 @@ mod tests {
     }
 
     #[test]
+    fn mapped_variable_types_match_sort_meta_translation() {
+        let metas = [
+            SortMeta::Bool,
+            SortMeta::MathInt,
+            SortMeta::Real,
+            SortMeta::BitVector { width: 8, signed: true },
+            SortMeta::BitVector { width: 32, signed: false },
+            SortMeta::Opaque { name: "T".to_string() },
+            SortMeta::Seq { elem: Box::new(SortMeta::MathInt) },
+            SortMeta::Set { elem: Box::new(SortMeta::Bool) },
+        ];
+        for meta in metas {
+            let sort = crate::translate_sort(&meta).expect("fixture sort should translate");
+            let var = MappedVar { name: "v".to_string(), sort: sort.clone(), meta: meta.clone() };
+            let via_meta = TypeInfo::from_sort_meta(&meta).expect("fixture sort should map");
+            assert_eq!(TypeInfo::from_mapped_var(&var), via_meta, "{meta:?}");
+            assert_eq!(via_meta.sort(), sort, "{meta:?}");
+        }
+        assert_eq!(
+            TypeInfo::from_sort(&Sort::bitvec(16)).expect("bitvector sort should map"),
+            TypeInfo::BitVector { width: 16, signed: false }
+        );
+        assert_eq!(
+            TypeInfo::from_sort(&Sort::real()).expect("real sort should map"),
+            TypeInfo::Other(Sort::real())
+        );
+    }
+
+    #[test]
     fn indexed_applications_require_exact_numeral_indices() {
         for smt in [
             "((_ zero_extend |1|) #b0)",
@@ -431,6 +490,72 @@ mod tests {
             ExprMapper::new(&[])
                 .lower_from_smt(smt, None, smt)
                 .expect_err("zero-width bitvectors must be rejected");
+        }
+    }
+
+    #[test]
+    fn bitvector_literal_digits_accepts_only_bv_then_decimal_digits() {
+        assert_eq!(bitvector_literal_digits("bv5"), Some("5"));
+        assert_eq!(bitvector_literal_digits("bv0042"), Some("0042"));
+        for name in ["bv", "bvx", "bv5a", "b5", "int2bv", ""] {
+            assert_eq!(bitvector_literal_digits(name), None, "`{name}` is not a bv literal");
+        }
+    }
+
+    #[test]
+    fn indexed_applications_lower_each_supported_shape() {
+        let variable = MappedVar {
+            name: "x".to_string(),
+            sort: Sort::bitvec(8),
+            meta: SortMeta::BitVector { width: 8, signed: false },
+        };
+        let mut mapper = ExprMapper::new(&[variable]);
+        let x = Expr::var("x", Sort::bitvec(8));
+        let lower = |mapper: &mut ExprMapper, smt: &str| {
+            mapper.lower_from_smt(smt, None, smt).unwrap_or_else(|err| panic!("{smt}: {err}"))
+        };
+
+        assert_eq!(lower(&mut mapper, "(_ bv7 4)"), Expr::bitvec_const(BigInt::from(7_u8), 4));
+        assert_eq!(
+            lower(&mut mapper, "((_ zero_extend 8) x)"),
+            x.clone().try_zero_extend(8).expect("zero_extend")
+        );
+        assert_eq!(
+            lower(&mut mapper, "((_ sign_extend 8) x)"),
+            x.clone().try_sign_extend(8).expect("sign_extend")
+        );
+        assert_eq!(
+            lower(&mut mapper, "((_ extract 3 0) x)"),
+            x.clone().try_extract(3, 0).expect("extract")
+        );
+        assert_eq!(
+            lower(&mut mapper, "((_ int2bv 8) 5)"),
+            Expr::int_const(5).try_int2bv(8).expect("int2bv")
+        );
+    }
+
+    #[test]
+    fn indexed_applications_with_the_wrong_shape_are_unsupported() {
+        for smt in [
+            // a bv literal takes no operands, and only a `bv<digits>` name is one
+            "((_ bv5 8) #b0)",
+            "(_ bvx 8)",
+            "(_ zero_extend 8)",
+            // unary indexed operators take exactly one operand
+            "((_ zero_extend 1) #b0 #b1)",
+            "((_ int2bv 8) 1 2)",
+            // extract takes two indices, and only extract takes two
+            "((_ extract 7) #xff)",
+            "((_ zero_extend 1 2) #b0)",
+            "((_ frobnicate 1) #b0)",
+        ] {
+            let err = ExprMapper::new(&[])
+                .lower_from_smt(smt, None, smt)
+                .expect_err("a wrong-shaped indexed application must fail closed");
+            assert!(
+                matches!(err, IngestError::UnsupportedExpression { .. }),
+                "unexpected error for {smt}: {err}"
+            );
         }
     }
 }

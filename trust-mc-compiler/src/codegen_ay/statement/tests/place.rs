@@ -181,7 +181,7 @@ fn test_mir_codegen_place_struct_field() {
                         let _r = codegen.codegen_place(place);
                         exercised += 1;
                     }
-                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rvalue
+                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rvalue
                         && place_has_projection(p, |p| matches!(p, ProjectionElem::Field(..)))
                     {
                         let _r = codegen.codegen_place(p);
@@ -220,7 +220,7 @@ fn test_mir_codegen_place_tuple_field() {
                         let _r = codegen.codegen_place(place);
                         exercised += 1;
                     }
-                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rvalue
+                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rvalue
                         && place_has_projection(p, |p| matches!(p, ProjectionElem::Field(..)))
                     {
                         let _r = codegen.codegen_place(p);
@@ -265,7 +265,7 @@ fn test_mir_codegen_place_missing_env_downcast_index_projection() {
             .find_map(|stmt| match &stmt.kind {
                 StatementKind::Assign(
                     _,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) if place_has_projection(place, |p| matches!(p, ProjectionElem::Downcast(_)))
                     && place_has_projection(place, |p| matches!(p, ProjectionElem::Field(..))) =>
                 {
@@ -319,7 +319,7 @@ fn test_mir_codegen_place_ref_deref() {
                         let _r = codegen.codegen_place(place);
                         exercised += 1;
                     }
-                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rvalue
+                    if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rvalue
                         && place_has_projection(p, |p| matches!(p, ProjectionElem::Deref))
                     {
                         let _r = codegen.codegen_place(p);

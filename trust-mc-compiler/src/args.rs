@@ -126,8 +126,10 @@ pub(crate) struct Arguments {
     pub c_lib: Vec<String>,
     /// Emit NaN-generation obligations for float arithmetic (opt-in).
     ///
-    /// OFF by default, matching Kani: producing a NaN is DEFINED behaviour in
-    /// Rust, not UB, so this is a lint rather than a safety property.
+    /// OFF by default. Kani's default is ON (kani-driver passes CBMC
+    /// `--nan-check` whenever overflow checks are on); trust-mc's differs
+    /// deliberately, see the driver's `--nan-check`. Producing a NaN is
+    /// DEFINED behaviour in Rust, not UB.
     #[arg(long = "nan-check")]
     pub nan_checks: bool,
     /// Turn off default unwinding checks.
@@ -226,6 +228,16 @@ pub(crate) struct Arguments {
     /// relying on the solver for invariant synthesis.
     #[arg(long)]
     pub ay_chc_bounded_unroll: bool,
+    /// Per-harness translation budget, in milliseconds.
+    ///
+    /// trust-mc-driver derives it from `--harness-timeout`. Codegen of one
+    /// harness (reachability, MIR transforms, MIR-to-CHC translation, emit-time
+    /// optimization) that outlives its budget stops, and the harness is
+    /// reported UNKNOWN with reason `TranslationTimeout` instead of the whole
+    /// process running into the driver's watchdog. Absent means no budget.
+    /// See `codegen_ay::translation_deadline::per_harness_budget`.
+    #[arg(long)]
+    pub translation_timeout_ms: Option<u64>,
     /// If we are running the autoharness subcommand, the paths to include.
     /// See kani_driver::autoharness_args for documentation.
     #[arg(long = "autoharness-include-pattern", num_args(1))]
@@ -244,4 +256,152 @@ pub(crate) enum ExtraChecks {
     Validity,
     /// Check for using uninitialized memory.
     Uninit,
+}
+
+impl Arguments {
+    /// The `--check-version` trust-mc-driver always sends; `None` when the
+    /// arguments did not come from the driver.
+    pub(crate) fn check_version(&self) -> Option<&str> {
+        self.check_version.as_deref()
+    }
+}
+
+/// Why `-C llvm-args` did not yield engine [`Arguments`].
+#[derive(Debug)]
+pub(crate) enum LlvmArgsError {
+    /// A malformed `pct1` group (`trust_mc_metadata::engine_args`).
+    Channel(trust_mc_metadata::engine_args::EngineArgsError),
+    /// The decoded argv is not a valid engine command line.
+    Clap(clap::Error),
+}
+
+/// Parse the engine arguments from rustc's `-C llvm-args` values, after a
+/// synthetic program name, exactly as the old `Callbacks::config` did.
+///
+/// The values are first decoded with
+/// [`trust_mc_metadata::engine_args::decode_llvm_args`]: trust-mc-driver's
+/// Trustc route sends each engine argv as a counted `pct1` group, so a path with
+/// whitespace survives rustc's `split_whitespace`. Tokens outside a group (the
+/// DevCli form, which never encodes) come back unchanged.
+///
+/// Returns the error instead of exiting, so the backend can report it as a
+/// fatal rustc diagnostic inside a host compiler.
+pub(crate) fn parse_llvm_args(llvm_args: &[String]) -> Result<Arguments, LlvmArgsError> {
+    use clap::Parser;
+    let argv = trust_mc_metadata::engine_args::decode_llvm_args(llvm_args)
+        .map_err(LlvmArgsError::Channel)?;
+    Arguments::try_parse_from(
+        std::iter::once("trust_mc-compiler").chain(argv.iter().map(String::as_str)),
+    )
+    .map_err(LlvmArgsError::Clap)
+}
+
+/// An engine-argument error as the text of one rustc diagnostic: without clap's
+/// own `error: ` prefix (rustc prints one) and without trailing blank lines.
+pub(crate) fn render_llvm_args_error(err: &LlvmArgsError) -> String {
+    match err {
+        LlvmArgsError::Channel(err) => err.to_string(),
+        LlvmArgsError::Clap(err) => {
+            let text = err.to_string();
+            let text = text.trim_end();
+            text.strip_prefix("error: ").unwrap_or(text).to_owned()
+        }
+    }
+}
+
+/// What rustc hands the engine in `cg.llvm_args` on trust-mc-driver's Trustc
+/// route (`tests/trust-lane/engine-args/<name>.llvm-args`), recorded from the
+/// driver's own argv composition. The driver test
+/// `compiler_route_trustc_llvm_args_match_the_engine_fixtures` fails when the
+/// driver stops producing exactly these lists, so the two sides cannot drift.
+#[cfg(test)]
+pub(crate) fn trustc_route_llvm_args_fixture(name: &str) -> Vec<String> {
+    let text = match name {
+        "standalone" => include_str!("../../tests/trust-lane/engine-args/standalone.llvm-args"),
+        "cargo-dependency" => {
+            include_str!("../../tests/trust-lane/engine-args/cargo-dependency.llvm-args")
+        }
+        "cargo-local" => include_str!("../../tests/trust-lane/engine-args/cargo-local.llvm-args"),
+        _ => unreachable!("no fixture {name}"),
+    };
+    text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.replace("@CARGO_PKG_VERSION@", env!("CARGO_PKG_VERSION")))
+        .collect()
+}
+
+#[cfg(test)]
+mod llvm_args_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// What `trust-mc-driver` puts in `-Cllvm-args` for a single-file run
+    /// (`util::encode_as_rustc_arg` joins them with spaces; rustc splits them
+    /// back into `cg.llvm_args`), in the BMC and the `--ay-chc` lane.
+    const DRIVER_FLAG_LISTS: &[&str] = &[
+        "--check-version=0.7.0 --log-level=warn --assertion-reach-checks --reachability=harnesses",
+        "--check-version=0.7.0 --log-level=warn --assertion-reach-checks --reachability=harnesses --ay-chc --harness check_u8 --exact",
+        "--ignore-global-asm --build-std",
+    ];
+
+    #[test]
+    fn init_parses_llvm_args() {
+        for list in DRIVER_FLAG_LISTS {
+            let llvm_args: Vec<String> = list.split_whitespace().map(str::to_owned).collect();
+            let parsed = parse_llvm_args(&llvm_args).expect("the driver's flag list parses");
+            let config = Arguments::parse_from(
+                std::iter::once("trust_mc-compiler").chain(llvm_args.iter().map(String::as_str)),
+            );
+            assert_eq!(format!("{parsed:?}"), format!("{config:?}"), "for {list}");
+        }
+    }
+
+    #[test]
+    fn unknown_llvm_arg_is_returned_not_exited() {
+        let err = parse_llvm_args(&["--no-such-flag".to_owned()])
+            .expect_err("an unknown engine argument is an error");
+        let text = render_llvm_args_error(&err);
+        assert!(text.contains("--no-such-flag"), "{text}");
+        assert!(!text.starts_with("error: "), "{text}");
+    }
+
+    fn assert_driver_fixture_args(args: &Arguments, what: &str) {
+        assert_eq!(args.c_lib, ["/opt/Application Support/stub.o"], "{what}: {args:?}");
+        assert_eq!(args.harnesses, ["check_add"], "{what}: {args:?}");
+        assert_eq!(args.default_unwind, Some(3), "{what}: {args:?}");
+        assert!(args.check_assertion_reachability, "{what}: {args:?}");
+        assert_eq!(args.reachability_analysis, ReachabilityType::Harnesses, "{what}: {args:?}");
+        assert_eq!(args.check_version(), Some(env!("CARGO_PKG_VERSION")), "{what}: {args:?}");
+    }
+
+    #[test]
+    fn init_decodes_the_trustc_route_standalone_llvm_args() {
+        let llvm_args = trustc_route_llvm_args_fixture("standalone");
+        let args = parse_llvm_args(&llvm_args).expect("the driver's Trustc argv parses");
+        assert_driver_fixture_args(&args, "standalone");
+    }
+
+    #[test]
+    fn init_decodes_the_trustc_route_cargo_groups_in_either_order() {
+        let dependency = trustc_route_llvm_args_fixture("cargo-dependency");
+        let local = trustc_route_llvm_args_fixture("cargo-local");
+        for (first, second) in [(&dependency, &local), (&local, &dependency)] {
+            let llvm_args: Vec<String> = first.iter().chain(second).cloned().collect();
+            let args = parse_llvm_args(&llvm_args).expect("the concatenated groups parse");
+            assert_driver_fixture_args(&args, "cargo");
+        }
+    }
+
+    #[test]
+    fn malformed_pct1_group_is_returned_not_exited() {
+        for llvm_args in [
+            vec!["--trust-mc-engine-args=pct1".to_owned(), "--log-level=warn".to_owned()],
+            vec!["--trust-mc-engine-args=pct1:2".to_owned(), "--log-level=warn".to_owned()],
+            vec!["--trust-mc-engine-args=pct1:1".to_owned(), "%zz".to_owned()],
+        ] {
+            let err = parse_llvm_args(&llvm_args).expect_err("a malformed group is an error");
+            assert!(matches!(err, LlvmArgsError::Channel(_)), "{llvm_args:?}: {err:?}");
+            assert!(!render_llvm_args_error(&err).is_empty());
+        }
+    }
 }

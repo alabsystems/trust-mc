@@ -26,6 +26,7 @@ mod transition_gen_terminators;
 mod unreachable_error;
 
 // Re-export dispatch_block_terminator for fragment_gen (Part of #112).
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 pub(in crate::codegen_ay::chc) use transition_gen::dispatch_block_terminator;
 
 use std::collections::HashSet;
@@ -38,7 +39,7 @@ use tracing::{debug, warn};
 use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
 use crate::codegen_ay::types::int_sort;
 
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 use trust_mc_core::chc::{RelationApp, Rule, RuleBody};
 
 pub(in crate::codegen_ay::chc) struct TransitionContext<'a> {
@@ -144,12 +145,22 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Wall-2: nested-legacy loop sentinel → fail-closed demotion (see
         // `prescan_loop_rule_nested_legacy_demotion`).
         crate::codegen_ay::chc::loop_modifies_frame::prescan_loop_rule_nested_legacy_demotion(self);
+        // Design 5: every legacy loop-contract latch -> fail-closed booking
+        // (see `prescan_loop_contract_legacy_latches`).
+        crate::codegen_ay::chc::loop_modifies_frame::prescan_loop_contract_legacy_latches(self);
+        // Design 5 backstop: every loop contract the body can reach outside
+        // itself -> fail-closed booking (see `prescan_loop_contracts_beyond_body`).
+        crate::codegen_ay::chc::call::codegen_call_virtual_inline::loop_contract_scan::prescan_loop_contracts_beyond_body(self);
         // Part of #112: dispatch to fragment-based rule generation in Large mode.
         if self.step_mode == crate::args::ChcStepMode::Large {
             super::fragment_gen::generate_fragment_rules(self);
         } else {
             transition_gen::generate_transition_rules(self);
         }
+        // Every block is encoded: judge each heap read against every store of
+        // its object, in either encoding order (`heap_view_ledger.rs`).
+        self.record_heap_view_ledger_reasons();
+        self.record_symbolic_lane_bound_completeness();
     }
 
     /// Fail-closed fallback for untranslatable MIR Assert conditions.
@@ -219,8 +230,8 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Part of #3447: Record that SwitchInt discriminant is unresolvable —
         // the selector is unconstrained (nondeterministic branch choice).
         // Part of #3814: upgrade to reason-coded recording for bootstrap diagnosis.
-        self.record_sound_fallback_reason("switchint_discriminant_unresolvable");
-        let selector = declare_pending_var(chc_fresh_name("__switch_choice"), int_sort());
+        let booked = self.record_sound_fallback_reason("switchint_discriminant_unresolvable");
+        let selector = Havoc::booked(booked, chc_fresh_name("__switch_choice"), int_sort());
         for (choice_idx, (_, target)) in branches.iter().enumerate() {
             let guard = selector.clone().eq(Expr::int_const(BigInt::from(choice_idx)));
             self.emit_guarded_goto_rule_shared(
@@ -269,13 +280,22 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // extra may contain store chain constraints (`mem_*__out = store(...)`)
         // that supersede constraints already in stmt_constraints. Without
         // filtering, both target the same __out variable → UNSAT.
-        let extra_vec: Vec<Expr> = extra.into_iter().collect();
-        let filtered_stmts =
-            super::heap_store_chains::filter_superseded_store_chains(stmt_constraints, &extra_vec);
+        let mut extra_vec: Vec<Expr> = extra.into_iter().collect();
+        let filtered_stmts = super::heap_store_chains::filter_superseded_store_chains(
+            stmt_constraints,
+            &mut extra_vec,
+        );
         let effective_stmts: &[Expr] = filtered_stmts.as_deref().unwrap_or(stmt_constraints);
         let mut extra_with_guards = extra_vec;
         append_constructor_guards(&mut extra_with_guards);
 
+        // FC-06 frame net: classify caller-visible writes this transition makes.
+        self.modifies_frame_net_rule(
+            &from_app,
+            output_args,
+            crate::codegen_ay::chc::modifies_frame_net::NetBase::Slice(effective_stmts),
+            &extra_with_guards,
+        );
         let Some(to_rel) = self.block_relations.get(&target).map(|s| &**s) else {
             // Part of #112, #3595: Unreachable or error-only targets may have no
             // declared relation when excluded from BFS chains. Emit error rule.
@@ -338,11 +358,22 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         rustc_public::mir::TerminatorKind::Unreachable
                     )
                 {
-                    let _ = self.register_error_head(
-                        trust_mc_core::violation::PropertyKind::Unreachable,
-                        target,
-                        Some("unreachable code reached".to_string()),
-                    );
+                    // NOT discharged here, deliberately. This guard folding to
+                    // false proves THIS EDGE is infeasible; the property is per
+                    // TARGET BLOCK, and another edge may still reach it. Marking
+                    // it discharged made `unreachable_discharge_dual.rs::
+                    // bug_reachable_unreachable` and `obligation_free_walk_dual.rs::
+                    // bug_unreachable_unchecked_one_deep` report SUCCESSFUL on a
+                    // real bug (measured 2026-09-18; both packs exist for exactly
+                    // this hazard). A per-edge fact cannot discharge a per-block
+                    // obligation.
+                    //
+                    // Registering the property and emitting NO rule is not the
+                    // answer either: a RULELESS property is what the driver reads
+                    // as `LostErrorRules` and refuses, which cost 22 corpus units
+                    // Kani proves. Emit the per-block obligation instead and let a
+                    // SOLVER decide it.
+                    self.emit_infeasible_edge_unreachable_obligation(target);
                 }
                 debug!(?target, "skipping guarded transition rule (guard=false)");
                 return;
@@ -351,6 +382,12 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
         let mut extra = vec![guard];
         append_constructor_guards(&mut extra);
+        self.modifies_frame_net_rule(
+            &from_app,
+            output_args,
+            crate::codegen_ay::chc::modifies_frame_net::NetBase::Slice(stmt_constraints),
+            &extra,
+        );
         let Some(to_rel) = self.block_relations.get(&target).map(|s| &**s) else {
             // Part of #112, #3595: emit error rule for unreachable/error-only targets.
             if !self.try_emit_unreachable_error(&from_app, target, stmt_constraints, extra) {
@@ -421,11 +458,22 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                         rustc_public::mir::TerminatorKind::Unreachable
                     )
                 {
-                    let _ = self.register_error_head(
-                        trust_mc_core::violation::PropertyKind::Unreachable,
-                        target,
-                        Some("unreachable code reached".to_string()),
-                    );
+                    // NOT discharged here, deliberately. This guard folding to
+                    // false proves THIS EDGE is infeasible; the property is per
+                    // TARGET BLOCK, and another edge may still reach it. Marking
+                    // it discharged made `unreachable_discharge_dual.rs::
+                    // bug_reachable_unreachable` and `obligation_free_walk_dual.rs::
+                    // bug_unreachable_unchecked_one_deep` report SUCCESSFUL on a
+                    // real bug (measured 2026-09-18; both packs exist for exactly
+                    // this hazard). A per-edge fact cannot discharge a per-block
+                    // obligation.
+                    //
+                    // Registering the property and emitting NO rule is not the
+                    // answer either: a RULELESS property is what the driver reads
+                    // as `LostErrorRules` and refuses, which cost 22 corpus units
+                    // Kani proves. Emit the per-block obligation instead and let a
+                    // SOLVER decide it.
+                    self.emit_infeasible_edge_unreachable_obligation(target);
                 }
                 debug!(?target, "skipping guarded transition rule (guard=false)");
                 return;
@@ -434,6 +482,12 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
         let mut extra = vec![guard];
         append_constructor_guards(&mut extra);
+        self.modifies_frame_net_rule(
+            &from_app,
+            output_args,
+            crate::codegen_ay::chc::modifies_frame_net::NetBase::Shared(shared_constraints),
+            &extra,
+        );
         let Some(to_rel) = self.block_relations.get(&target).map(|s| &**s) else {
             // Part of #112, #3436: emit error rule for unreachable/error-only targets.
             if !self.try_emit_unreachable_error_shared(&from_app, target, shared_constraints, extra)
@@ -462,6 +516,12 @@ impl<'tcx, 'body> CodegenRules<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         let from_app = self.refresh_block_relation_app(from_app);
         let mut extra_with_guards: Vec<Expr> = extra.into_iter().collect();
         append_constructor_guards(&mut extra_with_guards);
+        self.modifies_frame_net_rule(
+            &from_app,
+            output_args,
+            crate::codegen_ay::chc::modifies_frame_net::NetBase::Shared(shared_constraints),
+            &extra_with_guards,
+        );
         let Some(to_rel) = self.block_relations.get(&target).map(|s| &**s) else {
             // Part of #112, #3436: emit error rule for unreachable/error-only targets.
             if !self.try_emit_unreachable_error_shared(

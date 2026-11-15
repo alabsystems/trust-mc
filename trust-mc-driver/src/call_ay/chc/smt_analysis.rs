@@ -29,6 +29,15 @@ pub(crate) fn smt_has_vacuous_checks_marker(smt_content: &str) -> bool {
     smt_content.contains("; VACUOUS_ALL_CHECKS_UNREACHABLE:")
 }
 
+/// The compiler stopped translating this harness at its translation budget.
+///
+/// Returns the marker's payload (`phase=... budget_ms=...`) so the driver can
+/// say where the time went. The artifact carrying it is a fail-closed error
+/// fact, never something to solve.
+pub(crate) fn smt_translation_timeout_marker(smt_content: &str) -> Option<&str> {
+    smt_content.lines().find_map(|line| line.strip_prefix("; TRANSLATION_TIMEOUT:")).map(str::trim)
+}
+
 /// Detect CHC systems where `error` is queried but no rule can derive it.
 ///
 /// A rule with an explicitly false body, such as `(rule (=> false error))`,
@@ -443,5 +452,25 @@ mod tests {
 
         assert!(smt_error_query_is_trivially_safe(smt));
         assert!(!smt_error_query_has_false_error_obligation(smt));
+    }
+}
+
+#[cfg(test)]
+mod translation_timeout_marker_tests {
+    use super::smt_translation_timeout_marker;
+
+    #[test]
+    fn marker_payload_is_returned() {
+        let smt = "(set-logic HORN)\n(query chc_translation_timeout)\n\
+                   ; TRANSLATION_TIMEOUT: phase=chc_walker budget_ms=30000\n";
+        assert_eq!(smt_translation_timeout_marker(smt), Some("phase=chc_walker budget_ms=30000"));
+    }
+
+    #[test]
+    fn ordinary_artifacts_carry_no_marker() {
+        let smt = "(set-logic HORN)\n(query error)\n; DEMOTED_FALLBACK: chc_fallback\n";
+        assert_eq!(smt_translation_timeout_marker(smt), None);
+        // A mention inside a rule, not a marker line, does not count.
+        assert_eq!(smt_translation_timeout_marker("(rule TRANSLATION_TIMEOUT)\n"), None);
     }
 }

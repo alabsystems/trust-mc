@@ -44,6 +44,7 @@ pub(crate) struct PropertyId {
 
 impl Property {
     const COVER_PROPERTY_CLASS: &'static str = "cover";
+    const UNATTRIBUTED_CHC_CLASS: &'static str = "chc";
 
     pub(crate) fn property_class(&self) -> &str {
         &self.property_id.class
@@ -52,6 +53,24 @@ impl Property {
     /// Returns true if this is a cover property
     pub(crate) fn is_cover_property(&self) -> bool {
         self.property_id.class == Self::COVER_PROPERTY_CLASS
+    }
+
+    /// Whether this is the anonymous `chc.0` check a CHC result falls back to when it
+    /// cannot attribute the verdict to any registered property: no function, the `chc`
+    /// class, id 0, and no source location.
+    ///
+    /// That check says only that `error` is (un)reachable. It names no assertion, so a
+    /// proof whose sole check it is does not show WHICH properties were proved, and it
+    /// cannot reveal that an expected property never reached the encoding (T1 first
+    /// green: a bypassed `assert!` override left exactly one such check).
+    pub(crate) fn is_unattributed_chc_check(&self) -> bool {
+        self.property_id.class == Self::UNATTRIBUTED_CHC_CLASS
+            && self.property_id.fn_name.is_none()
+            && self.property_id.id == 0
+            && self.source_location.file.is_none()
+            && self.source_location.function.is_none()
+            && self.source_location.line.is_none()
+            && self.source_location.column.is_none()
     }
 
     pub(crate) fn property_name(&self) -> String {

@@ -101,7 +101,7 @@ impl LoopContractPass {
                 let inner = Self::operand_to_smt2(operand, local_exprs)?;
                 Some(format!("(not {})", inner))
             }
-            Rvalue::Use(operand) => Self::operand_to_smt2(operand, local_exprs),
+            Rvalue::Use(operand, ..) => Self::operand_to_smt2(operand, local_exprs),
             Rvalue::Ref(_, _, place) | Rvalue::CopyForDeref(place) => {
                 local_exprs.get(&place.local).cloned()
             }
@@ -128,6 +128,8 @@ impl LoopContractPass {
                 local_exprs.get(&place.local).cloned()
             }
             Operand::Constant(const_op) => Self::const_to_smt2(&const_op.const_),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 

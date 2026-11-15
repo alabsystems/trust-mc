@@ -10,6 +10,8 @@
 //!
 //! Extracted from place.rs per #2140 for reviewability.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use super::{
     Expr, IndexedVal, IntoOption, Place, ProjectionElem, RigidTy, StatementCodegen, TyKind,
     constant_index_offset,
@@ -358,6 +360,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 ref_base, sort
                             );
                             let symbolic_value = self.ctx.declare_var(&name, sort);
+                            self.ctx.bmc_sound_havoc("ref_symbolic");
                             // Store in heap_pointees for consistency
                             self.heap_pointees.insert(
                                 std::sync::Arc::from(ref_base.as_str()),

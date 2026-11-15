@@ -199,11 +199,15 @@ impl KaniSession {
     /// Add the compiler arguments specific to the `autoharness` subcommand.
     pub(crate) fn add_auto_harness_args(&mut self, included: &[String], excluded: &[String]) {
         let mut args = vec![];
+        // One engine argv token per element, so the Trustc route's pct1 channel keeps a
+        // pattern with whitespace intact; the DevCli route's space join is unchanged.
         for pattern in included {
-            args.push(format!("--autoharness-include-pattern {pattern}"));
+            args.push("--autoharness-include-pattern".to_string());
+            args.push(pattern.to_string());
         }
         for pattern in excluded {
-            args.push(format!("--autoharness-exclude-pattern {pattern}"));
+            args.push("--autoharness-exclude-pattern".to_string());
+            args.push(pattern.to_string());
         }
         self.autoharness_compiler_flags = Some(args);
     }

@@ -72,5 +72,30 @@ pub(crate) unsafe fn any_raw_internal<T: Copy>() -> T {
         };
     });
     assert_eq!(next_concrete_val.len(), sz, "Expected {sz} bytes in the following det vals vec");
-    unsafe { *(next_concrete_val.as_ptr() as *mut T) }
+    // The byte vector guarantees initialized bytes, not T's alignment. The
+    // caller's any_raw contract still requires a valid bit pattern for T.
+    unsafe { std::ptr::read_unaligned(next_concrete_val.as_ptr().cast::<T>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_decodes_native_multibyte_values() {
+        concrete_playback_run(vec![0x1234_u64.to_ne_bytes().to_vec()], || {
+            assert_eq!(unsafe { any_raw_internal::<u64>() }, 0x1234);
+        });
+    }
+
+    #[test]
+    fn aligned_zero_sized_values_consume_no_input() {
+        #[derive(Clone, Copy)]
+        #[repr(align(64))]
+        struct AlignedZst;
+        concrete_playback_run(Vec::new(), || {
+            let _: AlignedZst = unsafe { any_raw_internal() };
+            let _: () = unsafe { any_raw_internal() };
+        });
+    }
 }

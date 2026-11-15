@@ -109,6 +109,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 Operand::Constant(c) => {
                     let const_ty = c.const_.ty();
+                    self.premint_const_ref_targets(&c.const_);
                     if let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) = const_ty.kind()
                         && let Some(pointee_expr) =
                             self.try_codegen_const_ref_pointee(&c.const_, pointee_ty)
@@ -143,6 +144,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         self.ref_pointees.insert(Arc::from(lhs_field_base), pointee_base);
                     }
                 }
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => {}
             }
         }
     }

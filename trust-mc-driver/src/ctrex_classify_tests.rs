@@ -331,13 +331,18 @@ fn test_classify_ctrex_unknown_when_undecided_with_no_violation() {
     // No properties at all (empty model on `unknown`) → no non-CHC violation.
     let counts = CrateUnsoundnessCounts::default();
 
-    // Mirror the classification logic in harness_runner::check_harness.
+    // Mirror the classification logic in harness_runner::check_harness, calling
+    // the same predicate it calls so the mirror cannot drift from it.
     demote_for_all_unsoundness(&mut result, &harness, &counts);
     if result.status == VerificationStatus::Failure && result.demotion_reasons.is_empty() {
         let has_non_chc_violation = result.results.iter().any(|p| {
             p.status == crate::property_model::CheckStatus::Failure && p.property_id.class != "chc"
         });
-        if matches!(result.failed_properties, FailedProperties::Other) && !has_non_chc_violation {
+        if crate::harness_runner::chc_failure_is_undecided(
+            result.failed_properties,
+            has_non_chc_violation,
+            result.chc_exact_counterexample,
+        ) {
             result.ctrex_category = Some(CtrexCategory::Unknown);
         } else {
             result.ctrex_category = Some(classify_ctrex(&harness, &counts));
@@ -406,6 +411,50 @@ fn test_classify_ctrex_fail_closed_assert_untranslatable() {
     match category {
         CtrexCategory::EncodingGap { categories } => {
             assert_eq!(categories[0], "assert_untranslatable=1");
+        }
+        other => panic!("Expected EncodingGap for assert_untranslatable, got {other:?}"),
+    }
+}
+
+/// One harness's untranslatable assert must not demote a SIBLING's
+/// counterexample. Before the per-harness map, `assert_untranslatable` was
+/// charged crate-wide, so every harness of
+/// negative/modifies_frame_slice_params.rs read `assert_untranslatable=10` and
+/// the CHC slice-footprint false certificate in that file was hidden as an
+/// EncodingGap while the identical accusation showed as Genuine in a file
+/// without an untranslatable assert.
+#[test]
+fn test_classify_ctrex_assert_untranslatable_is_scoped_to_its_own_harness() {
+    let counts = CrateUnsoundnessCounts {
+        assert_untranslatable: 10,
+        assert_untranslatable_per_harness: BTreeMap::from([("crate::dirty".to_string(), 10)]),
+        ..Default::default()
+    };
+
+    let dirty = test_harness("crate::dirty", "crate");
+    match classify_ctrex(&dirty, &counts) {
+        CtrexCategory::EncodingGap { categories } => {
+            assert_eq!(categories, vec!["assert_untranslatable=10"]);
+        }
+        other => panic!("the harness that OWNS the untranslatable assert must be EncodingGap, got {other:?}"),
+    }
+
+    let clean = test_harness("crate::clean", "crate");
+    assert!(
+        !matches!(classify_ctrex(&clean, &counts), CtrexCategory::EncodingGap { .. }),
+        "a sibling harness must not inherit another harness's untranslatable assert"
+    );
+}
+
+/// An EMPTY per-harness map still charges the crate total, so a compiler that
+/// does not yet attribute the count fails closed rather than silently clean.
+#[test]
+fn test_classify_ctrex_assert_untranslatable_without_a_map_charges_the_crate() {
+    let harness = test_harness("crate::harness", "crate");
+    let counts = CrateUnsoundnessCounts { assert_untranslatable: 4, ..Default::default() };
+    match classify_ctrex(&harness, &counts) {
+        CtrexCategory::EncodingGap { categories } => {
+            assert_eq!(categories, vec!["assert_untranslatable=4"]);
         }
         other => panic!("Expected EncodingGap for assert_untranslatable, got {other:?}"),
     }
@@ -625,4 +674,184 @@ fn test_classify_ctrex_task77_independent_target_still_stays_over_approximation(
         "an independent-looking bug under sound-approximation taint must NOT be \
          certified Genuine driver-side (Task #77)"
     );
+}
+
+/// The exact-derivation flag ROUTES a row to [`classify_ctrex`]; it never
+/// certifies one.
+///
+/// This is the soundness direction of the G8 fix
+/// (docs/chc-unknown-root-causes-2026-09-14.md). A counterexample the driver
+/// derived exactly is still only as trustworthy as the encoding it was derived
+/// from, so a harness carrying an encoding gap must come out `EncodingGap` —
+/// exactly as it would without the flag. Only a harness with zero unsoundness
+/// counts reaches `Genuine`.
+#[test]
+fn test_exactly_derived_ctrex_with_an_encoding_gap_is_not_genuine() {
+    let harness = test_harness("crate::harness", "crate");
+    let mut result = test_result(VerificationStatus::Failure, FailedProperties::Other);
+    result.chc_exact_counterexample = true;
+    let counts = CrateUnsoundnessCounts { chc_fallback: 2, ..Default::default() };
+
+    demote_for_all_unsoundness(&mut result, &harness, &counts);
+    if result.status == VerificationStatus::Failure && result.demotion_reasons.is_empty() {
+        let has_non_chc_violation = result.results.iter().any(|p| {
+            p.status == crate::property_model::CheckStatus::Failure && p.property_id.class != "chc"
+        });
+        if crate::harness_runner::chc_failure_is_undecided(
+            result.failed_properties,
+            has_non_chc_violation,
+            result.chc_exact_counterexample,
+        ) {
+            result.ctrex_category = Some(CtrexCategory::Unknown);
+        } else {
+            result.ctrex_category = Some(classify_ctrex(&harness, &counts));
+        }
+    }
+
+    match result.ctrex_category.expect("a non-demoted failure is classified") {
+        CtrexCategory::EncodingGap { categories } => {
+            assert!(
+                categories.contains(&"chc_fallback=2".to_string()),
+                "the encoding gap must still name its trigger: {categories:?}"
+            );
+        }
+        other => panic!("an exactly derived ctrex over a gapped encoding must not be certified: {other:?}"),
+    }
+}
+
+/// The same row with a CLEAN encoding is the parity this fix buys: `Genuine`,
+/// where the pre-fix reading was `Unknown`.
+#[test]
+fn test_exactly_derived_ctrex_on_a_clean_encoding_is_genuine() {
+    let harness = test_harness("crate::harness", "crate");
+    let mut result = test_result(VerificationStatus::Failure, FailedProperties::Other);
+    result.chc_exact_counterexample = true;
+    let counts = CrateUnsoundnessCounts::default();
+
+    demote_for_all_unsoundness(&mut result, &harness, &counts);
+    if result.status == VerificationStatus::Failure && result.demotion_reasons.is_empty() {
+        let has_non_chc_violation = result.results.iter().any(|p| {
+            p.status == crate::property_model::CheckStatus::Failure && p.property_id.class != "chc"
+        });
+        if crate::harness_runner::chc_failure_is_undecided(
+            result.failed_properties,
+            has_non_chc_violation,
+            result.chc_exact_counterexample,
+        ) {
+            result.ctrex_category = Some(CtrexCategory::Unknown);
+        } else {
+            result.ctrex_category = Some(classify_ctrex(&harness, &counts));
+        }
+    }
+
+    assert_eq!(
+        result.ctrex_category,
+        Some(CtrexCategory::Genuine),
+        "an exactly derived counterexample over an unapproximated encoding is genuine"
+    );
+}
+
+/// D1 (2026-09-14): the SAME exactly-derived row, over a harness whose only
+/// recorded doubt is an UNSTUBBED ABSTRACTION, must not be `Genuine`.
+///
+/// This is the shape of `kani/SizeAndAlignOfDst/main_assert_fixme.rs`
+/// `macos::simplified`: a program that is safe in real Rust, whose whole
+/// counterexample comes from an unconstrained `MutexGuard::deref`
+/// (`[AY:CTREX_CAT:OverApproximation:unstubbed_abstraction=2]` on the fixed
+/// build, `Genuine` before). The sibling
+/// `test_exactly_derived_ctrex_on_a_clean_encoding_is_genuine` above pins that
+/// the recovery this branch buys survives: the difference between the two is
+/// exactly the recorded abstraction.
+#[test]
+fn test_exactly_derived_ctrex_over_an_unstubbed_abstraction_is_not_genuine() {
+    let harness = test_harness("crate::harness", "crate");
+    let mut result = test_result(VerificationStatus::Failure, FailedProperties::Other);
+    result.chc_exact_counterexample = true;
+    let sound_approx = BTreeMap::from([(
+        "crate::harness".to_string(),
+        vec![("unstubbed_abstraction".to_string(), 2)],
+    )]);
+    let counts =
+        CrateUnsoundnessCounts { sound_approx_per_harness: sound_approx, ..Default::default() };
+
+    demote_for_all_unsoundness(&mut result, &harness, &counts);
+    assert!(
+        result.demotion_reasons.is_empty(),
+        "unstubbed_abstraction is a SoundApproximation: it must not demote a proof"
+    );
+    let has_non_chc_violation = result.results.iter().any(|p| {
+        p.status == crate::property_model::CheckStatus::Failure && p.property_id.class != "chc"
+    });
+    assert!(
+        !crate::harness_runner::chc_failure_is_undecided(
+            result.failed_properties,
+            has_non_chc_violation,
+            result.chc_exact_counterexample,
+        ),
+        "the exact-derivation flag still routes this row to the classifier"
+    );
+    match classify_ctrex(&harness, &counts) {
+        CtrexCategory::OverApproximation { categories } => {
+            assert!(
+                categories.contains(&"unstubbed_abstraction=2".to_string()),
+                "the over-approximation must name its trigger: {categories:?}"
+            );
+        }
+        other => panic!(
+            "a counterexample raised over an unconstrained abstracted stdlib call must not \
+             be certified: {other:?}"
+        ),
+    }
+}
+
+/// D1, the other half: an unstubbed abstraction taints a COUNTEREXAMPLE and
+/// leaves a PROOF exactly as it stands.
+///
+/// `apply_sound_fallback_fail_close` Step C converts a Success carrying any
+/// fail-close sound approximation into an `OverApproximation` failure. Routing
+/// the new counter into that would flip every SUCCESS harness that merely
+/// touches such a call — a corpus-wide change to the proof side that this fix
+/// does not measure. `qualifies_proof_unchanged` keeps it out, so the proof
+/// side is byte-identical to the pre-D1 driver (where the event reached no
+/// counter at all). Measured: `r14a_string_len_true_assert` /
+/// `r11a_dyn_call_true_assert` stay `SUCCESSFUL` on the fixed build.
+#[test]
+fn test_unstubbed_abstraction_leaves_a_success_verdict_alone() {
+    let harness = test_harness("crate::harness", "crate");
+    let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+    let sound_approx = BTreeMap::from([(
+        "crate::harness".to_string(),
+        vec![("unstubbed_abstraction".to_string(), 4)],
+    )]);
+    let counts =
+        CrateUnsoundnessCounts { sound_approx_per_harness: sound_approx, ..Default::default() };
+
+    crate::demotion::apply_sound_fallback_fail_close(&mut result, &harness, &counts);
+
+    assert_eq!(result.status, VerificationStatus::Success, "the proof verdict must not move");
+    assert_eq!(result.sound_fallback_count, 0, "it must not qualify the proof either");
+    assert_eq!(result.ctrex_category, None, "and it must not mint a counterexample");
+}
+
+/// The reachability boundary keys its unstubbed abstraction by the harness's
+/// pretty name and the CHC encoder keys its havocs by the qualified function
+/// name; the classifier sees both (decision REDS-REST). One exact lookup took
+/// only the pretty-name entry, so the taint total left out the encoder's
+/// accounted havoc and coincided with its count.
+#[test]
+fn test_sound_approximations_of_both_key_spellings_are_merged() {
+    let harness = test_harness("harness", "crate");
+    let sound_approx = BTreeMap::from([
+        ("harness".to_string(), vec![("unstubbed_abstraction".to_string(), 1)]),
+        ("crate::harness".to_string(), vec![("chc_sound_havoc_drop".to_string(), 1)]),
+    ]);
+    let counts =
+        CrateUnsoundnessCounts { sound_approx_per_harness: sound_approx, ..Default::default() };
+    match classify_ctrex(&harness, &counts) {
+        CtrexCategory::OverApproximation { categories } => {
+            assert!(categories.contains(&"unstubbed_abstraction=1".to_string()), "{categories:?}");
+            assert!(categories.contains(&"chc_sound_havoc_drop=1".to_string()), "{categories:?}");
+        }
+        other => panic!("both producers' approximations taint the harness: {other:?}"),
+    }
 }

@@ -83,7 +83,7 @@ fn box_coroutine_move_alias_from_stmt(
     kind: &StatementKind,
     source_local: usize,
 ) -> Option<usize> {
-    let StatementKind::Assign(lhs, Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))) = kind
+    let StatementKind::Assign(lhs, Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), ..)) = kind
     else {
         return None;
     };

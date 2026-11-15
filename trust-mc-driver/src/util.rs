@@ -181,8 +181,9 @@ pub(crate) mod args {
     };
 
     #[derive(Clone, PartialEq)]
-    /// Kani-specific arguments passed to `rustc` and then used by `kani-compiler`.
-    pub(crate) struct KaniArg(String);
+    /// Kani-specific arguments passed to `rustc` and then used by `kani-compiler`:
+    /// one engine flag as its argv tokens (a bare flag, or a flag and its value).
+    pub(crate) struct KaniArg(Vec<String>);
 
     #[derive(Clone, PartialEq, Debug)]
     /// Arguments passed to `rustc`.
@@ -212,7 +213,29 @@ pub(crate) mod args {
         };
     }
 
-    from_impl!(KaniArg, String);
+    impl<T> From<T> for KaniArg
+    where
+        T: Into<String>,
+    {
+        /// A single engine argv token.
+        fn from(value: T) -> Self {
+            KaniArg(vec![value.into()])
+        }
+    }
+
+    impl KaniArg {
+        /// A flag and its value as two engine argv tokens. A value that may hold
+        /// whitespace (a path, a pattern) must come through here, so the Trustc
+        /// route can carry it as one token (see [`encode_as_pct1_rustc_arg`]).
+        pub(crate) fn flag_value(flag: impl Into<String>, value: impl Into<String>) -> Self {
+            KaniArg(vec![flag.into(), value.into()])
+        }
+
+        fn tokens(&self) -> &[String] {
+            &self.0
+        }
+    }
+
     from_impl!(RustcArg, OsString);
     from_impl!(CargoArg, OsString);
 
@@ -233,10 +256,29 @@ pub(crate) mod args {
             r#"-Cllvm-args={}"#,
             kani_args
                 .into_iter()
-                .map(KaniArg::as_inner)
+                .flat_map(KaniArg::tokens)
                 .cloned()
                 .collect::<Vec<String>>()
                 .join(" ")
+        )
+        .into()
+    }
+
+    /// The Trustc route's form of [`encode_as_rustc_arg`].
+    ///
+    /// rustc splits a `-Cllvm-args` value on whitespace, so the space-joined DevCli
+    /// form turns `--c-lib <path under Application Support>` into three tokens.
+    /// This form writes one `pct1` group (`trust_mc_metadata::engine_args`): a header
+    /// naming the token count, then every engine argv token encoded, which the
+    /// engine decodes back into the exact argv while leaving foreign tokens alone. The DevCli route keeps the legacy form.
+    pub(crate) fn encode_as_pct1_rustc_arg<'a>(
+        kani_args: impl IntoIterator<Item = &'a KaniArg>,
+    ) -> RustcArg {
+        format!(
+            "-Cllvm-args={}",
+            trust_mc_metadata::engine_args::encode_llvm_args(
+                kani_args.into_iter().flat_map(KaniArg::tokens)
+            )
         )
         .into()
     }

@@ -10,6 +10,7 @@
 //! moved to stubs_util_collections.rs, stubs_util_intrinsics.rs,
 //! stubs_util_dispatch.rs.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -18,8 +19,7 @@ use tracing::{debug, trace};
 
 use super::stubs::StubKind;
 use super::stubs_option_helpers::OptionHelpers;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
-use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
+use super::{ChcCtx, chc_fresh_name};
 use crate::codegen_ay::types::CtorFieldExt;
 
 /// Recovers Option payload from a reconstructed flattened ITE:
@@ -473,10 +473,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && let Some(payload) = self.resolve_flattened_enum_payload(&args[0], modified_locals)
         {
             let is_some_or_ok = discr_to_bool_predicate(discr)?;
-            self.diagnostics.stub_approximation.inc();
+            let booked = self.diagnostics.book_stub_approximation();
             let closure_name = chc_fresh_name("unwrap_or_else_chc");
             let closure_sort = payload.sort().clone();
-            let closure_result = declare_pending_var(closure_name, closure_sort);
+            let closure_result = Havoc::booked(booked, closure_name, closure_sort);
             return Some(Expr::ite(is_some_or_ok, payload, closure_result));
         }
 
@@ -492,10 +492,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let is_some = self.option_is_some(self_expr.clone());
             let inner = self.option_unwrap_value(self_expr)?;
             // Symbolic closure result with same sort as inner value
-            self.diagnostics.stub_approximation.inc();
+            let booked = self.diagnostics.book_stub_approximation();
             let closure_name = chc_fresh_name("opt_unwrap_or_else_chc");
             let closure_sort = inner.sort().clone();
-            let closure_result = declare_pending_var(closure_name, closure_sort);
+            let closure_result = Havoc::booked(booked, closure_name, closure_sort);
             Some(Expr::ite(is_some, inner, closure_result))
         } else if stub == StubKind::ResultUnwrapOrElse {
             let is_ok = self.result_variant_tester(self_expr.clone(), "Ok", "result_is_ok");
@@ -514,9 +514,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let inner_sort = dt.constructors.iter().find_map(|c| c.field_sort(field_name))?;
             let ok_value = self_expr.field_select(dt_name, field_name, inner_sort.clone());
             // Symbolic closure result
-            self.diagnostics.stub_approximation.inc();
+            let booked = self.diagnostics.book_stub_approximation();
             let closure_name = chc_fresh_name("res_unwrap_or_else_chc");
-            let closure_result = declare_pending_var(closure_name, inner_sort);
+            let closure_result = Havoc::booked(booked, closure_name, inner_sort);
             Some(Expr::ite(is_ok, ok_value, closure_result))
         } else {
             None
@@ -563,9 +563,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // classification per StubKind ungates proofs and therefore needs its
         // own missed-bug gate; until then all arms stay counted and Step-C
         // decides (fail-closed).
-        self.diagnostics.stub_approximation.inc();
+        let booked = self.diagnostics.book_stub_approximation();
         let sym_name = chc_fresh_name(prefix);
-        Some(declare_pending_var(sym_name, dest_sort.clone()))
+        Some(Havoc::booked(booked, sym_name, dest_sort.clone()))
     }
 
     // Flattened enum fld0/fld1 helpers moved to stubs_util_flattened_enum.rs

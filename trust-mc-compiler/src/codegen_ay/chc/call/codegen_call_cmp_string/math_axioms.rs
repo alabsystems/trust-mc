@@ -96,8 +96,9 @@ pub(in crate::codegen_ay::chc) fn try_exact_unary_encoding(
 /// Currently handles:
 /// - `copysign{f32,f64}(mag, sig)` — combine magnitude bits of `mag`
 ///   with sign bit of `sig`: `(mag & 0x7FFF...) | (sig & 0x8000...)`
-/// - `minnum{f32,f64}(x, y)` — IEEE 754 minimum with NaN propagation
-/// - `maxnum{f32,f64}(x, y)` — IEEE 754 maximum with NaN propagation
+///
+/// `minnum` / `maxnum` are NOT functions of their arguments and are not encoded here: see
+/// [`minmax_num_result_constraint`].
 pub(in crate::codegen_ay::chc) fn try_exact_binary_encoding(
     intrinsic_name: &str,
     arg0: &Expr,
@@ -118,36 +119,78 @@ pub(in crate::codegen_ay::chc) fn try_exact_binary_encoding(
         return Some(mag_bits.bvor(sig_sign));
     }
 
-    // minnum/maxnum: IEEE 754 minimum/maximum with NaN propagation.
-    //
-    // Part of #3798: use STRICT comparison (bv_float_gt for maxnum, bv_float_lt
-    // for minnum) instead of non-strict bv_float_le. This is critical because
-    // the CHC path uses raw BV equality for float == (#3839). When x and y are
-    // IEEE-equal but BV-different (±0.0), strict comparison returns false,
-    // so we return arg1 (y). This matches the standard test pattern:
-    //   if x > y { assert!(res == x) } else { assert!(res == y) }
-    // The else branch checks BV(res) == BV(y), which requires res IS y.
-    //
-    // Previous encoding used bv_float_le + ±0.0 tie-breaking that tried to
-    // return the IEEE-canonical zero (+0.0 for maxnum, -0.0 for minnum).
-    // That was correct per IEEE 754-2008 but incompatible with BV equality:
-    // maxnum(+0.0, -0.0) returned +0.0, but `+0.0 == -0.0` is false in BV.
-    let is_minnum = intrinsic_name.ends_with("minnumf32") || intrinsic_name.ends_with("minnumf64");
-    let is_maxnum = intrinsic_name.ends_with("maxnumf32") || intrinsic_name.ends_with("maxnumf64");
-    if is_minnum || is_maxnum {
-        let x_nan = build_float_predicate_expr(arg0, FloatPredicateKind::Nan)?;
-        let y_nan = build_float_predicate_expr(arg1, FloatPredicateKind::Nan)?;
-        // Strict comparison: x wins only when STRICTLY better than y.
-        // When IEEE-equal (including ±0.0), x does NOT win → return y.
-        let x_wins =
-            if is_maxnum { bv_float_gt(arg0, arg1, width) } else { bv_float_lt(arg0, arg1, width) };
-        let inner = Expr::ite(x_wins, arg0.clone(), arg1.clone());
-
-        let handle_y_nan = Expr::ite(y_nan, arg0.clone(), inner);
-        return Some(Expr::ite(x_nan, arg1.clone(), handle_y_nan));
-    }
-
     None
+}
+
+/// Which of `minnum` (`true`) / `maxnum` (`false`) `intrinsic_name` names, at `f32` or `f64`.
+///
+/// On Trust these are `minimum_number_nsz_f*` / `maximum_number_nsz_f*`, which reach here
+/// under their nightly spelling (`intrinsics::nightly_float_intrinsic_name`).
+pub(in crate::codegen_ay::chc) fn minmax_num_kind(intrinsic_name: &str) -> Option<bool> {
+    if intrinsic_name.ends_with("minnumf32") || intrinsic_name.ends_with("minnumf64") {
+        Some(true)
+    } else if intrinsic_name.ends_with("maxnumf32") || intrinsic_name.ends_with("maxnumf64") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The relation `dest ∈ minnum(x, y)` (`is_min`) or `dest ∈ maxnum(x, y)` over IEEE 754
+/// bitvectors of `width` bits. `None` when a sort is not a `width`-bit bitvector.
+///
+/// The Rust contract of `f32::min` / `f32::max` and of the intrinsics under them (nightly
+/// `minnumf*` / `maxnumf*`, Trust `minimum_number_nsz_f*` / `maximum_number_nsz_f*`) is a
+/// relation, not a function:
+///
+/// - exactly one argument NaN: the other argument, bit for bit;
+/// - both NaN: a NaN, whose sign and payload Rust leaves unspecified;
+/// - arguments that compare equal: EITHER argument ("If the inputs compare equal (such as
+///   for the case of +0.0 and -0.0), either input may be returned non-deterministically").
+///   Equal non-zero values have identical bits, so only zeros of opposite sign differ;
+/// - otherwise the smaller (larger) argument.
+///
+/// Measured on arm64 with trust 8571 and nightly-2025-12-03: at run time `min(+0, -0)` is
+/// `-0`, while const evaluation of the same expression in the same toolchain is `+0`. The
+/// previous encoding returned `y` for every equal pair, so CHC proved sign properties that
+/// fail in one of the two. The constraint below admits both results and nothing else.
+pub(in crate::codegen_ay::chc) fn minmax_num_result_constraint(
+    is_min: bool,
+    arg0: &Expr,
+    arg1: &Expr,
+    dest: &Expr,
+    width: u32,
+) -> Option<Expr> {
+    if arg0.sort().bitvec_width() != Some(width)
+        || arg1.sort().bitvec_width() != Some(width)
+        || dest.sort().bitvec_width() != Some(width)
+    {
+        return None;
+    }
+    let magnitude_mask = match width {
+        32 => Expr::bitvec_const(0x7FFF_FFFFu64, 32),
+        64 => Expr::bitvec_const(0x7FFF_FFFF_FFFF_FFFFu64, 64),
+        _ => return None,
+    };
+    let zero = Expr::bitvec_const(0u64, width);
+    let x_nan = build_float_predicate_expr(arg0, FloatPredicateKind::Nan)?;
+    let y_nan = build_float_predicate_expr(arg1, FloatPredicateKind::Nan)?;
+    let dest_nan = build_float_predicate_expr(dest, FloatPredicateKind::Nan)?;
+    let x_zero = arg0.clone().bvand(magnitude_mask.clone()).eq(zero.clone());
+    let y_zero = arg1.clone().bvand(magnitude_mask).eq(zero);
+    // Strict IEEE comparison: x is the result only when it is strictly smaller (larger);
+    // NaN operands are handled before this is consulted.
+    let x_wins =
+        if is_min { bv_float_lt(arg0, arg1, width) } else { bv_float_gt(arg0, arg1, width) };
+    let ordered = Expr::ite(x_wins, arg0.clone(), arg1.clone());
+    let one_nan =
+        Expr::ite(x_nan.clone(), arg1.clone(), Expr::ite(y_nan.clone(), arg0.clone(), ordered));
+    let either_argument = dest.clone().eq(arg0.clone()).or(dest.clone().eq(arg1.clone()));
+    Some(Expr::ite(
+        x_nan.and(y_nan),
+        dest_nan,
+        Expr::ite(x_zero.and(y_zero), either_argument, dest.clone().eq(one_nan)),
+    ))
 }
 
 #[cfg(test)]
@@ -161,43 +204,33 @@ mod tests {
     const POS_ZERO_32: u64 = 0x0000_0000;
     const NEG_ZERO_32: u64 = 0x8000_0000;
 
-    /// maxnumf64(+0.0, -0.0) must produce an expression, not None.
+    /// minnum/maxnum are relations: the exact functional encoding no longer claims them.
     #[test]
-    fn test_maxnumf64_returns_some() {
+    fn test_minmax_num_is_not_a_functional_encoding() {
         let x = Expr::bitvec_const(POS_ZERO_64, 64);
         let y = Expr::bitvec_const(NEG_ZERO_64, 64);
-        let result = try_exact_binary_encoding("maxnumf64", &x, &y, 64);
-        assert!(result.is_some(), "maxnumf64 should produce an encoding");
-        assert_eq!(result.expect("encoding exists").sort().bitvec_width(), Some(64));
+        for name in ["minnumf64", "maxnumf64"] {
+            assert!(try_exact_binary_encoding(name, &x, &y, 64).is_none(), "{name}");
+        }
+        assert_eq!(minmax_num_kind("std::intrinsics::minnumf32"), Some(true));
+        assert_eq!(minmax_num_kind("std::intrinsics::maxnumf64"), Some(false));
+        assert_eq!(minmax_num_kind("std::intrinsics::copysignf64"), None);
     }
 
-    /// minnumf64(-0.0, +0.0) must produce an expression, not None.
+    /// The relation is built at both widths and refuses a mismatched destination sort.
     #[test]
-    fn test_minnumf64_returns_some() {
-        let x = Expr::bitvec_const(NEG_ZERO_64, 64);
-        let y = Expr::bitvec_const(POS_ZERO_64, 64);
-        let result = try_exact_binary_encoding("minnumf64", &x, &y, 64);
-        assert!(result.is_some(), "minnumf64 should produce an encoding");
-        assert_eq!(result.expect("encoding exists").sort().bitvec_width(), Some(64));
-    }
-
-    /// maxnumf32(+0.0, -0.0) must produce an expression, not None.
-    #[test]
-    fn test_maxnumf32_returns_some() {
-        let x = Expr::bitvec_const(POS_ZERO_32, 32);
-        let y = Expr::bitvec_const(NEG_ZERO_32, 32);
-        let result = try_exact_binary_encoding("maxnumf32", &x, &y, 32);
-        assert!(result.is_some(), "maxnumf32 should produce an encoding");
-        assert_eq!(result.expect("encoding exists").sort().bitvec_width(), Some(32));
-    }
-
-    /// minnumf32(-0.0, +0.0) must produce an expression, not None.
-    #[test]
-    fn test_minnumf32_returns_some() {
-        let x = Expr::bitvec_const(NEG_ZERO_32, 32);
-        let y = Expr::bitvec_const(POS_ZERO_32, 32);
-        let result = try_exact_binary_encoding("minnumf32", &x, &y, 32);
-        assert!(result.is_some(), "minnumf32 should produce an encoding");
-        assert_eq!(result.expect("encoding exists").sort().bitvec_width(), Some(32));
+    fn test_minmax_num_result_constraint_sorts() {
+        for (width, pz, nz) in [(32u32, POS_ZERO_32, NEG_ZERO_32), (64, POS_ZERO_64, NEG_ZERO_64)] {
+            let x = Expr::bitvec_const(pz, width);
+            let y = Expr::bitvec_const(nz, width);
+            let dest = Expr::var("dest", ay_bindings::Sort::bitvec(width));
+            for is_min in [true, false] {
+                let c =
+                    minmax_num_result_constraint(is_min, &x, &y, &dest, width).expect("constraint");
+                assert!(c.sort().is_bool(), "width {width} is_min {is_min}");
+            }
+            let narrow = Expr::var("narrow", ay_bindings::Sort::bitvec(16));
+            assert!(minmax_num_result_constraint(true, &x, &y, &narrow, width).is_none());
+        }
     }
 }

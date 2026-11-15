@@ -12,6 +12,7 @@ mod address_and_naming;
 mod alloc_preconditions_and_regions;
 mod allocator_intrinsics_core;
 mod allocator_intrinsics_semantics;
+mod bounded_mem_array_names;
 mod error_rule_fallbacks;
 mod heap_access_checks;
 mod heap_state_accumulation;

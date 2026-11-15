@@ -107,6 +107,9 @@ fn run_compiletest_parity_harness<'tcx>(
         max_depth: ctx.config.inline_depth,
         enabled: ctx.config.function_inlining,
         preserve_block_on: true,
+        preserve_array_comparisons: true,
+        bmc_native_box_validity: false,
+        chc_native_box_drop: false,
     };
     let mut inline_pass =
         crate::kani_middle::transform::inline::FunctionInlinePass::new(inline_cfg);
@@ -116,7 +119,7 @@ fn run_compiletest_parity_harness<'tcx>(
                 return None;
             }
             let callee_name = callee_instance.name();
-            if crate::kani_middle::reachability::is_prefix_abstracted(&callee_name) {
+            if ctx.std_abstraction.abstracts_public_instance(ctx.tcx, callee_instance) {
                 return None;
             }
             if callee_name.ends_with("::any_where") || callee_name.contains("::any_where::") {
@@ -133,6 +136,7 @@ fn run_compiletest_parity_harness<'tcx>(
         ChcConfig {
             frame_narrowing: crate::codegen_ay::chc::frame_narrowing_enabled(),
             frame_narrowing_flattened: crate::codegen_ay::chc::frame_narrowing_flattened_enabled(),
+            straightline_discharge: true,
             nan_checks: ctx.config.nan_checks,
             track_level: ctx.config.chc_track_level,
             step_mode: ctx.config.chc_step_mode,
@@ -152,6 +156,8 @@ fn run_compiletest_parity_harness<'tcx>(
             unwinding_assertions: ctx.config.unwinding_assertions,
             uninit_checks: ctx.config.uninit_checks,
             contract_static_havoc: false,
+            keep_error_obligations: false,
+            loop_contracts: false,
         },
     );
 

@@ -139,13 +139,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         let ChcVecFields { vec_sort, ptr, len: old_len, cap, data } = fields;
 
-        // Resize: len' = new_len, cap' = max(cap, new_len).
-        let grow_needed = cap.clone().bvult(new_len.clone());
-        let new_cap = Expr::ite(grow_needed, new_len.clone(), cap);
+        // Resize: len' = new_len, cap' = RawVec's amortized growth.
+        let new_cap = self.vec_reserved_cap(
+            field_projs.last().and_then(|proj| proj.field_ty),
+            &cap,
+            &new_len,
+            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            extra_constraints,
+        );
         extra_constraints.push(new_cap.clone().bvuge(new_len.clone()));
 
         let (out_data, resize_relation, modeled_fill) =
-            quantified_resize_growth_array(data, old_len, new_len.clone(), fill_value);
+            quantified_resize_growth_array(self, data, old_len, new_len.clone(), fill_value);
         extra_constraints.push(resize_relation);
         if !modeled_fill {
             // Part of #3447: struct resize growth without a translated fill value
@@ -256,13 +261,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return false;
         }
 
-        // Resize: len' = new_len, cap' = max(cap, new_len).
-        let grow_needed = old_cap_e.clone().bvult(new_len.clone());
-        let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap_e);
+        // Resize: len' = new_len, cap' = RawVec's amortized growth.
+        let new_cap = self.vec_reserved_cap(
+            field_projs.last().and_then(|proj| proj.field_ty),
+            &old_cap_e,
+            &new_len,
+            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            extra_constraints,
+        );
         extra_constraints.push(new_cap.clone().bvuge(new_len.clone()));
 
-        let (out_data, resize_relation, modeled_fill) =
-            quantified_resize_growth_array(old_data_e, old_len_e, new_len.clone(), fill_value);
+        let (out_data, resize_relation, modeled_fill) = quantified_resize_growth_array(
+            self,
+            old_data_e,
+            old_len_e,
+            new_len.clone(),
+            fill_value,
+        );
         extra_constraints.push(resize_relation);
         if !modeled_fill {
             // Part of #3447: struct resize growth without a translated fill value

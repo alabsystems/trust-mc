@@ -12,7 +12,7 @@
 //!
 //! Part of #3792: portable-SIMD vector boundary residuals.
 
-use ay_bindings::Expr;
+use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{BasicBlockIdx, Operand};
 use tracing::debug;
 
@@ -23,7 +23,9 @@ use super::codegen_call_simd::{
     SimdIntrinsicKind, emit_simd_dest_constraint, extract_simd_layout,
     neutral_simd_result_array_like, resolve_simd_array,
 };
-use super::codegen_call_simd_ops::{codegen_simd_elementwise_binop, codegen_simd_shift};
+use super::codegen_call_simd_ops::{
+    SimdBinopOrigin, codegen_simd_elementwise_binop, codegen_simd_shift,
+};
 use super::codegen_rules::CodegenRules;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
@@ -92,6 +94,20 @@ fn detect_simd_arith_op(path: &str) -> Option<SimdIntrinsicKind> {
     }
 }
 
+/// Whether the callee `func` resolves to an instance defined in `core`, where
+/// core_simd, and so every `<Simd<T, N> as core::ops::*>` impl, lives
+/// (library/core/src/lib.rs `mod core_simd`). The callee's `FnDef` alone does
+/// not tell: `a / b` names the trait method `core::ops::Div::div` whatever
+/// `Self` is, so the impl is resolved first. Unresolvable is "no".
+fn callee_is_core_instance(func: &Operand, locals: &[rustc_public::mir::LocalDecl]) -> bool {
+    use rustc_public::CrateDef;
+    use rustc_public::mir::mono::Instance;
+    use rustc_public::ty::{RigidTy, TyKind};
+    let Ok(func_ty) = func.ty(locals) else { return false };
+    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = func_ty.kind() else { return false };
+    Instance::resolve(def, &args).is_ok_and(|instance| instance.def.krate().name == "core")
+}
+
 /// Try to dispatch a SIMD library call. Returns `true` if handled.
 ///
 /// Must run before `try_dispatch_call_fn_inline` to avoid the fn_inline
@@ -105,7 +121,19 @@ pub(in crate::codegen_ay::chc) fn try_dispatch_simd_lib_call(
 
     // Part of #4086: Check for portable-SIMD arithmetic operator trait impls first.
     // These are thin wrappers around simd_add/sub/mul etc. that fn_inline can't handle.
+    //
+    // The interception puts core_simd's operator semantics in place of the
+    // callee's body (`PortableOperator` drops the `MIN / -1` rule because
+    // core_simd's `int_divrem_guard` defines that lane), which is a fact about
+    // core's impls alone. `detect_simd_arith_op` matches a spelling that an
+    // impl under any path holding "simd" and "ops" shares
+    // (`mod simd_ops { impl Div for V { .. } }`); that body is user code, and
+    // replacing it dropped whatever it does (a panic, or a raw `simd_div`'s UB
+    // at `MIN / -1`). Such a call is dispatched like any other.
     if let Some(arith_kind) = detect_simd_arith_op(path) {
+        if !callee_is_core_instance(dcx.func, ctx.body.locals()) {
+            return false;
+        }
         return dispatch_simd_arith_op(ctx, dcx, arith_kind);
     }
 
@@ -152,6 +180,10 @@ pub(in crate::codegen_ay::chc) fn try_dispatch_simd_lib_call(
             let Some(arr_sort) = dest_sort.array_sort() else {
                 return false;
             };
+            let Some(val) = splat_lane_value(val, &arr_sort.element_sort) else {
+                debug!("simd splat: lane value does not fit the destination lane sort, deferring");
+                return false;
+            };
             let result = Expr::const_array(arr_sort.index_sort.clone(), val);
             debug!(bb = dcx.bb_idx, "simd splat dispatch");
             emit_simd_dest_constraint(ctx, dcx, *target, dest_local, result);
@@ -161,6 +193,28 @@ pub(in crate::codegen_ay::chc) fn try_dispatch_simd_lib_call(
         }
     }
     true
+}
+
+/// The lane value `splat(v)` stores, in the destination's lane sort.
+///
+/// `Mask::<T, N>::splat(b: bool)` is `Self(Simd::splat(T::from_bool(b)))`
+/// (core_simd `masks.rs`), and `MaskElement::from_bool(b)` is `-(b as T)`:
+/// every lane holds all ones for `true` and zero for `false`. A mask is
+/// `repr(transparent)` over its integer vector, so its destination carries
+/// bitvector lanes while the translated argument is a Bool — storing the Bool
+/// array made the call-result equality ill-sorted and it was dropped
+/// (`kani/SIMD/portable_simd.rs` `check_mask`). A value already in the lane
+/// sort is stored unchanged; any other sort mismatch returns `None`.
+fn splat_lane_value(val: Expr, lane_sort: &Sort) -> Option<Expr> {
+    if val.sort() == lane_sort {
+        return Some(val);
+    }
+    let width = lane_sort.bitvec_width()?;
+    if !val.sort().is_bool() || width == 0 || width > 128 {
+        return None;
+    }
+    let all_ones = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+    Some(Expr::ite(val, Expr::bitvec_const(all_ones, width), Expr::bitvec_const(0u128, width)))
 }
 
 /// Handle `as_array` when dest is a reference type (not Array sort).
@@ -317,10 +371,16 @@ fn dispatch_simd_arith_op(
         | SimdIntrinsicKind::And
         | SimdIntrinsicKind::Or
         | SimdIntrinsicKind::Xor => {
-            codegen_simd_elementwise_binop(ctx, dcx, *target, kind);
+            codegen_simd_elementwise_binop(
+                ctx,
+                dcx,
+                *target,
+                kind,
+                SimdBinopOrigin::PortableOperator,
+            );
         }
         SimdIntrinsicKind::Shl | SimdIntrinsicKind::Shr => {
-            codegen_simd_shift(ctx, dcx, *target, kind);
+            codegen_simd_shift(ctx, dcx, *target, kind, SimdBinopOrigin::PortableOperator);
         }
         SimdIntrinsicKind::Neg => {
             // Neg is unary — delegate to the existing simd neg handler via the
@@ -386,6 +446,37 @@ mod tests {
     fn test_detect_simd_lib_op_splat() {
         let path = "core::core_simd::vector::Simd::<u64, 16>::splat";
         assert!(matches!(detect_simd_lib_op(path), Some(SimdLibKind::Splat)));
+    }
+
+    #[test]
+    fn test_splat_lane_value_keeps_a_value_already_in_the_lane_sort() {
+        let v = Expr::bitvec_const(7u64, 32);
+        assert_eq!(splat_lane_value(v.clone(), &Sort::bitvec(32)), Some(v));
+    }
+
+    #[test]
+    fn test_splat_lane_value_mask_bool_is_all_ones_or_zero() {
+        let lane = splat_lane_value(Expr::bool_const(true), &Sort::bitvec(32))
+            .expect("a bool splat into i32 mask lanes converts");
+        assert_eq!(lane.sort(), &Sort::bitvec(32));
+        assert_eq!(
+            lane,
+            Expr::ite(
+                Expr::bool_const(true),
+                Expr::bitvec_const(0xFFFF_FFFFu128, 32),
+                Expr::bitvec_const(0u128, 32)
+            )
+        );
+    }
+
+    #[test]
+    fn test_splat_lane_value_rejects_other_mismatches() {
+        assert!(splat_lane_value(Expr::bitvec_const(1u64, 8), &Sort::bitvec(32)).is_none());
+        assert!(splat_lane_value(Expr::bool_const(false), &Sort::bool()).is_some());
+        assert!(
+            splat_lane_value(Expr::bitvec_const(1u64, 8), &Sort::bool()).is_none(),
+            "a non-bool value is never coerced into bool lanes"
+        );
     }
 
     #[test]

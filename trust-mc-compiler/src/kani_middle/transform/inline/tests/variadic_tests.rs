@@ -10,6 +10,7 @@ use rustc_public::mir::{AssertMessage, Body, TerminatorKind};
 use rustc_public::ty::{RigidTy, TyKind};
 
 /// A Rust-defined `extern "C" fn(u64, ...)` whose body fetches in a loop.
+#[cfg(not(trust_toolchain))]
 const VA_FETCH_LOOP: &str = r#"
 #![feature(c_variadic)]
 #![allow(dead_code)]
@@ -19,6 +20,28 @@ pub unsafe extern "C" fn va_sum(num: u64, mut args: ...) -> u64 {
     let mut i: u64 = 0;
     while i < num {
         accum = accum.wrapping_add(unsafe { args.arg::<u64>() });
+        i += 1;
+    }
+    accum
+}
+
+pub fn calls_va_sum() -> u64 {
+    unsafe { va_sum(2, 5u64, 7u64) }
+}
+"#;
+
+/// Trust twin of `VA_FETCH_LOOP`: Trust's `VaList` fetches with `next_arg` (it
+/// has no `arg` method, so the nightly fixture does not compile there).
+#[cfg(trust_toolchain)]
+const VA_FETCH_LOOP: &str = r#"
+#![feature(c_variadic)]
+#![allow(dead_code)]
+
+pub unsafe extern "C" fn va_sum(num: u64, mut args: ...) -> u64 {
+    let mut accum: u64 = 0;
+    let mut i: u64 = 0;
+    while i < num {
+        accum = accum.wrapping_add(unsafe { args.next_arg::<u64>() });
         i += 1;
     }
     accum
@@ -44,6 +67,7 @@ pub fn calls_va_noop() {
 /// The fetch asks for a type WIDER than the actual that was passed: reading
 /// eight bytes where four were passed is UB whose value no sound model can
 /// supply, so the specialization must decline instead of inventing a coercion.
+#[cfg(not(trust_toolchain))]
 const VA_WIDENING_FETCH: &str = r#"
 #![feature(c_variadic)]
 #![allow(dead_code)]
@@ -57,10 +81,31 @@ pub fn calls_va_widen() -> u64 {
 }
 "#;
 
+/// Trust twin of `VA_WIDENING_FETCH` (`next_arg` instead of `arg`).
+#[cfg(trust_toolchain)]
+const VA_WIDENING_FETCH: &str = r#"
+#![feature(c_variadic)]
+#![allow(dead_code)]
+
+pub unsafe extern "C" fn va_widen(mut args: ...) -> u64 {
+    unsafe { args.next_arg::<u64>() }
+}
+
+pub fn calls_va_widen() -> u64 {
+    unsafe { va_widen(7u32) }
+}
+"#;
+
 fn run_inline(tcx: rustc_middle::ty::TyCtxt<'_>, suffix: &str) -> (FunctionInlinePass, Body) {
     let instance = find_instance_by_suffix(tcx, suffix);
     let body = instance.body().expect("caller body");
-    let mut pass = FunctionInlinePass::new(InlineConfig { max_depth: 4, enabled: true, preserve_block_on: true });
+    let mut pass = FunctionInlinePass::new(InlineConfig {
+        max_depth: 4,
+        enabled: true,
+        preserve_block_on: true,
+        preserve_array_comparisons: true,
+        ..InlineConfig::default()
+    });
     let (_changed, out) =
         pass.transform_with_body_provider(tcx, body, instance, |callee: Instance| callee.body());
     (pass, out)
@@ -72,7 +117,11 @@ fn has_va_arg_call(body: &Body) -> bool {
         let Ok(ty) = func.ty(body.locals()) else { return false };
         let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = ty.kind() else { return false };
         let name = fn_def.0.name();
-        name.ends_with("::va_arg") || (name.contains("VaList") && name.ends_with("::arg"))
+        #[cfg(not(trust_toolchain))]
+        let fetch_method = "::arg";
+        #[cfg(trust_toolchain)]
+        let fetch_method = "::next_arg";
+        name.ends_with("::va_arg") || (name.contains("VaList") && name.ends_with(fetch_method))
     })
 }
 

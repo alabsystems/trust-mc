@@ -160,6 +160,25 @@ impl SarifLog {
         for harness_result in results {
             let harness = harness_result.harness;
             let result = &harness_result.result;
+            let verdict = classify_harness_verdict(result, harness.attributes.should_panic);
+
+            // D16: a compiler-certified obligation-free harness exits 0 and
+            // has no property to report, so the loop below would leave the
+            // file with no findings — indistinguishable from a file whose
+            // checks were all proved. The report says why instead: a NOTE,
+            // never an error, under the id the failing shape already uses, so
+            // code scanning can tell "nothing to check" from "checked and
+            // clean" without failing the run.
+            if verdict == HarnessVerdict::SuccessfulNoChecks {
+                push_harness_level_finding(
+                    &mut rules,
+                    &mut sarif_results,
+                    harness,
+                    verdict,
+                    "note",
+                );
+                continue;
+            }
 
             if is_effective_manual_success(
                 result.status,
@@ -169,7 +188,6 @@ impl SarifLog {
                 continue;
             }
 
-            let verdict = classify_harness_verdict(result, harness.attributes.should_panic);
             let results_before = sarif_results.len();
 
             for prop in &result.results {
@@ -233,35 +251,15 @@ impl SarifLog {
             // For code scanning that reads as a clean file. A failing harness has
             // to leave a finding behind, so synthesize one against the harness
             // itself when its properties produced none.
-            if sarif_results.len() == results_before
-                && result.status == VerificationStatus::Failure
+            if sarif_results.len() == results_before && result.status == VerificationStatus::Failure
             {
-                let (rule_id, text) = harness_level_finding(verdict);
-                rules.entry(rule_id.to_string()).or_insert_with(|| ReportingDescriptor {
-                    id: rule_id.to_string(),
-                    short_description: Message { text: harness_rule_description(rule_id) },
-                });
-                sarif_results.push(SarifResult {
-                    rule_id: rule_id.to_string(),
-                    level: "error",
-                    message: Message { text: format!("[{}] {text}", harness.pretty_name) },
-                    locations: vec![Location {
-                        physical_location: PhysicalLocation {
-                            artifact_location: ArtifactLocation {
-                                uri: relativize_path(&harness.original_file),
-                            },
-                            region: Region {
-                                start_line: harness.original_start_line as u32,
-                                start_column: None,
-                            },
-                        },
-                    }],
-                    properties: ResultProperties {
-                        harness: harness.pretty_name.clone(),
-                        property_name: None,
-                        verdict: verdict.label(),
-                    },
-                });
+                push_harness_level_finding(
+                    &mut rules,
+                    &mut sarif_results,
+                    harness,
+                    verdict,
+                    "error",
+                );
             }
         }
 
@@ -283,7 +281,46 @@ impl SarifLog {
     }
 }
 
-/// Rule id and message for a harness that failed without any failing property.
+/// One finding against the harness ITSELF, for a harness whose properties
+/// produced none: the failing shapes at `"error"`, the certified
+/// obligation-free success at `"note"`.
+fn push_harness_level_finding(
+    rules: &mut BTreeMap<String, ReportingDescriptor>,
+    sarif_results: &mut Vec<SarifResult>,
+    harness: &trust_mc_metadata::HarnessMetadata,
+    verdict: HarnessVerdict,
+    level: &'static str,
+) {
+    let (rule_id, text) = harness_level_finding(verdict);
+    rules.entry(rule_id.to_string()).or_insert_with(|| ReportingDescriptor {
+        id: rule_id.to_string(),
+        short_description: Message { text: harness_rule_description(rule_id) },
+    });
+    sarif_results.push(SarifResult {
+        rule_id: rule_id.to_string(),
+        level,
+        message: Message { text: format!("[{}] {text}", harness.pretty_name) },
+        locations: vec![Location {
+            physical_location: PhysicalLocation {
+                artifact_location: ArtifactLocation {
+                    uri: relativize_path(&harness.original_file),
+                },
+                region: Region {
+                    start_line: harness.original_start_line as u32,
+                    start_column: None,
+                },
+            },
+        }],
+        properties: ResultProperties {
+            harness: harness.pretty_name.clone(),
+            property_name: None,
+            verdict: verdict.label(),
+        },
+    });
+}
+
+/// Rule id and message for a harness that failed without any failing property
+/// — and for the one SUCCESS that leaves no property behind either.
 ///
 /// The distinction matters to whoever reads the report: "you assumed something
 /// contradictory" and "you compiled to zero obligations" have different fixes,
@@ -301,7 +338,10 @@ fn harness_level_finding(verdict: HarnessVerdict) -> (&'static str, &'static str
         HarnessVerdict::InconclusiveUndecided => {
             ("trust_mc.harness.undecided", verdict.description())
         }
-        HarnessVerdict::InconclusiveNoChecks => {
+        // One id for both empty-table shapes: the uncertified INCONCLUSIVE
+        // (an error) and the certified SUCCESSFUL (a note). `level` and
+        // `properties.verdict` tell them apart; the id says "no checks".
+        HarnessVerdict::InconclusiveNoChecks | HarnessVerdict::SuccessfulNoChecks => {
             ("trust_mc.harness.no_checks", verdict.description())
         }
         // Both all-checks-unreachable shapes keep the ONE id they have always
@@ -541,6 +581,36 @@ mod tests {
         assert_eq!(v["runs"][0]["results"][0]["properties"]["verdict"], "inconclusive_undecided");
     }
 
+    /// D16: a compiler-certified obligation-free harness exits 0 and would
+    /// otherwise leave the report EMPTY, which is what a fully proved file
+    /// looks like. It leaves a note instead — the no-checks id, `"note"`
+    /// level, its own verdict — and a plain proof still leaves nothing.
+    #[test]
+    fn test_sarif_notes_a_certified_obligation_free_harness() {
+        let harness = test_harness("nothing_to_prove", "test_crate");
+        let mut certified = test_result(VerificationStatus::Success, FailedProperties::None);
+        certified
+            .proof_qualifiers
+            .push(crate::verification_result::OBLIGATION_FREE_CERTIFIED_QUALIFIER.to_string());
+        let log = SarifLog::from_harness_results(&[HarnessResult {
+            harness: &harness,
+            result: certified,
+        }]);
+        let v = serde_json::to_value(&log).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "{v}");
+        assert_eq!(results[0]["ruleId"], "trust_mc.harness.no_checks");
+        assert_eq!(results[0]["level"], "note");
+        assert_eq!(results[0]["properties"]["verdict"], "successful_no_checks");
+        assert_eq!(results[0]["properties"]["harness"], "nothing_to_prove");
+
+        let proved = test_result(VerificationStatus::Success, FailedProperties::None);
+        let log =
+            SarifLog::from_harness_results(&[HarnessResult { harness: &harness, result: proved }]);
+        let v = serde_json::to_value(&log).unwrap();
+        assert!(v["runs"][0]["results"].as_array().unwrap().is_empty(), "{v}");
+    }
+
     /// The rule ids are what CI gates on: the finer verdicts ride in
     /// `properties`, and these four ids keep their exact meaning.
     #[test]
@@ -549,6 +619,11 @@ mod tests {
         assert_eq!(
             harness_level_finding(HarnessVerdict::InconclusiveNoChecks).0,
             "trust_mc.harness.no_checks"
+        );
+        assert_eq!(
+            harness_level_finding(HarnessVerdict::SuccessfulNoChecks).0,
+            "trust_mc.harness.no_checks",
+            "the certified success keeps the id the empty-table failure had"
         );
         assert_eq!(
             harness_level_finding(HarnessVerdict::InconclusiveUndecided).0,
@@ -563,6 +638,7 @@ mod tests {
         for verdict in [
             HarnessVerdict::Vacuous,
             HarnessVerdict::InconclusiveNoChecks,
+            HarnessVerdict::SuccessfulNoChecks,
             HarnessVerdict::InconclusiveUndecided,
             HarnessVerdict::Failed,
         ] {

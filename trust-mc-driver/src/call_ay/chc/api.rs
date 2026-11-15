@@ -255,33 +255,40 @@ fn solve_with_guard(
     timeout: Duration,
     guard_slack: Duration,
 ) -> Result<VerifiedChcResult, String> {
-    // Held across the move so the guard-timeout arm can cancel the solve
-    // instead of orphaning a thread that keeps burning cores after we have
-    // stopped waiting for its answer. Cancellation only ever degrades a verdict
-    // to Unknown, and this arm discards the verdict anyway.
-    let (tx, rx) = std::sync::mpsc::channel();
+    // An owned lane (AY ask R1): the guard-timeout arm cancels the solve and
+    // JOINS it instead of orphaning a thread that keeps burning cores after we
+    // have stopped waiting for its answer. Cancellation only ever degrades a
+    // verdict to Unknown, and this arm discards the verdict anyway.
     let cancel = solver.cancellation_handle();
-    let solver_thread = std::thread::spawn(move || {
-        let result = solver.try_solve();
-        let _ = tx.send(result);
-    });
+    let lane = super::owned_lane::OwnedLane::spawn(
+        "programmatic-portfolio",
+        move || cancel.cancel(),
+        move || solver.try_solve(),
+    )
+    .map_err(|err| format!("ay-chc solver thread could not be spawned: {err}"))?;
 
-    if timeout.is_zero() {
-        let result = rx.recv().map_err(|e| format!("solver thread ended without result: {e}"))?;
-        let _ = solver_thread.join();
-        return result.map_err(|reason| format!("ay-chc panic during adaptive solve: {reason}"));
-    }
-
-    let guard_timeout = timeout + guard_slack;
-    match rx.recv_timeout(guard_timeout) {
-        Ok(result) => {
-            let _ = solver_thread.join();
+    // A zero timeout means "no guard": wait for the lane however long it takes.
+    let guard_timeout = if timeout.is_zero() { Duration::MAX } else { timeout + guard_slack };
+    let (outcome, join) = lane.finish(guard_timeout);
+    match outcome {
+        super::owned_lane::LaneOutcome::Completed(result) => {
             result.map_err(|reason| format!("ay-chc panic during adaptive solve: {reason}"))
         }
-        Err(_) => {
-            cancel.cancel();
-            let _ = rx.recv_timeout(Duration::from_secs(3));
+        // A failed drain is still a guard timeout: the lane has been joined
+        // (this test-only API sets no harness deadline, so it is never
+        // abandoned). The join record says how late it exited.
+        super::owned_lane::LaneOutcome::TimedOut { .. } if join.drain_failed() => Err(format!(
+            "ay-chc portfolio exceeded guard timeout ({guard_timeout:?}); the drain failed: {}",
+            join.marker_line()
+        )),
+        super::owned_lane::LaneOutcome::TimedOut { .. } => {
             Err(format!("ay-chc portfolio exceeded guard timeout ({guard_timeout:?})"))
+        }
+        super::owned_lane::LaneOutcome::Panicked(message) => {
+            Err(format!("solver thread panicked: {message}"))
+        }
+        super::owned_lane::LaneOutcome::Disconnected => {
+            Err("solver thread ended without result".to_string())
         }
     }
 }

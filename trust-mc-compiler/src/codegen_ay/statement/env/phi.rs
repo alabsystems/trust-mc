@@ -6,7 +6,7 @@
 //!
 //! Part of #2408: extracted from env.rs.
 
-use super::{Env, Expr, IncomingEdge, StatementCodegen, VariantFact};
+use super::{Env, Expr, IncomingEdge, RefPointees, StatementCodegen, VariantFact};
 use tracing::debug;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -24,6 +24,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // does not skip it. Read only by the unwinding-assertion sentinel lookup
         // in the `Unreachable` terminator arm.
         self.current_bb = bb_idx;
+        self.initialize_storage_block(bb_idx);
 
         // SwitchInt→variant bridge (#3017): a `Discriminant(P)` read and the `SwitchInt`
         // that consumes it live in the SAME basic block, so the discriminant-scrutinee
@@ -61,9 +62,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 return;
             };
             // Single predecessor inherits its facts directly (#3017).
-            let IncomingEdge { env, variant_facts, .. } = single_edge;
+            let IncomingEdge { env, variant_facts, ref_pointees, .. } = single_edge;
             self.current_env = env;
             self.current_variant_facts = variant_facts;
+            // The predecessor's pointee table, not whatever block was encoded last.
+            self.adopt_ref_pointees(ref_pointees);
             debug!(
                 "init_block_entry_env bb{}: single incoming edge, {} vars",
                 bb_idx,
@@ -76,6 +79,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // (place_key, ctor_idx, dt_name) on EVERY incoming edge (#3017). A kill on
         // one predecessor path therefore cannot be masked by a sibling that kept it.
         self.current_variant_facts = Self::intersect_variant_facts(&incoming);
+        // Same for reference pointees: keep what every edge agrees on, poison the
+        // rest with the per-edge alternatives (`ref_pointee_table`).
+        let merged_pointees = RefPointees::merge_incoming(
+            incoming
+                .iter()
+                .map(|edge| (edge.edge_predicate.clone(), edge.ref_pointees.clone()))
+                .collect(),
+        );
+        self.adopt_ref_pointees(merged_pointees);
 
         debug!("init_block_entry_env bb{}: {} incoming edges", bb_idx, incoming.len());
         for (idx, edge) in incoming.iter().enumerate() {
@@ -96,6 +108,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         self.current_env = entry_env;
         debug!("init_block_entry_env bb{}: merged {} vars", bb_idx, self.current_env.len());
+    }
+
+    /// Install the block-entry pointee table, keeping any hits the outgoing
+    /// table still holds (they are flushed by the statement that made them).
+    fn adopt_ref_pointees(&mut self, table: RefPointees) {
+        let previous = std::mem::replace(&mut self.ref_pointees, table);
+        self.ref_pointees.absorb_hits(&previous);
     }
 
     /// Intersect variant facts across incoming edges (#3017 bridge).
@@ -179,10 +198,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Consume incoming_vals via into_iter().rev() to avoid cloning each (cond, val) pair
         let mut iter = incoming_vals.into_iter().rev();
-        let Some((_, mut ite_expr)) = iter.next() else { return Some(phi_var) };
+        let Some((_, mut ite_expr)) = iter.next() else {
+            // An UNDEFINED phi is not a neutral outcome: the solver may give it
+            // any value, so an equality over it is satisfiably false and its
+            // negation becomes "provable". Record the havoc so the harness
+            // cannot be certified on top of it.
+            self.ctx.bmc_sound_havoc("phi_no_incoming_value");
+            return Some(phi_var);
+        };
         for (cond, val) in iter {
             let pred = cond.unwrap_or_else(|| Expr::bool_const(true));
             ite_expr = Expr::ite(pred, val, ite_expr);
+        }
+        // For the allocation resolver only (alloc_view.rs, `alloc_phi_defs`):
+        // `if c { base.add(2) } else { base.add(4) }` merges here, and without
+        // the definition the merged pointer named no allocation, so a proof over
+        // it was demoted (offset_from_distance_dual_safe.rs
+        // `safe_offset_from_branch_aligned_distance`, after2 bundle).
+        if let ay_bindings::ExprValue::Var { name } = phi_var.value() {
+            self.ctx.alloc_phi_defs.insert(name.clone(), ite_expr.clone());
         }
 
         // SMT-LIB requires same-width operands for equality, so coerce widths.
@@ -192,7 +226,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             None => {
                 match self.coerce_to_match_widths_untyped(phi_var.clone(), ite_expr, var_name) {
                     Some(pair) => pair,
-                    None => return Some(phi_var),
+                    // Same hazard as the no-incoming-value case above: without
+                    // the `phi == ite(..)` definition this variable is
+                    // unconstrained, and an unconstrained value proves anything.
+                    None => {
+                        self.ctx.bmc_sound_havoc("phi_width_coercion_failed");
+                        return Some(phi_var);
+                    }
                 }
             }
         };

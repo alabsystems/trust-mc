@@ -53,6 +53,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let keys_name = self.ctx.fresh_name("hashmap_iter_keys");
         let keys_sort = Sort::array(ptr_sort(), key_sort.clone());
         let keys = self.ctx.declare_var(&keys_name, keys_sort.clone());
+        self.ctx.bmc_sound_havoc("hashmap_iter_keys");
 
         // Part of #1744: Use tracked length if available, otherwise create symbolic >= 0
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
@@ -105,8 +106,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // keys are present (true). The DT-based Option encoding tracks membership
         // via is_some/is_none, so the presence array is not semantically used here
         // but is required by the shared iterator field layout (Part of #3057).
+        // `Expr::const_array` takes the INDEX sort first: the presence array is
+        // indexed by key, matching the declared `fld_present: Array(K, Bool)`.
+        let present = Expr::const_array(key_sort.clone(), Expr::bool_const(true));
         let present_sort = Sort::array(key_sort, bool_sort());
-        let present = Expr::const_array(bool_sort(), Expr::bool_const(true));
 
         // Create iterator struct sort
         let iter_sort = struct_sort(

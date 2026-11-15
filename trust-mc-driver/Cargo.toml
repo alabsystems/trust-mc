@@ -63,14 +63,16 @@ ay-chc = { workspace = true, optional = true }
 # frontend-neutral verdict, and proof certificate. Re-exports the same ay-chc
 # types the typed CHC/PDR path already uses, so it joins the ay-chc-native set.
 ay-encode = { workspace = true, optional = true }
-# ay-sys for process-wide memory limit (RSS guard)
+# ay-sys for process-wide memory limit (RSS guard), and for the thread CPU
+# clock the direct-SMT composer meters its budgets on (`ay-chc-native`;
+# `direct_smt_cex::check_sat_on_budget`).
 ay-sys = { workspace = true, optional = true }
 # Core types for VC artifact parsing and CHC conversion (#1164)
 # Required for source location mapping from .vc.json sidecar files
 trust-mc-core = { path = "../trust-mc-core" }
 # Optional native trust_ir bundle embedding path for compiler integrations.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", optional = true }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", optional = true }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", optional = true }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", optional = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 
 # Unix SIGPIPE handling (#663)
@@ -81,10 +83,12 @@ trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979", features = ["serde"] }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "7a93cc8b9b289e4961aa54cb0a7a9bdd99274979" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["serde"] }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87" }
 ay_bindings = { workspace = true }
-trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc" }
+# `legacy-liveness-oracle` is test-only: it exposes the pre-fix CHC relation
+# liveness so `tests/chc_liveness_verdict_parity.rs` can compare verdicts.
+trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", features = ["legacy-liveness-oracle"] }
 
 [lints]
 workspace = true
@@ -137,7 +141,7 @@ ay = ["cli"]
 ay-direct = ["cli", "dep:ay-dpll", "dep:ay-frontend", "dep:ay_bindings", "ay_bindings/direct"]
 # Enable native CHC solver using ay root facade (#632, #3971)
 # Removes dependency on Z3 Spacer subprocess for CHC verification
-ay-chc-native = ["dep:ay", "dep:ay-chc", "dep:ay-encode", "dep:ay-frontend", "dep:ay_bindings"]
+ay-chc-native = ["dep:ay", "dep:ay-chc", "dep:ay-encode", "dep:ay-frontend", "dep:ay_bindings", "dep:ay-sys"]
 # Stable library-only feature for compiler integrations that already own typed
 # `trust-mc-core::ChcVc` obligations and need native CHC/PDR solving without the
 # CLI or rustc-private `trust-mc-compiler` crate. Embedders should use

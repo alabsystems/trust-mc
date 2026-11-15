@@ -57,6 +57,8 @@ fn places_from_operand(op: &rustc_public::mir::Operand) -> Vec<&Place> {
     match op {
         rustc_public::mir::Operand::Copy(p) | rustc_public::mir::Operand::Move(p) => vec![p],
         rustc_public::mir::Operand::Constant(_) => vec![],
+        #[cfg(trust_toolchain)]
+        rustc_public::mir::Operand::RuntimeChecks(_) => vec![],
     }
 }
 
@@ -81,7 +83,7 @@ fn find_downcast_variant_field_place(
                 }
                 // Check all source places in the rvalue
                 let source_places: Vec<&Place> = match rvalue {
-                    rustc_public::mir::Rvalue::Use(op) => places_from_operand(op),
+                    rustc_public::mir::Rvalue::Use(op, ..) => places_from_operand(op),
                     rustc_public::mir::Rvalue::Ref(_, _, place) => vec![place],
                     rustc_public::mir::Rvalue::AddressOf(_, place) => vec![place],
                     rustc_public::mir::Rvalue::CopyForDeref(place) => vec![place],

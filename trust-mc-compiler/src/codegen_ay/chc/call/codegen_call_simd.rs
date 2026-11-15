@@ -11,6 +11,9 @@
 //! Part of #3441: CHC SIMD intrinsic handlers.
 //! Handler implementations in `codegen_call_simd_ops.rs`.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -22,7 +25,7 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::codegen_call_simd_ops::{
-    codegen_simd_cast, codegen_simd_comparison, codegen_simd_elementwise_binop,
+    SimdBinopOrigin, codegen_simd_cast, codegen_simd_comparison, codegen_simd_elementwise_binop,
     codegen_simd_extract, codegen_simd_insert, codegen_simd_reduce, codegen_simd_reduce_bool,
     codegen_simd_shift, codegen_simd_shuffle,
 };
@@ -133,7 +136,7 @@ pub(in crate::codegen_ay::chc) fn extract_simd_layout(
     let fields = variants[0].fields();
 
     if fields.len() == 1 {
-        let field_ty = fields[0].ty_with_args(&args);
+        let field_ty = mono_ty::field_ty(&fields[0], &args)?;
         if let TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) = field_ty.kind() {
             let lane_count = len_const.eval_target_usize().ok()? as usize;
             let (elem_width, is_signed, is_float) = elem_ty_info(elem_ty)?;
@@ -141,7 +144,7 @@ pub(in crate::codegen_ay::chc) fn extract_simd_layout(
         }
     }
 
-    let first_field_ty = fields[0].ty_with_args(&args);
+    let first_field_ty = mono_ty::field_ty(&fields[0], &args)?;
     let (elem_width, is_signed, is_float) = elem_ty_info(first_field_ty)?;
     Some(SimdLayoutInfo { lane_count: fields.len(), elem_width, is_signed, is_float })
 }
@@ -258,10 +261,16 @@ impl<'tcx, 'body> CallDispatchSimd for ChcCtx<'tcx, 'body> {
             | SimdIntrinsicKind::Xor
             | SimdIntrinsicKind::Div
             | SimdIntrinsicKind::Rem => {
-                codegen_simd_elementwise_binop(self, dcx, *target, kind);
+                codegen_simd_elementwise_binop(
+                    self,
+                    dcx,
+                    *target,
+                    kind,
+                    SimdBinopOrigin::RawIntrinsic,
+                );
             }
             SimdIntrinsicKind::Shl | SimdIntrinsicKind::Shr => {
-                codegen_simd_shift(self, dcx, *target, kind);
+                codegen_simd_shift(self, dcx, *target, kind, SimdBinopOrigin::RawIntrinsic);
             }
             SimdIntrinsicKind::Eq
             | SimdIntrinsicKind::Ne
@@ -380,12 +389,33 @@ pub(in crate::codegen_ay::chc) fn emit_simd_dest_constraint(
     dest_local: usize,
     result: Expr,
 ) {
+    emit_simd_dest_constraint_guarded(ctx, dcx, target, dest_local, result, None);
+}
+
+/// [`emit_simd_dest_constraint`] whose successor is reached only where
+/// `continues` holds: the call returns there, and elsewhere it panicked. The
+/// sound fallback (an unresolvable destination) keeps every execution, which
+/// can only add failures.
+pub(in crate::codegen_ay::chc) fn emit_simd_dest_constraint_guarded(
+    ctx: &mut ChcCtx<'_, '_>,
+    dcx: &DispatchCallContext<'_>,
+    target: BasicBlockIdx,
+    dest_local: usize,
+    result: Expr,
+    continues: Option<Expr>,
+) {
     if let Some((_, dest_var)) = ctx.resolve_destination(dest_local) {
         let s = dest_var.sort().clone();
         let eq = ctx.make_coerced_eq_constraint(&dest_var, result, &s, dest_local, "simd_op");
         let out = ctx.build_output_args(dcx.modified_locals, &[dest_local]);
-        if let Some(eq) = eq {
-            ctx.emit_goto_rule_extra(dcx.from_app, target, &out, dcx.stmt_constraints, [eq]);
+        if eq.is_some() || continues.is_some() {
+            ctx.emit_goto_rule_extra(
+                dcx.from_app,
+                target,
+                &out,
+                dcx.stmt_constraints,
+                eq.into_iter().chain(continues),
+            );
         } else {
             ctx.emit_goto_rule(dcx.from_app, target, &out, dcx.stmt_constraints);
         }

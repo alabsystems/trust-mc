@@ -9,12 +9,11 @@
 
 use ay_bindings::{Expr, ExprValue};
 use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue, StatementKind};
-use rustc_public::ty::{ConstantKind, RigidTy, Ty, TyConstKind, TyKind};
+use rustc_public::ty::{RigidTy, Ty, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::ptr_repr::PtrRepr;
 
-use super::super::stmt::codegen_stmt_projection::constant_index_offset;
 use super::ChcCtx;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -51,7 +50,38 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return false;
         };
 
+        // A cast to another pointee TYPE reads another window of the static.
+        // A FIXED static is then read from its memory, which is seeded whole at
+        // every type the harness dereferences (D2); carrying its state
+        // variable and value seed to `&raw const SW as *const u8` indexed the
+        // `[u16; 2]` value by byte offset and certified a counterexample to a
+        // true byte. A LIVE static keeps the mapping: its state variable is
+        // the only place its writes reach, and a read at a mismatched type
+        // through it fails closed (measured: `probe_live_cast`).
+        if propagation == "Cast (#428)"
+            && !self.ref_resolution.mutable_static_state_idxs.contains(&vec_idx)
+        {
+            let locals = self.body.locals();
+            let pointee =
+                |local: usize| locals.get(local).and_then(|l| Self::deref_pointee_ty(l.ty));
+            if let (Some(src), Some(dest)) = (pointee(src_local), pointee(dest_local))
+                && !crate::codegen_ay::chc::decl::global_objects::fact_types_compatible(src, dest)
+            {
+                debug!(
+                    src = src_local,
+                    dest = dest_local,
+                    vec_idx,
+                    "CHC: fixed static cast to another pointee type: memory answers"
+                );
+                return false;
+            }
+        }
+
         self.map_static_local_to_state_idx(dest_local, vec_idx);
+        // The same pointer: the same part of the static (D6).
+        if let Some(path) = self.ref_resolution.static_ref_paths.get(&src_local).cloned() {
+            self.ref_resolution.static_ref_paths.insert(dest_local, path);
+        }
         debug!(
             src = src_local,
             dest = dest_local,
@@ -70,7 +100,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return false;
         }
 
-        let Some(value) = self.projected_immutable_static_value(place) else {
+        let Some((value, value_ty, slot_offset)) = self.projected_immutable_static_value(place)
+        else {
             return false;
         };
         // `const_ref_values[X]` answers "what is `*X`?" — see
@@ -88,16 +119,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             else {
                 return false;
             };
-            let Some(pointee_value) =
-                self.ref_resolution.static_pointee_init_values.get(&vec_idx).cloned()
+            if !self.static_metadata_value_is_stable(place.local)
+                || !self.static_metadata_value_is_stable(dest_local)
+                || !super::static_path::same_ty_modulo_regions(
+                    value_ty,
+                    self.body.locals()[dest_local].ty,
+                )
+            {
+                return false;
+            }
+            let Some(pointee_ty) = Self::deref_pointee_ty(value_ty) else { return false };
+            let Some((pointee_value, metadata)) =
+                self.projected_pointer_static_seed(place.local, vec_idx, slot_offset, pointee_ty)
             else {
                 return false;
             };
             self.ref_resolution.const_ref_values.insert(dest_local, pointee_value);
+            if let Some(metadata) = metadata {
+                self.ref_resolution.subslice_len.insert(dest_local, metadata);
+            }
             debug!(
                 src = place.local,
                 dest = dest_local,
-                "CHC: propagated pointer-static referent value through the pointer level"
+                "CHC: propagated projected pointer slot's fixed referent value"
             );
             return true;
         }
@@ -150,29 +194,96 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    fn projected_immutable_static_value(&self, place: &Place) -> Option<Expr> {
+    fn projected_immutable_static_value(&self, place: &Place) -> Option<(Expr, Ty, usize)> {
         let &vec_idx = self.ref_resolution.static_ref_to_state_idx.get(&place.local)?;
         if self.ref_resolution.mutable_static_state_idxs.contains(&vec_idx) {
             return None;
         }
         let mut current = self.ref_resolution.static_initial_values.get(&vec_idx)?.clone();
+        let mut current_ty =
+            self.normalize_static_ty(*self.ref_resolution.static_state_ty.get(&vec_idx)?);
+        let mut slot_offset = 0usize;
 
         for proj in &place.projection[1..] {
+            let TyKind::RigidTy(RigidTy::Array(element_ty, length)) = current_ty.kind() else {
+                return None;
+            };
+            let length = usize::try_from(length.eval_target_usize().ok()?).ok()?;
             let index = match proj {
                 ProjectionElem::Index(index_local) => {
+                    if !self.static_metadata_value_is_stable(*index_local) {
+                        return None;
+                    }
                     let value = self.unique_constant_usize_assignment(*index_local)?;
                     Expr::bitvec_const(value as u128, crate::codegen_ay::types::POINTER_WIDTH)
                 }
                 ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    let actual = constant_index_offset(*offset, *min_length, *from_end)?;
+                    let offset = usize::try_from(*offset).ok()?;
+                    if length < usize::try_from(*min_length).ok()? {
+                        return None;
+                    }
+                    let actual = if *from_end { length.checked_sub(offset)? } else { offset };
                     Expr::bitvec_const(actual as u128, crate::codegen_ay::types::POINTER_WIDTH)
                 }
                 _ => return None,
             };
+            let element_index = Self::bitvec_const_key(&index)?.0;
+            let element_index = usize::try_from(element_index).ok()?;
+            if element_index >= length {
+                return None;
+            }
+            slot_offset = slot_offset
+                .checked_add(element_index.checked_mul(self.get_type_size(element_ty)?)?)?;
             current = Self::simplify_select_from_static_array(&current, &index)?;
+            current_ty = self.normalize_static_ty(element_ty);
         }
 
-        Some(current)
+        Some((current, current_ty, slot_offset))
+    }
+
+    /// Declaration-time value facts cannot describe an entry parameter or
+    /// storage that can be reassigned through an alias.
+    fn static_metadata_value_is_stable(&self, local: usize) -> bool {
+        !(local > 0 && local <= self.body.arg_locals().len())
+            && !self.pointer_value_is_path_dependent(local)
+            && !self.local_bytes_may_be_rewritten(local)
+    }
+
+    /// Decode the pointer at its actual slot in the immutable parent static,
+    /// then read only the fixed pointee window that relocation and metadata name.
+    fn projected_pointer_static_seed(
+        &mut self,
+        source_local: usize,
+        vec_idx: usize,
+        slot_offset: usize,
+        pointee_ty: Ty,
+    ) -> Option<(Expr, Option<Expr>)> {
+        use crate::codegen_ay::shared::const_pointer::{self, Fixedness};
+        // The one mapped state slot is not sufficient authority: a copied
+        // argument or a join can have inherited one producer's mapping.
+        let source = Operand::Copy(Place { local: source_local, projection: vec![] });
+        let mut keys = self.static_pointer_sources(&source, 16)?.into_iter();
+        let key = keys.next()?;
+        if keys.next().is_some()
+            || self.ref_resolution.static_state_idx_by_obj.get(&self.global_object(&key)?.obj_id)
+                != Some(&vec_idx)
+        {
+            return None;
+        }
+        let (bytes, fixed) = const_pointer::target_bytes(self.tcx, &key)?;
+        if fixed != Fixedness::Fixed {
+            return None;
+        }
+        let (pointer, value) = self.fixed_window_value(&bytes, slot_offset, pointee_ty)?;
+        let metadata = if const_pointer::pointee_has_len_metadata(pointee_ty) {
+            Some(Expr::bitvec_const(
+                u128::from(pointer.metadata?),
+                crate::codegen_ay::types::POINTER_WIDTH,
+            ))
+        } else {
+            None
+        };
+        Some((value, metadata))
     }
 
     fn unique_constant_usize_assignment(&self, local: usize) -> Option<usize> {
@@ -182,7 +293,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if let StatementKind::Assign(lhs, rhs) = &stmt.kind
                     && lhs.projection.is_empty()
                     && lhs.local == local
-                    && let Rvalue::Use(Operand::Constant(const_op)) = rhs
+                    && let Rvalue::Use(Operand::Constant(const_op), ..) = rhs
                     && let Some(value) = Self::extract_static_const_usize(&const_op.const_)
                 {
                     values.push(value);
@@ -204,14 +315,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ) {
             return None;
         }
-        match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => alloc.read_uint().ok().map(|value| value as usize),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_, alloc) => alloc.read_uint().ok().map(|value| value as usize),
-                _ => None,
-            },
-            _ => None,
-        }
+        crate::codegen_ay::shared::const_pointer::const_uint(mir_const)
+            .and_then(|value| usize::try_from(value).ok())
     }
 
     fn simplify_select_from_static_array(array: &Expr, select_index: &Expr) -> Option<Expr> {
@@ -258,13 +363,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     };
 
-                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rhs
+                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) = rhs
                         && place.projection.is_empty()
                     {
                         changed |=
                             self.propagate_static_local(place.local, lhs.local, "Copy/Move (#428)");
                     }
-                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rhs
+                    if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) = rhs
                         && !place.projection.is_empty()
                     {
                         changed |= self.propagate_projected_static_value(place, lhs.local);

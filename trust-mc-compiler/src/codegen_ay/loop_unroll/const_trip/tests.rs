@@ -20,7 +20,7 @@
 
 use super::*;
 use rustc_public::mir::{
-    BasicBlock, Body, LocalDecl, Mutability, Operand, Place, Statement, Terminator, TerminatorKind,
+    BasicBlock, Body, LocalDecl, Mutability, Operand, Place, Statement, TerminatorKind,
 };
 
 /// Create dummy Span/Ty handles for unit tests that run without a rustc session.
@@ -253,11 +253,11 @@ fn body_from(blocks: Vec<BasicBlock>, local_count: usize) -> Body {
 }
 
 fn stmt(kind: StatementKind) -> Statement {
-    Statement { kind, span: dummy_span() }
+    crate::rustc_compat::mir_statement(kind, dummy_span())
 }
 
 fn block(statements: Vec<Statement>, kind: TerminatorKind) -> BasicBlock {
-    BasicBlock { statements, terminator: Terminator { kind, span: dummy_span() } }
+    BasicBlock { statements, terminator: crate::rustc_compat::mir_terminator(kind, dummy_span()) }
 }
 
 #[test]

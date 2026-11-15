@@ -6,6 +6,7 @@
 //!
 //! Extracted from codegen_decl_ref_const_extract.rs per #4147 (large-file decomposition).
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use std::sync::Arc;
 
 use ay_bindings::{Expr, Sort};
@@ -19,7 +20,9 @@ use crate::codegen_ay::types::{
 use crate::kani_middle::abi::LayoutOf;
 
 use super::codegen_types::CodegenTypes;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var, push_pending_datatype_sort};
+use super::global_objects::InitSite;
+use super::{ChcCtx, chc_fresh_name, push_pending_datatype_sort};
+use crate::codegen_ay::shared::const_pointer::ConstRead;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Extract a constant array (`[T; N]`) from a target allocation.
@@ -28,12 +31,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Reads element bytes from the allocation and builds an SMT array
     /// via nested store operations, matching translate_array_aggregate.
     pub(super) fn extract_array_from_const_ref(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         elem_ty: rustc_public::ty::Ty,
         const_len: &rustc_public::ty::TyConst,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         let array_len = const_len.eval_target_usize().ok()? as usize;
         if array_len == 0 {
@@ -41,7 +45,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let name = chc_fresh_name("__const_arr_empty");
             let arr_sort = Sort::array(ptr_sort(), elem_sort);
             // Part of #2317: declare the fresh symbolic array variable.
-            return Some(declare_pending_var(name, arr_sort));
+            return Some(ExactVar::unobserved(name, arr_sort));
         }
         let (elem_sort, elem_byte_width) = match elem_ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => (bool_sort(), 1usize),
@@ -55,45 +59,55 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             // Part of #3607 D2: Char element type — Unicode scalar (u32, 4 bytes).
             TyKind::RigidTy(RigidTy::Char) => (Sort::bitvec(32), 4usize),
+            // Floats are their IEEE-754 bit pattern in the CHC lane.
+            TyKind::RigidTy(RigidTy::Float(ft)) => {
+                let bits = crate::codegen_ay::types::float_ty_to_bitvec_width(ft);
+                (Sort::bitvec(bits), (bits / 8) as usize)
+            }
             // Part of #1739: Tuple/struct element types — read as Datatype,
             // flatten to BV. Same approach as static_init_from_alloc but for
             // const promoted references.
             _ => {
-                return Self::extract_dt_array_from_const_ref(
+                return self.extract_dt_array_from_const_ref(
                     target_alloc,
                     inner_ty,
                     elem_ty,
                     array_len,
                     memory_inits,
-                    promoted_obj_id,
+                    site,
                 );
             }
         };
-        if target_alloc.bytes.len() < array_len * elem_byte_width {
+        if target_alloc.len() < array_len * elem_byte_width {
             return None;
         }
         let array_sort = Sort::array(ptr_sort(), elem_sort.clone());
         let name = chc_fresh_name("__const_arr");
         // Part of #2317: declare the fresh symbolic array variable.
-        let mut result = declare_pending_var(name, array_sort);
+        let mut result = ExactVar::unobserved(name, array_sort);
         // Part of #2986: Get element type key for per-element memory_inits.
         // Part of #2267: Convert Cow to Arc<str> once; per-element clones
         // are O(1) refcount bumps instead of O(n) heap allocations.
         let elem_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(elem_ty));
+        // An array read at its own type (`*r` with `r: &[T; N]`) loads each
+        // element from the ARRAY's key at element sort (`load_from_memory`'s
+        // flat reconstruction, #4086; array stores write that key the same way,
+        // #4099). Seeding the elements under `T`'s key only left those cells
+        // free: `raw_eq(&[13u8, 42], &[13, 42])`, which Kani lowers to
+        // `(*a) as u16 == (*b) as u16`, compared two unconstrained reads and
+        // was refuted with a Genuine certificate
+        // (tools/soundness-duals/raw_eq_model_dual_safe.rs).
+        let array_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(inner_ty));
         for i in 0..array_len {
             let offset = i * elem_byte_width;
             // Part of #3527: Propagate None for uninitialized bytes.
+            // Every element obeys the slot clause (`const_pointer`): a byte a
+            // relocation covers, or an uninitialized one, is not data.
             let elem_expr = if elem_sort.is_bool() {
-                let byte_val: u8 = target_alloc.bytes.get(offset).copied()??;
-                Expr::bool_const(byte_val != 0)
+                Expr::bool_const(target_alloc.read_bool_at(offset)?)
             } else {
                 let bits = elem_sort.bitvec_width()?;
-                let mut value: u128 = 0;
-                for b in 0..elem_byte_width {
-                    let byte_val: u8 = target_alloc.bytes.get(offset + b).copied()??;
-                    value |= (byte_val as u128) << (b * 8);
-                }
-                Expr::bitvec_const(value, bits)
+                Expr::bitvec_const(target_alloc.read_uint_at(offset, elem_byte_width)?, bits)
             };
             // Part of #2986: Emit per-element memory constraint so
             // try_raw_eq_array reads correct values from promoted constants.
@@ -101,23 +115,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 elem_type_key.clone(),
                 elem_sort.clone(),
                 elem_expr.clone(),
-                promoted_obj_id,
-                offset as u64,
+                site.obj_id,
+                site.at(offset as u64),
             ));
+            if array_type_key != elem_type_key {
+                memory_inits.push((
+                    array_type_key.clone(),
+                    elem_sort.clone(),
+                    elem_expr.clone(),
+                    site.obj_id,
+                    site.at(offset as u64),
+                ));
+            }
             let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
             result = result.store(idx, elem_expr);
         }
         // Part of #3497: Also seed the whole array value into the array-level
         // typed memory so that fat pointer dereferences through the 2D slice
         // memory see constrained values.
-        let array_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(inner_ty));
         let array_value_sort = Sort::array(ptr_sort(), elem_sort);
         memory_inits.push((
             array_type_key,
             array_value_sort,
             result.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0u64),
         ));
         Some(result)
     }
@@ -127,12 +149,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Handles the `_ =>` fallthrough in the array element type dispatch:
     /// tuple/struct element types are read as Datatype and flattened to BV.
     fn extract_dt_array_from_const_ref(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         elem_ty: rustc_public::ty::Ty,
         array_len: usize,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         use crate::codegen_ay::types::flatten_dt_array_element;
         use trust_mc_codegen_types::types::flatten_datatype_to_bitvec;
@@ -162,12 +185,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let physical_bv_width = (elem_byte_width as u32).checked_mul(8)?;
         let physical_sort = Sort::bitvec(physical_bv_width);
 
-        if target_alloc.bytes.len() < array_len * elem_byte_width {
+        if target_alloc.len() < array_len * elem_byte_width {
             return None;
         }
         let array_sort = Sort::array(ptr_sort(), flattened_sort.clone());
         let name = chc_fresh_name("__const_arr");
-        let mut result = declare_pending_var(name, array_sort);
+        let mut result = ExactVar::unobserved(name, array_sort);
         let elem_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(elem_ty));
         for i in 0..array_len {
             let base = i * elem_byte_width;
@@ -175,18 +198,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let mut field_exprs = Vec::with_capacity(ctor.fields.len());
             for (field_idx, field) in ctor.fields.iter().enumerate() {
                 let fld_offset = base + elem_layout.field_offset(field_idx)?;
+                // Slot clause: a pointer field is its relocation's address
+                // (D8), never its offset bytes.
                 let field_expr = if field.sort.is_bool() {
-                    let byte_val: u8 = target_alloc.bytes.get(fld_offset).copied()??;
-                    Expr::bool_const(byte_val != 0)
+                    Expr::bool_const(target_alloc.read_bool_at(fld_offset)?)
                 } else {
                     let bits = field.sort.bitvec_width()?;
-                    let fw = (bits as usize / 8).max(1);
-                    let mut value: u128 = 0;
-                    for b in 0..fw {
-                        let byte_val: u8 = target_alloc.bytes.get(fld_offset + b).copied()??;
-                        value |= (byte_val as u128) << (b * 8);
-                    }
-                    Expr::bitvec_const(value, bits)
+                    self.read_scalar_from_allocation(target_alloc, fld_offset, bits)?.into_expr()
                 };
                 field_exprs.push(field_expr);
             }
@@ -210,8 +228,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 elem_type_key.clone(),
                 physical_sort.clone(),
                 mem_expr,
-                promoted_obj_id,
-                base as u64,
+                site.obj_id,
+                site.at(base as u64),
             ));
             let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
             result = result.store(idx, elem_expr);
@@ -222,8 +240,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             array_type_key,
             array_value_sort,
             result.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0u64),
         ));
         Some(result)
     }
@@ -232,11 +250,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Part of #3495: Handle constant slice references (`const &[u8]`).
     pub(super) fn extract_slice_from_const_ref(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         elem_ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         let (elem_sort, elem_byte_width) = match elem_ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => (bool_sort(), 1usize),
@@ -248,51 +267,64 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let bits = int_ty_to_bitvec_width(it);
                 (Sort::bitvec(bits), (bits / 8) as usize)
             }
+            // Floats are their IEEE-754 bit pattern in the CHC lane.
+            TyKind::RigidTy(RigidTy::Float(ft)) => {
+                let bits = crate::codegen_ay::types::float_ty_to_bitvec_width(ft);
+                (Sort::bitvec(bits), (bits / 8) as usize)
+            }
             _ => return None, // external enum: TyKind
         };
         if elem_byte_width == 0 {
             return None;
         }
-        let array_len = target_alloc.bytes.len() / elem_byte_width;
+        let array_len = target_alloc.len() / elem_byte_width;
         if array_len == 0 {
             return None;
         }
         let array_sort = Sort::array(ptr_sort(), elem_sort.clone());
         let name = chc_fresh_name("__const_slice");
-        let mut result = declare_pending_var(name, array_sort);
+        let mut result = ExactVar::unobserved(name, array_sort);
         let elem_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(elem_ty));
+        // The slice's elements are seeded under the slice's own key too, at
+        // element sort, as an array's are (`extract_array_from_const_ref`):
+        // the cells hold the constant's own bytes under either key.
+        let array_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(inner_ty));
         for i in 0..array_len {
             let offset = i * elem_byte_width;
+            // Every element obeys the slot clause (`const_pointer`): a byte a
+            // relocation covers, or an uninitialized one, is not data.
             let elem_expr = if elem_sort.is_bool() {
-                let byte_val: u8 = target_alloc.bytes.get(offset).copied()??;
-                Expr::bool_const(byte_val != 0)
+                Expr::bool_const(target_alloc.read_bool_at(offset)?)
             } else {
                 let bits = elem_sort.bitvec_width()?;
-                let mut value: u128 = 0;
-                for b in 0..elem_byte_width {
-                    let byte_val: u8 = target_alloc.bytes.get(offset + b).copied()??;
-                    value |= (byte_val as u128) << (b * 8);
-                }
-                Expr::bitvec_const(value, bits)
+                Expr::bitvec_const(target_alloc.read_uint_at(offset, elem_byte_width)?, bits)
             };
             memory_inits.push((
                 elem_type_key.clone(),
                 elem_sort.clone(),
                 elem_expr.clone(),
-                promoted_obj_id,
-                offset as u64,
+                site.obj_id,
+                site.at(offset as u64),
             ));
+            if array_type_key != elem_type_key {
+                memory_inits.push((
+                    array_type_key.clone(),
+                    elem_sort.clone(),
+                    elem_expr.clone(),
+                    site.obj_id,
+                    site.at(offset as u64),
+                ));
+            }
             let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
             result = result.store(idx, elem_expr);
         }
-        let array_type_key: Arc<str> = Arc::from(&*Self::type_key_for_ty(inner_ty));
         let array_value_sort = Sort::array(ptr_sort(), elem_sort);
         memory_inits.push((
             array_type_key,
             array_value_sort,
             result.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0u64),
         ));
         Some(result)
     }
@@ -310,13 +342,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// separately and remains correct. String content becomes unconstrained, which
     /// is sound because CHC proofs do not verify panic message content.
     pub(super) fn extract_str_from_const_ref(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
-        let elem_byte_width = 1usize;
         let elem_sort = Sort::bitvec(8);
-        let array_len = target_alloc.bytes.len();
+        let array_len = target_alloc.len();
         if array_len == 0 {
             return None;
         }
@@ -330,27 +362,112 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 len = array_len,
                 "CHC: eliding per-byte memory_inits for long const str (>{MAX_CONST_STR_INIT_BYTES} bytes)"
             );
-            return Some(declare_pending_var(name, array_sort));
+            // The bytes are known; not reading them out leaves values the
+            // encoding does not compute: a booked havoc (Rule E).
+            return Some(Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_CONSTANT_BYTES,
+                name,
+                array_sort,
+            ));
         }
-        let mut result = declare_pending_var(name, array_sort);
         let elem_type_key: Arc<str> = Arc::from("u8");
-        for i in 0..array_len {
-            let byte_val: u8 = target_alloc.bytes.get(i).copied()??;
-            let elem_expr = Expr::bitvec_const(byte_val as u128, 8);
+        let result = read_const_str_value(target_alloc, name, |i, elem_expr| {
             memory_inits.push((
                 elem_type_key.clone(),
                 elem_sort.clone(),
                 elem_expr.clone(),
-                promoted_obj_id,
-                (i * elem_byte_width) as u64,
+                site.obj_id,
+                site.at(i as u64),
             ));
-            let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
-            result = result.store(idx, elem_expr);
-        }
+        })?;
         // Do not seed a typed `slice_u8` memory init with the whole byte array.
         // `slice_u8` is modeled as byte-addressed memory (`Array<BV64, BV8>`), so an
         // array-valued init here produces `select(mem_slice_u8, addr) = store(...)`
         // sort mismatches in the entry rule.
         Some(result)
+    }
+
+    /// A fixed string whose local is assigned only on a failing path needs
+    /// its exact value for that path, but no entry-memory seeds. Do not route
+    /// it through the live-string elision: that would book an approximation
+    /// even when no continuing execution can read these bytes.
+    pub(super) fn extract_panic_only_str_value(
+        &self,
+        target_alloc: &dyn ConstRead,
+    ) -> Option<Expr> {
+        read_const_str_value(target_alloc, chc_fresh_name("__const_str"), |_, _| {})
+    }
+}
+
+/// Decode every byte under the constant-pointer slot rule. The caller owns
+/// memory seeding policy; omitted seeds never stand in for omitted values.
+fn read_const_str_value(
+    target_alloc: &dyn ConstRead,
+    name: String,
+    mut seed: impl FnMut(usize, &Expr),
+) -> Option<Expr> {
+    if target_alloc.len() == 0 {
+        return None;
+    }
+    let mut result = ExactVar::unobserved(name, Sort::array(ptr_sort(), Sort::bitvec(8)));
+    for i in 0..target_alloc.len() {
+        let byte = Expr::bitvec_const(target_alloc.read_uint_at(i, 1)?, 8);
+        seed(i, &byte);
+        result = result.store(Expr::bitvec_const(i as u128, POINTER_WIDTH), byte);
+    }
+    Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen_ay::shared::const_pointer::{ConstPtr, ConstWindow, Slot, TargetKey};
+
+    struct IncompleteBytes {
+        partial_pointer: bool,
+    }
+
+    impl ConstRead for IncompleteBytes {
+        fn len(&self) -> usize {
+            66
+        }
+        fn read_slot(&self, at: usize, width_bits: u32) -> Slot {
+            if at >= self.len() || width_bits != 8 {
+                Slot::OutOfBounds
+            } else if at == 65 {
+                if self.partial_pointer { Slot::PartialPointer } else { Slot::Uninit }
+            } else {
+                Slot::Data(u128::from(b'a'))
+            }
+        }
+        fn stored_pointer(&self, _: usize) -> Option<ConstPtr> {
+            None
+        }
+        fn stored_word(&self, _: usize) -> Option<u64> {
+            None
+        }
+        fn sub_window(&self, _: usize, _: usize) -> Option<ConstWindow> {
+            None
+        }
+        fn relocations(&self) -> Vec<(usize, Option<ConstPtr>)> {
+            Vec::new()
+        }
+        fn relocation_keys(&self) -> Vec<(usize, Option<TargetKey>)> {
+            Vec::new()
+        }
+        fn align(&self) -> u64 {
+            1
+        }
+    }
+
+    #[test]
+    fn exact_panic_string_refuses_uninitialized_or_relocated_bytes() {
+        for partial_pointer in [false, true] {
+            let bytes = IncompleteBytes { partial_pointer };
+            assert!(
+                read_const_str_value(&bytes, "incomplete_string".to_string(), |_, _| {}).is_none()
+            );
+        }
     }
 }

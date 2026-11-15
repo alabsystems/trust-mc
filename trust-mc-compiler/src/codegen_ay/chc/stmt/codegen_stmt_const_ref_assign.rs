@@ -38,13 +38,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .get(&local_idx)
             .is_some_and(|expr| expr.sort().is_array())
         {
-            let promoted_obj_id = self
-                .ref_resolution
-                .const_ref_promoted_obj_ids
-                .get(&local_idx)
-                .copied()
-                .unwrap_or(self.heap_state.promoted_const_obj_id);
-            return Some(self.heap_state.promoted_const_address_for(promoted_obj_id));
+            // D4: the recorded object base PLUS its offset; a local with no
+            // record has no address here (never the shared object 1).
+            return self.ref_resolution.const_ref_objects.get(&local_idx).map(|o| o.address());
         }
         let local_ty = self.body.locals()[local_idx].ty;
         if !matches!(local_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))) {
@@ -52,28 +48,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         match rhs {
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 if place.projection.is_empty() =>
             {
                 let src_local = place.local;
                 if let Some(const_value) =
                     self.ref_resolution.const_ref_values.get(&src_local).cloned()
                 {
-                    // Part of #3860: Always propagate promoted_obj_id from source
-                    // to destination on Copy/Move, even for non-array const refs.
-                    // Without this, a copied promoted ref (e.g., assert_eq! macro
-                    // temporaries for &Some(4u8)) loses its per-constant obj_id
-                    // and falls back to the shared obj_id=1, producing an address
-                    // mismatch with the entry rule / bb0 memory seeds.
-                    let promoted_obj_id = self
-                        .ref_resolution
-                        .const_ref_promoted_obj_ids
-                        .get(&src_local)
-                        .copied()
-                        .unwrap_or(self.heap_state.promoted_const_obj_id);
-                    self.ref_resolution
-                        .const_ref_promoted_obj_ids
-                        .insert(local_idx, promoted_obj_id);
+                    // Part of #3860 / D4: always propagate the object RECORD
+                    // (object and offset) from source to destination on
+                    // Copy/Move, even for non-array const refs. Without it a
+                    // copied constant ref (e.g., assert_eq! macro temporaries
+                    // for &Some(4u8)) loses its object and offset.
+                    let object = self.ref_resolution.const_ref_objects.get(&src_local).copied();
+                    match object {
+                        Some(object) => {
+                            self.ref_resolution.const_ref_objects.insert(local_idx, object);
+                        }
+                        None => {
+                            self.ref_resolution.const_ref_objects.remove(&local_idx);
+                        }
+                    }
                     if !const_value.sort().is_array() {
                         // Part of #4070: propagate DT const ref values on copy/move
                         // so downstream PartialEq tuple comparisons can resolve the
@@ -92,20 +87,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     {
                         self.ref_resolution.subslice_offset.insert(local_idx, offset);
                     }
-                    return Some(self.heap_state.promoted_const_address_for(promoted_obj_id));
+                    return object.map(|o| o.address());
                 }
                 // Source local has no const_ref_values entry — fall through
                 // to the array catch-all below.
             }
-            Rvalue::Use(Operand::Constant(_)) => {
+            Rvalue::Use(Operand::Constant(_), ..) => {
                 self.ref_resolution.const_ref_values.insert(local_idx, rhs_expr.clone());
-                let promoted_obj_id = self
-                    .ref_resolution
-                    .const_ref_promoted_obj_ids
-                    .get(&local_idx)
-                    .copied()
-                    .unwrap_or(self.heap_state.promoted_const_obj_id);
-                return Some(self.heap_state.promoted_const_address_for(promoted_obj_id));
+                return self.ref_resolution.const_ref_objects.get(&local_idx).map(|o| o.address());
             }
             _ => {}
         }
@@ -120,13 +109,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             ?rhs,
             "promoted_const_ref_array: catch-all for unmatched array→pointer pattern"
         );
+        // D4: without a recorded object this catch-all DECLINES (residual 5):
+        // borrowing the shared object 1 aliased every unregistered constant.
+        let object = self.ref_resolution.const_ref_objects.get(&local_idx).copied()?;
         self.ref_resolution.const_ref_values.insert(local_idx, rhs_expr.clone());
-        let promoted_obj_id = self
-            .ref_resolution
-            .const_ref_promoted_obj_ids
-            .get(&local_idx)
-            .copied()
-            .unwrap_or(self.heap_state.promoted_const_obj_id);
-        Some(self.heap_state.promoted_const_address_for(promoted_obj_id))
+        Some(object.address())
     }
 }

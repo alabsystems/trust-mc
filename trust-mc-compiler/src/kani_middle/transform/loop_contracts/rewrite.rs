@@ -46,13 +46,15 @@ impl LoopContractPass {
                 &SourceInstruction::Terminator { bb: first_blockid },
                 new_terminator,
             );
-            let span = body.blocks()[first_blockid]
-                .statements
-                .first()
-                .expect("block should have statements")
-                .span;
+            let span = mir_span!(
+                body.blocks()[first_blockid]
+                    .statements
+                    .first()
+                    .expect("block should have statements")
+            );
             // Add the StorageLive(nthpat) statement at the begining of the same block
-            let storagelive_stmt = Statement { kind: StatementKind::StorageLive(nthvar), span };
+            let storagelive_stmt =
+                crate::rustc_compat::mir_statement(StatementKind::StorageLive(nthvar), span);
             body.insert_stmt(
                 storagelive_stmt,
                 &mut SourceInstruction::Statement { idx: 0, bb: first_blockid },
@@ -83,7 +85,7 @@ impl LoopContractPass {
                 .iter()
                 .filter_map(|istmt| {
                     if let StatementKind::Assign(iprjplace, irval) = &istmt.kind
-                        && let Rvalue::Use(Operand::Copy(nthpatplace)) = irval
+                        && let Rvalue::Use(Operand::Copy(nthpatplace), ..) = irval
                         && nthpatplace.local == nthvar
                     {
                         Some((&nthpatplace.projection, iprjplace.local))
@@ -95,7 +97,7 @@ impl LoopContractPass {
 
             for fstmt in &body.blocks()[first_blockid + 1].statements {
                 if let StatementKind::Assign(fprjplace, frval) = &fstmt.kind
-                    && let Rvalue::Use(Operand::Copy(firstpatplace)) = frval
+                    && let Rvalue::Use(Operand::Copy(firstpatplace), ..) = frval
                     && firstpatplace.local == firstvar
                 {
                     let firstprj = fprjplace.local;
@@ -127,60 +129,60 @@ impl LoopContractPass {
                         // The assign statements of the projections
                         StatementKind::Assign(fprjplace, frval) => {
                             let new_stmt = match frval {
-                                Rvalue::Use(Operand::Copy(firstpatplace))
+                                Rvalue::Use(Operand::Copy(firstpatplace), ..)
                                     if firstpatplace.local == firstvar =>
                                 {
                                     let nthprj = firstprj_nthprj
                                         .get(&fprjplace.local)
                                         .expect("nthprj mapping should exist");
-                                    Statement {
-                                        kind: StatementKind::Assign(
+                                    crate::rustc_compat::mir_statement(
+                                        StatementKind::Assign(
                                             Place {
                                                 local: *nthprj,
                                                 projection: fprjplace.projection.clone(),
                                             },
-                                            Rvalue::Use(Operand::Copy(Place {
+                                            rvalue_use!(Rvalue::Use(Operand::Copy(Place {
                                                 local: nthvar,
                                                 projection: firstpatplace.projection.clone(),
-                                            })),
+                                            }))),
                                         ),
-                                        span: stmt.span,
-                                    }
+                                        mir_span!(stmt),
+                                    )
                                 }
                                 Rvalue::CopyForDeref(firstpatplace)
                                     if firstpatplace.local == firstvar =>
                                 {
-                                    Statement {
-                                        kind: StatementKind::Assign(
+                                    crate::rustc_compat::mir_statement(
+                                        StatementKind::Assign(
                                             fprjplace.clone(),
                                             Rvalue::CopyForDeref(Place {
                                                 local: nthvar,
                                                 projection: firstpatplace.projection.clone(),
                                             }),
                                         ),
-                                        span: stmt.span,
-                                    }
+                                        mir_span!(stmt),
+                                    )
                                 }
                                 // When Use(Copy) or CopyForDeref matched the pattern but
                                 // the guard failed (firstpatplace.local != firstvar), the
                                 // statement must pass through unchanged — do NOT fall into
                                 // the catch-all which would apply the nthprj remapping.
-                                Rvalue::Use(Operand::Copy(_)) | Rvalue::CopyForDeref(_) => {
+                                Rvalue::Use(Operand::Copy(_), ..) | Rvalue::CopyForDeref(_) => {
                                     stmt.clone()
                                 }
                                 _ => {
                                     // external enum: Rvalue
                                     if let Some(nthprj) = firstprj_nthprj.get(&fprjplace.local) {
-                                        Statement {
-                                            kind: StatementKind::Assign(
+                                        crate::rustc_compat::mir_statement(
+                                            StatementKind::Assign(
                                                 Place {
                                                     local: *nthprj,
                                                     projection: fprjplace.projection.clone(),
                                                 },
                                                 frval.clone(),
                                             ),
-                                            span: stmt.span,
-                                        }
+                                            mir_span!(stmt),
+                                        )
                                     } else {
                                         stmt.clone()
                                     }
@@ -243,10 +245,10 @@ impl LoopContractPass {
                                 }
                             }
                             let new_rval = Rvalue::Aggregate(aggrkind.clone(), new_operands);
-                            new_loophead_stmts.push(Statement {
-                                kind: StatementKind::Assign(lhs.clone(), new_rval),
-                                span: stmt.span,
-                            });
+                            new_loophead_stmts.push(crate::rustc_compat::mir_statement(
+                                StatementKind::Assign(lhs.clone(), new_rval),
+                                mir_span!(stmt),
+                            ));
                         } else if let StatementKind::Assign(
                             lhs,
                             Rvalue::Ref(
@@ -263,10 +265,10 @@ impl LoopContractPass {
                                 *borrowkind,
                                 Place { local: *nthlocal, projection: projection.clone() },
                             );
-                            new_loophead_stmts.push(Statement {
-                                kind: StatementKind::Assign(lhs.clone(), new_rval),
-                                span: stmt.span,
-                            });
+                            new_loophead_stmts.push(crate::rustc_compat::mir_statement(
+                                StatementKind::Assign(lhs.clone(), new_rval),
+                                mir_span!(stmt),
+                            ));
                         } else {
                             new_loophead_stmts.push(stmt.clone());
                         }
@@ -549,10 +551,13 @@ impl LoopContractPass {
         // For the performance benefits remove the re-assign statements of kaniiter variables
         // after adding the same one at loop head
         for block_idx in kaniiter_blocks {
-            let span = body.blocks()[block_idx].terminator.span;
+            let span = mir_span!(body.blocks()[block_idx].terminator);
             body.replace_terminator(
                 &SourceInstruction::Terminator { bb: block_idx },
-                Terminator { kind: TerminatorKind::Goto { target: block_idx + 1 }, span },
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Goto { target: block_idx + 1 },
+                    span,
+                ),
             );
         }
     }

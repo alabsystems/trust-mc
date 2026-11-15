@@ -15,7 +15,7 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place};
-use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::statement::StatementCodegen;
@@ -104,28 +104,17 @@ fn try_extract_const_u128(operand: &Operand) -> Option<u128> {
     let const_op = match operand {
         Operand::Constant(c) => c,
         Operand::Copy(_) | Operand::Move(_) => return None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
     let mir_const = &const_op.const_;
 
-    let extract_from_alloc =
-        |alloc: &rustc_public::ty::Allocation, ty: rustc_public::ty::Ty| -> Option<u128> {
-            match ty.kind() {
-                TyKind::RigidTy(RigidTy::Uint(_)) => alloc.read_uint().ok(),
-                TyKind::RigidTy(RigidTy::Int(_)) => {
-                    let v = alloc.read_int().ok()?;
-                    u128::try_from(v).ok()
-                }
-                _ => None,
-            }
-        };
-
-    let ty = mir_const.ty();
-    match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => extract_from_alloc(alloc, ty),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(value_ty, alloc) => extract_from_alloc(alloc, *value_ty),
-            _ => None,
-        },
+    use crate::codegen_ay::shared::const_pointer;
+    match mir_const.ty().kind() {
+        TyKind::RigidTy(RigidTy::Uint(_)) => const_pointer::const_uint(mir_const),
+        TyKind::RigidTy(RigidTy::Int(_)) => {
+            u128::try_from(const_pointer::const_int(mir_const)?).ok()
+        }
         _ => None,
     }
 }

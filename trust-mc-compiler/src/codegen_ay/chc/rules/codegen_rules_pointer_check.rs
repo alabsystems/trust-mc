@@ -53,7 +53,18 @@ impl<'tcx, 'body> CodegenRulesPointerCheck<'tcx, 'body> for ChcCtx<'tcx, 'body> 
         // provably non-null pointers (statics, allocations, references).
         // Uses global assignment map because the static pointer constant may
         // be assigned in an earlier block than the assert. Part of #3094.
-        if matches!(msg, AssertMessage::NullPointerDereference) {
+        #[cfg(not(trust_toolchain))]
+        let is_null_check = matches!(msg, AssertMessage::NullPointerDereference);
+        // Trust split the borrow-context null check (`&*p`) out of
+        // `NullPointerDereference` into `NullReferenceConstructed`. Its
+        // condition has the same shape, `!(is_null & pointee_should_be_checked)`,
+        // so the non-null proof applies to both, as it did on nightly.
+        #[cfg(trust_toolchain)]
+        let is_null_check = matches!(
+            msg,
+            AssertMessage::NullPointerDereference | AssertMessage::NullReferenceConstructed
+        );
+        if is_null_check {
             let global_assignments = self.global_assignment_map();
             let mut visited = HashSet::new();
             if self.operand_depends_on_ref_target(cond, global_assignments, &mut visited, 8) {
@@ -96,6 +107,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.place_depends_on_ref_target(place, bb_assignments, visited, depth)
             }
             Operand::Constant(_) => false,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => false,
         }
     }
 
@@ -208,7 +221,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return false;
         }
         match rvalue {
-            Rvalue::Use(operand) => {
+            Rvalue::Use(operand, ..) => {
                 self.operand_depends_on_ref_target(operand, bb_assignments, visited, depth)
             }
             // Part of #1836: Trace through Cast operands for null-check suppression.

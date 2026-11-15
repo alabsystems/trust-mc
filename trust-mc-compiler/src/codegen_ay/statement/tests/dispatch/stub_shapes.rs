@@ -254,14 +254,13 @@ fn test_ub_check_noop_stubs() {
 // Formatting stubs — diverging
 // =============================================================================
 
-/// Verify FmtArgumentNewDisplay/FmtArgumentsNew/FmtArgumentsFromStr stubs
-/// diverge (return Some(None)).
+/// FmtArgumentNewDisplay/FmtArgumentsNew/FmtArgumentsFromStr RETURN to their
+/// target (`Some(target)`): diverging there cut the edge into the block that
+/// panics with the message, and that block's panic became unconditional.
 #[test]
-fn test_fmt_stubs_diverge() {
-    // These are on panic paths. The stub returns Some(None) meaning
-    // "handled but diverging" (no continuation block).
-    let diverging_result: Option<Option<usize>> = Some(None);
-    assert_eq!(diverging_result, Some(None));
+fn test_fmt_stubs_return_to_target() {
+    let returning_result: Option<Option<usize>> = Some(Some(5));
+    assert_eq!(returning_result, Some(Some(5)));
 }
 
 /// Verify PanicUnreachable diverges (returns Some(None)).

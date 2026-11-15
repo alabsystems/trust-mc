@@ -7,6 +7,7 @@
 //!
 //! Part of #2308: shared set operations (insert, contains, remove, len, is_empty, clear, clone).
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -15,7 +16,7 @@ use tracing::error;
 
 use super::codegen_expr_signedness::arg_signedness_or_fallback;
 use super::types::{POINTER_WIDTH, SignExtension, bool_sort, coerce_bitvec_width_safe, ptr_sort};
-use super::{ChcCtx, CollectionCallResult, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, CollectionCallResult, chc_fresh_name};
 use crate::codegen_ay::shared::SignednessFallbackKind;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -336,7 +337,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let mut prefix = String::with_capacity(collection_name.len() + 4);
                 prefix.push_str(collection_name);
                 prefix.push_str("_len");
-                declare_pending_var(chc_fresh_name(&prefix), ptr_sort())
+                Havoc::mint_deferred(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
+                    chc_fresh_name(&prefix),
+                    ptr_sort(),
+                )
             });
         Some(CollectionCallResult::read_only(result))
     }
@@ -363,7 +369,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let mut prefix = String::with_capacity(collection_name.len() + 9);
                 prefix.push_str(collection_name);
                 prefix.push_str("_is_empty");
-                declare_pending_var(chc_fresh_name(&prefix), bool_sort())
+                Havoc::mint_deferred(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
+                    chc_fresh_name(&prefix),
+                    bool_sort(),
+                )
             });
         Some(CollectionCallResult::read_only(result))
     }

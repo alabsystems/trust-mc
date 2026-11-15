@@ -10,6 +10,9 @@
 //!
 //! Extracted from `codegen_stmt_ptr_metadata_mir_trace.rs` per #4130.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use rustc_public::mir::{AggregateKind, Operand, ProjectionElem, Rvalue, StatementKind};
@@ -17,7 +20,6 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::shared::IntoOption;
-use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::ChcCtx;
 
@@ -53,7 +55,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         struct_local: usize,
         field_idx: usize,
     ) -> Option<usize> {
-        if self.local_has_multiple_whole_definitions(struct_local) {
+        if !self.path_insensitive_metadata_is_stable(struct_local) {
             return None;
         }
         // Direct Aggregate lookup on struct_local.
@@ -66,7 +68,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = struct_local;
         let mut visited = HashSet::new();
         while visited.len() < 6 && visited.insert(current) {
-            if self.local_has_multiple_whole_definitions(current) {
+            if !self.path_insensitive_metadata_is_stable(current) {
                 return None;
             }
             let mut next = None;
@@ -83,7 +85,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => {
                                 next = Some(p.local);
                             }
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                                 if p.projection.is_empty() =>
                             {
                                 next = Some(p.local);
@@ -112,7 +114,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Search for an Aggregate assignment on `local` and return the source local
     /// for `field_idx`. Helper for `trace_field_through_aggregate`.
     fn find_aggregate_field(&self, local: usize, field_idx: usize) -> Option<usize> {
-        if self.local_has_multiple_whole_definitions(local) {
+        if !self.path_insensitive_metadata_is_stable(local) {
             return None;
         }
         for block in &self.body.blocks {
@@ -154,7 +156,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Follow Use(Move(_X)) / Use(Copy(_X)) chains to find the originating local.
     fn trace_through_moves(&self, mut local_idx: usize) -> Option<usize> {
         for _ in 0..5 {
-            if self.local_has_multiple_whole_definitions(local_idx) {
+            if !self.path_insensitive_metadata_is_stable(local_idx) {
                 return None;
             }
             let mut followed = false;
@@ -162,7 +164,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 for stmt in &block.statements {
                     if let StatementKind::Assign(lhs, rvalue) = &stmt.kind
                         && lhs.local == local_idx
-                        && let Rvalue::Use(operand) = rvalue
+                        && let Rvalue::Use(operand, ..) = rvalue
                         && let Some(next) = Self::operand_bare_local(operand)
                     {
                         local_idx = next;
@@ -184,7 +186,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Find a Range Aggregate definition for the given local and extract
     /// constant start/end fields as (start, end).
     fn find_range_aggregate_const_fields(&self, local_idx: usize) -> Option<(u64, u64)> {
-        if self.local_has_multiple_whole_definitions(local_idx) {
+        if !self.path_insensitive_metadata_is_stable(local_idx) {
             return None;
         }
         for block in &self.body.blocks {
@@ -220,45 +222,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn extract_str_len_from_const_operand(
         operand: &Operand,
     ) -> Option<u64> {
-        use rustc_public::ty::ConstantKind;
-
         let Operand::Constant(const_op) = operand else { return None };
         let ty = const_op.ty();
 
-        // Only handle &str references.
+        // Handle &str and &[T] fat-pointer constants.
         let TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) = ty.kind() else { return None };
-        if !matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Str)) {
+        if !matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Str | RigidTy::Slice(_))) {
             return None;
         }
 
-        // Extract the allocation from the constant.
-        let alloc = match const_op.const_.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            ConstantKind::Ty(ty_const) => {
-                use rustc_public::ty::TyConstKind;
-                match ty_const.kind() {
-                    TyConstKind::Value(_ty, alloc) => alloc,
-                    _ => return None, // external enum: TyConstKind
-                }
-            }
-            _ => return None, // external enum: ConstantKind
-        };
-
-        // &str fat pointer layout: [data_ptr, length] — each POINTER_WIDTH/8 bytes.
-        // alloc.bytes is Vec<Option<u8>> — None indicates uninitialized bytes.
-        // The length field (second word) should be fully initialized.
-        let ptr_bytes = (POINTER_WIDTH / 8) as usize;
-        if alloc.bytes.len() >= ptr_bytes * 2 {
-            let mut len_arr = [0u8; 8];
-            for (i, opt_byte) in alloc.bytes[ptr_bytes..ptr_bytes * 2].iter().enumerate() {
-                len_arr[i] = (*opt_byte)?;
-            }
-            let len = u64::from_le_bytes(len_arr);
-            debug!(len, "PtrMetadata: resolved str len from constant allocation");
-            Some(len)
-        } else {
-            None
-        }
+        // The `&str` constant's own value: its length word, beside the data
+        // pointer (`const_pointer::const_ref`).
+        let bytes = crate::codegen_ay::shared::const_pointer::const_bytes(&const_op.const_)?;
+        let len =
+            crate::codegen_ay::shared::const_pointer::const_ref(&bytes, 0, pointee)?.metadata?;
+        debug!(len, "PtrMetadata: resolved str len from constant allocation");
+        Some(len)
     }
 
     /// Extract the array length N from a reference/pointer to `[T; N]` or a struct
@@ -275,24 +254,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Recursively extract the array length from a type's tail field.
-    /// Handles `[T; N]` directly, or ADTs/tuples whose last field is `[T; N]`.
+    /// Handles `[T; N]` directly, or structs/tuples whose last field is `[T; N]`.
+    ///
+    /// "Last" is the last DECLARED field: that is the field an unsize coercion
+    /// unsizes, and rustc keeps it last in memory for exactly that reason. The
+    /// highest-offset field is not a substitute: a zero-sized field declared
+    /// before the tail can share its offset, and the tie then named the wrong
+    /// field (design 4: an unsize must carry the tail's own length).
     fn extract_tail_array_len(ty: rustc_public::ty::Ty) -> Option<u64> {
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Array(_, len)) => len.eval_target_usize().into_option(),
-            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-                let fields = def.variants_iter().next()?.fields();
-                let layout = ty.layout().ok()?.shape();
-                let fields_sorted = layout.fields.fields_by_offset_order();
-                let last_idx = *fields_sorted.last()?;
-                let last_ty = fields.get(last_idx)?.ty_with_args(&args);
+            TyKind::RigidTy(RigidTy::Adt(def, args))
+                if def.kind() == rustc_public::ty::AdtKind::Struct =>
+            {
+                let last_ty =
+                    mono_ty::field_ty(def.variants_iter().next()?.fields().last()?, &args)?;
                 Self::extract_tail_array_len(last_ty)
             }
-            TyKind::RigidTy(RigidTy::Tuple(tys)) => {
-                let layout = ty.layout().ok()?.shape();
-                let fields_sorted = layout.fields.fields_by_offset_order();
-                let last_idx = *fields_sorted.last()?;
-                Self::extract_tail_array_len(*tys.get(last_idx)?)
-            }
+            TyKind::RigidTy(RigidTy::Tuple(tys)) => Self::extract_tail_array_len(*tys.last()?),
             _ => None, // external enum: TyKind
         }
     }

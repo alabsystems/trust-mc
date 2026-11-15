@@ -39,11 +39,12 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 
         // Build PropertyMetadata for each violation in bmc_vc.
         // #1164: Use stored smt_var for exact variable name matching
-        // Part of #2267: drain violations by value to avoid cloning 4 fields per violation
-        // (property_id, smt_var, location, message). Safe because violations are not
-        // accessed after build_vc_artifact in the production flow.
-        for violation in std::mem::take(&mut self.bmc_vc.violations) {
-            let var_name = violation.smt_var.unwrap_or_else(|| {
+        // Artifact construction precedes both BMC finalizers. Preserve the
+        // complete original violations for logic selection and OR emission;
+        // draining them made emit_bmc emit an empty, false counterexample query.
+        // Clone only owned metadata here, never the condition Expr or VC.
+        for violation in &self.bmc_vc.violations {
+            let var_name = violation.smt_var.clone().unwrap_or_else(|| {
                 use std::fmt::Write;
                 let label = violation.kind.label();
                 let mut s = String::with_capacity(14 + label.len() + 4);
@@ -54,18 +55,18 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
                 s
             });
             #[allow(deprecated)] // Backward compatibility: populate both fields
-            let mut prop = PropertyMetadata::new(violation.property_id, violation.kind)
+            let mut prop = PropertyMetadata::new(violation.property_id.clone(), violation.kind)
                 .with_violation_var(var_name.clone())
                 .with_smt_var(var_name); // #1164: Also set smt_var for forward compatibility
 
-            if let Some(loc) = violation.location {
-                prop = prop.with_location(loc);
+            if let Some(loc) = &violation.location {
+                prop = prop.with_location(loc.clone());
             }
-            if let Some(msg) = violation.message {
-                prop = prop.with_message(msg);
+            if let Some(msg) = &violation.message {
+                prop = prop.with_message(msg.clone());
             }
-            if let Some(reach_var) = violation.reach_var {
-                prop = prop.with_reach_var(reach_var);
+            if let Some(reach_var) = &violation.reach_var {
+                prop = prop.with_reach_var(reach_var.clone());
             }
 
             artifact.add_property(prop);
@@ -260,6 +261,29 @@ mod tests {
             assert_eq!(matching.len(), 1);
             assert_eq!(matching[0].smt_var.as_deref(), Some("explicit_null_check"));
             assert_eq!(matching[0].kind, PropertyKind::NullPointer);
+        });
+    }
+
+    #[test]
+    fn test_build_vc_artifact_keeps_the_violations_emit_bmc_reads() {
+        // compiler_interface builds the artifact before either BMC finalizer.
+        // Draining the violations here left `emit_bmc` with none, so the IR
+        // route (`--ay-emit-bmc`) asserted false: every harness came out UNSAT.
+        with_test_ay_ctx(|mut ctx| {
+            ctx.bmc_vc.add_violation(
+                Violation::new(PropertyId::new(3), PropertyKind::Assertion, Expr::bool_const(true))
+                    .with_smt_var("kept_violation"),
+            );
+            let before = ctx.bmc_vc.clone();
+
+            let artifact = ctx.build_vc_artifact("crate::harness", None);
+            assert_eq!(artifact.properties.len(), 1);
+            assert_eq!(ctx.bmc_vc, before, "the artifact must leave the VC whole");
+
+            ctx.finalize_emit_bmc();
+            let smt = ctx.split_emit_bmc().1.to_string();
+            assert!(smt.contains("kept_violation"), "the violation is queried: {smt}");
+            assert!(!smt.contains("(assert false)"), "no vacuous query: {smt}");
         });
     }
 

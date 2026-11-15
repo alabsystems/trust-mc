@@ -13,10 +13,21 @@
 /// made the biggest bucket in the parity gate (139 rows = 12.4% of the denominator)
 /// unactionable: you could not tell whether those rows needed a bigger budget or a
 /// missing feature. The split below answers that from the gate output alone.
+/// Stable phrase in the error a skipped stage bails with, so
+/// [`SolverUnknownReason::from_chc_error`] can file it as `BudgetExhausted`.
+/// The bail sites format it as `"ay-chc {BUDGET_EXHAUSTED_BEFORE_STAGE}
+/// '<stage>' (...)"`.
+pub(crate) const BUDGET_EXHAUSTED_BEFORE_STAGE: &str = "per-harness budget exhausted before stage";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SolverUnknownReason {
     /// A solver guard-timeout: the engine itself ran out of its solve budget.
     Timeout,
+    /// The COMPILER stopped translating this harness when its per-harness
+    /// translation budget ran out (`; TRANSLATION_TIMEOUT:` in the artifact),
+    /// so nothing was ever handed to a solver. BUDGET-bound, and on the
+    /// encoder side: the translation itself is the slow part.
+    TranslationTimeout,
     /// The per-harness deadline was exhausted BEFORE/BETWEEN pre-solve phases
     /// (SMT read, bv2int rewrite, CHC parse, nullary-fail expansion, acyclic
     /// witness search, scalarize/split), so no solving was even attempted —
@@ -34,9 +45,14 @@ pub(crate) enum SolverUnknownReason {
     /// does not accept, and a parse error aborts the WHOLE problem, so the
     /// harness is scored inconclusive having never been solved. Strictly worse
     /// than a hard verification problem, and always fixable on the encoder side.
-    /// Two causes seen so far: a non-Bool `declare-fun` (only Bool-returning
-    /// predicates are supported) and a predicate applied with an argument sort
-    /// that disagrees with its declaration.
+    /// Causes seen so far: a predicate applied with an argument sort that
+    /// disagrees with its declaration, and — until AY 0.23.0 — a non-Bool
+    /// `declare-fun`. AY now accepts those as ordinary uninterpreted functions
+    /// with congruence, and the CHC lane emits them again (adoption step 8).
+    /// The inverse is now the hazard worth naming: a BOOL-returning
+    /// `declare-fun` still routes to `declare_predicate`, i.e. a Horn relation
+    /// the solver may synthesise rather than an uninterpreted function, which
+    /// is why the encoder declares Bool-returning callees as `BitVec 1`.
     ChcParseError,
     /// ay REJECTED one or more commands of the emitted BMC SMT-LIB query —
     /// `(error "line L column C: ...")` / `(error "unknown constant ...")` —
@@ -74,12 +90,46 @@ pub(crate) enum SolverUnknownReason {
     /// look at the accompanying `[AY:UNKNOWN-CATEGORY]` line, which names the
     /// specific limit (e.g. the `≥2 Array-sorted state parameters` ceiling, #4259).
     SolverError,
+    /// The CHC problem queries `error`, the harness REGISTERED checked
+    /// obligations, and no solver ever answered for them: no rule derives
+    /// `error` (`try_ay_chc_solver`'s no-derivation shortcut), or AY pruned
+    /// every per-property query away (`PerPropertyOutcome::AllQueriesPruned`).
+    ///
+    /// The compiler names this shape "lost checks, not proved checks"
+    /// (`straightline_proof::discharge_straightline_safety`, SOUNDNESS #67):
+    /// the error rules left the encoding (const-prop plus orphan prune after
+    /// a dropped edge, a check whose statement was never encoded), so there is
+    /// no obligation for any solver to discharge. A discharge the compiler
+    /// actually proved keeps an explicit false-bodied `(=> false error)`
+    /// obligation and never lands here. Never budget-bound and never a solver
+    /// limit: always an encoder defect, and the harness was not verified.
+    LostErrorRules,
+    /// The per-harness deadline had less than a stage's minimum useful budget
+    /// left, so the stage that would have decided the harness was SKIPPED
+    /// rather than started: the CHC portfolio after the acyclic-BMC shortcut
+    /// spent the budget, or a BMC-lane solver process that was never spawned
+    /// (`session::process` refuses a zero-budget spawn). Unlike `Timeout` the
+    /// engine never ran; unlike `PreSolveDeadline` solving was reached.
+    /// BUDGET-bound: strictly a matter of time, not capability.
+    BudgetExhausted,
+    /// The process-wide wall-clock watchdog fired during verification: a
+    /// harness overran its deadline AND the watchdog's headroom — a hang in
+    /// code the deadline cannot interrupt. Printed by the watchdog's raw-write
+    /// fire path (`wall_clock_watchdog::fire`), never through the result
+    /// pipeline, so it also carries `VERIFICATION:- FAILED` itself.
+    DriverTimeout,
+    /// The watchdog fired BEFORE codegen completed: compilation (rustc /
+    /// trust-mc-compiler) did not finish inside the process budget, so no
+    /// harness was ever solved. Split from `DriverTimeout` because the remedy
+    /// differs — the solve budget was never the constraint.
+    CompileTimeout,
 }
 
 impl SolverUnknownReason {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Timeout => "Timeout",
+            Self::TranslationTimeout => "TranslationTimeout",
             Self::PreSolveDeadline => "PreSolveDeadline",
             Self::UndecidedModel => "UndecidedModel",
             Self::ChcParseError => "ChcParseError",
@@ -87,26 +137,66 @@ impl SolverUnknownReason {
             Self::Memout => "Memout",
             Self::FalseProofRejected => "FalseProofRejected",
             Self::SolverError => "SolverError",
+            Self::LostErrorRules => "LostErrorRules",
+            Self::BudgetExhausted => "BudgetExhausted",
+            Self::DriverTimeout => "DriverTimeout",
+            Self::CompileTimeout => "CompileTimeout",
         }
+    }
+
+    /// True for the reasons that are strictly a matter of wall clock or memory
+    /// budget — the harness was not decided because a budget ran out, not
+    /// because the solver lacked a capability. The external-ay proof fallback
+    /// keys on this: retrying a budget-bound UNKNOWN with a second engine under
+    /// what is left of the same deadline cannot buy the budget back.
+    pub(crate) fn is_budget_bound(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::TranslationTimeout
+                | Self::PreSolveDeadline
+                | Self::Memout
+                | Self::BudgetExhausted
+                | Self::DriverTimeout
+                | Self::CompileTimeout
+        )
     }
 
     /// Classify the `anyhow` error that `try_ay_chc_solver` failed with.
     ///
-    /// The deadline gate bails with a stable message
-    /// (`"ay-chc per-harness deadline exhausted before pre-solve phase '<phase>'"`),
-    /// which is the ONLY budget-bound shape on this path; anything else is a real
-    /// solver error. Matching on the message is deliberate: the gate returns
-    /// `anyhow::Error`, so there is no typed discriminant to switch on, and
-    /// mis-matching can only mislabel a bucket — never change a verdict.
+    /// The budget-bound shapes on this path are all stable messages: the
+    /// pre-solve gate (`"ay-chc per-harness deadline exhausted before pre-solve
+    /// phase '<phase>'"`), a stage skipped for want of budget
+    /// ([`BUDGET_EXHAUSTED_BEFORE_STAGE`]), and the guard / batch timeouts.
+    /// Anything else is a real solver error. Matching on the message is
+    /// deliberate: the gate returns `anyhow::Error`, so there is no typed
+    /// discriminant to switch on, and mis-matching can only mislabel a bucket
+    /// — never change a verdict.
     pub(crate) fn from_chc_error(err: &anyhow::Error) -> Self {
         let text = format!("{err}");
         if text.contains("deadline exhausted before pre-solve phase") {
             Self::PreSolveDeadline
+        } else if text.contains(BUDGET_EXHAUSTED_BEFORE_STAGE) {
+            // A post-solve or solve stage was skipped for want of budget
+            // (`Deadline::stage_budget` returned `None`); see the variant.
+            Self::BudgetExhausted
         } else if text.contains("Failed to parse CHC problem") || text.contains("parse error:") {
             Self::ChcParseError
         } else if text.contains("false proof detected") {
             Self::FalseProofRejected
-        } else if text.contains("exceeded guard timeout") {
+        } else if text.contains("exceeded guard timeout")
+            // The per-property CHC batch has no detached-thread guard to exceed:
+            // its cooperative clock winds every row down and the batch reports
+            // this stable phrase instead. Same BUDGET-bound meaning, so it must
+            // land in the same bucket rather than in the `SolverError`
+            // catch-all. See `call_ay::chc::per_property::
+            // BATCH_BUDGET_EXHAUSTED_PHRASE`.
+            || text.contains("solve budget exhausted")
+            // A lane still alive at the harness deadline, abandoned into the
+            // quarantine (`call_ay::chc::LANE_ABANDONED_PHRASE`): the harness
+            // ran out of its deadline, so it is budget-bound too.
+            || text.contains("lane abandoned at the harness deadline")
+        {
             // `native.rs:1286` — the engine ran out of ITS solve budget. This is
             // BUDGET-bound and was previously indistinguishable from a genuine
             // solver failure, which is a large part of why `SolverError` grew
@@ -198,6 +288,46 @@ mod tests {
         }
     }
 
+    /// A stage skipped for want of budget is budget-bound, and distinct from
+    /// both the pre-solve gate (nothing was attempted) and a guard timeout
+    /// (the engine ran and was stopped).
+    #[test]
+    fn skipped_stage_classifies_as_budget_exhausted() {
+        let err = anyhow::anyhow!(
+            "ay-chc {} 'portfolio' (0.4s left, 1s needed)",
+            super::BUDGET_EXHAUSTED_BEFORE_STAGE
+        );
+        assert_eq!(SolverUnknownReason::from_chc_error(&err), SolverUnknownReason::BudgetExhausted);
+        assert_eq!(SolverUnknownReason::BudgetExhausted.label(), "BudgetExhausted");
+    }
+
+    /// The budget-bound set is what gates the external-ay fallback: every
+    /// time/memory reason is in it, and no capability reason is.
+    #[test]
+    fn budget_bound_partition_is_exact() {
+        for reason in [
+            SolverUnknownReason::Timeout,
+            SolverUnknownReason::TranslationTimeout,
+            SolverUnknownReason::PreSolveDeadline,
+            SolverUnknownReason::Memout,
+            SolverUnknownReason::BudgetExhausted,
+            SolverUnknownReason::DriverTimeout,
+            SolverUnknownReason::CompileTimeout,
+        ] {
+            assert!(reason.is_budget_bound(), "{reason:?}");
+        }
+        for reason in [
+            SolverUnknownReason::UndecidedModel,
+            SolverUnknownReason::ChcParseError,
+            SolverUnknownReason::SmtParseError,
+            SolverUnknownReason::FalseProofRejected,
+            SolverUnknownReason::SolverError,
+            SolverUnknownReason::LostErrorRules,
+        ] {
+            assert!(!reason.is_budget_bound(), "{reason:?}");
+        }
+    }
+
     #[test]
     fn any_other_chc_error_stays_solver_error() {
         let err =
@@ -211,6 +341,7 @@ mod tests {
     fn labels_are_distinct() {
         let labels = [
             SolverUnknownReason::Timeout.label(),
+            SolverUnknownReason::TranslationTimeout.label(),
             SolverUnknownReason::PreSolveDeadline.label(),
             SolverUnknownReason::UndecidedModel.label(),
             SolverUnknownReason::ChcParseError.label(),
@@ -218,6 +349,10 @@ mod tests {
             SolverUnknownReason::Memout.label(),
             SolverUnknownReason::FalseProofRejected.label(),
             SolverUnknownReason::SolverError.label(),
+            SolverUnknownReason::LostErrorRules.label(),
+            SolverUnknownReason::BudgetExhausted.label(),
+            SolverUnknownReason::DriverTimeout.label(),
+            SolverUnknownReason::CompileTimeout.label(),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "labels collided: {labels:?}");

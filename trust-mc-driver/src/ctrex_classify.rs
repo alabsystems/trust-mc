@@ -44,6 +44,36 @@ fn push_fail_closed_trigger(
 /// 2. OverApproximation — SOUND_APPROXIMATION nonzero (unconstrained symbolics
 ///    allowed impossible counterexample) (#3303)
 /// 3. Genuine — no unsoundness detected
+/// Every sound approximation recorded for `harness_name`, summed per category
+/// across the keys that name it. The producers key their per-harness maps
+/// differently (the reachability boundary by the harness's pretty name, the
+/// CHC encoder by its qualified function name), so one exact lookup saw only
+/// one producer's categories. The certification check compares the taint
+/// total with the compiler's accounted identities, and a partial total made
+/// the counts coincide: an unstubbed abstraction (unaccounted) stood in for
+/// the encoder's one accounted havoc and a safe program's counterexample was
+/// certified Genuine (unstubbed_abstraction_safe.rs, decision REDS-REST). A
+/// key that could name this harness counts (fail-closed: extra taint, never
+/// less).
+pub(crate) fn harness_sound_approximations(
+    counts: &CrateUnsoundnessCounts,
+    harness_name: &str,
+) -> Vec<(String, usize)> {
+    let mut merged: BTreeMap<String, usize> = BTreeMap::new();
+    for (key, categories) in &counts.sound_approx_per_harness {
+        let names_this_harness = key == harness_name
+            || crate::demotion::unique_harness_suffix_match(key, harness_name)
+            || crate::demotion::unique_harness_suffix_match(harness_name, key);
+        if !names_this_harness {
+            continue;
+        }
+        for (category, count) in categories {
+            *merged.entry(category.clone()).or_default() += count;
+        }
+    }
+    merged.into_iter().filter(|(_, count)| *count > 0).collect()
+}
+
 pub(crate) fn classify_ctrex(
     harness: &HarnessMetadata,
     counts: &CrateUnsoundnessCounts,
@@ -71,10 +101,13 @@ pub(crate) fn classify_ctrex(
     // codegen. Iterator/BigInt fail-closed counters also carry per-harness
     // maps, so prefer harness-local precision when it exists.
     let mut fail_closed_triggers: Vec<String> = Vec::new();
-    if counts.assert_untranslatable > 0 {
-        fail_closed_triggers
-            .push(format!("assert_untranslatable={}", counts.assert_untranslatable));
-    }
+    push_fail_closed_trigger(
+        &mut fail_closed_triggers,
+        "assert_untranslatable",
+        counts.assert_untranslatable,
+        &counts.assert_untranslatable_per_harness,
+        harness,
+    );
     if counts.heap_check_untranslatable > 0 {
         fail_closed_triggers
             .push(format!("heap_check_untranslatable={}", counts.heap_check_untranslatable));
@@ -126,12 +159,8 @@ pub(crate) fn classify_ctrex(
     // OverApproximation (still non-Genuine) — never a false positive.
     if offset_only_demotion {
         let mut freeing_set = demoted_triggers;
-        if let Some(approx_cats) =
-            lookup_per_harness(&counts.sound_approx_per_harness, &harness.pretty_name)
-        {
-            for (cat, count) in approx_cats {
-                freeing_set.push(format!("{cat}={count}"));
-            }
+        for (cat, count) in harness_sound_approximations(counts, &harness.pretty_name) {
+            freeing_set.push(format!("{cat}={count}"));
         }
         return CtrexCategory::OverApproximation { categories: freeing_set };
     }
@@ -166,14 +195,11 @@ pub(crate) fn classify_ctrex(
     // sound-approximation counts, the CTREX may be spurious: the solver found a
     // counterexample using unconstrained symbolic values that the real program
     // can never produce.
-    if let Some(approx_cats) =
-        lookup_per_harness(&counts.sound_approx_per_harness, &harness.pretty_name)
-    {
-        if !approx_cats.is_empty() {
-            let cat_entries: Vec<String> =
-                approx_cats.iter().map(|(cat, count)| format!("{cat}={count}")).collect();
-            return CtrexCategory::OverApproximation { categories: cat_entries };
-        }
+    let approx_cats = harness_sound_approximations(counts, &harness.pretty_name);
+    if !approx_cats.is_empty() {
+        let cat_entries: Vec<String> =
+            approx_cats.iter().map(|(cat, count)| format!("{cat}={count}")).collect();
+        return CtrexCategory::OverApproximation { categories: cat_entries };
     }
 
     // Part of #3447: when per-harness attribution is missing or ambiguous,

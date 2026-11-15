@@ -83,7 +83,7 @@ fn test_mir_alloc_invalid_layout_emits_error_rule() {
         );
 
         let error_rules: Vec<_> =
-            vc.rules.iter().filter(|rule| rule.head.name == "error").collect();
+            vc.rules.iter().filter(|rule| is_error_check_rule(rule)).collect();
         assert!(
             !error_rules.is_empty(),
             "invalid layout allocation must emit at least one error-headed rule"

@@ -91,6 +91,8 @@ fn assert_ptr_comparison_helper_harness(source: &str, fn_name: &str) {
 
     let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
     let _ = crate::codegen_ay::take_inferable_predicate_count();
+    let _ = crate::codegen_ay::chc::codegen_ctx::diagnostics::GLOBAL_COUNTERS
+        .take_aggregate_gap_reasons_by_fn();
 
     with_test_ay_ctx_for_source(source, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, fn_name);
@@ -138,7 +140,32 @@ fn assert_ptr_comparison_helper_harness(source: &str, fn_name: &str) {
             !has_p_inf_rule,
             "{fn_name} should not reference P_inf_* summaries in emitted rules"
         );
-        assert_z3_result(&smt, "unsat");
+        // The helper bodies are inlined and their assertions ARE obligations
+        // now: a SwitchInt arm that diverges into the panic machinery used to
+        // be filtered out of the ITE and silently assumed not taken
+        // (switchint.rs, `is_panic_arm`). Three of this harness's conditions
+        // come from comparison calls the walker could not inline, so their
+        // discriminants are fresh unconstrained symbols and the three
+        // obligations riding them cannot be discharged — the harness is no
+        // longer SMT-`unsat`.
+        //
+        // That is strictly stricter than the `unsat` this used to assert: that
+        // proof held only because three `assert!`s inside `compare_diff` /
+        // `compare_equal` were dropped. What the harness must still not do is
+        // lose PRECISION — no demoted translation drops, no `P_inf_*`
+        // summaries (asserted above) — and the residual must be attributable,
+        // not anonymous. Both are pinned here; a regression back to silent
+        // dropping flips the reason away AND the result back to `unsat`.
+        let gap_reasons = crate::codegen_ay::chc::codegen_ctx::diagnostics::GLOBAL_COUNTERS
+            .take_aggregate_gap_reasons_by_fn()
+            .remove(fn_name)
+            .unwrap_or_default();
+        assert!(
+            gap_reasons.contains_key("switchint_panic_arm_on_overapprox"),
+            "{fn_name}: the un-dischargeable panic-arm obligations must be NAMED, \
+             not anonymous; gap_reasons={gap_reasons:?}"
+        );
+        assert_z3_result(&smt, "sat");
     });
 }
 

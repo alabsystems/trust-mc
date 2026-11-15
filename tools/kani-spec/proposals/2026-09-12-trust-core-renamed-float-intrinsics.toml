@@ -1,0 +1,54 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# PROPOSED overlay ruling, not applied. spec/kani/overlay.toml is the only file the
+# generator reads; this proposal needs a toolchain-scoped kind the schema does not have
+# yet (overlay kinds are per Kani rev, and this difference is per compiler), so it is
+# recorded here for the owner of tools/kani-spec to accept, reshape or reject.
+#
+# Ruling: a corpus unit that calls an intrinsic Trust core removed is a TOOLCHAIN
+# DIFFERENCE, not an engine gap. On the Trust toolchain it is scored as
+# `corpus-invalid-on-trust` (the unit does not compile there, so it neither proves nor
+# refutes the engine); on the frozen nightly it keeps its upstream oracle. The engine
+# must not fake the removed intrinsic: the renamed Trust spellings ARE modelled exactly
+# as their nightly counterparts (trust-mc-compiler/src/intrinsics.rs,
+# `nightly_float_intrinsic_name`), so the same property written against Trust core is
+# verified.
+
+schema = "trust-mc.kani-spec.overlay-proposal/v1"
+
+[[proposed_correction]]
+id = "trust-core-renamed-float-intrinsics"
+kind = "toolchain-difference"
+toolchain = "trust 45dc60873c4fef21649ae277a93cc8cc9cf39191 (seal build 8571)"
+effect = { stage = "compile-error", scored_as = "corpus-invalid-on-trust" }
+source = "library/core/src/intrinsics/mod.rs of trust 45dc60873 against nightly-2025-12-03 rust-src"
+audit = """
+Trust core renamed three families of float intrinsics; every other float intrinsic keeps
+its nightly name and signature (fast-math, algebraic and float_to_int_unchecked only moved
+a bound from Copy to bounds::FloatPrimitive):
+  nightly fabsf16/fabsf32/fabsf64/fabsf128(x)        -> Trust fabs::<T: bounds::FloatPrimitive>(x)
+  nightly minnumf16/32/64/128(x, y)  (no body)         -> Trust minimum_number_nsz_f16/32/64/128(x, y) (fallback body)
+  nightly maxnumf16/32/64/128(x, y)  (no body)         -> Trust maximum_number_nsz_f16/32/64/128(x, y) (fallback body)
+A unit calling `std::intrinsics::minnumf32` stops in trustc with
+`error[E0425]: cannot find function `minnumf32` in module `std::intrinsics`` before the
+engine runs (T1 first-green parity, trustc 8571, 2026-09-12:
+~/Library/Caches/trust-mc-t1/first-green/parity/bmc-trustc-Intrinsics__MinNum__minnumf32.rs/stderr.txt,
+three E0425s and a `help: a function with a similar name exists`). Upstream Kani made the same
+move: at spec rev b07abe8a72f8eb1ef1ea3521ca6b00a973d341bc (nightly-2026-08-21) these six
+units call `minimum_number_nsz_f*`, `maximum_number_nsz_f*` and generic `fabs`, and add
+fabsf16.rs / fabsf128.rs. The parity-1 sample (scratchpad phase9/parity-1) re-measures the
+units it includes on both routes.
+"""
+
+[proposed_correction.blast_radius]
+"4c0fce8c300e1f049f2b0c6766a5111dfc9ff32e" = [
+  "kani/Intrinsics/Math/fabsf32.rs",
+  "kani/Intrinsics/Math/fabsf64.rs",
+  "kani/Intrinsics/MaxNum/maxnumf32.rs",
+  "kani/Intrinsics/MaxNum/maxnumf64.rs",
+  "kani/Intrinsics/MinNum/minnumf32.rs",
+  "kani/Intrinsics/MinNum/minnumf64.rs",
+]
+# Not asserted at b07abe8a72f8eb1ef1ea3521ca6b00a973d341bc: those units already use the
+# Trust spellings and compile on Trust.

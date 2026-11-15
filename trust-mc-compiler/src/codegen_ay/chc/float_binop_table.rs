@@ -38,10 +38,34 @@
 //! it fails closed on any symbolic float binop whose operands are not
 //! provably non-NaN sources, keeping a live error edge over the table term.
 //!
+//! SOUNDNESS (for counterexamples): a table value is a free choice, so an
+//! assertion over it can be refuted by an interpretation no FPU has. Every
+//! symbolic table select therefore records the blessed sound-approximation
+//! `float_binop_table_overapprox`, WITH the table as its freed-var identity
+//! (`record_sound_fallback_reason_identified_deferred`): a proof stays clean,
+//! and a counterexample that rests on the term classifies `OverApproximation`,
+//! never `Genuine`. The identity is what lets a counterexample that does NOT
+//! rest on the table be certified: the fast-math operand-finiteness checks read
+//! only the operands (`fadd_fast(x, y)` with `x` NaN is UB whatever the sum
+//! is), and while the record was unidentified the harness could never be
+//! certified at all (kani/Intrinsics/FastMath/*_overflow_*: 8 units reported
+//! `OverApproximation` at ledger row 72). The driver certifies such a
+//! counterexample only when the per-property dependence analysis finds the
+//! violated check independent of the table AND a replay derives that check on
+//! a system with every table read removed. Measured before the record, with
+//! `m = 0.0f32.min(-0.0)` (a relation result, either zero): `(m + 0.0)
+//! .is_sign_positive()`, `(1.0 / m).is_infinite()` and `m * -1.0 == 0.0` —
+//! each true for both zeros — were FAILED with `[AY:CTREX_CAT:Genuine]` on
+//! both routes. The exact-zero refinements below now decide those shapes; the
+//! record covers every shape they do not.
+//!
 //! The tables are declared ONLY when a pre-scan of the MIR body finds a float
 //! value binop (or fast-math intrinsic) with potentially-symbolic operands,
 //! so ordinary harnesses keep their relation arity unchanged.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{BinOp, Operand, Rvalue, StatementKind, TerminatorKind};
 use rustc_public::ty::{FloatTy, RigidTy, TyKind};
@@ -52,8 +76,12 @@ use crate::codegen_ay::float_arithmetic::{bv_float_binop_chc, is_float_arithmeti
 use super::ChcCtx;
 use super::call::codegen_call_cmp_string::fast_math::detect_fast_math_intrinsic;
 
-pub(in crate::codegen_ay::chc) const FLOAT_BINOP_TBL_F32: &str = "float_binop_tbl_f32";
-pub(in crate::codegen_ay::chc) const FLOAT_BINOP_TBL_F64: &str = "float_binop_tbl_f64";
+// Shared with the driver, whose counterexample recertification replays a
+// table-independent counterexample before certifying it (see the module doc).
+pub(in crate::codegen_ay::chc) const FLOAT_BINOP_TBL_F32: &str =
+    trust_mc_core::chc::FLOAT_BINOP_TABLE_F32;
+pub(in crate::codegen_ay::chc) const FLOAT_BINOP_TBL_F64: &str =
+    trust_mc_core::chc::FLOAT_BINOP_TABLE_F64;
 
 /// Width of the op tag prepended to the concatenated operands in the key.
 const FLOAT_BINOP_TAG_WIDTH: u32 = 8;
@@ -214,6 +242,98 @@ fn operand_nan_guard(v: &Expr, width: u32) -> OperandNan {
     }
 }
 
+/// Exact results of a float binop when an operand is a zero, as IEEE 754-2019
+/// determines them under round-to-nearest (Rust's rounding mode):
+///
+/// - `x + ±0 = x` and `±0 + x = x` for `x` neither NaN nor zero (finite or
+///   infinite: no rounding occurs); `±0 + ±0` is a zero whose sign is the AND of
+///   the operand signs (§6.3: a sum of like signs keeps the sign, a sum of
+///   opposite signs is `+0`).
+/// - `x - ±0 = x` for `x` neither NaN nor zero; `±0 - x = -x` for such `x`;
+///   `±0 - ±0` is a zero with sign `sign(lhs) AND NOT sign(rhs)` (the
+///   difference of like signs is `+0`, `-0 - +0 = -0`).
+/// - `±0 * x = ±0` and `x * ±0 = ±0` for finite `x` (NaN and infinity
+///   excluded: `0 * inf` is NaN), with the XOR sign of a product.
+/// - `±0 / x` is a zero with the XOR sign for `x` neither NaN nor zero;
+///   `x / ±0` is an infinity with the XOR sign for `x` neither NaN nor zero
+///   (`0 / 0` is NaN and stays a free table value).
+///
+/// Each case is a guarded `ite` over the same `(lhs, rhs, tbl_term)`, a pure
+/// function of the operands, so congruence by construction is preserved. Every
+/// guard excludes NaN operands explicitly, so the NaN-propagation refinement's
+/// territory is untouched. Rem is not refined.
+fn refine_zero_operand_exact(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    width: u32,
+    tbl_term: Expr,
+) -> Expr {
+    let Some((exp_field, mant_mask)) = ieee754_bit_fields(width) else {
+        return tbl_term;
+    };
+    let magnitude_mask = exp_field | mant_mask;
+    let is_zero = |v: &Expr| {
+        v.clone()
+            .bvand(Expr::bitvec_const(magnitude_mask, width))
+            .eq(Expr::bitvec_const(0u128, width))
+    };
+    let is_nan = |v: &Expr| {
+        let exp_all_ones = v
+            .clone()
+            .bvand(Expr::bitvec_const(exp_field, width))
+            .eq(Expr::bitvec_const(exp_field, width));
+        let mant_nonzero = v
+            .clone()
+            .bvand(Expr::bitvec_const(mant_mask, width))
+            .eq(Expr::bitvec_const(0u128, width))
+            .not();
+        exp_all_ones.and(mant_nonzero)
+    };
+    let is_inf = |v: &Expr| {
+        v.clone()
+            .bvand(Expr::bitvec_const(magnitude_mask, width))
+            .eq(Expr::bitvec_const(exp_field, width))
+    };
+    // Neither NaN nor zero: a finite non-zero value or an infinity.
+    let is_nonzero_number = |v: &Expr| is_nan(v).not().and(is_zero(v).not());
+    let is_finite = |v: &Expr| is_nan(v).not().and(is_inf(v).not());
+    let sign = |v: &Expr| v.clone().extract(width - 1, width - 1);
+    let with_sign = |s: Expr, magnitude: u128| s.concat(Expr::bitvec_const(magnitude, width - 1));
+    let sign_mask = Expr::bitvec_const(1u128 << (width - 1), width);
+    let both_zero = is_zero(lhs).and(is_zero(rhs));
+    let (sl, sr) = (sign(lhs), sign(rhs));
+    let xor_sign = sl.clone().bvxor(sr.clone());
+    match op {
+        BinOp::Add | BinOp::AddUnchecked => {
+            let zero_sum = with_sign(sl.bvand(sr), 0);
+            let term = Expr::ite(both_zero, zero_sum, tbl_term);
+            let term = Expr::ite(is_zero(rhs).and(is_nonzero_number(lhs)), lhs.clone(), term);
+            Expr::ite(is_zero(lhs).and(is_nonzero_number(rhs)), rhs.clone(), term)
+        }
+        BinOp::Sub | BinOp::SubUnchecked => {
+            let zero_diff = with_sign(sl.bvand(sr.bvnot()), 0);
+            let term = Expr::ite(both_zero, zero_diff, tbl_term);
+            let term = Expr::ite(is_zero(rhs).and(is_nonzero_number(lhs)), lhs.clone(), term);
+            let negated_rhs = rhs.clone().bvxor(sign_mask);
+            Expr::ite(is_zero(lhs).and(is_nonzero_number(rhs)), negated_rhs, term)
+        }
+        BinOp::Mul | BinOp::MulUnchecked => {
+            let signed_zero = with_sign(xor_sign, 0);
+            let a_zero_times_finite = is_zero(lhs).and(is_finite(rhs));
+            let finite_times_zero = is_zero(rhs).and(is_finite(lhs));
+            Expr::ite(a_zero_times_finite.or(finite_times_zero), signed_zero, tbl_term)
+        }
+        BinOp::Div => {
+            let signed_zero = with_sign(xor_sign.clone(), 0);
+            let signed_inf = with_sign(xor_sign, exp_field);
+            let term = Expr::ite(is_zero(rhs).and(is_nonzero_number(lhs)), signed_inf, tbl_term);
+            Expr::ite(is_zero(lhs).and(is_nonzero_number(rhs)), signed_zero, term)
+        }
+        _ => tbl_term,
+    }
+}
+
 /// P4-4: exact reflexive-subtraction boundary refinement.
 ///
 /// When the operands are BITWISE equal and FINITE, IEEE 754 subtraction
@@ -280,12 +400,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let tbl = self.float_binop_table_var(width)?;
         let key = float_binop_congruent_key(op, lhs.clone(), rhs.clone(), width)?;
         let tbl_term = tbl.select(key);
+        // The term is a free choice wherever no refinement below decides it, so a
+        // counterexample resting on it is never certified (module doc). The
+        // table is the freed identity: a check that never reads it may be.
+        let (tbl_name, _) = float_binop_table_names(width)?;
+        self.record_sound_fallback_reason_identified_deferred(
+            "float_binop_table_overapprox",
+            tbl_name,
+        );
 
-        // The two refinements compose: the NaN-propagation guard (an operand
-        // is NaN) and the Sub-reflexive guard (operands bitwise equal AND
-        // finite) are mutually exclusive, so layering Sub on top of NaN never
-        // loses either exact case.
+        // The refinements compose: each is a guarded `ite` whose guard names the
+        // operands' IEEE classes (NaN; both zero / one zero with a number; bitwise
+        // equal and finite), and the guards of different refinements exclude each
+        // other, so layering never loses an exact case.
         let tbl_term = refine_nan_propagation(&lhs, &rhs, width, tbl_term);
+        let tbl_term = refine_zero_operand_exact(op, &lhs, &rhs, width, tbl_term);
         Some(refine_sub_reflexive_boundary(op, &lhs, &rhs, width, tbl_term))
     }
 
@@ -395,14 +524,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// simply doesn't declare the table (old fail-closed fallback).
     fn simd_float_elem_width(&self, operand: &Operand) -> Option<u32> {
         let ty = operand.ty(self.body.locals()).ok()?;
-        let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
             return None;
         };
         let variants = def.variants();
         if variants.len() != 1 {
             return None;
         }
-        let f0 = variants[0].fields().first()?.ty();
+        let f0 = mono_ty::field_ty(variants[0].fields().first()?, &args)?;
         let elem = match f0.kind() {
             TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
             _ => f0,
@@ -518,6 +647,110 @@ mod tests {
                 "{op:?} must pass the table term through unchanged"
             );
         }
+    }
+
+    /// Evaluate a refinement over constant operands: the guards fold, and the exact
+    /// branch is a constant the core folder can read; the table value stays free.
+    fn eval_refined(op: BinOp, lhs: u64, rhs: u64, width: u32) -> Option<u64> {
+        let l = Expr::bitvec_const(lhs, width);
+        let r = Expr::bitvec_const(rhs, width);
+        let refined = refine_zero_operand_exact(op, &l, &r, width, sym("tbl_val", width));
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&refined)?;
+        match folded.value() {
+            ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).ok(),
+            _ => None,
+        }
+    }
+
+    const PZ: u64 = 0x0000_0000;
+    const NZ: u64 = 0x8000_0000;
+    const ONE: u64 = 0x3f80_0000;
+    const NEG_ONE: u64 = 0xbf80_0000;
+    const INF: u64 = 0x7f80_0000;
+    const NEG_INF: u64 = 0xff80_0000;
+    const QNAN: u64 = 0x7fc0_0000;
+
+    /// The zero-operand cases IEEE 754 determines are decided bit for bit.
+    #[test]
+    fn test_zero_operand_refinement_decides_ieee_exact_cases() {
+        // Sums of zeros: like signs keep the sign, opposite signs give +0.
+        assert_eq!(eval_refined(BinOp::Add, PZ, PZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Add, NZ, NZ, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Add, PZ, NZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Add, NZ, PZ, 32), Some(PZ));
+        // x + 0 = x, 0 + x = x for a non-zero number, infinities included.
+        assert_eq!(eval_refined(BinOp::Add, NEG_ONE, PZ, 32), Some(NEG_ONE));
+        assert_eq!(eval_refined(BinOp::Add, NZ, ONE, 32), Some(ONE));
+        assert_eq!(eval_refined(BinOp::Add, INF, NZ, 32), Some(INF));
+        // Differences of zeros; x - 0 = x; 0 - x = -x.
+        assert_eq!(eval_refined(BinOp::Sub, PZ, PZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Sub, NZ, NZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Sub, PZ, NZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Sub, NZ, PZ, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Sub, ONE, NZ, 32), Some(ONE));
+        assert_eq!(eval_refined(BinOp::Sub, PZ, ONE, 32), Some(NEG_ONE));
+        assert_eq!(eval_refined(BinOp::Sub, NZ, NEG_INF, 32), Some(INF));
+        // Products with a zero and a finite number: a zero with the XOR sign.
+        assert_eq!(eval_refined(BinOp::Mul, NZ, ONE, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Mul, PZ, NEG_ONE, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Mul, NEG_ONE, NZ, 32), Some(PZ));
+        assert_eq!(eval_refined(BinOp::Mul, PZ, NZ, 32), Some(NZ));
+        // Quotients: 0 / x is a zero, x / 0 an infinity, both with the XOR sign.
+        assert_eq!(eval_refined(BinOp::Div, NZ, ONE, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Div, PZ, NEG_INF, 32), Some(NZ));
+        assert_eq!(eval_refined(BinOp::Div, ONE, NZ, 32), Some(NEG_INF));
+        assert_eq!(eval_refined(BinOp::Div, NEG_ONE, NZ, 32), Some(INF));
+        assert_eq!(eval_refined(BinOp::Div, NEG_INF, PZ, 32), Some(NEG_INF));
+        // f64 too.
+        assert_eq!(
+            eval_refined(BinOp::Div, 0x3ff0_0000_0000_0000, 0x8000_0000_0000_0000, 64),
+            Some(0xfff0_0000_0000_0000)
+        );
+        assert_eq!(eval_refined(BinOp::Add, 0x8000_0000_0000_0000, 0, 64), Some(0));
+    }
+
+    /// Everything IEEE leaves to rounding or makes NaN keeps the free table value:
+    /// `0 * inf`, `0 / 0`, `inf - inf`, any NaN operand, two non-zero numbers.
+    #[test]
+    fn test_zero_operand_refinement_keeps_the_table_value_elsewhere() {
+        for (op, l, r) in [
+            (BinOp::Mul, PZ, INF),
+            (BinOp::Mul, NEG_INF, NZ),
+            (BinOp::Div, PZ, NZ),
+            (BinOp::Div, NZ, PZ),
+            (BinOp::Sub, INF, INF),
+            (BinOp::Add, QNAN, PZ),
+            (BinOp::Add, PZ, QNAN),
+            (BinOp::Mul, QNAN, NZ),
+            (BinOp::Div, NZ, QNAN),
+            (BinOp::Add, ONE, NEG_ONE),
+            (BinOp::Mul, ONE, ONE),
+            (BinOp::Rem, PZ, ONE),
+        ] {
+            let folded = eval_refined(op, l, r, 32);
+            assert_eq!(folded, None, "{op:?} {l:#x} {r:#x} must stay the free table value");
+        }
+        // The same shapes as f64.
+        assert_eq!(eval_refined(BinOp::Mul, 0, 0x7ff0_0000_0000_0000, 64), None);
+        assert_eq!(eval_refined(BinOp::Div, 0, 0x8000_0000_0000_0000, 64), None);
+    }
+
+    /// The refinement is a pure function of `(lhs, rhs, tbl_term)`: identical
+    /// operands and table term give identical refined terms (congruence kept).
+    #[test]
+    fn test_zero_operand_refinement_is_congruent_by_construction() {
+        let a =
+            refine_zero_operand_exact(BinOp::Add, &sym("x", 32), &sym("y", 32), 32, sym("t", 32));
+        let b =
+            refine_zero_operand_exact(BinOp::Add, &sym("x", 32), &sym("y", 32), 32, sym("t", 32));
+        assert_eq!(a, b);
+        assert_eq!(a.sort().bitvec_width(), Some(32));
+        // A width with no IEEE 754 layout (x87 extended) passes the term through.
+        let t = sym("t80", 80);
+        assert_eq!(
+            refine_zero_operand_exact(BinOp::Add, &sym("x", 80), &sym("y", 80), 80, t.clone()),
+            t
+        );
     }
 
     #[test]

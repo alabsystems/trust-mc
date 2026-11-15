@@ -168,6 +168,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         debug!("HashMap::contains_key: map sort is not Array; symbolic fallback");
                         let name = self.ctx.fresh_name("contains_key");
                         let result = self.ctx.declare_var(&name, bool_sort());
+                        self.ctx.bmc_sound_havoc("hashmap_contains_key");
                         self.assign_value_to_place(destination, result);
                         return target;
                     }
@@ -179,6 +180,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Fallback: symbolic boolean
                     let name = self.ctx.fresh_name("contains_key");
                     let result = self.ctx.declare_var(&name, bool_sort());
+                    self.ctx.bmc_sound_havoc("hashmap_contains_key");
                     self.assign_value_to_place(destination, result);
                 }
 
@@ -249,6 +251,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     // Fallback: fresh symbol (can't track without base)
                     let name = self.ctx.fresh_name("hashmap_len");
+                    self.ctx.bmc_sound_havoc("hashmap_len_untracked");
                     self.ctx.declare_var(&name, ptr_sort())
                 };
 
@@ -265,6 +268,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // Create is_empty symbol
                 let is_empty_name = self.ctx.fresh_name("hashmap_is_empty");
                 let is_empty = self.ctx.declare_var(&is_empty_name, bool_sort());
+                if map_base.is_none() {
+                    self.ctx.bmc_sound_havoc("hashmap_is_empty_untracked");
+                }
 
                 // Get or create len symbol and assert invariant
                 if let Some(ref base) = map_base {

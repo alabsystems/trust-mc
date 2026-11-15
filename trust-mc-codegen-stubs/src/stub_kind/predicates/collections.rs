@@ -84,6 +84,8 @@ impl StubKind {
                 | Self::StringEq
                 | Self::StringAsStr
                 | Self::StringIntoBoxedStr
+                | Self::StringFromUtf8
+                | Self::StringIntoBytes
                 | Self::StrBytesNth
                 | Self::StrCharsNth
         )

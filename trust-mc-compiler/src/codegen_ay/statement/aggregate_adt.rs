@@ -13,6 +13,9 @@
 //!
 //! Struct aggregate handling is in `aggregate_struct.rs`.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::CrateDef;
@@ -325,6 +328,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         }
+        // The value (and its scoped variant constructor) is built in `sort`,
+        // which may be a model sort named apart from the ADT's path-derived name.
+        let adt_name = &crate::codegen_ay::names::constructor_datatype_name(&sort, adt_name);
 
         if variant_has_field {
             // This is the "Some" variant - construct with payload
@@ -431,7 +437,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // #918, #926: BigInt/BigUint/Ratio types return Int sort - handle specially
         if sort.is_int() {
-            return self.codegen_bigint_aggregate(adt_name, &sort);
+            return self.codegen_bigint_aggregate(def, &sort);
         }
         if !sort.is_datatype() {
             self.ctx.unsupported(
@@ -445,6 +451,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         }
+        // The value (and its scoped variant constructor) is built in `sort`,
+        // which may be a model sort named apart from the ADT's path-derived name.
+        let adt_name = &crate::codegen_ay::names::constructor_datatype_name(&sort, adt_name);
 
         // Codegen all field values, coercing sorts to match the declared datatype fields.
         // Part of #3094: ZST fields (e.g., `Unit` enum) translate to Bool operands but the
@@ -455,9 +464,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if let Some(expr) = self.codegen_operand(op) {
                 // Resolve the expected field sort from the variant's field type.
                 let coerced = if let Some(field_def) = variant_fields.get(i) {
-                    let field_ty = field_def.ty();
-                    let expected_sort = Self::resolve_generic_ty(field_ty, &args)
-                        .and_then(Self::infer_sort_from_ty);
+                    let field_ty = mono_ty::field_ty(field_def, &args);
+                    let expected_sort = field_ty.and_then(Self::infer_sort_from_ty);
 
                     if let Some(ref target_sort) = expected_sort {
                         if expr.sort() != target_sort {
@@ -474,10 +482,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             {
                                 debug!("  Coercing field {} Bool → Unit datatype", i);
                                 unit_expr
-                            } else if let Some(singleton) =
-                                Self::resolve_generic_ty(field_ty, &args)
-                                    .and_then(Self::try_singleton_enum_value)
-                                    .filter(|v| v.sort() == target_sort)
+                            } else if let Some(singleton) = field_ty
+                                .and_then(Self::try_singleton_enum_value)
+                                .filter(|v| v.sort() == target_sort)
                             {
                                 // Part of #4112 follow-up: singleton enums
                                 // (`Option<Infallible>` and friends) are ZSTs
@@ -570,6 +577,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             want
                         );
                         let fresh = self.ctx.fresh_name("field_sort_mismatch");
+                        self.ctx.bmc_sound_havoc("enum_field_sort_mismatch");
                         self.ctx.declare_var(&fresh, want.clone())
                     }
                 }
@@ -596,9 +604,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         let variants = def.variants();
         let mut inhabited = variants.iter().enumerate().filter(|(_, v)| {
+            // A field whose type does not instantiate counts as inhabited, so
+            // the variant is never wrongly ruled out.
             v.fields().iter().all(|f| {
-                let field_ty = Self::resolve_generic_ty(f.ty(), &args).unwrap_or_else(|| f.ty());
-                !Self::ty_is_uninhabited(field_ty, 0)
+                !mono_ty::field_ty(f, &args).is_some_and(|t| Self::ty_is_uninhabited(t, 0))
             })
         });
         let (idx, variant) = inhabited.next()?;
@@ -638,17 +647,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // (an enum with no variants is trivially uninhabited).
                 AdtKind::Enum => def.variants().iter().all(|v| {
                     v.fields().iter().any(|f| {
-                        let field_ty =
-                            Self::resolve_generic_ty(f.ty(), &args).unwrap_or_else(|| f.ty());
-                        Self::ty_is_uninhabited(field_ty, depth + 1)
+                        // A field whose type does not instantiate counts as
+                        // inhabited: "uninhabited" is the claim that prunes.
+                        mono_ty::field_ty(f, &args)
+                            .is_some_and(|t| Self::ty_is_uninhabited(t, depth + 1))
                     })
                 }),
                 // Struct: uninhabited iff any field is uninhabited.
                 AdtKind::Struct => def.variants().first().is_some_and(|v| {
                     v.fields().iter().any(|f| {
-                        let field_ty =
-                            Self::resolve_generic_ty(f.ty(), &args).unwrap_or_else(|| f.ty());
-                        Self::ty_is_uninhabited(field_ty, depth + 1)
+                        // A field whose type does not instantiate counts as
+                        // inhabited: "uninhabited" is the claim that prunes.
+                        mono_ty::field_ty(f, &args)
+                            .is_some_and(|t| Self::ty_is_uninhabited(t, depth + 1))
                     })
                 }),
                 // Unions and anything else: assume inhabited.

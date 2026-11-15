@@ -620,7 +620,7 @@ fn test_repr_simd_as_array_referent_keeps_array_view() {
         assert_rule_contains_expr_kind(
             &vc,
             "probe_simd_as_array_lane",
-            |expr| matches!(expr.value(), ay_bindings::ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
     });
@@ -649,7 +649,7 @@ fn test_repr_simd_into_array_referent_keeps_array_view() {
         assert_rule_contains_expr_kind(
             &vc,
             "probe_simd_into_array_lane",
-            |expr| matches!(expr.value(), ay_bindings::ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
     });
@@ -736,12 +736,7 @@ fn test_repr_simd_generic_symbolic_index_has_no_unknown_layout_heap_checks() {
         assert_rule_contains_expr_kind(
             &vc,
             "probe_generic_simd_symbolic_index",
-            |expr| {
-                matches!(
-                    expr.value(),
-                    ay_bindings::ExprValue::Select { array, .. } if array.sort().is_array()
-                )
-            },
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, symbolic_lane_idx)",
         );
     });
@@ -775,13 +770,13 @@ fn test_repr_simd_generic_local_symbolic_index_has_no_unknown_layout_heap_checks
         assert_rule_contains_expr_kind(
             &vc,
             "probe_generic_simd_local_symbolic_index",
+            // The local lane array is a constant ([0; N]); the read over it folds to
+            // an ITE over the index, so accept that as the lane view too.
             |expr| {
-                matches!(
-                    expr.value(),
-                    ay_bindings::ExprValue::Select { array, .. } if array.sort().is_array()
-                )
+                is_array_read_or_scalarized_lane(expr)
+                    || matches!(expr.value(), ay_bindings::ExprValue::Ite { .. })
             },
-            "Select(Array, local_symbolic_lane_idx)",
+            "Select(Array, local_symbolic_lane_idx) or its folded ITE",
         );
     });
 }
@@ -883,5 +878,316 @@ fn test_simd_compare_via_into_array_nested_inline_produces_nontrivial_chc() {
         );
 
         assert_has_nontrivial_transition_constraints(&vc, "compare_simd_via_into_array");
+    });
+}
+
+#[test]
+fn test_fixed_array_value_preserves_pointer_shaped_bits() {
+    use crate::codegen_ay::provenance::Val;
+    const SOURCE: &str = "pub fn array_value(value: [u32; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "array_value").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "array_value", ChcConfig::default());
+        let operand = Operand::Copy(Place { local: 1, projection: vec![] });
+        let bits = Expr::bitvec_const(57u64, 32).concat(Expr::bitvec_const(0u64, 32));
+        let value = chc.try_reinterpret_fixed_array_value(&operand, &Val::of_value(bits)).unwrap();
+        let mut remaining = vec![value.as_expr()];
+        let mut lanes = 0;
+        while let Some(expr) = remaining.pop() {
+            if let ExprValue::Store { index, value, .. } = expr.value() {
+                let expected = if *index == Expr::bitvec_const(0u64, 64) {
+                    0u64
+                } else {
+                    assert_eq!(*index, Expr::bitvec_const(1u64, 64));
+                    57
+                };
+                let scalar = trust_mc_core::chc_const_prop::eval::try_eval_to_const(value).unwrap();
+                assert_eq!(scalar, Expr::bitvec_const(expected, 32));
+                lanes += 1;
+            }
+            remaining.extend(expr.children());
+        }
+        assert_eq!(lanes, 2);
+        assert!(!value.as_expr().to_string().contains("mem_"));
+    });
+}
+
+#[test]
+fn test_fixed_array_symbolic_value_is_reinterpreted_without_memory_load() {
+    use crate::codegen_ay::provenance::Val;
+    const SOURCE: &str = "pub fn array_value(value: [u32; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "array_value").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "array_value", ChcConfig::default());
+        let operand = Operand::Copy(Place { local: 1, projection: vec![] });
+        let value = Val::of_value(Expr::var("array_bits", Sort::bv64()));
+        let result = chc.try_reinterpret_fixed_array_value(&operand, &value).unwrap();
+        let text = result.as_expr().to_string();
+        assert!(text.contains("extract"), "a real flattened array retains its lane view: {text}");
+        assert!(text.contains("array_bits"));
+        assert!(!text.contains("mem_"));
+    });
+}
+
+#[test]
+fn test_fixed_array_symbolic_address_loads_elements_instead_of_address_bits() {
+    use crate::codegen_ay::provenance::Loc;
+    const SOURCE: &str = "pub fn array_reference(value: &[u32; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "array_reference").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "array_reference", ChcConfig::default());
+        chc.declare_block_relations();
+        let target = Sort::array(Sort::bv64(), Sort::bv32());
+        let address = Loc::of_address(Expr::var("array_address", Sort::bv64()));
+        let result = chc
+            .try_load_fixed_array_referent_from_address(body.locals()[1].ty, address, &target)
+            .unwrap();
+        let address = Expr::var("array_address", Sort::bv64());
+        let mut offsets = Vec::new();
+        let mut remaining = vec![result.as_expr()];
+        while let Some(expr) = remaining.pop() {
+            assert!(
+                !matches!(expr.value(), ExprValue::BvExtract { .. }),
+                "address bits must never become elements: {expr}"
+            );
+            if let ExprValue::Select { array, index } = expr.value() {
+                assert!(
+                    matches!(array.value(), ExprValue::Var { name } if name.ends_with("mem_u32"))
+                );
+                for offset in [0u64, 4] {
+                    if *index == address.clone().bvadd(Expr::bitvec_const(offset, 64)) {
+                        offsets.push(offset);
+                    }
+                }
+            }
+            remaining.extend(expr.children());
+        }
+        offsets.sort();
+        assert_eq!(offsets, [0, 4], "loads must read both u32 elements at their byte offsets");
+    });
+}
+
+#[test]
+fn test_fixed_array_unknown_pointer_cannot_be_compared_as_a_datum() {
+    use crate::codegen_ay::chc::call::codegen_call_misc::Referent;
+    const SOURCE: &str = "pub fn array_reference(value: &[u32; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "array_reference").body().unwrap();
+        let chc = ChcCtx::new(ctx.tcx, &body, "array_reference", ChcConfig::default());
+        let pointer = Referent::Unreported(Expr::var("unknown_pointer", Sort::bv64()));
+        assert!(chc.slice_eq_referent_datum(pointer).is_none());
+    });
+}
+
+#[test]
+fn test_fixed_array_datatype_element_load_refuses_before_heap_checks() {
+    use crate::codegen_ay::provenance::Loc;
+    const SOURCE: &str =
+        "pub struct Pair(u32, u32); pub fn aggregate_array(value: &[Pair; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "aggregate_array").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "aggregate_array", ChcConfig::default());
+        chc.declare_block_relations();
+        let before = chc.heap_state.pending_checks.len();
+        let target = Sort::array(Sort::bv64(), Sort::bv64());
+        let address = Loc::of_address(Expr::var("array_address", Sort::bv64()));
+        assert!(
+            chc.try_load_fixed_array_referent_from_address(body.locals()[1].ty, address, &target)
+                .is_none()
+        );
+        assert_eq!(chc.heap_state.pending_checks.len(), before);
+    });
+}
+
+fn assert_fixed_array_comparison_drains_checks(decline: bool) {
+    const SOURCE: &str = "pub fn arrays(a: [u32; 2], b: [u32; 2]) -> bool { a == b }";
+    with_test_ay_ctx_for_source(SOURCE, move |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "arrays").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "arrays", ChcConfig::default());
+        chc.declare_block_relations();
+        let from_rel = chc.block_relations.get(&0).unwrap().clone();
+        let inputs = chc
+            .state_var_mgr
+            .state_vars
+            .iter()
+            .map(|(name, sort)| Expr::var(name.to_string(), sort.clone()))
+            .collect();
+        let from = RelationApp::new(&from_rel, inputs);
+        // The declined case supplies the bool destination as lhs, so the
+        // array-equality builder must refuse the mismatched operand sorts.
+        let args = [
+            Operand::Copy(Place { local: if decline { 0 } else { 1 }, projection: vec![] }),
+            Operand::Copy(Place { local: 2, projection: vec![] }),
+        ];
+        let destination = Place { local: 0, projection: vec![] };
+        let constraints = [Expr::bool_const(true)];
+        let modified = HashSet::new();
+        let target = Some(0);
+        let dcx = DispatchCallContext {
+            bb_idx: 0,
+            func: &args[0],
+            args: &args,
+            destination: &destination,
+            target: &target,
+            from_app: &from,
+            stmt_constraints: &constraints,
+            modified_locals: &modified,
+            callee_path: None,
+        };
+        let before_checks = chc.vc.rules.iter().filter(|rule| is_error_check_rule(rule)).count();
+        chc.heap_state.pending_checks.push(Expr::bool_const(false));
+        let claimed = chc.try_codegen_spec_array_eq(
+            &dcx,
+            "std::array::equality::SpecArrayEq<u32, 2>::spec_eq",
+            false,
+            0,
+            0,
+        );
+        assert_eq!(claimed, !decline);
+        assert!(chc.heap_state.pending_checks.is_empty());
+        assert_eq!(
+            chc.vc.rules.iter().filter(|rule| is_error_check_rule(rule)).count(),
+            before_checks + 1,
+            "a pending invalid-access check must become a check rule even if equality declines"
+        );
+    });
+}
+
+#[test]
+fn test_fixed_array_success_drains_pending_safety_checks() {
+    assert_fixed_array_comparison_drains_checks(false);
+}
+
+#[test]
+fn test_fixed_array_decline_drains_pending_safety_checks() {
+    assert_fixed_array_comparison_drains_checks(true);
+}
+
+#[test]
+fn test_fixed_array_zero_length_uses_no_element_checks() {
+    const SOURCE: &str = "pub fn empty_arrays(a: &[u32; 0], b: &[u32; 0]) -> bool { a == b }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "empty_arrays").body().unwrap();
+        let chc = ChcCtx::new(ctx.tcx, &body, "empty_arrays", ChcConfig::default());
+        let args = [
+            Operand::Copy(Place { local: 1, projection: vec![] }),
+            Operand::Copy(Place { local: 2, projection: vec![] }),
+        ];
+        assert_eq!(chc.fixed_unit_array_eq_expr_from_args(&args), Some(Expr::bool_const(true)));
+        assert!(chc.heap_state.pending_checks.is_empty());
+    });
+}
+
+#[test]
+fn test_fixed_array_nested_reference_is_not_an_array_datum() {
+    use crate::codegen_ay::chc::call::codegen_call_misc::Referent;
+    use crate::codegen_ay::provenance::{Loc, Val};
+    const SOURCE: &str = "pub fn nested(value: &&[u32; 2]) { let _ = value; }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "nested").body().unwrap();
+        let mut chc = ChcCtx::new(ctx.tcx, &body, "nested", ChcConfig::default());
+        let arg = Operand::Copy(Place { local: 1, projection: vec![] });
+        let pointer = Expr::var("inner_array_pointer", Sort::bv64());
+        assert!(
+            chc.try_reinterpret_fixed_array_value(&arg, &Val::of_value(pointer.clone())).is_none()
+        );
+        assert!(
+            chc.fixed_array_eq_referent_datum(
+                &arg,
+                Referent::Value(Val::of_value(pointer.clone()))
+            )
+            .is_none()
+        );
+        assert!(
+            chc.try_load_fixed_array_referent_from_address(
+                body.locals()[1].ty,
+                Loc::of_address(pointer),
+                &Sort::array(Sort::bv64(), Sort::bv32())
+            )
+            .is_none()
+        );
+        assert!(chc.heap_state.pending_checks.is_empty());
+    });
+}
+
+#[test]
+fn test_fixed_array_comparison_requires_actual_core_definition() {
+    const SOURCE: &str = "pub fn local_method() -> bool { false }";
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let body = find_instance_by_suffix(ctx.tcx, "local_method").body().unwrap();
+        let chc = ChcCtx::new(ctx.tcx, &body, "local_method", ChcConfig::default());
+        let local = find_instance_by_suffix(ctx.tcx, "local_method");
+        assert_eq!(chc.authenticated_spec_array_comparison_is_ne(local.def.def_id()), None);
+        let sized = ctx.tcx.lang_items().sized_trait().unwrap();
+        assert!(crate::kani_middle::std_abstraction::is_sysroot_core_definition(ctx.tcx, sized));
+        assert!(!crate::kani_middle::std_abstraction::is_sysroot_core_definition(
+            ctx.tcx,
+            rustc_public::rustc_internal::internal(ctx.tcx, local.def.def_id())
+        ));
+    });
+}
+
+#[test]
+fn test_fixed_array_real_core_methods_authenticate_and_check_element_semantics() {
+    use rustc_public::mir::mono::Instance;
+    const SOURCE: &str = r#"
+        pub fn ints_eq(a: [u32; 2], b: [u32; 2]) -> bool { a == b }
+        pub fn ints_ne(a: [u32; 2], b: [u32; 2]) -> bool { a != b }
+        pub fn floats_eq(a: [f32; 2], b: [f32; 2]) -> bool { a == b }
+        #[derive(PartialEq)] pub struct A(u32);
+        #[derive(PartialEq)] pub struct B(u32);
+        impl PartialEq<B> for A { fn eq(&self, _: &B) -> bool { false } }
+        pub fn heterogeneous_eq(a: [A; 2], b: [B; 2]) -> bool { a == b }
+    "#;
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        for (name, negated, faithful) in [
+            ("ints_eq", false, true),
+            ("ints_ne", true, true),
+            ("floats_eq", false, false),
+            ("heterogeneous_eq", false, false),
+        ] {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+            let chc = ChcCtx::new(ctx.tcx, &body, name, ChcConfig::default());
+            let mut pending = vec![(body.clone(), 0usize)];
+            let mut found = false;
+            while let Some((callee_body, depth)) = pending.pop() {
+                for block in &callee_body.blocks {
+                    let TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+                        continue;
+                    };
+                    let Ok(ty) = func.ty(callee_body.locals()) else { continue };
+                    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = ty.kind() else { continue };
+                    if let Some(op) = chc.authenticated_spec_array_comparison_is_ne(def.def_id()) {
+                        assert_eq!(op, negated);
+                        let resolved = Instance::resolve(def, &args).unwrap();
+                        assert_eq!(
+                            chc.spec_array_has_default_body(&resolved),
+                            matches!(name, "floats_eq" | "heterogeneous_eq")
+                        );
+                        assert_eq!(
+                            chc.spec_array_elements_are_faithful(func, callee_body.locals()),
+                            faithful
+                        );
+                        assert_eq!(
+                            chc.has_heterogeneous_sequence_elements(func, callee_body.locals()),
+                            name == "heterogeneous_eq"
+                        );
+                        found = true;
+                        break;
+                    }
+                    if depth < 4 && def.name().contains("PartialEq") {
+                        if let Some(next) =
+                            Instance::resolve(def, &args).ok().and_then(|i| i.body())
+                        {
+                            pending.push((next, depth + 1));
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            assert!(found, "actual core SpecArrayEq method must be identified for {name}");
+        }
     });
 }

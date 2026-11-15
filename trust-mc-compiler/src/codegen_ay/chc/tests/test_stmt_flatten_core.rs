@@ -15,6 +15,8 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::common::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 
 use super::super::stmt_accumulator::StmtAccumulator;

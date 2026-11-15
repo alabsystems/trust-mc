@@ -106,6 +106,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     );
                 }
                 ProjectionElem::Field(field, _ty) => {
+                    // A trait-object fat pointer (`Dyn_*`: `fld_ptr`, `fld_vtable`) is never
+                    // a place's pointee — a `dyn Trait` value is unsized and has no fields —
+                    // so a MIR field of the pointee can never be one of its fields. Reaching
+                    // here means a deref resolved to the POINTER instead of the pointee (a
+                    // devirtualized receiver `(*self).0` read `fld_ptr` as `Square.0`, and the
+                    // overflow check on that address was certified Genuine). Fail closed,
+                    // and count it so no verdict built on it is clean.
+                    if expr
+                        .sort()
+                        .datatype_sort()
+                        .is_some_and(|dt| crate::codegen_ay::names::is_dyn_sort_name(&dt.name))
+                    {
+                        self.ctx.unsupported_with_fallback(
+                            "field projection on a trait-object fat pointer",
+                            format!("{context_label}: field {field} of {:?}", expr.sort()),
+                        );
+                        return DerefProjectionResult::Unsupported;
+                    }
                     // Part of #944: Handle transparent wrapper bv64 (NonNull/Unique).
                     // Part of #1100: Also allow active_variant == Some(0) for ControlFlow::Continue.
                     // Shares the one documented representation predicate with the CHC

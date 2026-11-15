@@ -110,6 +110,12 @@ pub(in crate::codegen_ay::chc) fn apply_inline_alias_updates(
             extra_dests.push(caller_local);
         }
 
+        // Design 4 D: guard a slice slot once, so the local's update and its
+        // memory mirror below agree on one (possibly fresh) length.
+        let caller_ty = ctx.body.locals()[caller_local].ty;
+        let update_expr =
+            &ctx.guard_slice_len_slot_write(caller_ty, update_expr.clone(), reason_prefix);
+
         if let Some(mut constraints) =
             ctx.build_local_update_constraints(caller_local, update_expr.clone(), reason_prefix)
         {

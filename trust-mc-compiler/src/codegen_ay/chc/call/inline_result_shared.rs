@@ -184,17 +184,26 @@ pub(in crate::codegen_ay::chc) fn prepare_inline_result_epilogue<'dcx>(
         vtable_constraint = ctx.capture_known_vtable_discriminant(spec.dest_local, vtable_expr);
     }
 
-    capture_inline_return_local_value(ctx, spec.dest_local, &spec.result_expr);
+    // Design 4 D: guard the slice slot ONCE, here, so the destination
+    // equality, `local_expr_env` and the memory bridge all read the same value
+    // (and the same fresh length, when the result carried none). The side-table
+    // capture below reads the declared `fld_len` of a slice-view result, which
+    // is exactly the length the guard packs.
+    let returned_expr = spec.result_expr.clone();
+    let dest_ty = ctx.body.locals()[spec.dest_local].ty;
+    let result_expr = ctx.guard_slice_len_slot_write(dest_ty, spec.result_expr, "inline_result");
+
+    capture_inline_return_local_value(ctx, spec.dest_local, &result_expr);
 
     // Part of #4017: Seed slice metadata side tables for the destination local
     // so that downstream translate_ptr_metadata can resolve .len() / size_of_val()
     // for slice/str references returned from inline calls.
-    capture_inline_return_slice_metadata(ctx, spec.dest_local, &spec.result_expr);
+    capture_inline_return_slice_metadata(ctx, spec.dest_local, &returned_expr);
 
     let mut mem_constraints = build_call_result_memory_bridge_constraints(
         ctx,
         spec.dest_local,
-        &spec.result_expr,
+        &result_expr,
         spec.dcx.modified_locals,
     );
     let mut extra_dests = Vec::with_capacity(spec.extra_dests.len() + 1);
@@ -225,13 +234,13 @@ pub(in crate::codegen_ay::chc) fn prepare_inline_result_epilogue<'dcx>(
 
     let filtered_stmts = super::heap_store_chains::filter_superseded_store_chains(
         spec.dcx.stmt_constraints,
-        &mem_constraints,
+        &mut mem_constraints,
     );
     PreparedInlineResultEpilogue {
         dcx: spec.dcx,
         target: spec.target,
         dest_local: spec.dest_local,
-        result_expr: spec.result_expr,
+        result_expr,
         eq_reason: spec.eq_reason,
         vtable_constraint,
         mem_constraints,

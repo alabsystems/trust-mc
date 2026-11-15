@@ -7,6 +7,9 @@
 //! Extracted from projected_assign.rs for 500-line file-size compliance.
 //! Part of #4206.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::ProjectionElem;
@@ -140,7 +143,7 @@ pub(super) fn update_inline_value_expr(
                 local_exprs,
             )?;
             inline_store_through(ctx, &pointer_addr, updated.clone(), pointee_ty);
-            mirror_static_state_var_update(ctx, pointer_addr.as_addr_expr(), &updated);
+            note_inline_walk_lane_store(ctx, pointer_addr.as_addr_expr(), &updated, pointee_ty);
             // Return original pointer unchanged -- the write went to memory.
             Some(current)
         }
@@ -200,14 +203,18 @@ pub(super) fn inline_store_through(
     value: Expr,
     ty: rustc_public::ty::Ty,
 ) -> Option<Expr> {
-    match addr {
+    // A routed static store: every caller hands the same store to
+    // `note_inline_walk_lane_store`, whose static mirror updates the state of
+    // a static it lands in, or fails the harness closed
+    // (`decl::static_path::StaticImageWrites`).
+    ctx.with_static_store_routing(|ctx| match addr {
         MaybeLoc::Known(loc) => ctx.build_memory_store(loc.clone(), value, ty),
         MaybeLoc::Unknown(expr) =>
         {
             #[allow(deprecated)]
             ctx.build_memory_store_untyped(expr.clone(), value, ty)
         }
-    }
+    })
 }
 
 /// Add a byte offset to a deref target, preserving whether its provenance was
@@ -261,7 +268,9 @@ fn rebuild_inline_datatype_from_memory(
         field_exprs.push(load_inline_value_from_memory(ctx, &field_addr, *field_ty)?);
     }
 
-    Some(Expr::datatype_constructor(&*dt.name, &*ctor.name, field_exprs, sort))
+    Expr::try_datatype_constructor(&*dt.name, &*ctor.name, field_exprs, sort)
+        .map_err(|err| tracing::debug!(?err, "rebuild_inline_datatype_from_memory: datatype constructor signature mismatch; declining"))
+        .ok()
 }
 
 fn inline_aggregate_field_tys(
@@ -275,13 +284,11 @@ fn inline_aggregate_field_tys(
         {
             let variants = def.variants();
             let variant = variants.first()?;
-            Some(
-                variant
-                    .fields()
-                    .iter()
-                    .map(|field| ctx.resolve_body_ty(field.ty_with_args(&args)))
-                    .collect(),
-            )
+            variant
+                .fields()
+                .iter()
+                .map(|field| mono_ty::field_ty(field, &args).map(|t| ctx.resolve_body_ty(t)))
+                .collect::<Option<Vec<_>>>()
         }
         TyKind::RigidTy(RigidTy::Tuple(field_tys)) => {
             Some(field_tys.iter().map(|ty| ctx.resolve_body_ty(*ty)).collect())
@@ -351,8 +358,9 @@ pub(super) fn record_inline_loaded_value_vtable_forward(
         pointee_ty.kind()
         && let Some(variant) = def.variants().first()
         && variant.fields().len() == 1
+        && let Some(field_ty) = mono_ty::field_ty(&variant.fields()[0], &args)
     {
-        let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
+        let field_ty = ctx.resolve_body_ty(field_ty);
         if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr.clone()));
         }
@@ -362,46 +370,96 @@ pub(super) fn record_inline_loaded_value_vtable_forward(
     }
 }
 
-/// If `addr` matches a known static variable's address, emit a pending update
-/// constraining that static's output state variable to equal `value`.
+/// If `addr` is the base of a `static mut` the harness keeps a state variable
+/// for, emit a pending update constraining that static's output state
+/// variable to equal `value`.
 ///
 /// Part of #3793: Bridges the data path mismatch between inline walker
 /// memory stores (typed heap arrays) and outer-function static reads
 /// (CHC state variables). Without this, drop bodies that write to `static mut`
 /// via `*ptr = val` update the heap array but leave the state variable at its
 /// initial value, causing Genuine CTREX.
-pub(super) fn mirror_static_state_var_update(ctx: &mut ChcCtx<'_, '_>, addr: &Expr, value: &Expr) {
-    // Scan static_address_exprs for a matching address.
-    // Static addresses are BV64 constants (obj_id ++ offset), so structural
-    // equality on Expr is sufficient -- no symbolic comparison needed.
-    let addr_str = format!("{addr}");
-    for static_addr in ctx.ref_resolution.static_address_exprs.values() {
-        let static_str = format!("{static_addr}");
-        if static_str != addr_str {
-            continue;
-        }
-        // Found matching static. Find the mutable static state var whose sort
-        // matches. Each mutable static has a unique sort in practice (i32 for
-        // CELL, etc.), so sort matching is sufficient to identify the target.
-        // Part of #3793: avoids adding a new field to RefResolution by scanning
-        // existing mutable_static_state_idxs.
-        for &vec_idx in &ctx.ref_resolution.mutable_static_state_idxs {
-            let Some((out_name, out_sort)) = ctx.state_var_mgr.output_state_vars.get(vec_idx)
-            else {
-                continue;
-            };
-            let coerced = coerce_bitvec_width_safe(
-                value.clone(),
-                out_sort.bitvec_width().unwrap_or(POINTER_WIDTH),
-                SignExtension::ZeroExtend,
-            );
-            if coerced.sort() == out_sort {
-                let out_var = Expr::var(&**out_name, out_sort.clone());
-                ctx.heap_state.pending_updates.push(out_var.eq(coerced));
-                ctx.mark_state_var_modified(vec_idx);
-                return;
-            }
-        }
-        return;
+///
+/// The target is the state variable OF THE STATIC THE STORE REACHED, found by
+/// the obj_id `collect_static_state_vars` minted for it. It used to be the
+/// first mutable static state variable of a matching sort, so a store to a
+/// static the harness never names (a callee-only static has an address but
+/// no state variable) set ANOTHER static's state variable: a walked `H = 9`
+/// proved `K == 9` (tools/soundness-duals/walker_referent_write_dual.rs).
+pub(super) fn mirror_static_state_var_update(
+    ctx: &mut ChcCtx<'_, '_>,
+    addr: &Expr,
+    value: &Expr,
+    ty: rustc_public::ty::Ty,
+) -> super::super::inline_walk_guard::StaticMirror {
+    use super::super::inline_walk_guard::StaticMirror;
+    let Some((obj_id, offset)) = ChcCtx::try_extract_constant_addr(addr) else {
+        return StaticMirror::NoStateVar;
+    };
+    let Some(&vec_idx) = ctx.ref_resolution.static_state_idx_by_obj.get(&obj_id) else {
+        return StaticMirror::NoStateVar;
+    };
+    // A field of the static (offset != 0), or a static that is not `mut` (an
+    // interior-mutable one): its state variable is not updated here.
+    if offset != 0 || !ctx.ref_resolution.mutable_static_state_idxs.contains(&vec_idx) {
+        return StaticMirror::StateVarStale;
     }
+    let Some((out_name, out_sort)) = ctx.state_var_mgr.output_state_vars.get(vec_idx) else {
+        return StaticMirror::StateVarStale;
+    };
+    // A store of fewer (or more) bytes than the static holds is not the
+    // static's new value: the width coercion below zero-extended a walked
+    // `*(p as *mut u8) = 9` into the whole `static mut N: u32`, so `N == 9`
+    // PROVED where Kani reads `0x01020309`. The state variable stays stale
+    // and the store fails closed (`classify_inline_walk_lane_store`).
+    if let Some(static_ty) = ctx.ref_resolution.static_state_ty.get(&vec_idx).copied()
+        && let (Some(store_size), Some(static_size)) =
+            (ctx.get_type_size(ty), ctx.get_type_size(static_ty))
+        && store_size != static_size
+    {
+        return StaticMirror::StateVarStale;
+    }
+    let coerced = coerce_bitvec_width_safe(
+        value.clone(),
+        out_sort.bitvec_width().unwrap_or(POINTER_WIDTH),
+        SignExtension::ZeroExtend,
+    );
+    if coerced.sort() != out_sort {
+        return StaticMirror::StateVarStale;
+    }
+    let out_var = Expr::var(&**out_name, out_sort.clone());
+    if ctx.native_drop_memory.is_some() {
+        if super::super::native_drop_memory::has_output_or_binder(&coerced) {
+            ctx.refuse_native_drop_memory("native_drop_static_value_snapshot_unavailable");
+        } else {
+            // Native-drop reads use immutable SSA expressions; any unmodeled
+            // static read separately books hard refusal. A later actual store
+            // replaces the final state definition, not the earlier store's
+            // value in memory or in already captured observations.
+            ctx.heap_state.pending_updates.retain(|update|!matches!(update.value(),ay_bindings::ExprValue::Eq(left,_) if *left==out_var));
+        }
+    }
+    ctx.heap_state.pending_updates.push(out_var.eq(coerced.clone()));
+    // An unguarded write of a mutable static's state variable: a memory
+    // effect for the branch-arm rule (inline_walk_guard.rs).
+    ctx.heap_state.note_memory_effect();
+    ctx.mark_state_var_modified(vec_idx);
+    // The static's other views follow its new state, as after every other
+    // routed store into a static (`sync_static_image`).
+    ctx.note_static_store(vec_idx, Some(0), ty);
+    ctx.with_static_store_routing(|ctx| ctx.sync_static_image_or_fail_closed(vec_idx, Ok(coerced)));
+    StaticMirror::Mirrored
+}
+
+/// A store one of the walker's store lanes made at `addr` (the whole pointee
+/// or the updated object `value`): mirror it into its static's state variable
+/// and classify it (F3 widened, review finding M2; `inline_walk_guard.rs`).
+pub(super) fn note_inline_walk_lane_store(
+    ctx: &mut ChcCtx<'_, '_>,
+    addr: &Expr,
+    value: &Expr,
+    ty: rustc_public::ty::Ty,
+) {
+    let mirror = mirror_static_state_var_update(ctx, addr, value, ty);
+    ctx.classify_inline_walk_lane_store(addr, mirror);
 }

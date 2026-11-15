@@ -4,13 +4,18 @@
 //
 //! Arc/Rc drop handling for CHC encoding.
 //!
-//! In single-threaded verification, Arc/Rc always have strong count = 1,
-//! so drop always deallocates. The full drop shim contains complex atomic
-//! operations and recursive `drop_in_place::<dyn T>` calls through vtable
-//! dispatch that cause recursion unwinding assertions. Handle like Box drop:
-//! emit deallocation + skip inner drop (sound for assertion checking).
+//! The full drop shim contains complex atomic operations and recursive
+//! `drop_in_place::<dyn T>` calls through vtable dispatch that cause recursion
+//! unwinding assertions, so a handle's drop is encoded directly: the
+//! pointee's drop (when the encoder can run it) and the deallocation. An
+//! allocation whose strong count is kept (`rc_strong_count.rs`) is dropped
+//! only by its last handle. Without a count, a cloned allocation whose pointee
+//! the no-drop test accepts is never freed, and any other is freed by every
+//! handle.
 //!
 //! Split from `codegen_drop.rs` — Part of #3927.
+
+use std::sync::Arc;
 
 use ay_bindings::Expr;
 use tracing::debug;
@@ -18,6 +23,7 @@ use tracing::debug;
 use crate::codegen_ay::chc::ChcCtx;
 use crate::codegen_ay::chc::call::codegen_call_coerce::CallCoerce;
 use crate::codegen_ay::chc::call::inline_body::extract_inline_assert_guard;
+use crate::codegen_ay::chc::rc_strong_count::rc_strong_const;
 use crate::codegen_ay::chc::rules::codegen_rules_helpers::{
     rust_dealloc_base_ptr_for_known_alloc_id, traced_alloc_id_for_unprojected_drop_place,
 };
@@ -28,13 +34,7 @@ use super::shared_ptr::{
     shared_pointer_value_ptr_for_drop, try_translate_shared_pointer_inner_drop,
 };
 
-/// Part of #4067: Handle Arc<T>/Rc<T> drop as simple deallocation.
-///
-/// In single-threaded verification, Arc/Rc always have strong count = 1,
-/// so drop always deallocates. The full drop shim contains complex atomic
-/// operations and recursive `drop_in_place::<dyn T>` calls through vtable
-/// dispatch that cause recursion unwinding assertions. Handle like Box drop:
-/// emit deallocation + skip inner drop (sound for assertion checking).
+/// Part of #4067: Handle the drop of an Arc<T>/Rc<T> handle (module doc).
 pub(super) fn try_codegen_arc_drop(
     ctx: &mut ChcCtx<'_, '_>,
     place: &rustc_public::mir::Place,
@@ -63,18 +63,82 @@ pub(super) fn try_codegen_arc_drop(
         });
 
     let known_alloc_id = traced_alloc_id_for_unprojected_drop_place(ctx, place);
+
+    // A counted allocation (rc_strong_count.rs) is freed by its last handle.
+    if let Some(count) = wrapper_local_idx.and_then(|local| ctx.rc_strong_count_for_local(local)) {
+        let remaining = count.current.clone().bvsub(rc_strong_const(1));
+        let write = ctx.write_rc_strong_count(&count, remaining.clone());
+        let output_args = ctx.build_output_args(tctx.modified_locals, &[]);
+        // Another handle remains: the count drops and nothing else changes.
+        ctx.emit_goto_rule_extra(
+            tctx.from_app,
+            target,
+            &output_args,
+            tctx.shared_constraints,
+            [write.clone(), remaining.clone().ne(rc_strong_const(0))],
+        );
+        // The last handle: the allocation's drop, on that path only.
+        let last_shared: Arc<[Expr]> = tctx
+            .shared_constraints
+            .iter()
+            .cloned()
+            .chain([write, remaining.eq(rc_strong_const(0))])
+            .collect();
+        let last = TransitionContext {
+            from_app: tctx.from_app,
+            output_args: &output_args,
+            shared_constraints: &last_shared,
+            modified_locals: tctx.modified_locals,
+            bb_idx: tctx.bb_idx,
+        };
+        debug!(bb_idx = tctx.bb_idx, ?known_alloc_id, "CHC: Drop(Arc/Rc) → counted: free at zero");
+        emit_arc_dealloc(
+            ctx,
+            inner_ty,
+            wrapper_local_idx,
+            known_alloc_id,
+            wrapper_expr,
+            target,
+            &last,
+        );
+        return true;
+    }
+
     if known_alloc_id.is_some_and(|obj_id| ctx.rc_arc_shared_alloc_ids.contains(&obj_id))
         && super::no_drop::ty_trivially_no_drop(inner_ty)
     {
+        // An uncounted clone alias: which handle is the last is unknown, so no
+        // handle frees the allocation. That drops the deallocation, and with it
+        // every use-after-free / double-free check the free would arm (Rule D,
+        // C8b; `rc_shared_handle_dual.rs::bug_vec_u64_uaf` was a clean proof).
         debug!(
             bb_idx = tctx.bb_idx,
             ?known_alloc_id,
-            "CHC: Drop(Arc/Rc clone alias) → skip dealloc for no-drop pointee"
+            "CHC: Drop(Arc/Rc clone alias) → skip dealloc for no-drop pointee (lost effect)"
+        );
+        crate::codegen_ay::chc::call::inline_walk_guard::record_lost_obligation(
+            ctx,
+            crate::codegen_ay::chc::call::inline_walk_guard::LostEffect::RcDeallocSkippedCloneAlias,
         );
         ctx.emit_goto_rule_shared(tctx.from_app, target, tctx.output_args, tctx.shared_constraints);
         return true;
     }
 
+    emit_arc_dealloc(ctx, inner_ty, wrapper_local_idx, known_alloc_id, wrapper_expr, target, tctx);
+    true
+}
+
+/// The drop of the allocation behind an Arc/Rc handle: the pointee's drop (when
+/// it has one the encoder can run) and the deallocation.
+fn emit_arc_dealloc(
+    ctx: &mut ChcCtx<'_, '_>,
+    inner_ty: rustc_public::ty::Ty,
+    wrapper_local_idx: Option<usize>,
+    known_alloc_id: Option<u32>,
+    wrapper_expr: Option<Expr>,
+    target: usize,
+    tctx: &TransitionContext<'_>,
+) {
     let wrapper_expr =
         wrapper_expr.or_else(|| known_alloc_id.map(rust_dealloc_base_ptr_for_known_alloc_id));
     if let Some(wrapper_expr) = wrapper_expr
@@ -91,13 +155,21 @@ pub(super) fn try_codegen_arc_drop(
             target,
             tctx,
         );
-        return true;
+        return;
     }
 
-    // Can't extract pointer — fall through to skip (sound over-approximation).
-    debug!(bb_idx = tctx.bb_idx, "CHC: Drop(Arc/Rc) → skip (pointer unconstrained, #4067)");
+    // Can't extract the pointer: the drop is skipped, and with it the
+    // deallocation and the pointee's drop (Rule D, C8b: a lost effect, not a
+    // sound over-approximation).
+    debug!(
+        bb_idx = tctx.bb_idx,
+        "CHC: Drop(Arc/Rc) → skip (pointer unconstrained, #4067; lost effect)"
+    );
+    crate::codegen_ay::chc::call::inline_walk_guard::record_lost_obligation(
+        ctx,
+        crate::codegen_ay::chc::call::inline_walk_guard::LostEffect::RcDeallocSkippedPointerUnknown,
+    );
     ctx.emit_goto_rule_shared(tctx.from_app, target, tctx.output_args, tctx.shared_constraints);
-    true
 }
 
 /// Emit either inner-drop + dealloc, or dealloc-only for Arc/Rc.
@@ -209,6 +281,14 @@ fn emit_arc_inner_drop_success(
     target: usize,
     tctx: &TransitionContext<'_>,
 ) {
+    // The walk's side-channel checks (UB BinOps, Asserts, Assumes of the drop
+    // body) are real at this drop: emit them, as call hosts do.
+    ctx.emit_deferred_inline_checks_at(
+        tctx.from_app,
+        &tctx.shared_constraints[..],
+        tctx.bb_idx,
+        inline_result.deferred_checks.clone(),
+    );
     let inline_guard = extract_inline_assert_guard(&inline_result.value);
     if let Some(guard) = &inline_guard {
         ctx.emit_error_rule_for_condition_shared(
@@ -353,7 +433,7 @@ fn trace_rc_local_to_concrete(
             if place.local != local_idx || !place.projection.is_empty() {
                 continue;
             }
-            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src)) = rhs
+            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src), ..) = rhs
                 && src.projection.is_empty()
                 && src.local != local_idx
             {

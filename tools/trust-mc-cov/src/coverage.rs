@@ -13,7 +13,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{collections::HashMap, fmt::Display};
 use std::{fmt, fs};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Point};
 
 pub(crate) type Function = String;
 pub(crate) type Filename = String;
@@ -167,24 +167,38 @@ pub(crate) fn function_info_from_file(filepath: &PathBuf) -> Vec<FunctionInfo> {
     let mut cursor = tree.walk();
 
     for node in tree.root_node().children(&mut cursor) {
-        if node.kind() == "function_item" {
-            function_info.push(function_info_from_node(node, source_code_bytes));
+        if node.kind() == "function_item"
+            && let Some(info) = function_info_from_node(node, source_code_bytes)
+        {
+            function_info.push(info);
         }
     }
 
     function_info
 }
 
-/// Helper function to extract function information using a tree-sitter
-fn function_info_from_node(node: Node, source: &[u8]) -> FunctionInfo {
+/// Helper function to extract function information using a tree-sitter.
+///
+/// Returns `None` only when a position has no 1-based `usize` form (see
+/// [`one_based`]); such a function is left out of the report.
+fn function_info_from_node(node: Node, source: &[u8]) -> Option<FunctionInfo> {
     let name = node
         .child_by_field_name("name")
         .and_then(|name| name.utf8_text(source).ok())
         .expect("couldn't get function name")
         .to_string();
-    let start = (node.start_position().row + 1, node.start_position().column + 1);
-    let end = (node.end_position().row + 1, node.end_position().column + 1);
-    FunctionInfo { name, start, end }
+    let start = one_based(node.start_position())?;
+    let end = one_based(node.end_position())?;
+    Some(FunctionInfo { name, start, end })
+}
+
+/// The 1-based `(line, column)` of a 0-based tree-sitter point.
+///
+/// tree-sitter keeps points as `u32`, so the `+ 1` fits a 64-bit `usize`;
+/// `None` covers a row or column of `usize::MAX`, which has no 1-based form,
+/// instead of an overflow panic (or, without overflow checks, a wrapped 0).
+fn one_based(point: Point) -> Option<(LineNumber, ColumnNumber)> {
+    Some((point.row.checked_add(1)?, point.column.checked_add(1)?))
 }
 
 /// Extract the coverage results associated to a function
@@ -246,6 +260,30 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             assert!(json.contains(expected));
         }
+    }
+
+    #[test]
+    fn one_based_shifts_rows_and_columns_by_one() {
+        assert_eq!(one_based(Point { row: 0, column: 0 }), Some((1, 1)));
+        assert_eq!(one_based(Point { row: 41, column: 7 }), Some((42, 8)));
+    }
+
+    #[test]
+    fn one_based_refuses_a_position_with_no_one_based_form() {
+        assert_eq!(one_based(Point { row: usize::MAX, column: 0 }), None);
+        assert_eq!(one_based(Point { row: 0, column: usize::MAX }), None);
+    }
+
+    #[test]
+    fn function_info_from_file_reports_one_based_spans() {
+        let dir = std::env::temp_dir().join(format!("trust-mc-cov-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("spans.rs");
+        fs::write(&file, "fn first() {}\n\n    fn second() {\n}\n").unwrap();
+        let infos = function_info_from_file(&file);
+        fs::remove_file(&file).unwrap();
+        let spans: Vec<_> = infos.iter().map(|i| (i.name.as_str(), i.start, i.end)).collect();
+        assert_eq!(spans, vec![("first", (1, 1), (1, 14)), ("second", (3, 5), (4, 2))]);
     }
 
     #[test]

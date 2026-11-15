@@ -43,6 +43,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             edge_predicate,
             env: self.current_env.clone(),
             variant_facts,
+            ref_pointees: self.ref_pointees.clone(),
         });
 
         self.update_block_path_condition(target_bb, edge_cond);

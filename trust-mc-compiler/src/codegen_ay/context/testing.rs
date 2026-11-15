@@ -20,6 +20,56 @@ use trust_mc_core::bmc::BmcVc;
 use super::{AYConfig, AYCtx, HeapState};
 use crate::kani_queries::QueryDb;
 
+/// The standard library's own `libc` (design trust-mc-reds-final §7.1, E3).
+/// The sysroot ships two `liblibc` crates: std's (an rlib) and an rmeta-only
+/// copy the compiler's own crates were built against, so a test source's
+/// `extern crate libc` is ambiguous (E0464) unless it is named. std's is the
+/// one with an rlib. The sysroot is the one the running `librustc_driver`
+/// belongs to. Zero rlibs or more than one is refused rather than guessed.
+///
+/// Where std's metadata lives depends on how that sysroot was built, so the
+/// file that names the crate does too:
+/// - Trust seal: std's rlib holds only a metadata stub (its metadata is split
+///   out, as `-Z embed-metadata=no` does) and the full metadata is the
+///   `.rmeta` beside it with the same file stem. That `.rmeta` names the
+///   crate: rustc refuses a stub rlib as an `--extern` ("only metadata stub
+///   found for `rlib` dependency"), even with the `.rmeta` beside it.
+/// - Stock sysroot (the frozen `nightly-2025-12-03` oracle lane): the
+///   metadata is embedded in the rlib and no `.rmeta` of that stem ships, so
+///   the rlib names the crate itself.
+///
+/// The choice cannot load the wrong crate: the other `liblibc` has a
+/// different stem, and an rlib whose metadata is only a stub is refused by
+/// rustc, so the compile fails instead.
+fn sysroot_std_libc() -> PathBuf {
+    let sysroot = rustc_session::config::Sysroot::new(None);
+    let lib = rustc_session::filesearch::make_target_lib_path(
+        sysroot.path(),
+        rustc_session::config::host_tuple(),
+    );
+    let mut rlibs: Vec<PathBuf> = fs::read_dir(&lib)
+        .unwrap_or_else(|err| panic!("read the sysroot target libdir {}: {err}", lib.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "rlib")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("liblibc-"))
+        })
+        .collect();
+    assert_eq!(
+        rlibs.len(),
+        1,
+        "expected exactly one std liblibc rlib in {}, found {rlibs:?}",
+        lib.display()
+    );
+    let rlib = rlibs.pop().expect("one rlib");
+    let rmeta = rlib.with_extension("rmeta");
+    if rmeta.is_file() { rmeta } else { rlib }
+}
+
 pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source<F>(source: &str, callback: F)
 where
     F: for<'tcx> FnOnce(AYCtx<'tcx, 'static>) + Send,
@@ -34,7 +84,36 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
 ) where
     F: for<'tcx> FnOnce(AYCtx<'tcx, 'static>) + Send,
 {
-    fn with_tcx<F>(source: &str, edition: &str, callback: F)
+    with_test_ay_ctx_for_source_with_edition_and_rustc_flags(source, edition, &[], callback);
+}
+
+/// [`with_test_ay_ctx_for_source`] with extra `rustc` flags appended.
+///
+/// The default context compiles at `-C opt-level=0`, which turns debug
+/// assertions and overflow checks ON: every `a + b` gets an `Assert`
+/// terminator and every `*p` a null/alignment check. A test that wants the
+/// bare STATEMENT (`-C overflow-checks=off`, `-C debug-assertions=off`) — the
+/// shape `--prove-safety-only` compiles, and the shape core's own MIR takes —
+/// passes those flags here.
+pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_rustc_flags<F>(
+    source: &str,
+    rustc_flags: &[&str],
+    callback: F,
+) where
+    F: for<'tcx> FnOnce(AYCtx<'tcx, 'static>) + Send,
+{
+    with_test_ay_ctx_for_source_with_edition_and_rustc_flags(source, "2024", rustc_flags, callback);
+}
+
+pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition_and_rustc_flags<F>(
+    source: &str,
+    edition: &str,
+    rustc_flags: &[&str],
+    callback: F,
+) where
+    F: for<'tcx> FnOnce(AYCtx<'tcx, 'static>) + Send,
+{
+    fn with_tcx<F>(source: &str, edition: &str, rustc_flags: &[&str], callback: F)
     where
         F: for<'tcx> FnOnce(TyCtxt<'tcx>) + Send,
     {
@@ -52,18 +131,34 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
         let out_dir = temp_dir.path().join("out");
         fs::create_dir_all(&out_dir).expect("create output dir");
 
-        let args = vec![
+        let mut args = vec![
             "rustc".to_string(),
             src_path.to_string_lossy().into_owned(),
             "--crate-type=lib".to_string(),
-            format!("--crate-name={crate_name}"),
             "--out-dir".to_string(),
             out_dir.to_string_lossy().into_owned(),
             format!("--edition={edition}"),
             "-C".to_string(),
             "opt-level=0".to_string(),
         ];
+        // An explicit name lets identity regressions compile a user crate
+        // called core/std. Its unique temporary output directory still
+        // isolates it from concurrent fixtures and the real sysroot crate.
+        if !rustc_flags.iter().any(|flag| flag.starts_with("--crate-name=")) {
+            args.push(format!("--crate-name={crate_name}"));
+        }
+        args.extend(rustc_flags.iter().map(|flag| (*flag).to_string()));
+        if source.contains("extern crate libc") {
+            args.push("--extern".to_string());
+            args.push(format!("libc={}", sysroot_std_libc().display()));
+        }
+        // rustc compiles on a thread of its own; the compilation records its
+        // diagnostics into the registry of the test that started it, so the
+        // test reads them inside the callback and after it alike, and no
+        // concurrent test reads or drains them.
+        let counters = crate::codegen_ay::chc::compilation_counters();
         let result = run_with_tcx!(&args, |tcx| {
+            let _counters = crate::codegen_ay::chc::enter_compilation_counters(counters);
             callback(tcx);
             std::ops::ControlFlow::<(), ()>::Continue(())
         });
@@ -73,7 +168,7 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
         );
     }
 
-    with_tcx(source, edition, |tcx| {
+    with_tcx(source, edition, rustc_flags, |tcx| {
         let config = AYConfig::default();
         let mut program = if config.use_chc {
             AYProgram::horn()
@@ -90,6 +185,7 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
         bmc_vc.query.logic = Some(config.select_logic(false).to_owned());
         let ctx: AYCtx<'_, 'static> = AYCtx {
             obligation_free_body_by_fn: std::collections::HashMap::new(),
+            std_abstraction: crate::kani_middle::std_abstraction::StdAbstraction::resolve(tcx),
             tcx,
             queries: QueryDb::default(),
             config,
@@ -119,6 +215,14 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
             coverage_metadata: Vec::new(),
             chc_local_to_state_idx: HashMap::new(),
             bmc_mini_inline_stack: Vec::new(),
+            bmc_root_fn_name: None,
+            initial_memory: None,
+            global_alloc_addrs: std::collections::HashMap::new(),
+            global_alloc_bytes: std::collections::HashSet::new(),
+            alloc_views: HashMap::new(),
+            alloc_roots: rustc_data_structures::fx::FxIndexMap::default(),
+            alloc_views_poisoned: std::collections::HashSet::new(),
+            alloc_phi_defs: HashMap::new(),
         };
         callback(ctx);
     });

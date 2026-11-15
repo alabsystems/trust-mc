@@ -439,7 +439,7 @@ fn test_place_env_lookup_no_projection() {
 
         // Rvalue::Use(Copy(local 1, no projection)) should hit the env lookup path
         let place = Place { local: 1usize, projection: vec![] };
-        let rvalue = Rvalue::Use(Operand::Copy(place));
+        let rvalue = rvalue_use!(Rvalue::Use(Operand::Copy(place)));
         let result = chc_ctx.translate_rvalue_with_env(&rvalue, &env, &[], None, None);
         assert!(result.is_some(), "env lookup for local 1 should succeed");
         assert_eq!(
@@ -461,7 +461,7 @@ fn test_place_env_lookup_missing_local_returns_none() {
         let env: HashMap<usize, Expr> = HashMap::new(); // empty env
 
         let place = Place { local: 99usize, projection: vec![] };
-        let rvalue = Rvalue::Use(Operand::Copy(place));
+        let rvalue = rvalue_use!(Rvalue::Use(Operand::Copy(place)));
         let result = chc_ctx.translate_rvalue_with_env(&rvalue, &env, &[], None, None);
         assert!(result.is_none(), "env lookup for absent local should return None");
     });

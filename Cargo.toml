@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A bit-precise model checker for Rust."
 readme = "README.md"
@@ -78,7 +78,7 @@ codegen-units = 2
 split-debuginfo = "unpacked"
 
 # Optimize dependencies (notably the linked ay solver crates, which run hot
-# SAT/SMT inner loops) even in dev builds. Without this, `cargo build-dev`
+# SAT/SMT inner loops) even in dev builds. Without this, `targo --unverified build-dev`
 # ships an opt-level-0, debug-assertions-on solver inside the driver — a
 # 3-20x wall-clock handicap vs the release bundle users get (measured:
 # core::ub_checks frames dominating solver hot paths; #39 bisect). Workspace
@@ -111,12 +111,14 @@ members = [
   "tools/scanner",
   "tools/compile-timer",
   # NOTE: tools/kani-domination is deliberately NOT a member — it is a standalone
-  # stable-Rust CLI (its own workspace) that drives the trust-mc verifier as a
-  # subprocess, so building it needs no nightly / rustc-dev / rust-src and no
-  # git-dep resolution. Build it with `cd tools/kani-domination && cargo build`.
+  # CLI (its own workspace) that drives the trust-mc verifier as a subprocess,
+  # so building it needs no rustc_private crates and no git-dep resolution.
+  # Build it with `cd tools/kani-domination && targo --unverified build`.
   "trust-mc-driver",
   "trust-mc-replay",
   "trust-mc-compiler",
+  "trust-mc-engine",
+  "trust-mc-backend",
   "trust-mc-codegen-types",
   "trust-mc-codegen-shared",
   "trust-mc-codegen-stubs",
@@ -128,14 +130,13 @@ members = [
   "trust-mc-trust-bmc",
 ]
 
-# This indicates what package to e.g. build with 'cargo build' without --workspace
+# This indicates what package to e.g. build with 'targo --unverified build' without --workspace
 #
-# `trust-mc-compiler` is DELIBERATELY not here, for the same reason
-# tools/kani-domination is not a member at all: it is a rustc DRIVER
+# `trust-mc-compiler` is DELIBERATELY not here: it is a rustc DRIVER
 # (#![feature(rustc_private)], links librustc_driver, ~540K LOC) and so it can
-# only build on a toolchain that ships the rustc-dev closure. Having it in the
-# default set meant a bare `cargo build` dragged that requirement into every
-# build of this repo, including the Trust lane.
+# only build on a toolchain that ships the rustc-dev closure -- the Trust seal
+# does -- and it is the slowest build in the repo. A default build of the front
+# door and driver does not need it.
 #
 # It serves the KANI-COMPATIBILITY path: Rust source -> rustc internals -> AY.
 # The TRUST path does not go through it at all --
@@ -145,8 +146,13 @@ members = [
 # runtime (session/install.rs). Trust's own bootstrap builds trust-mc-core,
 # trust-mc-driver and trust-mc-trust-bmc, and never trust-mc-compiler.
 #
-# Build the Kani lane explicitly, on a toolchain with rustc-dev:
-#   cargo build -p trust-mc-compiler
+# Build the Kani lane explicitly (the Trust seal ships rustc-dev):
+#   targo --unverified build -p trust-mc-compiler
+#
+# The same holds for trust-mc-engine (the rustc_private engine rlib that binary
+# is a thin front door over; its sources stay in trust-mc-compiler/src) and
+# trust-mc-backend (librustc_codegen_trust_mc.dylib, the same engine loaded by
+# canonical trustc through -Zcodegen-backend=<path>).
 default-members = [
   ".",
   "trust-mc-driver",
@@ -155,10 +161,13 @@ default-members = [
 exclude = [
   "build",
   "target",
+  # The publication engine copies the export to publish/.out/cargo-metadata-tree
+  # inside this checkout and runs `cargo metadata` there; the export's own root
+  # excludes its standalone packages (proofs/, tests/perf/...), so cargo walks up
+  # to this manifest, which must exclude that copy too or it refuses them
+  # ("believes it's in a workspace when it's not").
+  "publish/.out",
   "proofs",
-  # Standalone reachability lint (own [workspace]); builds on stable, must not
-  # pull rustc-dev into the main build. See tools/main-thread-purity/.
-  "tools/main-thread-purity",
   # dependency tests have their own workspace
   "tests/kani-dependency-test/dependency3",
   # cargo kani tests should also have their own workspace
@@ -167,6 +176,11 @@ exclude = [
   "tests/cargo-ui",
   "tests/slow",
   "tests/std-checks",
+  # The T1 cargo pair's shared proc-macro: only ever a path dependency of the
+  # pass/ and fail/ fixtures (each its own workspace), never a member here.
+  # Without this, cargo loading it as a root refuses ("believes it's in a
+  # workspace when it's not"), and so does the publication re-lock.
+  "tests/trust-lane/cargo-pair/pair-macros",
   "tests/script-based-pre",
   "tests/script-based-pre/build-cache-bin/target/new_dep",
   "tests/script-based-pre/build-cache-dirty/target/new_dep",
@@ -376,10 +390,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # 2. The active [patch] table below redirects the pinned source to that checkout.
 #
 # To bump AY: align ../ay to the new pushed 40-char commit, then run
-# `scripts/bump-ay-pin.py <rev> <version>`. The helper updates every declaration,
-# refreshes Cargo.lock before locked validation, and restores both files if any
-# authority check fails. Then run `scripts/check-ay-pin.sh` and re-run the corpus
+# `scripts/bump-ay-pin.py <rev> <version>`. The helper updates every declaration
+# and tools/tuple.toml's [ay] rev, refreshes Cargo.lock before locked validation,
+# and restores all three files if any authority check fails. Then run
+# `scripts/check-ay-pin.sh` and re-run the corpus
 # measurement (scripts/ay-compiletest.sh) so the authority tuple is refreshed.
+# Run tools/tuple-check in the same commit
+# (docs/KANI-LANE-REVIVAL.md, "The measurement tuple").
 # With the path patch, a no-op lockfile update is expected when AY's package graph
 # and versions are unchanged.
 [workspace.dependencies]
@@ -388,22 +405,22 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # 40-character ay revision for reproducible measurements; a floating
 # `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
 # path-patched packages; this manifest rev records the exact upstream commit.
-ay-dpll = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
-ay-core = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
-ay-frontend = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
-ay-chc = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
-ay_bindings = { version = "0.22.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay-dpll = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay-core = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay-frontend = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay-chc = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
+ay_bindings = { version = "0.28.0", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
 # Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
 # `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
 # num_rational fallback is functionally identical and adds no native `-lgmp`
 # link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
-ay = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3", default-features = false }
-ay-sys = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be", default-features = false }
+ay-sys = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
 # Shared AY encoding/invocation surface — consumed from its canonical home in
 # the ay repo (NOT vendored). Because all ay-family deps above use the same
 # pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
 # rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
-ay-encode = { version = "0.22.0", git = "https://github.com/alabsystems/ay.git", rev = "5d586a5c2035e94c3f6ad00028e21ae5529cd2f3" }
+ay-encode = { version = "0.28.0", git = "https://github.com/alabsystems/ay.git", rev = "9dfa20b5790b03c8ffe57fbbe67316ece665c5be" }
 num-bigint = "0.4"
 
 # Common dependencies centralized for version consistency across workspace members.
@@ -451,14 +468,14 @@ thiserror = "2"
 #
 # trust-mc therefore ships as a SYSROOT BUNDLE (bin/ + lib/, relocated and
 # smoke-exec'd at pack time) via aterm's tools/atpkg-pack-bundle.sh. Build the
-# payload with `cargo run --release -p build-trust-mc -- build-dev --release`
-# and pack with SYSROOT=target/trust-mc EXPOSES="trust-mc-driver".
+# payload with `targo --unverified build-dev --release` and pack with
+# SYSROOT=target/trust-mc EXPOSES="trust-mc-driver".
 #
 # The ONE bin here that is genuinely self-contained — no sysroot, no rustc, no
 # `ay` on PATH — is the coverage post-processor, so that is all this lane
-# exposes. build-args keeps the pack off the rustc-driver build path: a bare
-# `cargo build --release` builds default-members, i.e. trust-mc-compiler, which
-# needs the rustc-dev component and is not relocatable.
+# exposes. build-args keeps the pack off the rustc-driver build path: only
+# trust-mc-cov is built, never trust-mc-compiler, which links the toolchain's
+# rustc-dev closure and is not relocatable.
 expose = ["trust-mc-cov"]
 build-args = ["-p", "trust-mc-cov"]
 # The paragraph above is a rule a human must read, and on 2026-08-21 a packer
@@ -469,3 +486,14 @@ build-args = ["-p", "trust-mc-cov"]
 # of every user who updated. So the rule is data now, not prose: aterm's
 # atpkg-pack.sh refuses a program that sets this, and names the bundle lane.
 bundle-only = true
+
+# Trust: policy for `targo trust` over this workspace.
+[trust]
+enabled = true
+level = "L2"
+hardened = true
+trust_profile = "unix_hardened"
+# This policy enables verification; it does not assert that it passes. It sets
+# no budget: the retired `function_budget_ms` key is deleted, with no
+# `backstop` in its place (Trust DECISION_QUEUE BUDGET-1a), so the builtin
+# per-query and per-function clocks apply.

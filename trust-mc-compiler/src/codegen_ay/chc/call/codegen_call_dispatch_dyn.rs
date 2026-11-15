@@ -20,33 +20,18 @@ use crate::kani_middle::abi::LayoutOf;
 use tracing::{debug, warn};
 
 fn try_extract_data_obj_id(ptr: &Loc) -> Option<u32> {
-    ChcCtx::try_extract_obj_id(ptr.as_expr()).or_else(|| {
+    ChcCtx::try_extract_base_obj_id(ptr.as_expr()).or_else(|| {
         // Wave 4: the `width == 2 * POINTER_WIDTH` gate is deleted. `PtrRepr`
         // says which half is the address and `into_data` is total, so a thin
         // pointer decodes to itself (making this retry a no-op for it) and a
         // packed one decodes to its data half — no width arithmetic needed.
         let data = PtrRepr::classify(ptr.as_expr())?.into_data();
-        ChcCtx::try_extract_obj_id(data.as_expr())
+        ChcCtx::try_extract_base_obj_id(data.as_expr())
     })
 }
 
 fn is_stack_obj_id(ctx: &ChcCtx<'_, '_>, obj_id: u32) -> bool {
     ctx.heap_state.stack_local_obj_ids().contains(&obj_id)
-}
-
-fn unique_known_heap_alloc_id(ctx: &ChcCtx<'_, '_>) -> Option<u32> {
-    let stack_obj_ids = ctx.heap_state.stack_local_obj_ids();
-    let mut found = None;
-    for obj_id in ctx.known_alloc_ids.values().copied() {
-        if stack_obj_ids.contains(&obj_id) {
-            continue;
-        }
-        if found.is_some_and(|seen| seen != obj_id) {
-            return None;
-        }
-        found = Some(obj_id);
-    }
-    found
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -65,8 +50,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let dyn_tail = dyn_coercion::find_dyn_trait_tail_ty(self, target_repr_ty)?;
         let trait_def_id = dyn_coercion::extract_dyn_trait_def_id(self, dyn_tail)?;
         let concrete_ty = dyn_coercion::resolve_unique_concrete_dyn_tail_ty(self, target_repr_ty)?;
+        if !self.universe_admits_sole_runtime(dyn_tail, concrete_ty) {
+            return None;
+        }
         let candidates = dyn_coercion::collect_dyn_trait_candidates(self, trait_def_id);
         dyn_coercion::resolve_vtable_id(&candidates, concrete_ty)
+    }
+
+    /// May `concrete_ty` be taken as the ONLY runtime type of the trait object
+    /// `dyn_tail`?
+    ///
+    /// `resolve_unique_concrete_dyn_tail_ty` answers from this body's own
+    /// `Unsize` casts (or a lone implementor), and a type unsized in a callee
+    /// or reached through an upcast is in neither. When the harness has a
+    /// dyn-coercion universe (every per-harness codegen does), the answer
+    /// must be its sole runtime type too: a statically unique vtable id made
+    /// a `dyn Sup` whose runtime type was the upcast `UB` dispatch to the one
+    /// type the body coerced directly, `UA`, and its overflow verified clean
+    /// (`walker_dyn_upcast_dual.rs`). With no universe (a body encoded
+    /// outside a per-harness codegen) the body-local answer stands, as before.
+    pub(in crate::codegen_ay::chc) fn universe_admits_sole_runtime(
+        &self,
+        dyn_tail: rustc_public::ty::Ty,
+        concrete_ty: rustc_public::ty::Ty,
+    ) -> bool {
+        let Some(universe) = &self.dyn_universe else { return true };
+        let Some(principal) = dyn_tail.kind().trait_principal() else { return false };
+        let (def, args) = (principal.value.def_id, principal.value.generic_args);
+        !universe.is_open(def, &args) && universe.concrete_types(def, Some(&args)) == [concrete_ty]
     }
 
     pub(in crate::codegen_ay::chc) fn zst_unique_vtable_expr_for_local(
@@ -345,6 +356,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && let Some((_, dest_var)) = self.resolve_destination(dest_local)
         {
             let ptr_obj_id = try_extract_data_obj_id(&ptr_expr);
+            // Test the incoming pointer before the intentional Rc/Arc header
+            // adjustment. An interior input must not inherit a base id from a
+            // source-table entry or the unique-allocation fallback.
+            let interior_input = Self::try_extract_constant_addr(ptr_expr.as_expr())
+                .is_some_and(|(_, offset)| offset != 0);
             // Part of #3589: Rc/Arc stores the value after a header
             // (strong + weak refcounts = 2×pointer_size = 16 bytes on
             // 64-bit). Shift the pointer forward so that subsequent
@@ -357,7 +373,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // (offset 0), but stores write the value at offset 16,
             // causing a 16-byte address mismatch → Genuine CTREX.
             let ptr_expr = if let Some(ptr_width) = ptr_expr.as_expr().sort().bitvec_width() {
-                let rc_header_size = 2u64 * (crate::codegen_ay::types::POINTER_WIDTH as u64 / 8);
+                // The value's field offset in the inner layout (the header
+                // rounded up to the value's alignment, `rc_value_offset`), as
+                // the `Rc::new` lane stores it.
+                let value_align = match self.body.locals()[dest_local].ty.kind() {
+                    rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(_, gargs)) => {
+                        gargs.0.first().and_then(|arg| match arg {
+                            rustc_public::ty::GenericArgKind::Type(t) => {
+                                self.get_type_align(self.resolve_body_ty(*t))
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
+                let rc_header_size =
+                    super::codegen_call_dispatch_dyn_rc::rc_value_offset(value_align.unwrap_or(1));
                 debug!(
                     rc_header_size,
                     ptr_width, dest_local, "from_inner_in: adding Rc header offset to pointer"
@@ -402,21 +433,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // (the raw pointer from exchange_malloc) to the Rc/Arc local. Without
             // this, Rc::deref cannot recover the alloc identity for store-to-load
             // forwarding, causing CTREX in rc_outer_coercion.
-            let src_local = match args.first() {
-                Some(rustc_public::mir::Operand::Copy(p) | rustc_public::mir::Operand::Move(p)) => {
-                    Some(p.local)
-                }
-                _ => None,
-            };
-            if let Some(obj_id) = src_local
-                .and_then(|sl| self.known_alloc_ids.get(&sl).copied())
-                .filter(|obj_id| !is_stack_obj_id(self, *obj_id))
-                .or_else(|| src_local.and_then(|sl| self.trace_deref_store_alloc_id(sl)))
-                .filter(|obj_id| !is_stack_obj_id(self, *obj_id))
-                .or(ptr_obj_id)
-                .filter(|obj_id| !is_stack_obj_id(self, *obj_id))
-                .or_else(|| unique_known_heap_alloc_id(self))
-            {
+            let src_local =
+                match args.first() {
+                    Some(
+                        rustc_public::mir::Operand::Copy(p) | rustc_public::mir::Operand::Move(p),
+                    ) if p.projection.is_empty() => Some(p.local),
+                    _ => None,
+                };
+            let base_obj_id = (!interior_input)
+                .then(|| {
+                    src_local
+                        .and_then(|sl| self.trace_deref_store_alloc_id(sl))
+                        .filter(|obj_id| !is_stack_obj_id(self, *obj_id))
+                        .or(ptr_obj_id)
+                        .filter(|obj_id| !is_stack_obj_id(self, *obj_id))
+                })
+                .flatten();
+            if let Some(obj_id) = base_obj_id {
                 self.known_alloc_ids.insert(dest_local, obj_id);
                 self.ref_resolution.alloc_result_locals.insert(dest_local);
                 debug!(
@@ -425,6 +458,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
             } else {
                 self.known_alloc_ids.remove(&dest_local);
+                self.ref_resolution.alloc_result_locals.remove(&dest_local);
             }
 
             let new_output_args = self.build_output_args(modified_locals, &[dest_local]);
@@ -479,9 +513,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         };
 
+        // The wrapper VALUE (the pointer it stores). A `&Wrapper` operand whose referent
+        // `resolve_ref_operand` cannot name translates to the wrapper's ADDRESS, and
+        // extracting "the stored pointer" from that address took the local's own slot as
+        // the data pointer: `Rc<dyn Shape>`'s receiver read a cell nothing writes, and the
+        // overflow on it was certified Genuine. Only a by-value operand may stand in.
+        let arg_is_reference =
+            args.first().and_then(|arg| arg.ty(self.body.locals()).ok()).is_some_and(|ty| {
+                matches!(
+                    ty.kind(),
+                    rustc_public::ty::TyKind::RigidTy(
+                        rustc_public::ty::RigidTy::Ref(..) | rustc_public::ty::RigidTy::RawPtr(..)
+                    )
+                )
+            });
         let raw_arg_expr = args.first().and_then(|arg| {
-            self.resolve_ref_operand(arg, modified_locals)
-                .or_else(|| self.translate_operand_with_modified(arg, modified_locals))
+            self.resolve_ref_operand(arg, modified_locals).or_else(|| {
+                (!arg_is_reference)
+                    .then(|| self.translate_operand_with_modified(arg, modified_locals))
+                    .flatten()
+            })
         });
         let src_local = args.first().and_then(|arg| match arg {
             rustc_public::mir::Operand::Copy(place) | rustc_public::mir::Operand::Move(place)
@@ -522,8 +573,40 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `pointer_wrapper_deref_result_ptr` here would add the header
         // offset a second time. For Box, the pointer is identity (no
         // offset), so extraction alone is also correct.
+        //
+        // That holds only for a pointer `from_inner_in` produced. `Rc::new` / `Arc::new`
+        // (`codegen_rc_arc_new`) store the header BASE and leave the shift to this deref,
+        // so the stored pointer alone does not say which convention it follows. A constant
+        // address does: offset 0 is a base (shift it), offset == the value offset was
+        // already shifted. Anything else cannot be placed, so the sound fallback below
+        // stands rather than a guessed receiver.
+        let is_shared_wrapper = Self::path_mentions_pointer_wrapper(callee_path, "rc::Rc")
+            || Self::path_mentions_pointer_wrapper(callee_path, "sync::Arc");
         let ptr_expr = concrete_deref_ptr.or_else(|| {
-            raw_arg_expr.as_ref().and_then(|expr| self.extract_pointer_storage_expr(expr))
+            let stored =
+                raw_arg_expr.as_ref().and_then(|expr| self.extract_pointer_storage_expr(expr))?;
+            if !is_shared_wrapper {
+                return Some(stored);
+            }
+            let (obj_id, offset) = Self::try_extract_constant_addr(stored.as_expr())?;
+            let base = Loc::of_address(
+                Expr::bitvec_const(obj_id as u128, 32).concat(Expr::bitvec_const(0u128, 32)),
+            );
+            let shifted = self.pointer_wrapper_deref_result_ptr(callee_path, dest_local, base)?;
+            let (_, value_offset) = Self::try_extract_constant_addr(shifted.as_expr())?;
+            if offset == 0 {
+                Some(shifted)
+            } else if offset == value_offset {
+                Some(stored)
+            } else {
+                debug!(
+                    obj_id,
+                    offset,
+                    value_offset,
+                    "pointer_wrapper_deref: Rc/Arc stored pointer follows no known convention"
+                );
+                None
+            }
         });
 
         if let Some(ptr_expr) = ptr_expr

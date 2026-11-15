@@ -325,7 +325,7 @@ impl<'tcx, 'body> CallStringConversion for ChcCtx<'tcx, 'body> {
                             let obj_size_out = super::super::codegen_expr_heap::obj_size_out();
                             extra_constraints
                                 .push(obj_size_out.eq(obj_size_in.store(obj_id_expr, len_32)));
-                            self.mark_heap_metadata_modified();
+                            self.mark_obj_size_modified();
                         }
                     }
                 }

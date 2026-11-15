@@ -20,6 +20,67 @@ pub use std::*;
 // Override process calls with stubs.
 pub mod process;
 
+/// The edition preludes, with Kani's macro overrides in them.
+///
+/// The compiler injects `use std::prelude::rust_20xx::*` into every crate, and
+/// `std` here is this crate. Newer toolchains (Trust 8571 at 45dc60873 among
+/// them) export `assert!`, `assert_eq!`, `debug_assert!`, `unreachable!`,
+/// `panic!` and the rest as items of std's prelude instead of reaching crates
+/// through `#[macro_use] extern crate std`. Without these modules the glob
+/// `pub use std::*` above hands out std's own prelude, whose `assert!` expands
+/// to `core::panicking::panic_fmt`: every override below is silently bypassed,
+/// checks lose their messages, and printing and panics run real std code
+/// (measured: `assert!(sum < 150, "sum reaches 150")` lost its CHC property on
+/// the Trustc route). A local `prelude` item shadows the glob-imported one, and
+/// each explicit re-export shadows the same name from std's prelude glob. On
+/// toolchains that still put these macros in the `macro_use` prelude the two
+/// paths name the same macro, so nothing changes there.
+pub mod prelude {
+    /// `panic` names both a macro and a module in std. Only the macro belongs in
+    /// the prelude, so the module is shadowed by a private one (the technique
+    /// std's own prelude uses).
+    #[cfg(not(feature = "concrete_playback"))]
+    mod panic_macro_only {
+        #[allow(hidden_glob_reexports)]
+        mod panic {}
+        pub use crate::*;
+    }
+
+    /// Declares one edition prelude module: std's prelude of the same name plus
+    /// every macro this crate overrides.
+    macro_rules! kani_prelude {
+        ($($edition:ident),+ $(,)?) => {$(
+            pub mod $edition {
+                pub use std::prelude::$edition::*;
+                // nightly-2025-12-03 (the frozen lane) also has the builtin
+                // `assert` in its prelude and still reaches every override
+                // through `#[macro_use] extern crate std`. There this `assert`
+                // re-export is ambiguous with the glob above, unused, and (under
+                // the workspace's `unreachable_pub = "warn"`) reported as an
+                // unreachable `pub` item, five times, once per edition module.
+                // Trust 8571 reports none of the three. The allow is scoped to
+                // `assert` alone: no other override conflicts on either
+                // toolchain. Measured on both toolchains: edition 2015, 2018,
+                // 2021 and 2024 crates expand `assert!` to `kani::assert`.
+                #[allow(ambiguous_glob_reexports, unused_imports, unreachable_pub)]
+                #[cfg(not(feature = "concrete_playback"))]
+                pub use crate::assert;
+                #[cfg(not(feature = "concrete_playback"))]
+                pub use crate::{
+                    assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, eprint,
+                    eprintln, print, println, unreachable,
+                };
+                #[cfg(not(feature = "concrete_playback"))]
+                pub use super::panic_macro_only::panic;
+            }
+        )+};
+    }
+
+    // `rust_future` is left out: it is unstable, and so is the edition that
+    // injects it.
+    kani_prelude!(v1, rust_2015, rust_2018, rust_2021, rust_2024);
+}
+
 /// This assert macro calls kani's assert function passing it down the condition
 /// as well as a message that will be used when reporting the assertion result.
 ///

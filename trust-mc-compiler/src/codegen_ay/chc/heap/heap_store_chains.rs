@@ -6,7 +6,7 @@
 //!
 //! Extracted from heap_state.rs per design D2 (file-decomposition-500loc-compliance).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -31,6 +31,101 @@ fn extract_store_chain_out_name(expr: &Expr) -> Option<&str> {
     None
 }
 
+/// The heap metadata arrays, as their input-variable names.
+const HEAP_METADATA_LANES: [&str; 2] = ["obj_valid", "obj_size"];
+
+/// `expr` with every variable named in `substitution` replaced by its value.
+fn substitute_vars(expr: &Expr, substitution: &HashMap<String, Expr>) -> Expr {
+    if let ExprValue::Var { name } = expr.value() {
+        return substitution.get(name).cloned().unwrap_or_else(|| expr.clone());
+    }
+    let children: Vec<&Expr> = expr.children().collect();
+    if children.is_empty() {
+        return expr.clone();
+    }
+    let rewritten: Vec<Expr> = children.iter().map(|c| substitute_vars(c, substitution)).collect();
+    if rewritten.iter().zip(children.iter()).all(|(new, old)| new == *old) {
+        return expr.clone();
+    }
+    ay_bindings::rebuild_with_children(expr, rewritten)
+}
+
+/// `rhs` when `constraint` is `out = rhs` and `rhs` does not mention `out`.
+fn proper_definition_rhs(constraint: &Expr, out: &str) -> Option<Expr> {
+    let ExprValue::Eq(lhs, rhs) = constraint.value() else { return None };
+    let ExprValue::Var { name } = lhs.value() else { return None };
+    if name != out {
+        return None;
+    }
+    let mut stack = vec![rhs.clone()];
+    while let Some(node) = stack.pop() {
+        if let ExprValue::Var { name } = node.value()
+            && name == out
+        {
+            return None;
+        }
+        stack.extend(node.children().cloned());
+    }
+    Some(rhs.clone())
+}
+
+/// Compose the bridge's definitions of a heap metadata output
+/// (`obj_valid__out`, `obj_size__out`) onto the block's.
+///
+/// A metadata write builds its new array on the block's INPUT
+/// (`obj_valid__out = store(obj_valid, id, true)`, the allocator stubs) or on
+/// `current_obj_valid_array()` (`store(obj_valid__out, id, false)`), so unlike a
+/// memory store chain it is not chained on an earlier write of the block, and
+/// [`filter_superseded_store_chains`] then drops that earlier write. A
+/// statement's integer-to-pointer invalidation followed by an allocating call
+/// in the same block lost the invalidation: `let p = a as *const u8; let v =
+/// vec![1, 2, 3];` read `*p` at the slot `a` named as valid, SUCCESSFUL where
+/// Kani reports an invalid integer address, on main and on fix/chc-lost-writes
+/// alike (lostwrite track round 2, finding 5). Each bridge definition is
+/// rewritten onto the one before it (the block's last proper definition, then
+/// the bridge's earlier ones), with both the input and the output name taken
+/// as that previous array, and only the last one is kept.
+fn compose_heap_metadata_definitions(stmt_constraints: &[Expr], bridge: &mut Vec<Expr>) {
+    for lane in HEAP_METADATA_LANES {
+        let out = format!("{lane}__out");
+        let positions: Vec<usize> = bridge
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| extract_store_chain_out_name(c) == Some(out.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let mut previous =
+            stmt_constraints.iter().rev().find_map(|c| proper_definition_rhs(c, &out));
+        if positions.is_empty() || (previous.is_none() && positions.len() == 1) {
+            continue;
+        }
+        let mut composed_last = None;
+        for &i in &positions {
+            let ExprValue::Eq(lhs, rhs) = bridge[i].value() else { continue };
+            let composed = match &previous {
+                Some(prev) => {
+                    let substitution = HashMap::from([
+                        (lane.to_string(), prev.clone()),
+                        (out.clone(), prev.clone()),
+                    ]);
+                    substitute_vars(rhs, &substitution)
+                }
+                None => rhs.clone(),
+            };
+            previous = Some(composed.clone());
+            composed_last = Some((i, lhs.clone().eq(composed)));
+        }
+        let Some((keep, definition)) = composed_last else { continue };
+        bridge[keep] = definition;
+        let mut index = 0;
+        bridge.retain(|_| {
+            let drop = index != keep && positions.contains(&index);
+            index += 1;
+            !drop
+        });
+    }
+}
+
 /// Filter `stmt_constraints` to remove store chain constraints superseded by
 /// `bridge_constraints`. Part of #3528.
 ///
@@ -38,14 +133,17 @@ fn extract_store_chain_out_name(expr: &Expr) -> Option<&str> {
 /// store chains, the resulting constraints may target the same `__out` variables
 /// as constraints already in `stmt_constraints` (from `encode_block_statements`'s
 /// drain). The bridge constraints are correctly chained (via seeds) and supersede
-/// the original constraints.
+/// the original constraints. Heap metadata definitions are not chained that
+/// way, so the bridge's are first composed onto the block's
+/// ([`compose_heap_metadata_definitions`]), which rewrites `bridge_constraints`.
 ///
 /// Returns `Some(filtered)` if any constraints were removed, `None` if no
 /// conflicts detected (caller should use original `stmt_constraints`).
 pub(in crate::codegen_ay::chc) fn filter_superseded_store_chains(
     stmt_constraints: &[Expr],
-    bridge_constraints: &[Expr],
+    bridge_constraints: &mut Vec<Expr>,
 ) -> Option<Vec<Expr>> {
+    compose_heap_metadata_definitions(stmt_constraints, bridge_constraints);
     let overridden: HashSet<&str> =
         bridge_constraints.iter().filter_map(extract_store_chain_out_name).collect();
 
@@ -87,6 +185,8 @@ impl ChcHeapState {
         store_expr: Expr,
     ) {
         let arr_out_name: Arc<str> = arr_out_name.into();
+        self.note_write();
+        self.note_memory_effect();
         // Insert/update the accumulated store expression.
         // First store: store(arr_in, addr1, val1)
         // Second store: store(store(arr_in, addr1, val1), addr2, val2) [pre-nested by caller]
@@ -94,6 +194,37 @@ impl ChcHeapState {
             *existing = (arr_out_name, store_expr);
         } else {
             self.store_chains.insert(type_key.into(), (arr_out_name, store_expr));
+        }
+    }
+
+    /// Rewrite every pending term of the block through `rewrite`: the live
+    /// store chains, the drained chain seeds a call handler chains on, the
+    /// pending updates and checks, and the store-to-load forwarding values.
+    ///
+    /// A call handler that rebinds a local's output slots (the Cell store
+    /// lane's register sync or havoc) calls this BEFORE it adds any term of
+    /// its own, with the rewrite onto the slots' pre-call values: every term
+    /// built earlier in the block meant the pre-call value, and a term built
+    /// afterwards means the post-call one, so the two must never be rewritten
+    /// together.
+    pub(in crate::codegen_ay::chc) fn rewrite_pending_terms(
+        &mut self,
+        rewrite: impl Fn(&Expr) -> Expr,
+    ) {
+        for (_, expr) in self.store_chains.values_mut() {
+            *expr = rewrite(expr);
+        }
+        for expr in self.drained_store_chain_seeds.values_mut() {
+            *expr = rewrite(expr);
+        }
+        for expr in &mut self.pending_updates {
+            *expr = rewrite(expr);
+        }
+        for expr in &mut self.pending_checks {
+            *expr = rewrite(expr);
+        }
+        for (_, expr, _) in self.store_forward_map.values_mut() {
+            *expr = rewrite(expr);
         }
     }
 

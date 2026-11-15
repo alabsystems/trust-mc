@@ -13,6 +13,8 @@
 //!
 //! Part of #718 - statement module refactoring.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::sync::Arc;
 
 use crate::kani_middle::abi::LayoutOf;
@@ -92,7 +94,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let dest_name = self.ctx.fresh_name("ay_any");
                     let sort = Sort::bitvec(bits);
                     let expr = self.ctx.declare_var(&dest_name, sort);
-                    self.ctx.record_kani_any_var(expr.clone());
+                    // The model discriminant width does not establish the selector
+                    // bytes consumed by a native derived Arbitrary implementation.
+                    self.ctx.record_unreplayable_playback_value(
+                        expr.clone(),
+                        self.current_path_condition.clone(),
+                    );
 
                     // Add discriminant validity constraint: value < num_variants
                     // This prevents invalid discriminant values from causing spurious failures.
@@ -111,10 +118,40 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
+        // `Box<T>`: Kani's `Arbitrary for Box<T>` is `Box::new(T::any())`, a
+        // fresh allocation holding an arbitrary `T`. An arbitrary pointer in its
+        // place could be null, misaligned or unallocated, and a deref of it
+        // failed certified Genuine (expected/derive-arbitrary/box). Allocate,
+        // make the payload the arbitrary input, and store it as Box::new does
+        // (`store_payload_bytes`, dispatch/box_new_payload.rs). A payload with
+        // no exact byte image leaves bytes that can disagree with the recorded
+        // heap pointee, so the counterexample is tainted rather than certified.
+        if let Some(ty) = ty
+            && Self::is_box_type(ty)
+            && let Some(pointee) = Self::box_pointee_ty(ty)
+            && let Some(size) = LayoutOf::new(pointee).size_of()
+            && let Some(align) = LayoutOf::new(pointee).align_of()
+        {
+            let payload = self.create_constrained_symbolic(pointee, "ay_any");
+            self.assert_scalar_validity_for_ty(pointee, payload.clone());
+            let ptr = self.ctx.heap_alloc(
+                Expr::bitvec_const(size as u128, POINTER_WIDTH),
+                Expr::bitvec_const(align as u128, POINTER_WIDTH),
+            );
+            let complete = self.store_payload_bytes(pointee, &payload, &ptr, 0);
+            debug!(complete, "codegen_kani_any_raw: Box<T> allocated with an arbitrary payload");
+            if !complete {
+                self.ctx.bmc_sound_havoc("kani_any_box_payload_unmodeled");
+            }
+            self.heap_pointees.insert(Arc::from(base_name.as_str()), payload);
+            self.env_update(base_name, ptr);
+            return;
+        }
+
         let dest_name = self.ctx.fresh_name("ay_any");
         let sort = self.infer_sort_from_place(destination).unwrap_or_else(|| Sort::bitvec(32));
         let expr = self.ctx.declare_var(&dest_name, sort);
-        self.ctx.record_kani_any_var(expr.clone());
+        self.ctx.record_kani_any_var(expr.clone(), self.current_path_condition.clone());
         if let Some(ty) = ty {
             self.assert_scalar_validity_for_ty(ty, expr.clone());
         }
@@ -145,7 +182,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let name = self.ctx.fresh_name(name_prefix);
                 let sort = Sort::bitvec(bits);
                 let expr = self.ctx.declare_var(&name, sort);
-                self.ctx.record_kani_any_var(expr.clone());
+                self.ctx.record_unreplayable_playback_value(
+                    expr.clone(),
+                    self.current_path_condition.clone(),
+                );
 
                 // Add discriminant validity constraint: value < num_variants
                 let upper_bound = Expr::bitvec_const(num_variants as i128, bits);
@@ -165,9 +205,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let sort = Self::infer_sort_from_ty(ty).unwrap_or_else(|| Sort::bitvec(32));
         let name = self.ctx.fresh_name(name_prefix);
         let expr = self.ctx.declare_var(&name, sort);
-        self.ctx.record_kani_any_var(expr.clone());
+        self.record_symbolic_playback_value(expr.clone(), name_prefix);
         self.assert_scalar_validity_for_ty(ty, expr.clone());
         expr
+    }
+
+    fn record_symbolic_playback_value(&mut self, expr: Expr, name_prefix: &str) {
+        let guard = self.current_path_condition.clone();
+        if name_prefix == "ay_any" {
+            self.ctx.record_kani_any_var(expr, guard);
+        } else {
+            self.ctx.record_unreplayable_playback_value(expr, guard);
+        }
     }
 
     pub(super) fn codegen_kani_write_any_slim(&mut self, args: &[Operand]) -> bool {
@@ -186,7 +235,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let fresh = self.create_constrained_symbolic(pointee_ty, "ay_write_any");
         let pointer = self.resolve_concrete_expr(&self.coerce_to_ptr_width(pointer_expr));
-        self.ctx.store_memory_bytes(pointer.clone(), fresh.clone());
+        self.store_memory_bytes_on_path(pointer.clone(), fresh.clone(), "kani::any write");
         // Register lane: prefer the tracked pointee NAME. The addr-symbol
         // structural match below fails whenever the pointer term is an SSA
         // var rather than the literal address symbol — e.g. a stub_verified
@@ -280,7 +329,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.ctx.assert(validity);
     }
 
-    fn nonzero_validity_constraint(expr: Expr) -> Option<Expr> {
+    pub(in crate::codegen_ay::statement) fn nonzero_validity_constraint(
+        expr: Expr,
+    ) -> Option<Expr> {
         if let Some(width) = expr.sort().bitvec_width() {
             return Some(expr.eq(Expr::bitvec_const(0u64, width)).not());
         }
@@ -290,7 +341,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         None
     }
 
-    fn char_validity_constraint(expr: Expr) -> Option<Expr> {
+    pub(in crate::codegen_ay::statement) fn char_validity_constraint(expr: Expr) -> Option<Expr> {
         if let Some(width) = expr.sort().bitvec_width() {
             let low_range = expr.clone().bvule(Expr::bitvec_const(0xD7FFu64, width));
             let high_lower = expr.clone().bvuge(Expr::bitvec_const(0xE000u64, width));
@@ -412,10 +463,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // pointer stored at `pointee`, so a deref of the result
                 // lands wherever that pointer's own pointee is.
                 if let Some(next) = self.ref_pointees.get(pointee.as_ref()).cloned() {
-                    debug!(
-                        "untracked_deref: chaining ref_pointees {} -> {}",
-                        dest_base, next
-                    );
+                    debug!("untracked_deref: chaining ref_pointees {} -> {}", dest_base, next);
                     self.ref_pointees.insert(Arc::from(dest_base.as_str()), next);
                 }
                 if let Some(val) = self.env_lookup(pointee.as_ref()).cloned() {
@@ -603,6 +651,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let fallback_sort =
                 Self::infer_sort_from_ty(arg_ty).unwrap_or_else(|| Sort::bitvec(32));
             let name = self.ctx.fresh_name("ay_value_view_unsupported");
+            self.ctx.bmc_sound_havoc("value_view_unsupported");
             let expr = self.ctx.declare_var(&name, fallback_sort);
             self.env_update(base_name, expr);
             return;

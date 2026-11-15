@@ -17,6 +17,9 @@
 //!
 //! Part of #3348: clone-return-from-method gap for struct-embedded collections.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -109,8 +112,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if variants.is_empty() {
             return None;
         }
-        let has_collection =
-            variants[0].fields().iter().any(|f| Self::type_is_hashmap(&f.ty_with_args(&args)));
+        let has_collection = variants[0]
+            .fields()
+            .iter()
+            .any(|f| mono_ty::field_ty(f, &args).is_some_and(|t| Self::type_is_hashmap(&t)));
         if !has_collection {
             return None;
         }

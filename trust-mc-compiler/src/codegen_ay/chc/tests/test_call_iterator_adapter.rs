@@ -205,7 +205,7 @@ fn test_fresh_adapter_symbol_produces_unique_names() {
     with_test_ay_ctx_for_source(ADAPTER_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "adapter_probe");
         let body = instance.body().expect("body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
 
         let sym1 = chc_ctx.fresh_adapter_symbol("test_sym", Sort::bitvec(32));
         let sym2 = chc_ctx.fresh_adapter_symbol("test_sym", Sort::bitvec(32));
@@ -225,7 +225,7 @@ fn test_fresh_adapter_symbol_preserves_sort() {
     with_test_ay_ctx_for_source(ADAPTER_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "adapter_probe");
         let body = instance.body().expect("body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
 
         let bool_sym = chc_ctx.fresh_adapter_symbol("filter_keep", Sort::bool());
         assert!(bool_sym.sort().is_bool(), "Bool sort should be preserved");
@@ -244,7 +244,7 @@ fn test_rebuild_datatype_with_field_replaces_named_field() {
     with_test_ay_ctx_for_source(ADAPTER_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "adapter_probe");
         let body = instance.body().expect("body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
 
         let iter_sort = struct_sort(
             "VecIter_u32",
@@ -270,7 +270,7 @@ fn test_rebuild_datatype_with_field_nonexistent_field() {
     with_test_ay_ctx_for_source(ADAPTER_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "adapter_probe");
         let body = instance.body().expect("body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
 
         let dt_sort = struct_sort("Simple", [("fld_x", Sort::bitvec(32))]);
 
@@ -288,7 +288,7 @@ fn test_rebuild_datatype_non_datatype_sort_returns_none() {
     with_test_ay_ctx_for_source(ADAPTER_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "adapter_probe");
         let body = instance.body().expect("body");
-        let chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "adapter_probe", ChcConfig::default());
 
         let non_dt = Expr::var("x", Sort::bitvec(32));
         let replacement = Expr::bitvec_const(0u64, 32);
@@ -510,11 +510,11 @@ fn test_range_spec_next_modeling_failure_emits_error_rule_without_symbolic_fallb
             stmt_constraints: &stmt_constraints,
             modified_locals: &modified_locals,
         };
-        chc_ctx.codegen_call_iterator_adapter(&cx);
+        chc_ctx.codegen_call_iterator_adapter(&cx, None);
 
-        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one fallback rule");
+        assert_eq!(chc_ctx.vc.rules.len(), before_rules + 2, "expected one fallback rule plus its error_p bridge");
         let rule = chc_ctx.vc.rules.last().expect("RangeSpecNext should emit one fallback rule");
-        assert_eq!(rule.head.name, "error", "RangeSpecNext fallback must be fail-closed");
+        assert!(is_error_check_rule(rule), "RangeSpecNext fallback must be fail-closed");
         assert_eq!(
             rule.body.constraints.len(),
             stmt_constraints.len(),

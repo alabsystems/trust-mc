@@ -28,7 +28,7 @@
 
 use std::collections::BTreeSet;
 
-use trust_ir::inst::{Inst, UnOp};
+use trust_ir::inst::{AllocOrigin, Inst, UnOp};
 use trust_ir::ty::Ty;
 use trust_ir_build::ModuleBuilder;
 use trust_mc_trust_bmc::{
@@ -41,7 +41,18 @@ const TRANSLATE_CHC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/translate_
 
 /// Exits labelled today. Bumping this is the deliberate act of adding an exit —
 /// it is not a formality: the census's cause split is only as complete as this.
-const EXPECTED_LABELLED_EXITS: usize = 83;
+// Complete field constructors add eight distinct shape/binding exits and four
+// definedness/opaque/argument-transport exits; every original exit is retained.
+// Canonical top-level call consumption adds three separately named exits.
+// Source identity, per-node consumption, and exact partial-constant encoding
+// add four independently named refusals; all 132 existing exits remain.
+// Explicit live-reference inputs add nested_argument_reference_arity.
+// Main's zero-field constant arm adds one binding-conflict exit.
+// Exact dataless enum values add six named exits (a3d70ec7f: the constant and
+// constructor arms, each with its binding and bind-conflict exits), and exact enum
+// tag selects add seven (a618f7d07: enum_select_*). Both landed without this
+// bump, so the census was red from 2026-11-03; every earlier exit remains.
+const EXPECTED_LABELLED_EXITS: usize = 151;
 
 /// Source of `try_direct_call_summary` + `call_summary_successor_state`, with
 /// line comments removed.
@@ -171,9 +182,14 @@ fn two_outcome_module() -> trust_ir::Module {
         fb.switch_to_block(entry);
         fb.set_entry(entry);
         let x = fb.add_block_param(entry, Ty::I32);
-        // `Alloca` has no arm in the bounded summary interpreter, so this callee
-        // takes the anonymous catch-all exit — with `Alloca` as the detail.
-        let _slot = fb.alloca(Ty::I32);
+        // `HeapAlloc` has no arm in the bounded summary interpreter, so this
+        // callee takes the anonymous catch-all exit — with `HeapAlloc` as the
+        // detail. (This was `Alloca` until the return-slot arms landed; a
+        // single-cell, non-escaping `Alloca` is now MODELLED, so it stopped
+        // being a decline control. The control must name a construct the
+        // interpreter genuinely does not model, or it silently stops testing
+        // the split it exists to test.)
+        let _slot = fb.heap_alloc(Ty::I32, None, None, AllocOrigin::RustHeap);
         fb.ret(vec![x]);
         fb.build()
     };
@@ -190,7 +206,7 @@ fn two_outcome_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn census_options() -> TranslateOptions {
@@ -247,7 +263,7 @@ fn census_positive_control_and_zero_false_positives() {
         .collect();
     assert_eq!(
         declined,
-        vec![("blocked", "unmodeled_instruction", Some("Alloca".to_owned()))],
+        vec![("blocked", "unmodeled_instruction", Some("HeapAlloc".to_owned()))],
         "an unmodelled construct must be attributed to its labelled exit, with the opcode"
     );
 

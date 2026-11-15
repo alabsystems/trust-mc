@@ -116,7 +116,8 @@ Exit codes:
     2  usage error                3  engine, sysroot or solver not installed
 
 Learn more:  trust-mc explain        trust-mc quickstart        trust-mc flags
-To verify a Cargo package rather than a single file, use `cargo trust-mc`.
+To verify a Cargo package rather than a single file, use `targo trust-mc`
+(`cargo trust-mc` with stock Rust).
 ",
         usage = usage_lines()
     )
@@ -255,10 +256,13 @@ binary on PATH with its build stamp.
 
 Install a published release bundle (engine + compiler + library sysroot) into
 ${KANI_HOME:-~/.kani}/kani-<VERSION> and the Rust toolchain it was built
-with. Needs curl, tar and rustup. Use --use-local-bundle to install a bundle
-you built with `cargo bundle`. A local checkout does not need setup:
-`cargo run --release -p build-trust-mc -- build-dev --release` builds an
-engine that trust-mc finds by itself.
+with. A bundle built with the Trust toolchain needs that toolchain named with
+--use-local-toolchain <seal directory> (rustup cannot download Trust); a
+bundle recording a rustup channel installs it with rustup. Needs curl and
+tar. Use --use-local-bundle to install a bundle you built with
+`targo --unverified bundle`. A local checkout does not need setup:
+`targo --unverified build-dev --release` builds an engine that trust-mc finds
+by itself.
 "
         }
         "help" => {

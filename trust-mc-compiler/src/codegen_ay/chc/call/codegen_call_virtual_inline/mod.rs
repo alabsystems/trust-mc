@@ -11,6 +11,7 @@
 //! Part of #3159: DynTrait category recovery Phase 1.
 //! Part of #3639: Decomposed from monolithic file into 8 submodules.
 
+mod assert_validity_inline;
 mod atomic_inline;
 mod dispatch;
 mod drop_placeholder_dispatch;
@@ -19,16 +20,21 @@ mod execution_state;
 mod field_map;
 mod fn_trait_dispatch;
 mod gap_classify;
+pub(in crate::codegen_ay::chc) mod host_bound_discharge;
 mod inline_alloc_helpers;
 mod inline_call_classify;
 mod inline_drop;
 mod inline_drop_helpers;
 mod inline_shared_drop;
 mod kani_inline;
+mod leaf_models;
+pub(in crate::codegen_ay::chc) mod loop_contract_scan;
 pub(in crate::codegen_ay::chc) mod loop_replay;
+mod nested_bounded_any;
 mod nested_call;
 mod nested_call_fallback;
 mod nested_iter_next;
+mod nested_iter_query;
 pub(in crate::codegen_ay::chc) mod nested_option_state;
 #[allow(dead_code)] // Call site wired in dirty-tree nested_call.rs (#4067)
 mod nested_option_unwrap;
@@ -40,6 +46,8 @@ mod nested_vec_push;
 mod pointer_wrapper;
 mod projected_assign;
 mod projected_assign_helpers;
+mod referent_write;
+pub(in crate::codegen_ay::chc) mod region_intervals;
 mod register_contract;
 #[allow(dead_code)] // Call site wired in dirty-tree nested_call.rs (#3979)
 mod result_copied;
@@ -51,11 +59,15 @@ mod statement_exec_helpers;
 mod statement_metadata;
 mod switchint;
 mod terminator_exec;
+#[cfg(test)]
+pub(in crate::codegen_ay::chc) use terminator_exec::host_local_built_valid;
+pub(in crate::codegen_ay::chc) mod uncertified_check;
 mod vtable_prop;
 mod walker;
 
 use super::ChcCtx;
 use super::codegen_types::CodegenTypes;
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, ProjectionElem};
 use rustc_public::rustc_internal;
@@ -65,7 +77,9 @@ use tracing::debug;
 // Re-export generic inline types from their neutral homes.
 // Part of #3241: generic callers now import from inline_field_map / inline_body.
 pub(in crate::codegen_ay::chc) use super::inline_body::InlineReturn;
-pub(in crate::codegen_ay::chc) use nested_option_state::is_option_like_sort;
+pub(in crate::codegen_ay::chc) use nested_option_state::{
+    CoreOptionStateMethod, core_option_state_method, is_option_like_sort,
+};
 pub(in crate::codegen_ay::chc) use vtable_prop::attach_spawn_task_slot_vtable;
 
 // Part of #3995: Re-export fn_trait_dispatch helpers for top-level virtual dispatch.
@@ -130,10 +144,14 @@ pub(in crate::codegen_ay::chc) fn switchint_walk_node_budget() -> usize {
 }
 
 /// Maximum inline recursion depth to prevent stack overflow on recursive Rust functions.
-/// At depth 4, we've inlined 4 nested bodies which is sufficient for most non-recursive
-/// call chains. Recursive functions bail to None (sound: falls through to over-approximation).
-/// Part of #3614: Prevents compiler crash on valid recursive Rust code.
-const MAX_INLINE_DEPTH: usize = 4;
+/// Iterator comparisons reach the element's PartialEq body through iter_eq,
+/// iter_compare, try_for_each and closure shims. Four frames stopped before the
+/// element comparison and replaced the remaining bodies with havoc. Walk the
+/// actual bodies through a bounded chain; loop fuel, SwitchInt node budget and
+/// the translation deadline still bound work, and exhaustion still fails closed.
+/// Recursive functions remain bounded too; this does not supply a return value
+/// or discharge an obligation when a body cannot be walked.
+pub(in crate::codegen_ay::chc) const MAX_INLINE_DEPTH: usize = 16;
 
 pub(super) fn current_inline_callee_name(ctx: &ChcCtx<'_, '_>) -> Option<String> {
     let instance = ctx.current_instance?;
@@ -163,8 +181,11 @@ fn virtual_panic_fallback<'tcx, 'body>(
         %callee,
         "virtual body: panic/assert fallback -> __assert_fail_inline"
     );
-    ctx.record_aggregate_gap(&reason);
-    Some(InlineReturn::value_only(super::declare_pending_var(
+    // Labelled only: the symbol is counted as a gap if it reaches a rule
+    // (`translate.rs` `account_escaped_assert_fallbacks`); a consumer that
+    // extracts its `false` guard cuts the path and strips it.
+    ctx.note_gap_reason(&reason);
+    Some(InlineReturn::value_only(ExactVar::nondet(
         super::chc_fresh_name("__assert_fail_inline"),
         ret_sort,
     )))
@@ -172,6 +193,10 @@ fn virtual_panic_fallback<'tcx, 'body>(
 
 // Public API re-exports for external consumers.
 pub(in crate::codegen_ay::chc) use dispatch::build_dispatch_ite_chain;
+pub(in crate::codegen_ay::chc) use dispatch::{
+    DispatchDefault, guard_dispatch_arm_pending_checks, merge_guarded_dispatch_results,
+};
+pub(in crate::codegen_ay::chc) use walker::expr_written_out_size;
 pub(in crate::codegen_ay::chc) use walker::translate_body_with_resolver;
 pub(in crate::codegen_ay::chc) use walker::translate_virtual_body_inline;
 

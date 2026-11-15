@@ -9,6 +9,8 @@
 //!
 //! Part of #3743: CHC statement dispatch + SetDiscriminant parity.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::{Place, ProjectionElem};
 use rustc_public::rustc_internal;

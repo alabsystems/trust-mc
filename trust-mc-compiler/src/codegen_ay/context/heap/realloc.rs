@@ -65,7 +65,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         let saved_old_ptr = old_ptr.clone();
 
         // Deallocate old — ptr-only variant handles double-free and base-pointer checks.
-        self.heap_dealloc_ptr_only(old_ptr);
+        self.heap_dealloc_ptr_only(old_ptr, None);
 
         // Allocate new
         let new_ptr = self.heap_alloc(new_size.clone(), align);

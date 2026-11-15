@@ -21,11 +21,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `[addr, addr + count * size_of::<T>())` must lie within `addr`'s
     /// allocation, and `addr` must be aligned for `T`.
     ///
-    /// Only emits when the address splits and its obj_id lane const-folds.
-    /// Genuinely-unknown provenance keeps the historical skip — the
-    /// allocation size is a caller contract we cannot invent (memory-model
-    /// precision plan, Step 5). Returned conditions must HOLD (same contract
-    /// as `heap_access_checks`).
+    /// Emits when the address splits. A symbolic object lane is bounded by
+    /// the size of the object the lane names (`symbolic_lane_bounds`), exactly
+    /// as `heap_access_checks` bounds a single access. Returned conditions
+    /// must HOLD (same contract as `heap_access_checks`).
     pub(in crate::codegen_ay::chc) fn heap_span_access_checks(
         &mut self,
         addr: &Expr,
@@ -53,13 +52,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // The size/bounds/no-wrap/fit-alloc checks below need a const-folded
-        // obj_id to resolve the allocation size — a caller contract we cannot
-        // invent for genuinely-unknown provenance (memory-model precision
-        // plan, Step 5). Return the alignment check alone in that case.
-        let Some(const_obj_id) = Self::const_obj_id_u32(&obj_id) else {
-            return checks;
-        };
+        // The size/bounds/no-wrap/fit-alloc checks below take the allocation's
+        // size from a const-folded obj_id, or, for a symbolic object lane, the
+        // size of the object that lane names (`symbolic_lane_bounds`): the
+        // lane is the object's number whatever produced it. A span through a pointer stepped past
+        // its object by the wrapping family used to get the alignment check
+        // alone (review of fix/chc-lost-writes, lostwrite round 1, finding 4).
+        let const_obj_id = Self::const_obj_id_u32(&obj_id);
         let Some(elem_size) = self.get_type_size(elem_ty) else {
             return checks;
         };
@@ -87,7 +86,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let end_offset = offset.clone().bvadd(span32);
         checks.push(end_offset.clone().bvuge(offset));
 
-        if let Some(alloc_size) = self.alloc_size_expr_for_const_obj_id(const_obj_id, &obj_id) {
+        let alloc_size = match const_obj_id {
+            Some(id) => self.alloc_size_expr_for_const_obj_id(id, &obj_id),
+            None if self.lane_is_fail_closed_havoc(&obj_id) => None,
+            None => {
+                let bounds = self.symbolic_lane_bounds(&obj_id, &end_offset);
+                if !bounds.is_empty() {
+                    // A symbolic-size allocation's bound reads `obj_size`.
+                    self.mark_heap_metadata_read();
+                }
+                checks.extend(bounds);
+                None
+            }
+        };
+        if let Some(alloc_size) = alloc_size {
             let zero = Expr::bitvec_const(0u64, 32);
             let is_zero_size = alloc_size.clone().eq(zero);
             checks.push(Expr::or(is_zero_size, end_offset.bvule(alloc_size)));

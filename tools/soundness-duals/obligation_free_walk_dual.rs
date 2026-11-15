@@ -6,11 +6,14 @@
 //
 // `ArtifactMetadata.obligation_free_body` is positive compiler evidence that
 // zero emitted checks means "nothing to prove" rather than "we dropped it".
-// The driver's V4 vacuity gate trusts it: a certified harness with no checks
-// is reported SUCCESSFUL instead of VACUOUS. So a certificate handed to a
-// harness that DOES have an obligation is a false-Safe channel — the only
-// thing that saves it is the encoder happening to emit the check anyway,
-// which is luck, not soundness.
+// From 886f60544 until 2026-09-11 the driver's V4b no-checks gate SKIPPED on
+// it: a certified harness with no checks was a bare clean SUCCESSFUL. Since
+// D16's second step a certified empty obligation set exits 0 THROUGH the gate,
+// as `SUCCESSFUL (no checks — compiler-certified obligation-free)` with a
+// non-clean proof qualifier, and an uncertified one stays INCONCLUSIVE. So a
+// certificate handed to a harness that DOES have an obligation is a live
+// false-Safe channel the moment the encoder drops that obligation's check:
+// these tripwires are what stands in front of it.
 //
 // The certificate used to require "no Call and no Assert terminator in this
 // body", which no harness that calls anything could satisfy. It now walks the

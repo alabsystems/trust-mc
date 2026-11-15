@@ -40,6 +40,14 @@ pub(in crate::codegen_ay::chc) fn is_recursively_flattenable(sort: &Sort, depth:
     false
 }
 
+/// A sort that occupies exactly one flattened slot as a scalar: BV, Bool, Int,
+/// Real or Array. `collect_leaf_sorts` returns a Datatype leaf only where
+/// flattening stopped (depth cap, multi-constructor datatype); such a slot is
+/// not a leaf of this kind.
+pub(in crate::codegen_ay::chc) fn is_scalar_leaf_sort(sort: &Sort) -> bool {
+    sort.is_bitvec() || sort.is_bool() || sort.is_int() || sort.is_real() || sort.is_array()
+}
+
 /// Recursively collect all leaf scalar sorts from a (possibly nested) Datatype sort.
 ///
 /// For a single-constructor Datatype with nested Datatypes, this recursively
@@ -130,6 +138,47 @@ pub(in crate::codegen_ay::chc) fn compute_nested_flat_slot(
     }
 
     None
+}
+
+/// Whether `compute_nested_flat_slot` / `compute_nested_flat_span` walk
+/// `field_indices` over the layout `collect_leaf_sorts(sort, 0)` really has.
+///
+/// Those walks count each earlier sibling's leaves from depth 0, while the
+/// layout expands a datatype only above `MAX_FLATTEN_DEPTH` counted from the
+/// root. They agree unless the path consumes a level at or below the cap (the
+/// layout keeps that datatype in ONE slot), or an earlier sibling at depth
+/// `d + 1`, or the terminal itself, has fewer leaves counted from its own
+/// depth than from 0 (a span over it reads slots that belong to others). For
+/// `K0 { k1: K1 { k2: K2 { k3: K3 { k4: K4 { x, y } } } }, z }` the layout is
+/// `[K4, z]` and `[0, 0, 0, 0, 1]` (`k1.k2.k3.k4.y`) resolved to slot 1, z's.
+///
+/// A path the walks themselves reject (an index out of range, a level that is
+/// not a single-constructor datatype) is not refused here: they return `None`.
+pub(in crate::codegen_ay::chc) fn nested_flat_walk_is_depth_faithful(
+    sort: &Sort,
+    field_indices: &[usize],
+) -> bool {
+    let mut current = sort.clone();
+    for (depth, &field_idx) in field_indices.iter().enumerate() {
+        if depth >= MAX_FLATTEN_DEPTH {
+            return false;
+        }
+        let next = {
+            let Some(dt) = current.datatype_sort() else { return true };
+            let [ctor] = dt.constructors.as_slice() else { return true };
+            let Some(field) = ctor.fields.get(field_idx) else { return true };
+            let siblings_agree = ctor.fields[..field_idx].iter().all(|sibling| {
+                collect_leaf_sorts(&sibling.sort, 0).len()
+                    == collect_leaf_sorts(&sibling.sort, depth + 1).len()
+            });
+            if !siblings_agree {
+                return false;
+            }
+            field.sort.clone()
+        };
+        current = next;
+    }
+    collect_leaf_sorts(&current, 0).len() == collect_leaf_sorts(&current, field_indices.len()).len()
 }
 
 /// Compute the flattened slot span for a field projection chain.
@@ -356,6 +405,66 @@ mod tests {
         assert_eq!(compute_nested_flat_slot(&a, &[0, 0, 0]), Some(0)); // b.c.x
         assert_eq!(compute_nested_flat_slot(&a, &[0, 1]), Some(1)); // b.y
         assert_eq!(compute_nested_flat_slot(&a, &[1]), Some(2)); // z
+    }
+
+    #[test]
+    fn test_is_scalar_leaf_sort() {
+        assert!(is_scalar_leaf_sort(&Sort::bitvec(8)));
+        assert!(is_scalar_leaf_sort(&Sort::bool()));
+        assert!(is_scalar_leaf_sort(&Sort::int()));
+        assert!(is_scalar_leaf_sort(&Sort::array(Sort::bitvec(64), Sort::bitvec(8))));
+        let dt = make_dt_sort("S", vec![("a", Sort::bitvec(32))]);
+        assert!(!is_scalar_leaf_sort(&dt));
+    }
+
+    /// Flattening stops at depth `MAX_FLATTEN_DEPTH` and keeps the subtree
+    /// there as ONE datatype slot, while `compute_nested_flat_span` recounts
+    /// every earlier sibling from depth 0. The two disagree on the offset of
+    /// anything after such a subtree, which is why `resolve_flat_struct_path`
+    /// refuses a local with a non-scalar declared slot.
+    #[test]
+    fn test_collect_leaf_sorts_depth_cap_keeps_datatype_slot() {
+        let l4 = make_dt_sort("L4", vec![("x", Sort::bitvec(8)), ("y", Sort::bitvec(8))]);
+        let l3 = make_dt_sort("L3", vec![("l4", l4.clone())]);
+        let l2 = make_dt_sort("L2", vec![("l3", l3)]);
+        let l1 = make_dt_sort("L1", vec![("l2", l2)]);
+        let l0 = make_dt_sort("L0", vec![("l1", l1.clone()), ("z", Sort::bitvec(8))]);
+
+        let declared = collect_leaf_sorts(&l0, 0);
+        assert_eq!(declared, vec![l4, Sort::bitvec(8)], "the depth-4 subtree stays one slot");
+        assert!(!declared.iter().all(is_scalar_leaf_sort));
+        // The recount from depth 0 sees two leaves before `z`, the declared
+        // layout one.
+        assert_eq!(collect_leaf_sorts(&l1, 0).len(), 2);
+        assert_eq!(compute_nested_flat_span(&l0, &[1]), Some((2, 1)));
+    }
+
+    /// The index walks are faithful to the capped layout only on paths that
+    /// stay above the cap and whose earlier siblings and terminal have the
+    /// same leaf count from their own depth as from 0.
+    #[test]
+    fn test_nested_flat_walk_is_depth_faithful() {
+        let l4 = make_dt_sort("L4", vec![("x", Sort::bitvec(8)), ("y", Sort::bitvec(8))]);
+        let l3 = make_dt_sort("L3", vec![("l4", l4)]);
+        let l2 = make_dt_sort("L2", vec![("l3", l3)]);
+        let l1 = make_dt_sort("L1", vec![("l2", l2)]);
+        let l0 = make_dt_sort("L0", vec![("l1", l1.clone()), ("z", Sort::bitvec(8))]);
+        // `l1.l2.l3.l4.y` walks into the capped L4 slot and named z's slot.
+        assert_eq!(compute_nested_flat_slot(&l0, &[0, 0, 0, 0, 1]), Some(1));
+        assert!(!nested_flat_walk_is_depth_faithful(&l0, &[0, 0, 0, 0, 1]));
+        // `l1.l2.l3.l4` as a span counts L4's two leaves; the layout has one.
+        assert!(!nested_flat_walk_is_depth_faithful(&l0, &[0, 0, 0, 0]));
+        // `z` after the capped subtree: two leaves from depth 0, one in place.
+        assert!(!nested_flat_walk_is_depth_faithful(&l0, &[1]));
+        // Shallow owners are untouched, and so is a path that stays clear of
+        // a deep sibling subtree's cap.
+        let inner = make_dt_sort("Inner", vec![("a", Sort::bitvec(32)), ("b", Sort::bitvec(32))]);
+        let outer = make_dt_sort("Outer", vec![("inner", inner.clone()), ("z", Sort::bitvec(64))]);
+        assert!(nested_flat_walk_is_depth_faithful(&outer, &[0, 1]));
+        assert!(nested_flat_walk_is_depth_faithful(&outer, &[1]));
+        let side = make_dt_sort("Side", vec![("s", inner), ("deep", l1)]);
+        assert!(nested_flat_walk_is_depth_faithful(&side, &[0, 1]));
+        assert!(!nested_flat_walk_is_depth_faithful(&side, &[1, 0, 0, 0]));
     }
 
     #[test]

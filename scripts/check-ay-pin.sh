@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="${ROOT_DIR}/Cargo.toml"
 AY_REPO="${ROOT_DIR}/../ay"
-TRUST_MC_CARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" cargo)"
+TRUST_MC_TARGO="$("${ROOT_DIR}/scripts/resolve-trust-tool.sh" targo)"
 AY_PINNED_PACKAGES=(
     ay-dpll
     ay-core
@@ -54,9 +54,9 @@ for package in "${AY_PATCHED_PACKAGES[@]}"; do
     checkout_manifest="${AY_REPO}/crates/${package}/Cargo.toml"
     [[ -f "${checkout_manifest}" ]] \
         || die "missing checkout manifest for ${package}: ${checkout_manifest}"
-    resolved_id="$("${TRUST_MC_CARGO}" pkgid --frozen --manifest-path "${MANIFEST}" "${package}")" \
+    resolved_id="$("${TRUST_MC_TARGO}" pkgid --frozen --manifest-path "${MANIFEST}" "${package}")" \
         || die "Cargo could not resolve ${package} from ${MANIFEST}"
-    checkout_id="$("${TRUST_MC_CARGO}" pkgid --frozen --manifest-path "${checkout_manifest}")" \
+    checkout_id="$("${TRUST_MC_TARGO}" pkgid --frozen --manifest-path "${checkout_manifest}")" \
         || die "Cargo could not identify checkout package ${checkout_manifest}"
     [[ "${resolved_id}" == "${checkout_id}" ]] \
         || die "Cargo resolves ${package} as ${resolved_id}, not checkout ${checkout_id}"

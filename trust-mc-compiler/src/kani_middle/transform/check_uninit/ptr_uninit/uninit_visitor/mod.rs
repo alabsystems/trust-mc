@@ -128,13 +128,14 @@ impl MirVisitor for CheckUninitVisitor {
             | StatementKind::SetDiscriminant { .. }
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
-            | StatementKind::Retag(_, _)
             | StatementKind::PlaceMention(_)
             | StatementKind::AscribeUserType { .. }
             | StatementKind::Coverage(_)
             | StatementKind::ConstEvalCounter
             | StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))
             | StatementKind::Nop => self.super_statement(stmt, location),
+            #[cfg(not(trust_toolchain))]
+            StatementKind::Retag(_, _) => self.super_statement(stmt, location),
         }
         // Switch to the next statement.
         if let SourceInstruction::Statement { idx, bb } = self.current_target.source {
@@ -297,6 +298,15 @@ impl MirVisitor for CheckUninitVisitor {
     }
 
     fn visit_rvalue(&mut self, rvalue: &Rvalue, location: Location) {
+        // A reborrow reads the bytes of `place`: codegen lowers it to `Operand::Copy(place)`.
+        // Visit it as that copy. `super_rvalue` would pass a mutating place context for a
+        // `Mut` reborrow, which skips the union-field initialization check in `visit_place`.
+        #[cfg(trust_toolchain)]
+        if let Rvalue::Reborrow(target, _, place) = rvalue {
+            self.visit_ty(target, location);
+            self.visit_operand(&Operand::Copy(place.clone()), location);
+            return;
+        }
         if let Rvalue::Cast(cast_kind, operand, ty) = rvalue {
             match cast_kind {
                 CastKind::PointerCoercion(PointerCoercion::Unsize) => {

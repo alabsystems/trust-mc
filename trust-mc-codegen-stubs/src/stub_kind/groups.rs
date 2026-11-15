@@ -167,6 +167,8 @@ impl StubKind {
             | Self::StringEq
             | Self::StringAsStr
             | Self::StringIntoBoxedStr
+            | Self::StringFromUtf8
+            | Self::StringIntoBytes
             | Self::StrBytesNth
             | Self::StrCharsNth => STRING_CORE,
             Self::RawVecNewIn
@@ -318,6 +320,7 @@ impl StubKind {
             | Self::BigRationalDivAssign => BIG_RATIONAL,
             // Ungrouped — routed by dedicated detectors (bigint, hashmap, alloc)
             Self::BoxNew
+            | Self::SliceRepeat
             | Self::RustAlloc
             | Self::RustAllocZeroed
             | Self::RustDealloc

@@ -249,6 +249,36 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
             return;
         }
     }
+    // minnum / maxnum (Trust: minimum_number_nsz_* / maximum_number_nsz_*): a RELATION between
+    // the arguments and the result, not a function of the arguments. Zeros of opposite sign
+    // may come back as either zero and two NaNs as any NaN, so the destination is constrained
+    // by `math_axioms::minmax_num_result_constraint` instead of being equated to one choice.
+    // Not an over-approximation beyond that contract, so nothing is recorded as a fallback.
+    // A sort the relation cannot express falls through to the sound tiers below.
+    if let Some(is_min) = math_axioms::minmax_num_kind(callee_path)
+        && dcx.args.len() >= 2
+        && let Some(arg0_expr) = ctx.translate_operand_with_modified(&dcx.args[0], modified_locals)
+        && let Some(arg1_expr) = ctx.translate_operand_with_modified(&dcx.args[1], modified_locals)
+        && let Some((_, dest_var)) = ctx.resolve_destination(dest_local)
+        && let Some(constraint) = math_axioms::minmax_num_result_constraint(
+            is_min, &arg0_expr, &arg1_expr, &dest_var, width,
+        )
+    {
+        let new_output_args = ctx.build_output_args(modified_locals, &[dest_local]);
+        ctx.emit_goto_rule_extra(
+            from_app,
+            target,
+            &new_output_args,
+            stmt_constraints,
+            [constraint],
+        );
+        debug!(
+            callee = callee_path,
+            is_f32, "math intrinsic minnum/maxnum relation (bb{}->bb{})", bb_idx, target
+        );
+        return;
+    }
+
     // Binary exact encoding (copysign).
     if dcx.args.len() >= 2
         && let Some(arg0_expr) = ctx.translate_operand_with_modified(&dcx.args[0], modified_locals)
@@ -277,12 +307,13 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
 
     // CONGRUENCE (Part of #4270 / TL18). Every tier below leaves the result a
     // fresh havoc, so the encoder could not prove `sin(x) == sin(x)` — the two
-    // sites got independent values. Bind the destination to a select over the
-    // frozen, never-constrained `call_uf_tbl` instead: still universally
-    // quantified (for a fixed key the ∀-table ranges over every value, so no
-    // behaviour is removed), but now EQUAL at equal arguments, which is what
-    // the real function does. Purity is established by the intrinsic's
-    // specification — see `call_uf_table::math_uf_summary_term`.
+    // sites got independent values. Bind the destination to an application of a
+    // never-constrained first-class `declare-fun` symbol instead: still
+    // universally quantified (no axiom about the symbol is emitted anywhere, so
+    // its interpretation ranges over every function and no behaviour is
+    // removed), but now EQUAL at equal arguments, which is what the real
+    // function does. Purity is established by the intrinsic's specification —
+    // see `call_uf_table::math_uf_summary_term`.
     let uf_congruence: Option<Expr> = math_uf_congruence(ctx, dcx, callee_path, dest_local);
 
     // Tier 2: Sound range axioms for transcendental intrinsics (Part of #3609).
@@ -382,17 +413,17 @@ pub(in crate::codegen_ay::chc) fn codegen_math_intrinsic(
     );
 }
 
-/// `dest == select(call_uf_tbl, tag(f) ++ args)` for a pure math intrinsic, or
-/// `None` when the table was not declared for this harness, an argument does
-/// not translate, or the key/value widths do not fit (never truncated — a
-/// colliding key would assert an equality that need not hold).
+/// `dest == (uf_call_<tag>_<intrinsic> args..)` for a pure math intrinsic, or
+/// `None` when the congruence lane is disabled for this harness, an argument
+/// does not translate, or a sort is outside the declarable scalar domain (see
+/// `call_uf_table::sort_is_uf_declarable`).
 fn math_uf_congruence(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
     callee_path: &str,
     dest_local: usize,
 ) -> Option<Expr> {
-    if !ctx.call_uf_table_declared() {
+    if !ctx.call_uf_congruence_enabled() {
         return None;
     }
     let mut arg_exprs: Vec<Expr> = Vec::with_capacity(dcx.args.len());

@@ -136,7 +136,8 @@ fn test_split_pointer_step_preserves_obj_id_lane() {
     let step = step_split_pointer(ptr, byte_offset);
 
     let smt = step.result.to_string();
-    assert!(smt.contains("concat"), "split-pointer step should use concat recomposition: {smt}");
+    // Constant operands fold to a literal pointer (3cba77dbc); symbolic ones recompose via concat.
+    assert!(smt.contains("concat") || smt.starts_with("#x"), "split-pointer step should use concat recomposition: {smt}");
 
     let result_obj_id = step.result.clone().extract(63, 32);
     let result_obj_id_smt = result_obj_id.to_string();
@@ -148,7 +149,10 @@ fn test_split_pointer_step_preserves_obj_id_lane() {
     let result_offset = step.result.extract(31, 0);
     let result_offset_smt = result_offset.to_string();
     assert!(
-        result_offset_smt.contains("bvadd"),
+        result_offset_smt.contains("bvadd")
+            // Constant operands fold the step (3cba77dbc) to 0x0000_0042_0000_0104; the
+            // offset lane is then the low half of that literal.
+            || result_offset_smt == "((_ extract 31 0) #x0000004200000104)",
         "offset lane should contain the addition: {result_offset_smt}"
     );
 

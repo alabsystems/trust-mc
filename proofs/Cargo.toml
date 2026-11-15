@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 #
 # Cargo manifest for trust-mc proof harnesses.
-# Run proofs with: cargo trust-mc --harness <name>
+# Run proofs with: targo trust-mc --harness <name>
 
 [package]
 name = "trust-mc-proofs"

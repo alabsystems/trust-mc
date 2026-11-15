@@ -151,7 +151,7 @@ fn test_call_family_files_do_not_silently_drop_coerce_eq_constraints() {
     use std::fs;
     use std::path::Path;
 
-    let chc_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codegen_ay/chc");
+    let chc_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../trust-mc-compiler")).join("src/codegen_ay/chc");
     let call_dir = chc_dir.join("call");
 
     // Dynamically discover all codegen_call_*.rs files so new files are automatically checked.

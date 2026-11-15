@@ -4,6 +4,9 @@
 //
 //! Array and slice `Ord::cmp` support for BMC comparison codegen.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Constraint, Expr, ExprValue, Sort};
 use num_bigint::BigInt;
 use rustc_public::mir::{Operand, Place, Rvalue, StatementKind};
@@ -52,6 +55,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         {
             let unknown_name = self.ctx.fresh_name("ay_ord_cmp_unrolled_overflow");
             let unknown = self.ctx.declare_var(&unknown_name, Sort::bv32());
+            self.ctx.bmc_sound_havoc("ord_cmp_unrolled_overflow");
             return build_ord_lexicographic_cmp_symbolic_len(
                 &lhs,
                 &rhs,
@@ -142,7 +146,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
                 let variants = adt_def.variants();
                 if variants.len() == 1 && variants[0].fields().len() == 1 {
-                    let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                    let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                     Self::ord_extract_array_len_from_ty(field_ty, elem_ty)
                 } else {
                     None
@@ -156,6 +160,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -204,7 +210,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 match rvalue {
                     Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return Some(src.local);
@@ -231,7 +237,7 @@ fn extract_ord_array_data(expr: &Expr) -> Option<Expr> {
         return Some(data.clone());
     }
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let data_field = dt.constructors[0].fields.iter().find(|field| &*field.name == "fld_data")?;
@@ -249,7 +255,7 @@ fn ord_len_from_expr(expr: &Expr) -> Option<usize> {
     }
 
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let len_field = dt.constructors[0].fields.iter().find(|field| &*field.name == "fld_len")?;
@@ -266,7 +272,7 @@ fn ord_len_bv_from_expr(expr: &Expr) -> Option<Expr> {
     }
 
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let len_field = dt.constructors[0].fields.iter().find(|field| &*field.name == "fld_len")?;

@@ -14,6 +14,10 @@
 //! Part of #3348 Direction 2: populate embedded-map aux bridge at constructor
 //! boundaries.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -147,7 +151,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let fields = variants[0].fields();
         let field_is_map: Vec<bool> = fields
             .iter()
-            .map(|field| Self::type_is_hashmap(&field.ty_with_args(&adt_args)))
+            .map(|field| {
+                mono_ty::field_ty(field, &adt_args).is_some_and(|t| Self::type_is_hashmap(&t))
+            })
             .collect();
         if !field_is_map.iter().any(|is_map| *is_map) {
             return None;
@@ -159,7 +165,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        let callee_body = instance.body()?;
+        let callee_body = instance.callee_body()?;
         let pattern = scan_constructor_pattern(&callee_body, &field_is_map)?;
 
         debug!(
@@ -304,7 +310,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
         let field = adt_def.variants().first()?.fields().get(map_field_idx)?.clone();
-        let field_ty = field.ty_with_args(&adt_args);
+        let field_ty = mono_ty::field_ty(&field, &adt_args)?;
         Self::extract_hashmap_sorts(field_ty).map(|(key_sort, _)| key_sort)
     }
 }
@@ -426,7 +432,7 @@ fn trace_to_parameter(body: &Body, mut local: usize, arg_count: usize) -> Option
                     continue;
                 }
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         local = src.local;

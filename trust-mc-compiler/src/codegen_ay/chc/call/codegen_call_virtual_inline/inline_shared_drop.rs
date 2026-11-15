@@ -10,7 +10,6 @@ use ay_bindings::Expr;
 use tracing::debug;
 
 use super::super::ChcCtx;
-use super::super::inline_body::extract_inline_assert_guard;
 use super::super::inline_shared::resolve_place;
 use super::walker::InlineWalkCtx;
 use crate::codegen_ay::chc::rules::codegen_rules::transition_drop::{
@@ -49,10 +48,7 @@ pub(super) fn try_handle_inline_shared_pointer_drop<'tcx, 'body>(
     ) {
         append_shared_pointer_dealloc_effects(ctx, &dealloc_wrapper_expr, known_alloc_id);
         debug!(bb_idx = walk_ctx.bb_idx, "inline drop: shared pointer inner inlined");
-        return Some(
-            extract_inline_assert_guard(&inline_result.value)
-                .unwrap_or_else(|| Expr::bool_const(true)),
-        );
+        return Some(super::inline_drop::park_drop_checks_and_guard(ctx, inline_result));
     }
     ctx.heap_state.restore_transient_rule_state(&heap_snapshot);
     ctx.encode.modified_state_indices = modified_snapshot;

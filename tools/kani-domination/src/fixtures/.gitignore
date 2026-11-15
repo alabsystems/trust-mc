@@ -1,0 +1,5 @@
+# The scorer tests (src/runner.rs) include_str! driver transcripts named *.out.
+# The repository root ignores *.out (build output), which kept all 14 of them
+# out of every commit, so a fresh checkout could not compile the tests
+# (tests/fixtures_tracked.rs guards this).
+!*.out

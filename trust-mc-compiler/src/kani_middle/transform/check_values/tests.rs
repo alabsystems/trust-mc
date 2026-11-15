@@ -353,17 +353,20 @@ fn local_decl() -> LocalDecl {
 }
 
 fn assignment(local: Local, source: Local) -> Statement {
-    Statement {
-        kind: StatementKind::Assign(
+    crate::rustc_compat::mir_statement(
+        StatementKind::Assign(
             Place::from(local),
-            Rvalue::Use(Operand::Copy(Place::from(source))),
+            rvalue_use!(Rvalue::Use(Operand::Copy(Place::from(source)))),
         ),
-        span: Span::to_val(0),
-    }
+        Span::to_val(0),
+    )
 }
 
 fn basic_block(statements: Vec<Statement>, kind: TerminatorKind) -> BasicBlock {
-    BasicBlock { statements, terminator: Terminator { kind, span: Span::to_val(0) } }
+    BasicBlock {
+        statements,
+        terminator: crate::rustc_compat::mir_terminator(kind, Span::to_val(0)),
+    }
 }
 
 fn goto(target: BasicBlockIdx) -> TerminatorKind {
@@ -443,4 +446,100 @@ fn array_source_declines_statement_and_call_destination_definitions() {
         unique_assignment_rhs(&body, 3).is_none(),
         "a call destination must count as a second reaching definition",
     );
+}
+
+// =========================================================================
+// Trust: a shared reborrow whose source place does not type.
+// =========================================================================
+
+#[cfg(trust_toolchain)]
+fn with_probe_tcx<F>(callback: F)
+where
+    F: for<'tcx> FnOnce(TyCtxt<'tcx>) + Send,
+{
+    use rustc_public::{CompilerError, run_with_tcx};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CRATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+    let src_path = temp_dir.path().join("lib.rs");
+    std::fs::write(&src_path, "pub fn probe() {}\n").expect("write test source");
+    let out_dir = temp_dir.path().join("out");
+    std::fs::create_dir_all(&out_dir).expect("create output dir");
+    let args = vec![
+        "rustc".to_string(),
+        src_path.to_string_lossy().into_owned(),
+        "--crate-type=lib".to_string(),
+        format!("--crate-name=check_values_probe_{}", CRATE_COUNTER.fetch_add(1, Ordering::SeqCst)),
+        "--out-dir".to_string(),
+        out_dir.to_string_lossy().into_owned(),
+        "--edition=2024".to_string(),
+    ];
+    let result = run_with_tcx!(&args, |tcx| {
+        callback(tcx);
+        std::ops::ControlFlow::<(), ()>::Continue(())
+    });
+    assert!(
+        result.is_ok() || matches!(result, Err(CompilerError::Skipped)),
+        "rustc_public run failed: {result:?}"
+    );
+}
+
+/// Trust: when the source place of a shared (`CoerceShared`) reborrow does not type (malformed
+/// MIR), the validity pass must fail closed through the `UnsupportedCheck` it already pushes for
+/// unequal validity, instead of panicking.
+#[cfg(trust_toolchain)]
+#[test]
+fn shared_reborrow_of_untyped_source_fails_closed() {
+    with_probe_tcx(|tcx| {
+        let u32_ty = Ty::unsigned_ty(rustc_public::ty::UintTy::U32);
+        let locals = vec![
+            LocalDecl { ty: u32_ty, span: Span::to_val(0), mutability: Mutability::Mut },
+            LocalDecl { ty: u32_ty, span: Span::to_val(0), mutability: Mutability::Not },
+        ];
+        let shared_reborrow_checks = |source: Place| {
+            let reborrow = crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
+                    Place::from(0),
+                    Rvalue::Reborrow(u32_ty, Mutability::Not, source),
+                ),
+                Span::to_val(0),
+            );
+            let body = MutableBody::from(Body::new(
+                vec![basic_block(vec![reborrow], TerminatorKind::Return)],
+                locals.clone(),
+                1,
+                Vec::new(),
+                None,
+                Span::to_val(0),
+            ));
+            CheckValueVisitor::find_next(tcx, &body, 0, false).map_or(0, |target| {
+                target
+                    .operations
+                    .iter()
+                    .filter(|op| {
+                        matches!(op, SourceOp::UnsupportedCheck { check, .. } if *check == "shared reborrow")
+                    })
+                    .count()
+            })
+        };
+
+        // `_1[0 of 1]` indexes a `u32`, so `Place::ty` is an error rather than a type.
+        let untyped = Place {
+            local: 1,
+            projection: vec![ProjectionElem::ConstantIndex {
+                offset: 0,
+                min_length: 1,
+                from_end: false,
+            }],
+        };
+        assert!(untyped.ty(&locals).is_err(), "fixture: the reborrow source must not type");
+        assert_eq!(
+            shared_reborrow_checks(untyped),
+            1,
+            "a shared reborrow of an untyped source must fail closed"
+        );
+        // Control: a well-typed source with exactly the target's validity needs no check.
+        assert_eq!(shared_reborrow_checks(Place::from(1)), 0);
+    });
 }

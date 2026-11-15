@@ -485,3 +485,167 @@ fn test_range_for_loop_int_lifted_has_zero_translation_drops() {
         "Int-lifted for-range should have zero translation drops (#3973), got {place_drops}"
     );
 }
+
+// =============================================================================
+// unanimous_borrowed_local / range_receiver_local — repeated identical borrows
+// =============================================================================
+
+fn range_ref_locals(body: &rustc_public::mir::Body) -> Vec<usize> {
+    use rustc_public::ty::{RigidTy, TyKind};
+    body.local_decls()
+        .filter_map(|(idx, decl)| match decl.ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+                if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Adt(def, _))
+                    if rustc_public::CrateDef::trimmed_name(&def) == "Range") =>
+            {
+                Some(idx)
+            }
+            _ => None, // external enum: TyKind
+        })
+        .collect()
+}
+
+fn whole_producer_count(body: &rustc_public::mir::Body, local: usize) -> usize {
+    use rustc_public::mir::StatementKind;
+    body.blocks
+        .iter()
+        .flat_map(|b| &b.statements)
+        .filter(|s| matches!(&s.kind, StatementKind::Assign(lhs, _)
+            if lhs.local == local && lhs.projection.is_empty()))
+        .count()
+}
+
+fn range_locals(body: &rustc_public::mir::Body) -> Vec<usize> {
+    use rustc_public::ty::{RigidTy, TyKind};
+    body.local_decls()
+        .filter_map(|(idx, decl)| match decl.ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, _))
+                if rustc_public::CrateDef::trimmed_name(&def) == "Range" =>
+            {
+                Some(idx)
+            }
+            _ => None, // external enum: TyKind
+        })
+        .collect()
+}
+
+/// Loop unrolling repeats `p = &mut r` once per copy; every producer names the same
+/// storage, so the walk resolves the receiver to `r`. This is the shape that left
+/// RangeSpecNext with no local and failed it closed on every unrolled step.
+#[test]
+fn test_unanimous_borrowed_local_accepts_repeated_identical_borrows() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+        pub fn probe_same_borrow(n: u64, b: bool) -> u64 {
+            let mut r = 0u64..n;
+            let p: &mut core::ops::Range<u64> = if b { &mut r } else { &mut r };
+            p.start
+        }
+    "#;
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_same_borrow");
+        let body = instance.body().expect("function body");
+        let ranges = range_locals(&body);
+        assert_eq!(ranges.len(), 1, "one Range local expected, got {ranges:?}");
+        let multi: Vec<usize> = range_ref_locals(&body)
+            .into_iter()
+            .filter(|&l| whole_producer_count(&body, l) >= 2)
+            .collect();
+        assert!(!multi.is_empty(), "expected a &mut Range local with several producers");
+        for local in multi {
+            assert_eq!(
+                super::super::codegen_call_iterator_adapter::unanimous_borrowed_local(&body, local),
+                Some(ranges[0]),
+                "every producer of _{local} borrows the one Range local"
+            );
+        }
+    });
+}
+
+/// `if b { &mut r1 } else { &mut r2 }` names different storage per path: no answer.
+#[test]
+fn test_unanimous_borrowed_local_refuses_different_borrows() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+        pub fn probe_diff_borrow(n: u64, b: bool) -> u64 {
+            let mut r1 = 0u64..n;
+            let mut r2 = 1u64..n;
+            let p: &mut core::ops::Range<u64> = if b { &mut r1 } else { &mut r2 };
+            p.start
+        }
+    "#;
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_diff_borrow");
+        let body = instance.body().expect("function body");
+        let multi: Vec<usize> = range_ref_locals(&body)
+            .into_iter()
+            .filter(|&l| whole_producer_count(&body, l) >= 2)
+            .collect();
+        assert!(!multi.is_empty(), "expected a &mut Range local with several producers");
+        for local in multi {
+            assert_eq!(
+                super::super::codegen_call_iterator_adapter::unanimous_borrowed_local(&body, local),
+                None,
+                "_{local} borrows r1 on one path and r2 on the other"
+            );
+        }
+    });
+}
+
+/// An argument has no producer in the body to vouch for its referent: no answer.
+#[test]
+fn test_unanimous_borrowed_local_refuses_argument_receiver() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+        pub fn probe_arg_borrow(p: &mut core::ops::Range<u64>) -> u64 {
+            p.start
+        }
+    "#;
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_arg_borrow");
+        let body = instance.body().expect("function body");
+        assert_eq!(
+            super::super::codegen_call_iterator_adapter::unanimous_borrowed_local(&body, 1),
+            None
+        );
+    });
+}
+
+/// A receiver whose points-at edge is missing still names `Range<i32>` in its type: the
+/// advance reads signedness through the reference (bvslt) instead of the fallback.
+#[test]
+fn test_advance_range_iterator_expr_signedness_through_reference_local() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+        pub fn probe_signed_ref(p: &mut core::ops::Range<i32>) -> i32 {
+            p.start
+        }
+    "#;
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        use ay_bindings::Sort;
+        use std::collections::HashSet;
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_signed_ref");
+        let body = instance.body().expect("function body");
+        let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_signed_ref", ChcConfig::default());
+        chc_ctx.declare_block_relations();
+        let bv = Sort::bitvec(32);
+        let range_sort = enum_sort(
+            "Range_i32_probe",
+            [("Range_i32_probe_ctor", vec![("fld_start", bv.clone()), ("fld_end", bv.clone())])],
+        );
+        let iter_expr = Expr::datatype_constructor(
+            "Range_i32_probe",
+            "Range_i32_probe_ctor",
+            vec![Expr::var("s", bv.clone()), Expr::var("e", bv)],
+            range_sort,
+        );
+        let (_, has_remaining, _) = chc_ctx
+            .advance_range_iterator_expr(&iter_expr, Some(1), &HashSet::new())
+            .expect("datatype Range advance");
+        assert!(
+            matches!(has_remaining.value(), ExprValue::BvSLt(_, _)),
+            "Range<i32> behind &mut must compare signed, got {:?}",
+            has_remaining.value()
+        );
+    });
+}

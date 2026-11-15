@@ -12,6 +12,7 @@
 //!
 //! Extracted from codegen_decl_ref_const_values.rs per #4147 (large-file decomposition).
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use std::sync::Arc;
 
 use ay_bindings::{Expr, Sort};
@@ -25,113 +26,181 @@ use crate::kani_middle::abi::LayoutOf;
 
 use super::codegen_decl_flatten::byte_size_to_bv_width;
 use super::codegen_types::CodegenTypes;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var, push_pending_datatype_sort};
+use super::global_objects::InitSite;
+use super::{ChcCtx, chc_fresh_name, push_pending_datatype_sort};
+use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    /// Extracts a scalar AY expression from a constant reference.
+    /// Decodes a pointee WINDOW (`const_pointer::fixed_pointee`) as a value of
+    /// `inner_ty`, pushing its typed-memory seeds at `site` (the window's own
+    /// object and offset).
     ///
-    /// Part of #1919: For `const &0u8`, the allocation contains a pointer with
-    /// provenance. We follow it to the target allocation and read the scalar value,
-    /// returning it as a AY expression with the correct sort.
-    ///
-    /// Part of #2958: Also populates `memory_inits` with byte-level memory
-    /// array initialization data for the promoted constant at address 0x1000.
-    pub(super) fn extract_scalar_from_const_ref(
-        kind: rustc_public::ty::ConstantKind,
+    /// Part of #1919 / #2958. The window starts at the pointer's offset in its
+    /// target and is exactly the pointee's extent, so every reader below
+    /// decodes from the window's byte 0 — which is the pointee's first byte,
+    /// not the target's. Decoding the whole target from its byte 0 read the
+    /// WRONG element: for `E = &[1u32, 2, 3][1]`, `*E == 1` PROVED.
+    pub(in crate::codegen_ay::chc) fn decode_window(
+        &self,
+        window: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
-        let target_alloc = Self::resolve_const_target_alloc(&kind)?;
-
+        let target_alloc = window;
         match inner_ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => {
-                Self::extract_bool_scalar(&target_alloc, inner_ty, memory_inits, promoted_obj_id)
+                Self::extract_bool_scalar(target_alloc, inner_ty, memory_inits, site)
             }
-            TyKind::RigidTy(RigidTy::Uint(uint_ty)) => Self::extract_uint_scalar(
-                &target_alloc,
-                inner_ty,
-                uint_ty,
-                memory_inits,
-                promoted_obj_id,
-            ),
-            TyKind::RigidTy(RigidTy::Int(int_ty)) => Self::extract_int_scalar(
-                &target_alloc,
-                inner_ty,
-                int_ty,
-                memory_inits,
-                promoted_obj_id,
-            ),
+            TyKind::RigidTy(RigidTy::Uint(uint_ty)) => {
+                Self::extract_uint_scalar(target_alloc, inner_ty, uint_ty, memory_inits, site)
+            }
+            TyKind::RigidTy(RigidTy::Int(int_ty)) => {
+                Self::extract_int_scalar(target_alloc, inner_ty, int_ty, memory_inits, site)
+            }
             TyKind::RigidTy(RigidTy::Char) => {
-                Self::extract_char_scalar(&target_alloc, inner_ty, memory_inits, promoted_obj_id)
+                Self::extract_char_scalar(target_alloc, inner_ty, memory_inits, site)
             }
-            TyKind::RigidTy(RigidTy::Array(elem_ty, const_len)) => {
-                Self::extract_array_from_const_ref(
-                    &target_alloc,
+            TyKind::RigidTy(RigidTy::Float(float_ty)) => {
+                Self::extract_float_scalar(target_alloc, inner_ty, float_ty, memory_inits, site)
+            }
+            TyKind::RigidTy(RigidTy::Array(elem_ty, const_len)) => self
+                .extract_array_from_const_ref(
+                    target_alloc,
                     inner_ty,
                     elem_ty,
                     &const_len,
                     memory_inits,
-                    promoted_obj_id,
-                )
-            }
-            TyKind::RigidTy(RigidTy::Slice(elem_ty)) => Self::extract_slice_from_const_ref(
-                &target_alloc,
+                    site,
+                ),
+            TyKind::RigidTy(RigidTy::Slice(elem_ty)) => self.extract_slice_from_const_ref(
+                target_alloc,
                 inner_ty,
                 elem_ty,
                 memory_inits,
-                promoted_obj_id,
+                site,
             ),
             TyKind::RigidTy(RigidTy::Str) => {
-                Self::extract_str_from_const_ref(&target_alloc, memory_inits, promoted_obj_id)
+                self.extract_str_from_const_ref(target_alloc, memory_inits, site)
             }
-            TyKind::RigidTy(RigidTy::Tuple(_)) => Self::extract_tuple_from_const_ref(
-                &target_alloc,
-                inner_ty,
-                memory_inits,
-                promoted_obj_id,
-            ),
-            TyKind::RigidTy(RigidTy::Adt(def, args)) => Self::extract_adt_from_const_ref(
-                &target_alloc,
+            TyKind::RigidTy(RigidTy::Tuple(_)) => {
+                self.extract_tuple_from_const_ref(target_alloc, inner_ty, memory_inits, site)
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => self.extract_adt_from_const_ref(
+                target_alloc,
                 inner_ty,
                 def,
                 &args,
                 memory_inits,
-                promoted_obj_id,
+                site,
             ),
+            // A pointer stored in the window (`&&T`, an array of references):
+            // its value is the pointer — the relocation at the window's byte 0,
+            // placed at its own target's object plus its offset — never the
+            // relocation's offset bytes, and never the allocation's FIRST
+            // relocation.
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => self
+                .extract_pointer_from_const_ref(
+                    target_alloc,
+                    inner_ty,
+                    pointee,
+                    memory_inits,
+                    site,
+                ),
+            // A function pointer stored in the window (`&SF` for a `fn`
+            // static): the identity of the function its relocation names, the
+            // value a reification of that instance mints. A slot that holds no
+            // function relocation declines.
+            TyKind::RigidTy(RigidTy::FnPtr(_)) => {
+                self.extract_fn_ptr_from_const_ref(target_alloc, inner_ty, memory_inits, site)
+            }
             _ => None, // external enum: TyKind
         }
     }
 
+    /// The function pointer stored at the window's byte 0: its function's
+    /// identity (`const_ptr_address`), seeded at the fn-pointer type's key.
+    fn extract_fn_ptr_from_const_ref(
+        &self,
+        window: &dyn ConstRead,
+        fn_ptr_ty: rustc_public::ty::Ty,
+        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
+        site: InitSite,
+    ) -> Option<Expr> {
+        let ptr = window.stored_pointer(0)?;
+        if !matches!(ptr.kind(), const_pointer::ConstTarget::Function(_)) {
+            return None;
+        }
+        let expr = self.const_ptr_address(&ptr)?.into_expr();
+        let type_key = Self::type_key_for_ty(fn_ptr_ty);
+        memory_inits.push((
+            Arc::from(&*type_key),
+            ptr_sort(),
+            expr.clone(),
+            site.obj_id,
+            site.at(0),
+        ));
+        Some(expr)
+    }
+
+    /// The pointer value stored at the window's byte 0 (thin: its address;
+    /// fat: `concat(len, address)`), seeded at the pointer type's key.
+    fn extract_pointer_from_const_ref(
+        &self,
+        window: &dyn ConstRead,
+        ptr_ty: rustc_public::ty::Ty,
+        pointee: rustc_public::ty::Ty,
+        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
+        site: InitSite,
+    ) -> Option<Expr> {
+        let r = const_pointer::const_ref(window, 0, pointee)?;
+        let addr = self.const_ptr_address(&r.ptr)?.into_expr();
+        if let Some(key) = r.ptr.key() {
+            self.note_object_read_deferred(key, pointee);
+        }
+        let expr = if Self::ref_pointee_is_fat_bv128(pointee) {
+            Expr::bitvec_const(u128::from(r.metadata?), POINTER_WIDTH).concat(addr)
+        } else {
+            if !matches!(pointee.layout().ok().map(|l| l.shape().is_sized()), Some(true)) {
+                return None;
+            }
+            addr
+        };
+        let sort = expr.sort().clone();
+        let type_key = Self::type_key_for_ty(ptr_ty);
+        memory_inits.push((Arc::from(&*type_key), sort, expr.clone(), site.obj_id, site.at(0)));
+        Some(expr)
+    }
+
     /// Extract a Bool scalar from a const allocation.
     fn extract_bool_scalar(
-        target_alloc: &rustc_public::ty::Allocation,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
-        let expr = Expr::bool_const(target_alloc.read_bool().ok()?);
+        let expr = Expr::bool_const(target_alloc.read_bool_at(0)?);
         let type_key = Self::type_key_for_ty(inner_ty);
         memory_inits.push((
             Arc::from(&*type_key),
             bool_sort(),
             expr.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0),
         ));
         Some(expr)
     }
 
     /// Extract a Uint scalar from a const allocation.
     fn extract_uint_scalar(
-        target_alloc: &rustc_public::ty::Allocation,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         uint_ty: rustc_public::ty::UintTy,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         let width = uint_ty_to_bitvec_width(uint_ty);
-        let value = target_alloc.read_uint().ok()?;
+        let value = target_alloc.read_uint_at(0, target_alloc.len())?;
         let masked = if width >= 128 { value } else { value & ((1u128 << width) - 1) };
         let expr = Expr::bitvec_const(masked, width);
         let type_key = Self::type_key_for_ty(inner_ty);
@@ -139,22 +208,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Arc::from(&*type_key),
             Sort::bitvec(width),
             expr.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0),
         ));
         Some(expr)
     }
 
     /// Extract an Int scalar from a const allocation.
     fn extract_int_scalar(
-        target_alloc: &rustc_public::ty::Allocation,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         int_ty: rustc_public::ty::IntTy,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         let width = int_ty_to_bitvec_width(int_ty);
-        let value = target_alloc.read_int().ok()?;
+        let value = target_alloc.read_int_at(0, target_alloc.len())?;
         let masked =
             if width >= 128 { value as u128 } else { (value as u128) & ((1u128 << width) - 1) };
         let expr = Expr::bitvec_const(masked, width);
@@ -163,28 +232,64 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Arc::from(&*type_key),
             Sort::bitvec(width),
             expr.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0),
+        ));
+        Some(expr)
+    }
+
+    /// Extract a float scalar from a const allocation as its IEEE-754 bit
+    /// pattern (the CHC lane's float sort is the bitvector of the float's
+    /// width, `translate_ty`).
+    ///
+    /// A promoted `&-0.0f32` used to fall through to `None`: its object id and
+    /// address were still registered, so a deref read a FREE memory cell and a
+    /// FREE `obj_size` for it, with nothing recorded — a false memory-safety
+    /// counterexample certified Genuine (T1 review, 2026-09-24,
+    /// `read_f32(&-0.0f32)`).
+    fn extract_float_scalar(
+        target_alloc: &dyn ConstRead,
+        inner_ty: rustc_public::ty::Ty,
+        float_ty: rustc_public::ty::FloatTy,
+        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
+        site: InitSite,
+    ) -> Option<Expr> {
+        let width = crate::codegen_ay::types::float_ty_to_bitvec_width(float_ty);
+        if target_alloc.len() * 8 != width as usize {
+            return None;
+        }
+        let value = target_alloc.read_uint_at(0, target_alloc.len())?;
+        let masked = if width >= 128 { value } else { value & ((1u128 << width) - 1) };
+        let expr = Expr::bitvec_const(masked, width);
+        let type_key = Self::type_key_for_ty(inner_ty);
+        memory_inits.push((
+            Arc::from(&*type_key),
+            Sort::bitvec(width),
+            expr.clone(),
+            site.obj_id,
+            site.at(0),
         ));
         Some(expr)
     }
 
     /// Extract a Char scalar (u32) from a const allocation.
     fn extract_char_scalar(
-        target_alloc: &rustc_public::ty::Allocation,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
-        let value = target_alloc.read_uint().ok()?;
+        let value = target_alloc.read_uint_at(0, 4)?;
+        // An invalid `char` is not a char: its cell stays free.
+        char::from_u32(u32::try_from(value).ok()?)?;
         let expr = Expr::bitvec_const(value & 0xFFFFFFFF, 32);
         let type_key = Self::type_key_for_ty(inner_ty);
         memory_inits.push((
             Arc::from(&*type_key),
             Sort::bitvec(32),
             expr.clone(),
-            promoted_obj_id,
-            0u64,
+            site.obj_id,
+            site.at(0),
         ));
         Some(expr)
     }
@@ -196,54 +301,53 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// expression, fn_inline sees only a raw pointer and cannot project
     /// `(*other).0/.1` precisely, causing false CTREX.
     fn extract_tuple_from_const_ref(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) -> Option<Expr> {
         let sort = Self::translate_ty(inner_ty)?;
         // Layout-aware: a tuple's ABI order is not its declaration order
         // (`(u8, u64)` puts the u64 first), so read each element at
         // `field_offset(i)` rather than at a declaration-order cursor.
-        let expr = Self::read_adt_composite_from_allocation(target_alloc, 0, inner_ty, &sort)?;
+        if self.const_safe_value_supported(inner_ty, 0) {
+            return self.decode_const_safe_window(target_alloc, inner_ty, memory_inits, site);
+        }
+        let expr = self.read_adt_composite_from_allocation(target_alloc, 0, inner_ty, &sort)?;
 
         // Seed flattened tuple value for statement-level field-ref lowering.
         Self::seed_flattened_memory_init(
-            target_alloc.bytes.len(),
+            target_alloc.len(),
             &expr,
             inner_ty,
             memory_inits,
-            promoted_obj_id,
+            site,
             0u64,
         );
 
         let TyKind::RigidTy(RigidTy::Tuple(field_tys)) = inner_ty.kind() else {
             return Some(expr);
         };
-        Self::seed_tuple_field_memory_inits(
-            target_alloc,
-            inner_ty,
-            &field_tys,
-            memory_inits,
-            promoted_obj_id,
-        );
+        self.seed_tuple_field_memory_inits(target_alloc, inner_ty, &field_tys, memory_inits, site);
         Some(expr)
     }
 
     /// Seed per-field memory_inits for a tuple's fields.
     fn seed_tuple_field_memory_inits(
-        target_alloc: &rustc_public::ty::Allocation,
+        &self,
+        target_alloc: &dyn ConstRead,
         inner_ty: rustc_public::ty::Ty,
         field_tys: &[rustc_public::ty::Ty],
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
     ) {
         let tuple_layout = LayoutOf::new(inner_ty);
         for (field_idx, field_ty) in field_tys.iter().enumerate() {
             let Some(field_sort) = Self::translate_ty(*field_ty) else { return };
             let Some(field_offset) = tuple_layout.field_offset(field_idx) else { return };
             let Some(field_expr) =
-                Self::read_composite_from_allocation(target_alloc, field_offset, &field_sort)
+                self.read_composite_from_allocation(target_alloc, field_offset, &field_sort)
             else {
                 return;
             };
@@ -257,8 +361,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Arc::from(&*field_type_key),
                 mem_sort,
                 mem_expr,
-                promoted_obj_id,
-                field_offset as u64,
+                site.obj_id,
+                site.at(field_offset as u64),
             ));
         }
     }
@@ -292,7 +396,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         expr: &Expr,
         ty: rustc_public::ty::Ty,
         memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
+        site: InitSite,
         offset: u64,
     ) {
         if byte_width > 0
@@ -315,107 +419,56 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Arc::from(&*type_key),
                 Sort::bitvec(byte_size_to_bv_width(byte_width)),
                 flat_expr,
-                promoted_obj_id,
-                offset,
+                site.obj_id,
+                site.at(offset),
             ));
         }
     }
 
-    /// Extract string bytes from a nested `&&str` promoted constant.
+    /// The `&str` stored at the window's byte 0 (`SS: &&str`): the string's
+    /// bytes as a byte array, its length, and the inner pointer's address.
     ///
-    /// Part of #3607: `PartialEq<&str>` often receives a local initialized from
-    /// a promoted `&&str` constant. This follows two levels of provenance to reach
-    /// the backing UTF-8 bytes.
+    /// Part of #3607 (`PartialEq<&str>` receives a local initialized from a
+    /// promoted `&&str`). The inner pointer is the relocation AT the window's
+    /// byte 0 — for `SS = &["ab", "cd"][1]` that is the pointer to `"cd"`,
+    /// while the allocation's FIRST relocation points to `"ab"` — and the
+    /// string's bytes are the window it names in its own target. Its seeds
+    /// live at the string's own object (`note_object_read` + D2), never at the
+    /// outer constant's.
     pub(super) fn extract_nested_str_from_const_ref(
-        kind: rustc_public::ty::ConstantKind,
-        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
-    ) -> Option<(Expr, usize)> {
-        use rustc_public::mir::alloc::GlobalAlloc;
-
-        let outer_alloc = Self::unwrap_const_alloc(&kind)?;
-        let inner_alloc_id = outer_alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(inner_alloc) = GlobalAlloc::from(inner_alloc_id) else {
-            return None;
-        };
-        let bytes_alloc_id = inner_alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(bytes_alloc) = GlobalAlloc::from(bytes_alloc_id) else {
-            return None;
-        };
-
-        let ptr_bytes = (POINTER_WIDTH / 8) as usize;
-        if inner_alloc.bytes.len() < ptr_bytes * 2 {
+        &self,
+        window: &dyn ConstRead,
+    ) -> Option<NestedStr> {
+        let str_ty = rustc_public::ty::Ty::from_rigid_kind(RigidTy::Str);
+        let (r, bytes_window) = const_pointer::fixed_pointee(self.tcx, window, 0, str_ty)?;
+        let len = usize::try_from(r.metadata?).ok()?;
+        if len == 0 || bytes_window.len() != len {
             return None;
         }
-        let mut len_arr = [0u8; 8];
-        for (i, opt_byte) in inner_alloc.bytes[ptr_bytes..ptr_bytes * 2].iter().enumerate() {
-            len_arr[i] = (*opt_byte)?;
-        }
-        let len = u64::from_le_bytes(len_arr) as usize;
-        if len == 0 || bytes_alloc.bytes.len() < len {
-            return None;
-        }
-
         let elem_sort = Sort::bitvec(8);
-        let array_sort = Sort::array(ptr_sort(), elem_sort.clone());
+        let array_sort = Sort::array(ptr_sort(), elem_sort);
         let name = chc_fresh_name("__const_str");
-        let mut result = declare_pending_var(name, array_sort);
-        let elem_type_key: Arc<str> = Arc::from("u8");
-        for i in 0..len {
-            let byte_val: u8 = bytes_alloc.bytes.get(i).copied()??;
-            let elem_expr = Expr::bitvec_const(byte_val as u128, 8);
-            memory_inits.push((
-                elem_type_key.clone(),
-                elem_sort.clone(),
-                elem_expr.clone(),
-                promoted_obj_id,
-                i as u64,
-            ));
+        let mut result = ExactVar::unobserved(name, array_sort);
+        for (i, byte) in bytes_window.read_data_bytes(0, len)?.into_iter().enumerate() {
             let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
-            result = result.store(idx, elem_expr);
+            result = result.store(idx, Expr::bitvec_const(u128::from(byte), 8));
         }
-        Some((result, len))
+        let target = r.ptr.key()?;
+        let inner = self.global_object(&target).map(|o| (o.obj_id, r.ptr.offset()));
+        Some(NestedStr { bytes: result, len, inner, target, str_ty })
     }
+}
 
-    /// Peel through one reference level in a promoted constant to extract the
-    /// inner referent's scalar/array value.
-    ///
-    /// Part of #3632: `assert_eq!` wraps the RHS array literal in `&&[u8; N]`.
-    pub(super) fn extract_nested_ref_from_const_ref(
-        kind: rustc_public::ty::ConstantKind,
-        nested_inner_ty: rustc_public::ty::Ty,
-        memory_inits: &mut Vec<(Arc<str>, Sort, Expr, u32, u64)>,
-        promoted_obj_id: u32,
-    ) -> Option<Expr> {
-        use rustc_public::mir::alloc::GlobalAlloc;
-        use rustc_public::ty::ConstantKind;
-
-        let outer_alloc = Self::unwrap_const_alloc(&kind)?;
-        let inner_alloc_id = outer_alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(inner_alloc) = GlobalAlloc::from(inner_alloc_id) else {
-            return None;
-        };
-        let synthetic_kind = ConstantKind::Allocated(inner_alloc);
-        Self::extract_scalar_from_const_ref(
-            synthetic_kind,
-            nested_inner_ty,
-            memory_inits,
-            promoted_obj_id,
-        )
-    }
-
-    /// Unwrap a ConstantKind to its raw Allocation (without provenance resolution).
-    fn unwrap_const_alloc(
-        kind: &rustc_public::ty::ConstantKind,
-    ) -> Option<rustc_public::ty::Allocation> {
-        use rustc_public::ty::{ConstantKind, TyConstKind};
-        match kind {
-            ConstantKind::Allocated(alloc) => Some(alloc.clone()),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_value_ty, alloc) => Some(alloc.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
+/// A `&str` read through an outer constant pointer (`&&str`).
+pub(super) struct NestedStr {
+    /// The string's bytes, as the byte-array value fact.
+    pub(super) bytes: Expr,
+    /// Its length (the inner fat pointer's metadata word).
+    pub(super) len: usize,
+    /// The inner pointer: the string's object and its offset in it.
+    pub(super) inner: Option<(u32, u64)>,
+    /// The string's target, to note its read type for D2 seeding.
+    pub(super) target: crate::codegen_ay::shared::const_pointer::TargetKey,
+    /// `str`.
+    pub(super) str_ty: rustc_public::ty::Ty,
 }

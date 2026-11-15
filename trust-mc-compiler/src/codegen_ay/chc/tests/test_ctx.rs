@@ -10,6 +10,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::common::*;
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use crate::codegen_ay::emit_chc;
 use rustc_public::mir::VarDebugInfoContents;
 
@@ -269,7 +270,7 @@ fn test_translate_drains_pending_fresh_var_decls_into_vc() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         PENDING_FRESH_VAR_DECLS.with(|decls| decls.borrow_mut().clear());
         let pending_name = "__pending_bug9_decl";
-        push_pending_var_decl(pending_name, Sort::bitvec(8));
+        let _ = ExactVar::nondet(pending_name.to_owned(), Sort::bitvec(8));
 
         let instance = find_instance_by_suffix(ctx.tcx, "probe_pending_decl");
         let body = instance.body().expect("function body");
@@ -318,7 +319,7 @@ fn test_translate_declares_datatype_sorts_for_pending_fresh_var_decls() {
             .find_map(|decl| ChcCtx::translate_ty(decl.ty).filter(|sort| sort.is_datatype()))
             .unwrap_or_else(|| ay_bindings::Sort::bitvec(64));
         let pending_name = "__pending_wrap_decl";
-        push_pending_var_decl(pending_name, pending_sort.clone());
+        let _ = ExactVar::nondet(pending_name.to_owned(), pending_sort.clone());
 
         let chc_ctx =
             ChcCtx::new(ctx.tcx, &body, "probe_pending_decl_datatype", ChcConfig::default());

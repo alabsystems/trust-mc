@@ -284,6 +284,59 @@ fn chc_kani_run_loop_contract(x: u32) {
 }
 "#;
 
+/// An invariant closure that reads a `&[u8]` through its `&&[u8]` capture,
+/// evaluated by the inline walker inside a `kani_register_loop_contract` fn
+/// whose body calls it: the body `LoopContractPass` swaps into the register fn
+/// and the walker now walks (tools/soundness-duals/lost_error_rules_dual.rs).
+/// The register fn is a kani function, so the MIR inliner leaves the call to
+/// the walker, which reaches the closure through `Fn::call` on its captures
+/// datatype. Before edition 2021 a closure captures each VARIABLE by
+/// reference (the dual compiles at rustc's default 2015: the driver passes no
+/// `--edition` unless asked), so the capture is `&&[u8]` and the walker's load
+/// of `*capture` yields a THIN term for the wide `&[u8]` type:
+/// `PtrMetadata(bytes)` has no metadata half to read. At edition 2021+ the
+/// capture is the `&[u8]` itself and the length survives, which is why this
+/// probe pins edition 2018.
+///
+/// Both asserted invariants are FALSE for every input: `bytes` has 10
+/// elements. `== 0` catches a length fabricated as 0; `== 1` catches a length
+/// read from a stale local (the closure's first temp held the untupled `()`
+/// call argument, which the walker read as 1).
+const CHC_KANI_LOOP_CONTRACT_LATCH_SLICE_LEN_SOURCE: &str = r#"#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+mod kani {
+    #[inline(never)]
+    #[kanitool::fn_marker = "AssertHook"]
+    pub fn assert(cond: bool) {
+        let _ = cond;
+    }
+}
+
+#[inline(never)]
+#[kanitool::fn_marker = "kani_register_loop_contract"]
+fn kani_register_loop_contract<F: Fn() -> bool>(f: &F, _transformed: usize) -> bool {
+    f()
+}
+
+fn chc_kani_loop_contract_latch_slice_len(x: u8) {
+    let a = [x; 10];
+    let s: &[u8] = &a;
+    let bytes = s;
+    let invariant = || bytes.len() == 0;
+    kani::assert(kani_register_loop_contract(&invariant, 1));
+}
+
+fn chc_kani_loop_contract_latch_slice_len_one(x: u8) {
+    let a = [x; 10];
+    let s: &[u8] = &a;
+    let bytes = s;
+    let invariant = || bytes.len() == 1;
+    kani::assert(kani_register_loop_contract(&invariant, 1));
+}
+"#;
+
 const CHC_KANI_IS_ALLOCATED_SIZED_SOURCE: &str = r#"#![allow(dead_code)]
 #![feature(register_tool)]
 #![register_tool(kanitool)]
@@ -468,6 +521,63 @@ fn chc_kani_write_any_str_unsupported() {
 }
 "#;
 
+// =========================================================================
+// `Iterator::sum` (AY alignment round 8, review round 3): probes whose only
+// check is a `kani::assert` hook, so nothing but the sum decides the query.
+// =========================================================================
+
+const CHC_KANI_ITER_SUM_SOURCE: &str = r#"#![allow(dead_code)]
+#![feature(register_tool)]
+#![register_tool(kanitool)]
+
+mod kani {
+    #[inline(never)]
+    #[kanitool::fn_marker = "AssertHook"]
+    pub fn assert(cond: bool) {
+        let _ = cond;
+    }
+}
+
+fn chc_kani_sum_of_known_elements() {
+    let s: u8 = [20u8, 20].iter().sum();
+    kani::assert(s == 40);
+}
+
+fn chc_kani_sum_two_calls_one_place(c: bool) {
+    let s: u8 = if c { (0u8..3).sum() } else { [1u8, 2].iter().sum() };
+    kani::assert(s == 3);
+}
+"#;
+
+/// A sum of known elements is decided before the solver, as main decided it:
+/// the straight-line discharge folds the replay's overflow check, because the
+/// replay encodes it the way the lane's own checked `a + b` is encoded. Built
+/// with `bvadd_no_overflow_unsigned`, a node the discharge does not fold, the
+/// whole VC went to the solver, and a sum of `[20u8; 2]` that main proved in
+/// 5 ms took 26 to 31 s and timed out under load (AY alignment round 8,
+/// review round 3).
+#[test]
+fn test_chc_e2e_kani_iter_sum_of_known_elements_is_discharged_before_the_solver() {
+    let smt = emit_chc_smt_for_fn(CHC_KANI_ITER_SUM_SOURCE, "chc_kani_sum_of_known_elements");
+    let rules = smt.matches("(rule ").count();
+    assert!(
+        rules == 1 && smt.contains("(rule (=> false error))"),
+        "expected the straight-line discharge's `(=> false error)` alone, got {rules} rules. SMT:\n{smt}"
+    );
+}
+
+/// rustc writes the two arms' sums into one local; each is std's `u8` sum (of
+/// `0..3` and of `[1, 2]`), and the CHC lane proves `s == 3`. A guard of the
+/// whole sum encoding on this shape (AY alignment round 8, review round 3):
+/// measured failing with that round's panic rule, static replay
+/// bound and checked-add encoding reverted. The classification of each call
+/// by its own callee operand (finding 1) is pinned by `iter_sum_summand`'s
+/// tests and, through the driver, by `iter_sum_two_calls_chc_dual.rs`.
+#[test]
+fn test_chc_e2e_kani_iter_sum_two_calls_one_place_proves_unsat() {
+    assert_chc_solver_result(CHC_KANI_ITER_SUM_SOURCE, "chc_kani_sum_two_calls_one_place", "unsat");
+}
+
 const CHC_KANI_WRITE_ANY_SLICE_SOURCE: &str = r#"#![allow(dead_code)]
 #![feature(register_tool)]
 #![register_tool(kanitool)]
@@ -604,6 +714,70 @@ fn test_chc_e2e_kani_run_loop_contract_inlines_ref_closure() {
     );
 }
 
+/// The inline walker must not invent a slice length for a thin term.
+///
+/// `translate_inline_ptr_metadata` knows from the MIR TYPE that `bytes` is
+/// wide; the term it got for the capture load is thin, so the length was lost
+/// on the way. It used to return the constant 0, which PROVED
+/// `bytes.len() == 0`. Declining instead was not enough: the walker left the
+/// closure's first temp unwritten and read the stale `()` argument bound to
+/// that local index, which PROVED `bytes.len() == 1`. The length must be a
+/// fresh value, so neither query may come back `unsat`.
+fn assert_loop_contract_latch_slice_len_not_fabricated(fn_suffix: &str, claim: &str) {
+    // This test TRANSLATES, so it writes the global per-function gap and
+    // fallback counters that guarded siblings assert on.
+    let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut maybe_smt: Option<String> = None;
+    crate::codegen_ay::context::with_test_ay_ctx_for_source_with_edition(
+        CHC_KANI_LOOP_CONTRACT_LATCH_SLICE_LEN_SOURCE,
+        "2018",
+        |ctx| {
+            let mut ctx = ctx;
+            ctx.config.use_chc = true;
+            ctx.queries.set_args(crate::args::Arguments::default());
+            let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
+            let body = instance.body().expect("body");
+            let name = instance.name();
+            ctx.set_current_fn(instance);
+            assert!(has_assert_probe(&body), "{fn_suffix}: expected a kani assert hook");
+            codegen_function_with_body(&mut ctx, instance, body, &name);
+            let chc_vc = ctx.chc_vc.as_ref().expect("CHC VC should be populated after CHC codegen");
+            maybe_smt = Some(crate::codegen_ay::emit_chc(chc_vc).to_string());
+        },
+    );
+    let smt = maybe_smt.expect("expected CHC SMT output");
+    let solver_result = run_ay_on_smt2(&smt);
+    assert!(
+        solver_result.is_ok(),
+        "AY execution failed: {}. SMT:\n{smt}",
+        solver_result.as_ref().err().map_or("", std::string::String::as_str)
+    );
+    let result = solver_result.unwrap_or_default();
+    assert_ne!(
+        result, "unsat",
+        "`{claim}` is false for a 10-element slice, so the assertion must not prove; \
+         an `unsat` here means the walker invented the slice length. SMT:\n{smt}"
+    );
+}
+
+#[test]
+fn test_chc_e2e_kani_loop_contract_latch_slice_len_through_capture_is_not_fabricated() {
+    assert_loop_contract_latch_slice_len_not_fabricated(
+        "chc_kani_loop_contract_latch_slice_len",
+        "bytes.len() == 0",
+    );
+}
+
+#[test]
+fn test_chc_e2e_kani_loop_contract_latch_slice_len_through_capture_is_not_a_stale_local() {
+    assert_loop_contract_latch_slice_len_not_fabricated(
+        "chc_kani_loop_contract_latch_slice_len_one",
+        "bytes.len() == 1",
+    );
+}
+
 #[test]
 fn test_chc_e2e_kani_is_allocated_uses_size_range_at_ptr_level() {
     let smt = emit_chc_smt_for_fn_with_track(
@@ -708,6 +882,8 @@ fn test_chc_e2e_kani_write_any_str_reports_unsupported() {
 }
 
 #[test]
+// Nightly spelling; see the Trust twin below.
+#[cfg(not(trust_toolchain))]
 fn test_chc_e2e_kani_write_any_slice_emits_element_havoc() {
     clear_chc_translation_metadata();
     let smt =
@@ -727,7 +903,33 @@ fn test_chc_e2e_kani_write_any_slice_emits_element_havoc() {
     );
 }
 
+/// Trust twin of the test above. Trust's `rustc_public` names a local instance with
+/// its crate (`testcrate_N::...`), so the emitted state symbols are `|`-quoted and
+/// the expected spelling carries the closing `|`. The encoding is unchanged.
 #[test]
+#[cfg(trust_toolchain)]
+fn test_chc_e2e_kani_write_any_slice_emits_element_havoc_trust() {
+    clear_chc_translation_metadata();
+    let smt =
+        emit_chc_smt_for_fn(CHC_KANI_WRITE_ANY_SLICE_SOURCE, "chc_kani_write_any_slice_havoc");
+    let drop_reasons = crate::codegen_ay::take_drop_fallback_reasons_by_fn();
+    let translation_drops = crate::codegen_ay::take_translation_drop_by_fn();
+    let translation_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+    assert!(
+        smt.matches("__kani_write_any_slice_elem").count() >= 2,
+        "WriteAnySliceModel should emit a fresh arbitrary value per concrete slice element. \
+         drops={translation_drops:?}, reasons={drop_reasons:?}, sites={translation_sites:?}. SMT:\n{smt}"
+    );
+    assert!(
+        smt.contains("_at_0x0_bv64__out| __kani_write_any_slice_elem_")
+            && smt.contains("_at_0x1_bv64__out| __kani_write_any_slice_elem_"),
+        "WriteAnySliceModel should update each scalarized backing-array element. SMT:\n{smt}"
+    );
+}
+
+#[test]
+// Nightly spelling; see the Trust twin below.
+#[cfg(not(trust_toolchain))]
 fn test_chc_e2e_kani_write_any_slice_subslice_rebases_indices() {
     clear_chc_translation_metadata();
     let smt = emit_chc_smt_for_fn(
@@ -756,7 +958,42 @@ fn test_chc_e2e_kani_write_any_slice_subslice_rebases_indices() {
     );
 }
 
+/// Trust twin of the test above. Trust's `rustc_public` names a local instance with
+/// its crate (`testcrate_N::...`), so the emitted state symbols are `|`-quoted and
+/// the expected spelling carries the closing `|`. The encoding is unchanged.
 #[test]
+#[cfg(trust_toolchain)]
+fn test_chc_e2e_kani_write_any_slice_subslice_rebases_indices_trust() {
+    clear_chc_translation_metadata();
+    let smt = emit_chc_smt_for_fn(
+        CHC_KANI_WRITE_ANY_SLICE_SOURCE,
+        "chc_kani_write_any_slice_subslice_havoc",
+    );
+    let drop_reasons = crate::codegen_ay::take_drop_fallback_reasons_by_fn();
+    let translation_drops = crate::codegen_ay::take_translation_drop_by_fn();
+    let translation_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+    assert!(
+        smt.matches("__kani_write_any_slice_elem").count() >= 2,
+        "WriteAnySliceModel should havoc each element in the concrete subslice. \
+         drops={translation_drops:?}, reasons={drop_reasons:?}, sites={translation_sites:?}. SMT:\n{smt}"
+    );
+    assert!(
+        !smt.contains("_at_0x0_bv64__out| __kani_write_any_slice_elem"),
+        "WriteAnySliceModel must not havoc the element before the subslice. SMT:\n{smt}"
+    );
+    assert!(
+        smt.contains("_at_0x1_bv64__out| __kani_write_any_slice_elem_"),
+        "WriteAnySliceModel should rebase the first subslice element to backing index 1. SMT:\n{smt}"
+    );
+    assert!(
+        smt.contains("_at_0x2_bv64__out| __kani_write_any_slice_elem_"),
+        "WriteAnySliceModel should address the second subslice element after the offset. SMT:\n{smt}"
+    );
+}
+
+#[test]
+// Nightly spelling; see the Trust twin below.
+#[cfg(not(trust_toolchain))]
 fn test_chc_e2e_kani_write_any_slice_subslice_preserves_prefix() {
     let smt = emit_chc_smt_for_fn(
         CHC_KANI_WRITE_ANY_SLICE_SOURCE,
@@ -764,6 +1001,30 @@ fn test_chc_e2e_kani_write_any_slice_subslice_preserves_prefix() {
     );
     assert!(
         !smt.contains("_at_0x0_bv64__out __kani_write_any_slice_elem"),
+        "WriteAnySliceModel must not assign fresh havoc to the prefix element. SMT:\n{smt}"
+    );
+    assert!(
+        smt.contains("(rule (=> false error))"),
+        "The preserved-prefix assertion should lower to an unreachable error rule. SMT:\n{smt}"
+    );
+}
+
+/// Trust twin of the test above. Trust's `rustc_public` names a local instance with
+/// its crate (`testcrate_N::...`), so the emitted state symbols are `|`-quoted and
+/// the expected spelling carries the closing `|`. The encoding is unchanged.
+#[test]
+#[cfg(trust_toolchain)]
+fn test_chc_e2e_kani_write_any_slice_subslice_preserves_prefix_trust() {
+    let smt = emit_chc_smt_for_fn(
+        CHC_KANI_WRITE_ANY_SLICE_SOURCE,
+        "chc_kani_write_any_slice_subslice_preserves_prefix",
+    );
+    assert!(
+        smt.contains("chc_kani_write_any_slice_subslice_preserves_prefix_1_at_0x1_bv64__out|"),
+        "fixture: the backing-array state symbols must use the quoted Trust spelling. SMT:\n{smt}"
+    );
+    assert!(
+        !smt.contains("_at_0x0_bv64__out| __kani_write_any_slice_elem"),
         "WriteAnySliceModel must not assign fresh havoc to the prefix element. SMT:\n{smt}"
     );
     assert!(

@@ -62,8 +62,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let Some(cap_var_name) = self.collections.len_state.get_cap_var(coll_local).cloned()
             {
                 let old_cap = self.collection_current_cap(&cap_var_name);
-                let grow_needed = old_cap.clone().bvult(new_len.clone());
-                let grown_cap = Expr::ite(grow_needed, new_len.clone(), old_cap);
+                let grown_cap = self.vec_reserved_cap(
+                    Some(self.body.locals()[coll_local].ty),
+                    &old_cap,
+                    &new_len,
+                    crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                    acc.constraints,
+                );
                 self.collection_cap_set(&cap_var_name, grown_cap.clone(), acc);
                 // Part of #1037 V2: cap >= len background invariant on sidecar path.
                 acc.constraints.push(grown_cap.bvuge(new_len));
@@ -93,14 +98,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     (ptr_field, len_field, cap_field, data_field)
                     && old_data.sort().is_array()
                 {
-                    let val =
-                        super::codegen_call_vec_ops::coerce_array_element(val, &old_data.sort());
+                    let val = super::codegen_call_vec_ops::coerce_array_element(
+                        self,
+                        val,
+                        &old_data.sort(),
+                    );
                     let new_data = old_data.store(old_len.clone(), val);
                     let new_fld_len = old_len_field.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-                    // Mirror sidecar cap growth semantics (max(cap, new_len)) so
-                    // projected Vec state stays reachable at len==cap boundaries.
-                    let grow_needed = old_cap.clone().bvult(new_fld_len.clone());
-                    let new_fld_cap = Expr::ite(grow_needed, new_fld_len.clone(), old_cap.clone());
+                    // Mirror the sidecar's cap growth (`RawVec::grow_amortized`)
+                    // so projected Vec state stays reachable at len==cap boundaries.
+                    let new_fld_cap = self.vec_reserved_cap(
+                        Some(self.body.locals()[coll_local].ty),
+                        &old_cap,
+                        &new_fld_len,
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                        acc.constraints,
+                    );
                     let new_ptr = self.allocate_vec_backing_on_zero_cap_growth(
                         old_ptr,
                         &old_cap,
@@ -146,13 +159,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Datatype path: extract all fields, store, reconstruct.
                     if let Some(fields) = ChcVecFields::extract(vec_in) {
                         let ChcVecFields { vec_sort, ptr, len, cap, data } = fields;
-                        let val =
-                            super::codegen_call_vec_ops::coerce_array_element(val, &data.sort());
+                        let val = super::codegen_call_vec_ops::coerce_array_element(
+                            self,
+                            val,
+                            &data.sort(),
+                        );
                         let new_data = data.store(old_len.clone(), val);
                         let new_len_field = len.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-                        let grow_needed = cap.clone().bvult(new_len_field.clone());
-                        let new_cap_field =
-                            Expr::ite(grow_needed, new_len_field.clone(), cap.clone());
+                        let new_cap_field = self.vec_reserved_cap(
+                            Some(self.body.locals()[coll_local].ty),
+                            &cap,
+                            &new_len_field,
+                            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                            acc.constraints,
+                        );
                         let new_ptr = self.allocate_vec_backing_on_zero_cap_growth(
                             ptr,
                             &cap,

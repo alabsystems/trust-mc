@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 
 use super::super::ChcCtx;
@@ -34,7 +35,9 @@ pub(super) fn inline_formatting_call_placeholder<'tcx, 'body>(
             let dest_sort =
                 ChcCtx::translate_ty(dest_ty).unwrap_or_else(|| Sort::bitvec(POINTER_WIDTH));
             ctx.record_aggregate_gap("inline_fmt_nested_call_symbolic");
-            super::super::declare_pending_var(
+            Havoc::mint(
+                ctx,
+                sound_havoc::UNTRACKED_CALL_RESULT,
                 super::super::chc_fresh_name("__fmt_inline"),
                 dest_sort,
             )
@@ -57,7 +60,7 @@ pub(super) fn try_inline_option_unwrap_call(
             }
             let is_some = ctx.option_is_some(receiver.clone());
             let inner = ctx.option_unwrap_value_on_some_path(receiver)?;
-            let fallback = super::super::declare_pending_var(
+            let fallback = ExactVar::unobserved(
                 super::super::chc_fresh_name("__assert_fail_inline_option_unwrap"),
                 inner.sort().clone(),
             );

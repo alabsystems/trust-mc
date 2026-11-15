@@ -13,8 +13,12 @@ use super::{
     AssertMessage, BinOp, Expr, IntoOption, Operand, RigidTy, StatementCodegen, SwitchTargets,
     Terminator, TerminatorKind, TerminatorSuccessors, TyKind,
 };
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::statement::dispatch::CallDispatchOutcome;
 use crate::codegen_ay::types::{bool_sort, int_ty_to_bitvec_width, uint_ty_to_bitvec_width};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use num_bigint::BigInt;
 use rustc_public::mir::{BasicBlockIdx, Mutability};
 use tracing::debug;
@@ -50,9 +54,501 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             .map_or_else(|_| String::from("unknown"), |ty| format!("{:?}", ty));
         self.ctx.unsupported_with_fallback(
             "Call terminator",
-            format!("{:?} (fn: {})", term.span, func_ty_str),
+            format!("{:?} (fn: {})", mir_span!(term), func_ty_str),
         );
         target.map(|t| vec![(t, None)]).unwrap_or_default()
+    }
+
+    /// BMC: Kani's unwinding assertion on a loop the callee of `func` may
+    /// run, where the call was handled by a MODEL (a stub, the abstracted
+    /// fallback, the array comparison, virtual and `pow` / math handlers), not
+    /// by inlining its body, under a declared unwind bound with unwinding
+    /// assertions on. `Vec::contains` over six elements under
+    /// `#[kani::unwind(2)]` verified clean where Kani fails `unwinding
+    /// assertion loop 0` (walker fail-closed repair round 4, finding 6's class,
+    /// `r4_std_models_unwind.rs` `u8_vec_contains_u2`). Fails closed
+    /// (`unsupported_with_fallback`) unless the callee runs no loop
+    /// (`obligation_free_walk::instance_may_loop`) or the passes of every
+    /// loop it runs have a bound `B` (`bmc_model_call_trip_bound`), where the
+    /// check is `B < U`, never certified; a reduction states its own
+    /// unwinding assertion (`iter_adapters.rs`, `record_reduce_unwinding`).
+    pub(in crate::codegen_ay::statement) fn bmc_model_call_unwinding_check(
+        &mut self,
+        func: &Operand,
+        args: &[Operand],
+    ) {
+        use trust_mc_codegen_stubs::StubKind;
+        if std::mem::take(&mut self.stub_stated_unwinding) {
+            return;
+        }
+        let config = &self.ctx.config;
+        if !config.has_explicit_unwind || !config.unwinding_assertions {
+            return;
+        }
+        if let Some(path) = self.resolve_callee_path(func)
+            && matches!(
+                self.stub_registry.lookup(&path),
+                Some(StubKind::IterFold | StubKind::IterSum)
+            )
+        {
+            return;
+        }
+        let stubs = self.ctx.unit_stub_map();
+        let may_loop = match func.ty(self.body.locals()).into_option().map(|ty| ty.kind()) {
+            Some(TyKind::RigidTy(RigidTy::FnDef(def, args))) => {
+                match crate::codegen_ay::obligation_free_walk::resolve_through_stubs(
+                    def, &args, &stubs,
+                ) {
+                    Some(instance) => bmc_instance_may_loop_cached(self.ctx.tcx, instance, &stubs),
+                    None => true,
+                }
+            }
+            _ => true,
+        };
+        if !may_loop {
+            return;
+        }
+        let unwind = u64::from(self.ctx.config.unwind_depth);
+        let Some(bound) = self.bmc_model_call_trip_bound(func, args) else {
+            self.ctx.unsupported_with_fallback(
+                "model_call_loop_under_declared_unwind",
+                "a call the BMC encoder models may run a loop past the declared unwind bound",
+            );
+            return;
+        };
+        let folded =
+            trust_mc_core::chc_const_prop::eval::try_eval_to_const(&bound).and_then(|value| {
+                match value.value() {
+                    ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).ok(),
+                    _ => None,
+                }
+            });
+        if folded.is_some_and(|bound| bound < unwind) {
+            debug!(
+                ?folded,
+                unwind, "BMC modelled call: every loop it runs stays under the declared bound"
+            );
+            return;
+        }
+        // `bound < U` where the bound is symbolic: a check, never certified
+        // (`bmc_sound_havoc`), since the bound over-approximates the passes
+        // (`memchr` stops at the first match).
+        self.ctx.bmc_sound_havoc("model_call_loop_unwind_bound");
+        let unwind = Expr::bitvec_const(unwind, crate::codegen_ay::types::POINTER_WIDTH);
+        self.record_violation_guarded_with_message(
+            bound.bvuge(unwind),
+            "unwind_assert",
+            Some(
+                "unwinding assertion loop 0 (a loop in a call the BMC encoder models, under the \
+                 declared unwind bound)"
+                    .to_string(),
+            ),
+        );
+    }
+
+    /// Kani's unwinding assertion on the loop the kani library's
+    /// `Arbitrary::any` runs for a `kani::any()` this lane models as a fresh
+    /// value (`shared::kani_any_loops`): `kani::any::<[bool; N]>()` runs `N`
+    /// passes, so under a declared unwind `U <= N` with unwinding assertions on
+    /// the assertion fails wherever the call is reached. Exact, and so
+    /// certified.
+    pub(in crate::codegen_ay::statement) fn bmc_kani_any_unwinding_check(
+        &mut self,
+        destination: &rustc_public::mir::Place,
+    ) {
+        let config = &self.ctx.config;
+        if !config.has_explicit_unwind || !config.unwinding_assertions {
+            return;
+        }
+        let Some(dest_ty) = destination.ty(self.body.locals()).into_option() else {
+            return;
+        };
+        let passes = crate::codegen_ay::shared::kani_any_loops::kani_any_loop_passes(dest_ty);
+        if passes < u64::from(self.ctx.config.unwind_depth) {
+            return;
+        }
+        debug!(passes, "BMC kani::any runs a loop past the declared unwind bound");
+        self.record_violation_guarded_with_message(
+            Expr::bool_const(true),
+            "unwind_assert",
+            Some(crate::codegen_ay::shared::kani_any_loops::kani_any_unwind_message(passes)),
+        );
+    }
+
+    /// Kani's unwinding assertion on the comparison loop of an equality the
+    /// BMC lane models as one value comparison (`dispatch_raw_eq_and_cmp`:
+    /// the `raw_eq` intrinsic, `PartialEq::eq` / `ne` on an array, slice,
+    /// `str` or `Vec`). Kani compares bytewise-comparable elements with
+    /// CBMC's `memcmp`, one pass per byte, and others with one pass per
+    /// element; the byte count (at least one per element) bounds both, as
+    /// in the CHC lane's table (`chc/call/codegen_call_model_unwind.rs`).
+    /// Under a declared unwind bound `U` with unwinding assertions on, a
+    /// count `B` that does not fold below `U` is the check `B < U`, never
+    /// certified; a slice whose length the lane cannot read fails closed.
+    /// Without it `same::<[u16; 4]>()` and `"hello" == "hello"` under
+    /// `unwind(3)` verified clean where Kani fails them (the merge of
+    /// fix/chc-walker-fail-closed with main, `model_call_unwind_eq_len_dual.rs`),
+    /// and so did `Some([1u16, 2, 3, 4]) == ..` and `Some("hello") == ..` until
+    /// the wrappers' parts were read (`shared::compare_loops`,
+    /// `model_call_unwind_wrapped_eq_dual.rs`).
+    pub(in crate::codegen_ay::statement) fn bmc_compare_unwinding_check(
+        &mut self,
+        fn_name: &str,
+        args: &[Operand],
+    ) {
+        let compared = self.compared_values.take();
+        let config = &self.ctx.config;
+        if !config.has_explicit_unwind || !config.unwinding_assertions {
+            return;
+        }
+        let pointer = crate::codegen_ay::types::POINTER_WIDTH;
+        let Some(first) = args.first() else {
+            return;
+        };
+        let Some(ty) = first.ty(self.body.locals()).into_option() else {
+            return;
+        };
+        let pointee = match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => inner,
+            _ => ty,
+        };
+        let size_of = |ty: rustc_public::ty::Ty| {
+            ty.layout().ok().map(|layout| layout.shape().size.bytes() as u64)
+        };
+        // The loops stop early (`shared::compare_loops`): from the two values
+        // the model compared, the condition under which one of them completes
+        // the declared bound's passes. A bound read from the types alone
+        // failed `[9u8, 2, 3, 4] != [1, 2, 3, 4]` and `"abc" != "ab"` under
+        // `unwind(2)` (undecided, or an uncertified failure) where main and
+        // Kani prove them (walker fail-closed review, round 2 of the repair
+        // after the merge with main, `model_call_unwind_early_exit_dual.rs`).
+        if let Some((lhs, rhs)) = compared {
+            use crate::codegen_ay::shared::compare_loops::{
+                compare_reach, is_const_false, raw_eq_reach,
+            };
+            let unwind = u64::from(self.ctx.config.unwind_depth);
+            let reach = if fn_name.contains("raw_eq") {
+                raw_eq_reach(pointee, &lhs, &rhs, unwind, &size_of)
+            } else {
+                // `codegen_partial_eq_value` reads through every reference level.
+                let mut value_ty = pointee;
+                while let TyKind::RigidTy(RigidTy::Ref(_, inner, _)) = value_ty.kind() {
+                    value_ty = inner;
+                }
+                compare_reach(value_ty, &lhs, &rhs, unwind, &size_of)
+            };
+            if let Some(reach) = reach {
+                if is_const_false(&reach.reaches) {
+                    return;
+                }
+                if !reach.exact {
+                    self.ctx.bmc_sound_havoc("model_call_loop_unwind_bound");
+                }
+                self.record_violation_guarded_with_message(
+                    reach.reaches,
+                    "unwind_assert",
+                    Some(
+                        "unwinding assertion loop 0 (a comparison loop the BMC encoder models, \
+                         under the declared unwind bound)"
+                            .to_string(),
+                    ),
+                );
+                return;
+            }
+        }
+        // A float compares element by element (it is not bytewise-comparable).
+        let units = |elem: rustc_public::ty::Ty| {
+            if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Float(_))) {
+                return Some(1);
+            }
+            size_of(elem).map(|bytes| bytes.max(1))
+        };
+        let bound = match pointee.kind() {
+            _ if fn_name.contains("raw_eq") => match size_of(pointee) {
+                Some(bytes) => Some(Expr::bitvec_const(bytes, pointer)),
+                None => None,
+            },
+            TyKind::RigidTy(RigidTy::Array(elem, len)) => {
+                let (Some(len), Some(per)) = (len.eval_target_usize().into_option(), units(elem))
+                else {
+                    return;
+                };
+                Some(Expr::bitvec_const(len.saturating_mul(per), pointer))
+            }
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                let Some(per) = units(elem) else {
+                    return;
+                };
+                self.slice_len_expr(first)
+                    .map(|len| (len, per))
+                    .map(|(len, per)| scaled_len(len, per, pointer))
+            }
+            TyKind::RigidTy(RigidTy::Str) => self.slice_len_expr(first),
+            TyKind::RigidTy(RigidTy::Adt(def, adt_args))
+                if rustc_public::CrateDef::trimmed_name(&def) == "Vec" =>
+            {
+                let Some(elem) = adt_args.0.iter().find_map(|arg| match arg {
+                    rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let Some(per) = units(elem) else {
+                    return;
+                };
+                self.slice_len_expr(first).map(|len| scaled_len(len, per, pointer))
+            }
+            // `Option`, `Result`, `Box`, a reference or a tuple: the loops of
+            // the parts it compares (`shared::compare_loops`). A `str`, slice
+            // or `Vec` part's length is not read here, so it fails closed.
+            _ if crate::codegen_ay::shared::compare_loops::is_compared_wrapper(pointee) => {
+                use crate::codegen_ay::shared::compare_loops::{CompareLoops, compare_loops};
+                match compare_loops(pointee, &size_of) {
+                    CompareLoops::LoopFree | CompareLoops::Unknown => return,
+                    CompareLoops::AtMost(passes) => Some(Expr::bitvec_const(passes, pointer)),
+                    CompareLoops::LengthOfAPart => self.option_slice_payload_len(first, pointee),
+                }
+            }
+            // A scalar compares without a loop; anything else is left to the
+            // calls its comparison makes.
+            _ => return,
+        };
+        let unwind = u64::from(self.ctx.config.unwind_depth);
+        let Some(bound) = bound.filter(|bound| bound.sort().bitvec_width() == Some(pointer)) else {
+            self.ctx.unsupported_with_fallback(
+                "model_call_loop_under_declared_unwind",
+                "a comparison the BMC encoder models runs a loop of unknown length under the \
+                 declared unwind bound",
+            );
+            return;
+        };
+        let folded =
+            trust_mc_core::chc_const_prop::eval::try_eval_to_const(&bound).and_then(|value| {
+                match value.value() {
+                    ay_bindings::ExprValue::BitVecConst { value, .. } => u64::try_from(value).ok(),
+                    _ => None,
+                }
+            });
+        if folded.is_some_and(|bound| bound < unwind) {
+            return;
+        }
+        self.ctx.bmc_sound_havoc("model_call_loop_unwind_bound");
+        let unwind = Expr::bitvec_const(unwind, pointer);
+        self.record_violation_guarded_with_message(
+            bound.bvuge(unwind),
+            "unwind_assert",
+            Some(
+                "unwinding assertion loop 0 (a comparison loop the BMC encoder models, under the \
+                 declared unwind bound)"
+                    .to_string(),
+            ),
+        );
+    }
+
+    /// The bytes `==` on an `Option<&str>` or `Option<&[P]>` (primitive `P`)
+    /// compares: the left payload's length (times `size_of::<P>()`) when it is
+    /// `Some`, else 0 (`Option::eq` compares payloads only when both are
+    /// `Some`, and a `str` or slice compares its bytes only when the lengths
+    /// agree, so the left length bounds the loop). `None` for any other shape,
+    /// or a value whose length field the lane does not hold: the caller then
+    /// fails closed.
+    fn option_slice_payload_len(
+        &mut self,
+        operand: &Operand,
+        pointee: rustc_public::ty::Ty,
+    ) -> Option<Expr> {
+        let pointer = crate::codegen_ay::types::POINTER_WIDTH;
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = pointee.kind() else {
+            return None;
+        };
+        if !matches!(
+            rustc_public::CrateDef::name(&def).as_str(),
+            "std::option::Option" | "core::option::Option"
+        ) {
+            return None;
+        }
+        let payload_ty = args.0.iter().find_map(|arg| match arg {
+            rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+            _ => None,
+        })?;
+        let TyKind::RigidTy(RigidTy::Ref(_, unsized_ty, _)) = payload_ty.kind() else {
+            return None;
+        };
+        let per = match unsized_ty.kind() {
+            TyKind::RigidTy(RigidTy::Str) => 1,
+            TyKind::RigidTy(RigidTy::Slice(elem))
+                if matches!(
+                    elem.kind(),
+                    TyKind::RigidTy(
+                        RigidTy::Bool
+                            | RigidTy::Char
+                            | RigidTy::Int(_)
+                            | RigidTy::Uint(_)
+                            | RigidTy::Float(_)
+                    )
+                ) =>
+            {
+                (elem.layout().ok()?.shape().size.bytes() as u64).max(1)
+            }
+            _ => return None,
+        };
+        let value = self.codegen_partial_eq_value(operand)?;
+        let option_dt = value.sort().datatype_sort()?.clone();
+        if option_dt.constructors.len() != 2 {
+            return None;
+        }
+        let some = option_dt.constructors.iter().find(|ctor| ctor.fields.len() == 1)?;
+        let field = some.fields.first()?;
+        let slice_dt = field.sort.datatype_sort()?;
+        let len_field =
+            slice_dt.constructors.first()?.fields.iter().find(|f| f.name == "fld_len")?;
+        if len_field.sort.bitvec_width() != Some(pointer) {
+            return None;
+        }
+        let payload = value
+            .clone()
+            .try_field_select(&option_dt.name, &field.name, field.sort.clone())
+            .ok()?;
+        let len =
+            payload.try_field_select(&slice_dt.name, "fld_len", len_field.sort.clone()).ok()?;
+        let is_some = value.try_is_constructor(&option_dt.name, &some.name).ok()?;
+        Some(Expr::ite(is_some, scaled_len(len, per, pointer), Expr::bitvec_const(0u64, pointer)))
+    }
+
+    /// A pointer-width bound on the back edges of every loop the modelled
+    /// callee of `func` runs, the BMC half of the CHC trip-count table
+    /// (`chc/call/codegen_call_model_unwind.rs`): `core::slice::memchr::
+    /// memchr(x, text)` runs at most `text.len()` passes in each of its loops
+    /// (frozen nightly `core/src/slice/memchr.rs`: `memchr_naive`,
+    /// `memchr_aligned`'s two-word steps and its tail), and
+    /// `SpecFromElem::from_elem(elem, n)` of a primitive element runs
+    /// `extend_with`'s one loop of at most `n` passes. Any other callee keeps
+    /// the fail-closed fallback. `vec![1u8, .., 6].contains(&x)` under
+    /// `unwind(8)` and `vec![x; 4]` under `unwind(5)` failed closed where main
+    /// and Kani prove them (walker fail-closed repair round 5,
+    /// `model_call_unwind_dual.rs` `u6`, `model_call_unwind_bound_dual.rs`
+    /// `b4`).
+    fn bmc_model_call_trip_bound(&mut self, func: &Operand, args: &[Operand]) -> Option<Expr> {
+        let path = self.resolve_callee_path(func)?;
+        let pointer = crate::codegen_ay::types::POINTER_WIDTH;
+        let whole_local_or_const = |operand: &Operand| match operand {
+            Operand::Copy(place) | Operand::Move(place) => place.projection.is_empty(),
+            Operand::Constant(_) => true,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => false,
+        };
+        let bound = if path.ends_with("slice::memchr::memchr") {
+            let text = args.get(1)?;
+            if !whole_local_or_const(text) {
+                return None;
+            }
+            self.slice_len_expr(text)?
+        } else if path.contains("BoundedArbitrary") && path.ends_with("bounded_any") {
+            // The kani library's `bounded_any::<N>` for `String`, `Vec<P>` and
+            // `Box<[P]>` of a primitive `P` (`library/trust-mc/src/
+            // bounded_arbitrary.rs`): each loop it runs takes at most `N`
+            // passes (the `0..len` fill with `len <= N`, `Utf8Chunks::next` over
+            // `N` bytes), and `P::any()` runs none. A map or set's `insert`
+            // loop has no such bound and keeps the fail-closed fallback.
+            let TyKind::RigidTy(RigidTy::FnDef(_, generics)) =
+                func.ty(self.body.locals()).into_option()?.kind()
+            else {
+                return None;
+            };
+            let mut n = None;
+            let mut container_ok = false;
+            for arg in &generics.0 {
+                match arg {
+                    rustc_public::ty::GenericArgKind::Const(len) => {
+                        n = len.eval_target_usize().into_option();
+                    }
+                    rustc_public::ty::GenericArgKind::Type(ty) => {
+                        container_ok = bounded_any_container_is_loop_bounded(*ty);
+                    }
+                    _ => {}
+                }
+            }
+            if !container_ok {
+                return None;
+            }
+            Expr::bitvec_const(n?, pointer)
+        } else if path.contains("SpecFromElem") && path.ends_with("from_elem") {
+            let elem = args.first()?.ty(self.body.locals()).into_option()?;
+            let primitive = matches!(
+                elem.kind(),
+                TyKind::RigidTy(
+                    RigidTy::Bool
+                        | RigidTy::Char
+                        | RigidTy::Int(_)
+                        | RigidTy::Uint(_)
+                        | RigidTy::Float(_)
+                )
+            );
+            let n = args.get(1)?;
+            if !primitive || !whole_local_or_const(n) {
+                return None;
+            }
+            match self.mir_usize_constant(n) {
+                Some(n) => Expr::bitvec_const(n, pointer),
+                None => self.codegen_operand(n)?,
+            }
+        } else {
+            return None;
+        };
+        debug!(%path, ?bound, "BMC modelled call trip bound");
+        (bound.sort().bitvec_width() == Some(pointer)).then_some(bound)
+    }
+
+    /// The value of a `usize` operand that is a constant, or a local whose
+    /// one definition in the body is a constant and that nothing borrows.
+    fn mir_usize_constant(&self, operand: &Operand) -> Option<u64> {
+        use rustc_public::mir::{Rvalue, StatementKind};
+        let constant_value = |operand: &Operand| match operand {
+            Operand::Constant(constant) => constant.const_.eval_target_usize().into_option(),
+            _ => None,
+        };
+        if let Some(value) = constant_value(operand) {
+            return Some(value);
+        }
+        let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+            return None;
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let local = place.local;
+        let mut value = None;
+        for block in &self.body.blocks {
+            for stmt in &block.statements {
+                let StatementKind::Assign(lhs, rvalue) = &stmt.kind else {
+                    continue;
+                };
+                if let Rvalue::Ref(_, _, borrowed) | Rvalue::AddressOf(_, borrowed) = rvalue
+                    && borrowed.local == local
+                {
+                    return None;
+                }
+                if lhs.local != local {
+                    continue;
+                }
+                let Rvalue::Use(defined, ..) = rvalue else {
+                    return None;
+                };
+                if !lhs.projection.is_empty() || value.is_some() {
+                    return None;
+                }
+                value = Some(constant_value(defined)?);
+            }
+            if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
+                && destination.local == local
+            {
+                return None;
+            }
+        }
+        if (1..=self.body.arg_locals().len()).contains(&local) {
+            return None;
+        }
+        value
     }
 
     /// Intercept a destructor-path `Call` (`drop_in_place::<T>` /
@@ -62,6 +558,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Returns `None` (decline → the existing "Call terminator" fallback stands,
     /// fail-closed) for anything with a real user `Drop` side effect. Keys on the
     /// destructor callee PATH only, never on a public method name like `clear`.
+
     fn try_codegen_drop_glue_call(
         &mut self,
         func: &Operand,
@@ -84,7 +581,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 return None;
             };
             let inner = *inner;
-            if bmc_ty_has_unresolved_params(inner) {
+            if mono_ty::has_unresolved_params(inner) {
                 return None;
             }
             if bmc_ty_trivially_no_drop(inner)
@@ -108,7 +605,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => pointee,
             _ => return None,
         };
-        if bmc_ty_has_unresolved_params(dropped_ty) {
+        if mono_ty::has_unresolved_params(dropped_ty) {
             return None;
         }
         // Exactly the Drop-arm predicate set, applied to the Call's dropped type —
@@ -137,9 +634,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         &mut self,
         term: &Terminator,
     ) -> TerminatorSuccessors {
+        // A call writes its destination: a pointee entry the handler does not
+        // re-insert still describes the previous value (`ref_pointee_table`).
+        let reassigned = match &term.kind {
+            TerminatorKind::Call { destination, .. }
+                if !destination
+                    .projection
+                    .iter()
+                    .any(|p| matches!(p, rustc_public::mir::ProjectionElem::Deref)) =>
+            {
+                Some(self.ssa_base_name(destination))
+            }
+            _ => None,
+        };
+        let generation = self.ref_pointees.generation();
+        let successors = self.codegen_terminator_with_successors_inner(term);
+        if let Some(key) = reassigned {
+            self.ref_pointees.poison_stale_since(&key, generation);
+        }
+        self.flush_ref_pointee_path_ambiguity();
+        successors
+    }
+
+    fn codegen_terminator_with_successors_inner(
+        &mut self,
+        term: &Terminator,
+    ) -> TerminatorSuccessors {
         debug!(?term, kind=?term.kind, "AY codegen_terminator_with_successors");
         // Track source span for property locations (#1164).
-        self.current_span = Some(term.span);
+        self.current_span = Some(mir_span!(term));
         // SwitchInt→variant bridge (#3017): per-branch facts are staged fresh for the
         // current terminator only; clear any stragglers (e.g. a duplicated switch
         // target from the previous terminator) so no stale fact rides a later edge.
@@ -203,6 +726,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             TerminatorKind::Drop { place, target, .. } => {
+                if self.try_native_box_drop(place) {
+                    return vec![(*target, None)];
+                }
                 // Phase 1 (#3499): Record sound fallback for drops on types that
                 // may implement Drop. Non-trivial drops are over-approximated as
                 // skip, so fallback recording triggers verdict demotion.
@@ -250,9 +776,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             TerminatorKind::Call { func, args, destination, target, .. } => {
+                if target.is_some() && self.try_native_box_transfer_call(func, args, destination) {
+                    return vec![(target.unwrap(), None)];
+                }
                 // SwitchInt→variant bridge (#3017): a callee may retag an enum through a
                 // mutable-reference argument, so drop facts that could go stale.
                 self.kill_variant_facts_for_call(args);
+                // FC-06 (BMC): a call destination through a deref is a store.
+                self.bmc_modifies_check_deref_store(destination);
+                // A sub-slice view with a nonzero start handed to a model that
+                // reads the SOURCE array instead of the view's own backing.
+                self.bmc_subslice_consumer_fail_closed(func, args);
 
                 // BMC drop-glue Call intercept — the Call-terminator analogue of the
                 // `TerminatorKind::Drop` empty/benign-glue skip. A non-empty Drop is
@@ -286,13 +820,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(successors) =
                     self.handled_call_successors(kani_result, func, *target, term)
                 {
+                    // FC-06 (BMC): a handler inlines no body, so its stores reach
+                    // the frame only through the call's pointer arguments.
+                    self.bmc_modifies_classify_handled_call(args, "kani model call");
                     return successors;
                 }
+                self.stub_stated_unwinding = false;
                 let stub_result =
                     self.try_codegen_stdlib_stub_call(func, args, destination, *target);
                 if let Some(successors) =
                     self.handled_call_successors(stub_result, func, *target, term)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "stub call");
+                    if target.is_some() {
+                        self.bmc_model_call_unwinding_check(func, args);
+                    }
                     return successors;
                 }
 
@@ -303,6 +845,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(next_bb) =
                     self.try_codegen_abstracted_fallback(func, destination, *target)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "abstracted call");
+                    self.bmc_model_call_unwinding_check(func, args);
                     return vec![(next_bb, None)];
                 }
 
@@ -312,6 +856,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(next_bb) =
                     self.try_codegen_array_cmp_call(func, args, destination, *target)
                 {
+                    self.bmc_model_call_unwinding_check(func, args);
                     return vec![(next_bb, None)];
                 }
 
@@ -321,6 +866,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(next_bb) =
                     self.try_codegen_virtual_call(func, args, destination, *target)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "virtual call");
+                    self.bmc_model_call_unwinding_check(func, args);
                     return vec![(next_bb, None)];
                 }
 
@@ -329,6 +876,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // that the BMC path cannot inline. Intercept and encode directly:
                 // constant-fold, base-2 shift, or symbolic over-approximation.
                 if let Some(next_bb) = self.try_codegen_pow_call(func, args, destination, *target) {
+                    self.bmc_model_call_unwinding_check(func, args);
                     return vec![(next_bb, None)];
                 }
 
@@ -338,6 +886,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(next_bb) =
                     self.try_codegen_math_unary_call(func, args, destination, *target)
                 {
+                    self.bmc_model_call_unwinding_check(func, args);
                     return vec![(next_bb, None)];
                 }
 
@@ -386,6 +935,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let Some(next_bb) =
                     self.try_codegen_sysconf_bmc(func, args, destination, *target)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "sysconf call");
                     return vec![(next_bb, None)];
                 }
                 // Part of #3736: direct `libc::posix_memalign` FFI model.
@@ -393,6 +943,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     && let Some(next_bb) =
                         self.try_codegen_posix_memalign_bmc(func, args, destination, *target)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "posix_memalign call");
                     return vec![(next_bb, None)];
                 }
 
@@ -406,6 +957,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     && let Some(next_bb) =
                         self.try_codegen_foreign_effect_frame_bmc(func, args, destination, *target)
                 {
+                    self.bmc_modifies_classify_handled_call(args, "foreign effect frame");
                     return vec![(next_bb, None)];
                 }
 
@@ -424,6 +976,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             "call to foreign \"C\" function `{name}` is not currently supported by Kani"
                         )),
                     );
+                    // The call's destination is never assigned, so an inlining
+                    // caller continues on a FREE value; and the forced check is
+                    // an unsupported construct, not a bug in the program. Neither
+                    // may be certified Genuine (tools/soundness-duals/
+                    // dual_77_dependent.rs). SAT-only: a dead-path call still
+                    // discharges to a clean proof.
+                    self.ctx.bmc_sound_havoc("unsupported_foreign_function");
                     return vec![];
                 }
 
@@ -468,6 +1027,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 "call to foreign \"C\" function `{name}` is not currently supported by Kani"
                             )),
                         );
+                        // Same taint as the FnDef branch above: the destination
+                        // stays free and an inlining caller (`call_on` in
+                        // dual_77_dependent.rs) reads it, so its downstream
+                        // assertion failure is an artifact of the havoc.
+                        self.ctx.bmc_sound_havoc("unsupported_foreign_function");
                         return vec![];
                     }
                 }
@@ -476,10 +1040,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             TerminatorKind::Assert { cond, expected, msg, target, .. } => {
+                // `--no-overflow-checks` / `--no-memory-safety-checks` turn this
+                // check off: no obligation, and the successor is entered with
+                // NO edge condition, so execution goes on (with the wrapped
+                // value of an overflowing op) as the CHC lane's
+                // `assert_check_disabled` does. Dropping only the check, the
+                // label-kind gate did that while still passing the assertion on
+                // as the edge condition: every overflowing (or out-of-bounds)
+                // execution was pruned, and code after it verified against
+                // states the program does reach.
+                if self.mir_assert_check_disabled(msg) {
+                    return vec![(*target, None)];
+                }
+                // `--prove-safety-only` checks UB, not panics. Kani turns every
+                // `PropertyClass::Assertion` check into a bare assume under the
+                // flag (codegen/assert.rs `codegen_assert_assume`), and it files
+                // every MIR `Assert` there but the pointer-UB ones, which are
+                // `SafetyCheck`. The CHC lane does the same
+                // (`emit_assert_error_rule_shared`). Only the check goes: the
+                // edge condition below is the assume half. Checked here, BMC
+                // failed a harness on an overflow or an index panic that Kani
+                // and the CHC lane do not report.
+                let assume_only =
+                    self.ctx.config.prove_safety_only && !Self::mir_assert_is_safety_check(msg);
                 if let AssertMessage::Overflow(op, lhs, rhs) = msg {
                     let lhs_expr = self.codegen_operand(lhs);
                     let rhs_expr = self.codegen_operand(rhs);
-                    if let (Some(lhs_expr), Some(rhs_expr)) = (lhs_expr, rhs_expr) {
+                    if assume_only {
+                        // No check; the edge condition below still holds.
+                    } else if let (Some(lhs_expr), Some(rhs_expr)) = (lhs_expr, rhs_expr) {
                         // For shift operations, only the value operand's (LHS) signedness
                         // matters. For non-shift ops, check both operands.
                         // Use signed fallback when unknown — unsigned is unsound for negative values (#2714)
@@ -528,24 +1117,31 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             } else {
                                 "attempt to shift right with overflow"
                             };
-                            self.emit_shift_distance_check_with_message(
+                            self.emit_mir_assert_shift_distance_check(
                                 &lhs_expr,
                                 &rhs_expr,
                                 distance_signed,
-                                Some(message),
+                                message,
                             );
-                        } else {
-                            self.emit_overflow_check(*op, &lhs_expr, &rhs_expr, is_signed);
+                        } else if let Some((no_overflow, label)) =
+                            self.overflow_check(*op, &lhs_expr, &rhs_expr, is_signed)
+                        {
+                            // Enabled (`mir_assert_check_disabled` above), so
+                            // recorded whatever the label's kind would say: the
+                            // edge condition below assumes it.
+                            self.record_violation_guarded_ungated(no_overflow.not(), label, None);
                         }
                     } else {
-                        let location = format!("{:?}", term.span);
+                        let location = format!("{:?}", mir_span!(term));
                         self.ctx.unsupported_with_fallback("Overflow assert operands", location);
                         // Conservative: record unconditional violation to prevent
                         // false PROOF when overflow check operands are untranslatable.
                         // Mirrors CHC emit_untranslatable_assert_fallback behavior.
-                        self.record_violation_guarded(
+                        // It stands for the enabled MIR `Assert`.
+                        self.record_violation_guarded_ungated(
                             Expr::bool_const(true),
                             "untranslatable_overflow_assert",
+                            None,
                         );
                     }
                     // Propagate assertion as edge condition so target block gets a
@@ -566,7 +1162,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         if let Some(w) = cond_expr.sort().bitvec_width() {
                             cond_expr.ne(Expr::bitvec_const(0u64, w))
                         } else {
-                            let location = format!("{:?}", term.span);
+                            let location = format!("{:?}", mir_span!(term));
                             self.ctx.unsupported_with_fallback("Assert condition sort", location);
                             // Conservative: record unconditional violation to prevent
                             // false PROOF when assertion condition is untranslatable.
@@ -580,7 +1176,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     } else if cond_expr.sort().is_int() {
                         cond_expr.ne(Expr::int_const(0))
                     } else {
-                        let location = format!("{:?}", term.span);
+                        let location = format!("{:?}", mir_span!(term));
                         self.ctx.unsupported_with_fallback("Assert condition sort", location);
                         // Conservative: record unconditional violation to prevent
                         // false PROOF when assertion condition sort is unsupported.
@@ -593,8 +1189,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     };
                     let assertion = if *expected { bool_cond } else { bool_cond.not() };
                     let label = Self::assert_label_for_message(msg);
-                    // Assert guarded by path condition
-                    self.record_violation_guarded(assertion.clone().not(), label);
+                    // Assert guarded by path condition. Enabled
+                    // (`mir_assert_check_disabled` above), so recorded whatever
+                    // the label's kind would say: the edge condition below
+                    // assumes it. Under `--prove-safety-only` a panic assert is
+                    // that assume alone (`assume_only` above).
+                    if !assume_only {
+                        self.record_violation_guarded_ungated(assertion.clone().not(), label, None);
+                    }
                     // Propagate assertion as edge condition so target block
                     // gets a non-None path condition (#762).
                     vec![(*target, Some(assertion))]
@@ -614,7 +1216,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             TerminatorKind::Resume | TerminatorKind::Abort => {
-                let location = format!("{:?}", term.span);
+                let location = format!("{:?}", mir_span!(term));
                 self.ctx.unsupported("Resume/Abort terminator", location);
                 vec![]
             }
@@ -628,7 +1230,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // PROOF to FAILURE (fail-closed), mirroring the CHC path.
                 // reachability.rs intentionally forwards InlineAsm here to be
                 // marked an unsupported construct rather than rejecting earlier.
-                let location = format!("{:?}", term.span);
+                let location = format!("{:?}", mir_span!(term));
                 self.ctx.unsupported_with_fallback("InlineAsm terminator", location);
                 vec![]
             }
@@ -809,7 +1411,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// aterm's `Parser` (owns `Vec<u8>` + `ArrayVec` buffers, no `Drop` impl) so a clean
     /// proof is not spuriously demoted by `Drop_side_effects`.
     fn bmc_adt_auto_glue_all_fields_benign(&self, ty: rustc_public::ty::Ty, depth: usize) -> bool {
-        use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+        use rustc_public::ty::{RigidTy, TyKind};
         if depth > 8 {
             return false;
         }
@@ -817,7 +1419,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return false;
         };
         // Unresolved params would ICE the internal query / resolve_drop_in_place (#3942).
-        if bmc_ty_has_unresolved_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return false;
         }
         // The crux: a user `Drop` impl (destructor) has observable effects BMC cannot
@@ -828,20 +1430,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         def.variants().iter().all(|variant| {
             variant.fields().iter().all(|f| {
-                let field_ty = f.ty();
-                let resolved = if let TyKind::Param(param) = field_ty.kind() {
-                    args.0
-                        .get(param.index as usize)
-                        .and_then(|ga| match ga {
-                            GenericArgKind::Type(t) => Some(*t),
-                            _ => None,
-                        })
-                        .unwrap_or(field_ty)
-                } else {
-                    field_ty
-                };
-                bmc_ty_drop_is_benign(resolved)
-                    || self.bmc_adt_auto_glue_all_fields_benign(resolved, depth + 1)
+                // Rule A (`shared::mono_ty`): the field's type at the ADT's own
+                // arguments. A field whose type does not instantiate is not
+                // benign (fail closed).
+                mono_ty::field_ty(f, &args).is_some_and(|resolved| {
+                    bmc_ty_drop_is_benign(resolved)
+                        || self.bmc_adt_auto_glue_all_fields_benign(resolved, depth + 1)
+                })
             })
         })
     }
@@ -856,10 +1451,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 /// generic params, which would ICE inside the resolver (#3942 parity).
 /// Part of #4112 follow-up.
 fn bmc_drop_glue_is_empty(ty: rustc_public::ty::Ty) -> bool {
-    if bmc_ty_has_unresolved_params(ty) {
-        return false;
-    }
-    rustc_public::mir::mono::Instance::resolve_drop_in_place(ty).is_empty_shim()
+    mono_ty::drop_in_place(ty).is_some_and(|glue| glue.is_empty_shim())
 }
 
 /// True when dropping `ty` runs only compiler-generated field glue: the drop
@@ -875,10 +1467,7 @@ fn bmc_drop_glue_is_empty(ty: rustc_public::ty::Ty) -> bool {
 /// missing shim body (returns false → demote).
 fn bmc_adt_drop_is_field_glue_only(ty: rustc_public::ty::Ty) -> bool {
     use rustc_public::mir::TerminatorKind;
-    if bmc_ty_has_unresolved_params(ty) {
-        return false;
-    }
-    let Some(body) = rustc_public::mir::mono::Instance::resolve_drop_in_place(ty).body() else {
+    let Some(body) = mono_ty::drop_glue_body(ty) else {
         return false;
     };
     body.blocks.iter().all(|bb| !matches!(bb.terminator.kind, TerminatorKind::Call { .. }))
@@ -899,14 +1488,16 @@ fn bmc_adt_drop_is_field_glue_only(ty: rustc_public::ty::Ty) -> bool {
 /// `Drop` of a `{async fn body}` always fell to `Drop_side_effects`.
 fn bmc_coroutine_drop_is_benign(ty: rustc_public::ty::Ty, depth: usize) -> bool {
     use rustc_public::mir::TerminatorKind;
-    if depth > 8 || bmc_ty_has_unresolved_params(ty) {
+    if depth > 8 {
         return false;
     }
-    let shim = rustc_public::mir::mono::Instance::resolve_drop_in_place(ty);
+    let Some(shim) = mono_ty::drop_in_place(ty) else {
+        return false;
+    };
     if shim.is_empty_shim() {
         return true;
     }
-    let Some(body) = shim.body() else {
+    let Some(body) = shim.callee_body() else {
         return false;
     };
     body.blocks.iter().all(|bb| match &bb.terminator.kind {
@@ -917,32 +1508,6 @@ fn bmc_coroutine_drop_is_benign(ty: rustc_public::ty::Ty, depth: usize) -> bool 
             .is_some_and(|dropped| bmc_drop_benign_rec(dropped, depth + 1)),
         _ => true,
     })
-}
-
-/// Detect unresolved generic params that would ICE `resolve_drop_in_place`
-/// (#3942 parity with the CHC drop pipeline).
-fn bmc_ty_has_unresolved_params(ty: rustc_public::ty::Ty) -> bool {
-    use rustc_public::ty::{GenericArgKind, TyConstKind};
-    match ty.kind() {
-        TyKind::Param(_) => true,
-        TyKind::RigidTy(RigidTy::Array(elem, len)) => {
-            bmc_ty_has_unresolved_params(elem) || matches!(len.kind(), TyConstKind::Param(_))
-        }
-        TyKind::RigidTy(RigidTy::Slice(elem)) => bmc_ty_has_unresolved_params(elem),
-        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => bmc_ty_has_unresolved_params(pointee),
-        TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => bmc_ty_has_unresolved_params(pointee),
-        TyKind::RigidTy(RigidTy::Tuple(fields)) => {
-            fields.iter().any(|f| bmc_ty_has_unresolved_params(*f))
-        }
-        TyKind::RigidTy(RigidTy::Adt(_, ref args))
-        | TyKind::RigidTy(RigidTy::Closure(_, ref args))
-        | TyKind::RigidTy(RigidTy::Coroutine(_, ref args)) => args.0.iter().any(|arg| match arg {
-            GenericArgKind::Type(arg_ty) => bmc_ty_has_unresolved_params(*arg_ty),
-            GenericArgKind::Const(c) => matches!(c.kind(), TyConstKind::Param(_)),
-            _ => false,
-        }),
-        _ => false,
-    }
 }
 
 fn bmc_ty_trivially_no_drop(ty: rustc_public::ty::Ty) -> bool {
@@ -1076,7 +1641,7 @@ fn bmc_drop_benign_rec(ty: rustc_public::ty::Ty, depth: usize) -> bool {
                 });
             }
             // Unresolved generic params would ICE resolve_drop_in_place (#3942).
-            if bmc_ty_has_unresolved_params(ty) {
+            if mono_ty::has_unresolved_params(ty) {
                 return false;
             }
             // A non-empty shim is acceptable ONLY when it is pure compiler
@@ -1097,19 +1662,10 @@ fn bmc_drop_benign_rec(ty: rustc_public::ty::Ty, depth: usize) -> bool {
             }
             def.variants().iter().all(|variant| {
                 variant.fields().iter().all(|f| {
-                    let field_ty = f.ty();
-                    let resolved = if let TyKind::Param(param) = field_ty.kind() {
-                        args.0
-                            .get(param.index as usize)
-                            .and_then(|ga| match ga {
-                                rustc_public::ty::GenericArgKind::Type(t) => Some(*t),
-                                _ => None,
-                            })
-                            .unwrap_or(field_ty)
-                    } else {
-                        field_ty
-                    };
-                    bmc_drop_benign_rec(resolved, depth + 1)
+                    // Rule A (`shared::mono_ty`): the field's type at the ADT's
+                    // own arguments, or not benign.
+                    mono_ty::field_ty(f, &args)
+                        .is_some_and(|resolved| bmc_drop_benign_rec(resolved, depth + 1))
                 })
             })
         }
@@ -1205,7 +1761,7 @@ fn bmc_container_drop_is_dealloc_only_by_name(name: &str) -> bool {
 /// non-container bottoms out immediately, so self-referential types via `Box`
 /// terminate at the first user struct (returning `false`, i.e. demote).
 fn bmc_ty_drop_is_dealloc_only(ty: rustc_public::ty::Ty) -> bool {
-    if bmc_ty_has_unresolved_params(ty) {
+    if mono_ty::has_unresolved_params(ty) {
         return false;
     }
     match ty.kind() {
@@ -1229,4 +1785,79 @@ fn bmc_ty_drop_is_dealloc_only(ty: rustc_public::ty::Ty) -> bool {
 /// `bmc_ty_trivially_no_drop` / `bmc_drop_glue_is_empty` / dealloc-only checks).
 fn bmc_ty_drop_is_irrelevant(ty: rustc_public::ty::Ty) -> bool {
     bmc_ty_trivially_no_drop(ty) || bmc_drop_glue_is_empty(ty) || bmc_ty_drop_is_dealloc_only(ty)
+}
+
+/// `obligation_free_walk::instance_may_loop`, cached per instance for a unit
+/// that stubs nothing (a stubbed unit walks every time).
+fn bmc_instance_may_loop_cached(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    instance: rustc_public::mir::mono::Instance,
+    stubs: &crate::codegen_ay::obligation_free_walk::StubMap,
+) -> bool {
+    thread_local! {
+        static LOOPS: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if !stubs.is_empty() {
+        return crate::codegen_ay::obligation_free_walk::instance_may_loop(tcx, instance, stubs);
+    }
+    let key = instance.mangled_name();
+    if let Some(cached) = LOOPS.with(|loops| loops.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let may_loop = crate::codegen_ay::obligation_free_walk::instance_may_loop(tcx, instance, stubs);
+    LOOPS.with(|loops| loops.borrow_mut().insert(key, may_loop));
+    may_loop
+}
+
+/// `len * per` without wrapping: past the pointer width the count is the
+/// most a loop can run.
+fn scaled_len(len: Expr, per: u64, pointer: u32) -> Expr {
+    if per == 1 {
+        return len;
+    }
+    let per = Expr::bitvec_const(per, pointer);
+    let max = Expr::bitvec_const(u64::MAX, pointer);
+    Expr::ite(len.clone().bvugt(max.clone().bvudiv(per.clone())), max, len.bvmul(per))
+}
+
+/// Is `ty` a container whose kani `bounded_any::<N>` runs only loops of at most
+/// `N` passes: `String`, or `Vec<P>` / `Box<[P]>` of a primitive `P`?
+fn bounded_any_container_is_loop_bounded(ty: rustc_public::ty::Ty) -> bool {
+    let primitive = |ty: rustc_public::ty::Ty| {
+        matches!(
+            ty.kind(),
+            TyKind::RigidTy(
+                RigidTy::Bool
+                    | RigidTy::Char
+                    | RigidTy::Int(_)
+                    | RigidTy::Uint(_)
+                    | RigidTy::Float(_)
+            )
+        )
+    };
+    let first_type_arg = |args: &rustc_public::ty::GenericArgs| {
+        args.0.iter().find_map(|arg| match arg {
+            rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+            _ => None,
+        })
+    };
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+            let name = rustc_public::CrateDef::name(&def);
+            if name == "std::string::String" || name == "alloc::string::String" {
+                return true;
+            }
+            if name == "std::vec::Vec" || name == "alloc::vec::Vec" {
+                return first_type_arg(&args).is_some_and(primitive);
+            }
+            if name == "std::boxed::Box" || name == "alloc::boxed::Box" {
+                return first_type_arg(&args).is_some_and(|inner| {
+                    matches!(inner.kind(), TyKind::RigidTy(RigidTy::Slice(elem)) if primitive(elem))
+                });
+            }
+            false
+        }
+        _ => false,
+    }
 }

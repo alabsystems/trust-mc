@@ -1,0 +1,439 @@
+{
+  "provenance": {
+    "ay": {
+      "build_commit": "4cadc2bf1deda68e08ac0e2a45a4939ab411d73d",
+      "cargo_toml_pin": "4cadc2bf1deda68e08ac0e2a45a4939ab411d73d",
+      "path": "~/Library/Caches/trust-mc-ay-cli-4cadc2bf1/release/ay",
+      "pin_match": true,
+      "version": "ay 0.26.0+build.9607.4cadc2bf1deda68e08ac0e2a45a4939ab411d73d@2026-09-13T02:35:56Z"
+    },
+    "bundle": {
+      "checkout_at_run": {
+        "dirty": true,
+        "dirty_tracked_paths": 11,
+        "head": "91b37a43b156c3f4d313d3fba502e5f22d42d4a2",
+        "note": "checkout HEAD at gate time; not evidence of the bundle's build commit",
+        "path": "~/trust-mc-unknowns",
+        "untracked_paths": 2
+      },
+      "compiler_sha256": "80e68334d00908156b28a30fdf41e46a91052c776f12884aa258b1614966c62d",
+      "dir": "~/trust-mc-unknowns/target/trust-mc",
+      "driver_mtime_utc": "2026-09-14T23:33:40+00:00",
+      "driver_sha256": "befda7870b2e741484861219415176acf96eca25af60fcd1b3771fdb3c22a243",
+      "driver_version": "trust-mc 0.6.0"
+    },
+    "config": {
+      "env": {
+        "PATH_first": "~/Library/Caches/trust-mc-ay-cli-4cadc2bf1/release",
+        "RUSTFLAGS": "-Awarnings",
+        "TRUST_MC_SYSROOT": "~/trust-mc-unknowns/target/trust-mc"
+      },
+      "harness_timeout_s": 30,
+      "inherited_env": {},
+      "jobs": 3,
+      "kinds": [],
+      "lanes": [
+        "bmc",
+        "chc"
+      ],
+      "only": [
+        "chc_exact_ctrex"
+      ],
+      "strict": false,
+      "wall_timeout_rule": "180 + harnesses * (2 * 30 + 30) seconds per file"
+    },
+    "finished_at_utc": "2026-09-14T23:57:15+00:00",
+    "host": {
+      "cpu_count": 10,
+      "load_average_end": [
+        7.49,
+        8.52,
+        8.28
+      ],
+      "load_average_start": [
+        8.55,
+        8.92,
+        8.4
+      ],
+      "platform": "macOS-26.6.2-arm64-arm-64bit",
+      "python": "3.12.14"
+    },
+    "manifest": {
+      "changed_during_run": false,
+      "path": "tools/soundness-duals/manifest.toml",
+      "sha256": "935f861caf6d52eef1a73b95aec030b14082fa373b7cc6a9abb0ffafe17a50d0"
+    },
+    "runtime_seconds": 67.3,
+    "started_at_utc": "2026-09-14T23:56:07+00:00",
+    "trust_mc": {
+      "dirty": true,
+      "dirty_tracked_paths": 11,
+      "head": "91b37a43b156c3f4d313d3fba502e5f22d42d4a2",
+      "path": "~/trust-mc-unknowns",
+      "untracked_paths": 2
+    },
+    "trust_mc_changed_during_run": false
+  },
+  "rows": [
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_offset_overflows_isize",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_offset_overflows_isize",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": false,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 5,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [],
+      "harness": "bug_offset_overflows_isize_from_any_index",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_offset_overflows_isize_from_any_index",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": false,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 11,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_from_any_index_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 12,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_from_any_index_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 12,
+      "class": "unknown",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "inconclusive",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Unknown",
+        "UNKNOWN_QUALITY:Clean",
+        "UNKNOWN_REASON:Memout"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "INCONCLUSIVE",
+      "verdict_line": "VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": null,
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "PROOF",
+        "PROOF_TRANSCRIPT_METADATA:v1",
+        "NATIVE_PROOF_GRADE:rejected:replay_not_replayable",
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    }
+  ],
+  "runs": [
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "chc_exact_ctrex_dual.rs",
+      "seconds": 2.2,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "chc_exact_ctrex_dual.rs",
+      "seconds": 0.3,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_safe.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "chc_exact_ctrex_safe.rs",
+      "seconds": 2.3,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_safe.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 0,
+      "lane": "chc",
+      "path": "chc_exact_ctrex_safe.rs",
+      "seconds": 66.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    }
+  ],
+  "schema": "trust-mc.soundness-dual-gate-report/v2",
+  "summary": {
+    "decided_rows": 4,
+    "false_certificate_rows": [],
+    "gate": "pass",
+    "gate_reasons": [],
+    "gating_rows": [],
+    "known_red_class_changed": [],
+    "known_red_now_green": [],
+    "needs_review": [],
+    "per_lane": {
+      "bmc": {
+        "error": 0,
+        "false-certificate": 0,
+        "false-failure": 0,
+        "match": 0,
+        "missed-bug": 0,
+        "property_mismatch": 0,
+        "total": 4,
+        "unclassified": 0,
+        "unknown": 4
+      },
+      "chc": {
+        "error": 0,
+        "false-certificate": 0,
+        "false-failure": 0,
+        "match": 4,
+        "missed-bug": 0,
+        "property_mismatch": 2,
+        "total": 4,
+        "unclassified": 0,
+        "unknown": 0
+      }
+    },
+    "soundness_rows": []
+  }
+}

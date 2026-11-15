@@ -231,6 +231,60 @@ pub(in crate::codegen_ay) fn mir_to_chc_with_instance<'tcx>(
     mir_to_chc_internal(tcx, body, Some(instance), fn_name, cfg)
 }
 
+/// Diagnostic lever: `TRUST_MC_NO_LOST_OBLIGATION_RECOVERY=1` restores the
+/// pre-recovery behaviour (a VC whose passes erased every error obligation is
+/// emitted as is, and the driver reports it INCONCLUSIVE, `LostErrorRules`).
+pub(in crate::codegen_ay) fn lost_obligation_recovery_disabled() -> bool {
+    std::env::var("TRUST_MC_NO_LOST_OBLIGATION_RECOVERY").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Whether a finished translation lost every error obligation of the checks it
+/// registered: properties registered, no `error` / `error_p{id}`-headed rule, and
+/// no certified discharge. The compiler calls that shape lost checks, not proved
+/// checks (`discharge_straightline_safety`, SOUNDNESS #67).
+pub(in crate::codegen_ay) fn translation_lost_every_error_obligation(vc: &ChcVc) -> bool {
+    !vc.trivially_safe_discharged
+        && !vc.keep_error_obligations
+        && !vc.properties.is_empty()
+        // Not lost, accounted for: emission turns a VC whose every property was
+        // recorded `discharged_at_encode` into the canonical `false => error`
+        // obligation (`all_properties_discharged_at_encode`), a clean proof with no
+        // solver run. Keep mode would pin live `error_p{id}` rules and defeat it.
+        && !vc.properties.iter().all(|prop| prop.discharged_at_encode.is_some())
+        && !vc.rules.iter().any(trust_mc_core::chc::rule_is_error_obligation)
+}
+
+/// Lost-checks recovery at the production translate site.
+///
+/// The translate passes (array pruning, scalarization, constant folding, orphan
+/// pruning) can erase the last error obligation of a VC with registered
+/// properties. Nothing was proved there: a check in a dead branch, a check whose
+/// guard folded to `false`, and a check whose edge the encoding never reaches all
+/// collapse to the same shape, and one of them hid a real bug
+/// (`tools/soundness-duals/lost_error_rules_dual.rs`). `re_encode` translates again
+/// with `ChcConfig::keep_error_obligations`, so the obligations reach the
+/// emit-time discharge and the solver, which decide them (Safe, vacuous,
+/// refuted) instead of the collapse. Only the collapsed shape pays for the
+/// second translation, the same speculative re-encode frame narrowing uses.
+///
+/// `disabled` is the caller's reading of the env lever, passed in rather than read
+/// here so a test of this function is not steered by the ambient environment.
+pub(in crate::codegen_ay) fn recover_lost_error_obligations(
+    vc: ChcVc,
+    disabled: bool,
+    re_encode: impl FnOnce() -> ChcVc,
+) -> ChcVc {
+    if disabled || !translation_lost_every_error_obligation(&vc) {
+        return vc;
+    }
+    warn!(
+        properties = vc.properties.len(),
+        "CHC: translation erased every error obligation of a VC with registered \
+         properties; re-encoding with error obligations kept"
+    );
+    re_encode()
+}
+
 /// Accept a frame-narrowed VC only if it is well-formed; otherwise re-encode with
 /// the full frame.
 ///
@@ -284,7 +338,9 @@ fn narrow_or_reencode<'tcx>(
     // away. Deciding it AFTER the full translate is what makes the guard exact:
     // `trivially_safe_discharged` is an observation of the emitted VC, not a
     // prediction from MIR.
-    if full_vc.trivially_safe_discharged {
+    // A VC the lost-checks recovery re-ran (`keep_error_obligations`) defers its
+    // discharge to the emit-time pipeline, so it is the same class: never narrow it.
+    if full_vc.trivially_safe_discharged || full_vc.keep_error_obligations {
         debug!(
             fn_name = %fn_name,
             "CHC: frame narrowing skipped — full-frame VC discharged syntactically"
@@ -311,12 +367,18 @@ fn narrow_or_reencode<'tcx>(
     // Speculative narrowed encode. `reset` must sit immediately before it: the
     // validator compares against the columns THIS translate dropped.
     crate::codegen_ay::chc::reset_dropped_frame_columns();
-    let ctx = if let Some(instance) = current_instance {
+    let mut ctx = if let Some(instance) = current_instance {
         ChcCtx::new_with_instance(tcx, body, instance, Arc::clone(fn_name), cfg)
     } else {
         ChcCtx::new(tcx, body, Arc::clone(fn_name), cfg)
     };
+    // The full-frame translation already recorded this function's per-function
+    // diagnostics; the speculative narrowed one must not add them a second time.
+    ctx.record_per_fn_diagnostics = false;
+    let accounting_attempt =
+        crate::codegen_ay::unstubbed_accounting::EncodingAttempt::begin(current_instance, body);
     let (narrow_vc, _) = ctx.translate();
+    accounting_attempt.finish();
 
     // GUARD 3 — free-variable validator on the EMITTED VC.
     let dropped = crate::codegen_ay::chc::take_dropped_frame_columns();
@@ -359,6 +421,102 @@ fn mir_to_chc_internal<'tcx>(
     fn_name: impl Into<Arc<str>>,
     cfg: super::ChcConfig,
 ) -> ChcVc {
+    use crate::codegen_ay::chc::heap::stack_address::{set_far_forced, take_far_prescan_retry};
+    let cfg = super::native_box_model_selection::config_for_body(tcx, cfg, body);
+    // A RustCall tuple can carry a mutable reference through an out-of-line
+    // callable body. Reg's plain-reference value snapshot cannot express its
+    // current owner or writeback. Select the existing memory encoder BEFORE
+    // translating that body, rather than encoding a failed Reg attempt and
+    // trying to discard its already-published approximation diagnostics.
+    // This selects an encoder only: its typed owner, allocation and alias
+    // checks still decide whether the call itself is supported.
+    let cfg = if cfg.track_level < ChcTrackLevel::Mem
+        && !cfg.int_lift
+        && mutable_rustcall_needs_memory(body)
+    {
+        super::ChcConfig { track_level: ChcTrackLevel::Mem, ..cfg }
+    } else {
+        cfg
+    };
+    let fn_name_str: Arc<str> = fn_name.into();
+    let vc = mir_to_chc_internal_once(tcx, body, current_instance, Arc::clone(&fn_name_str), cfg);
+    // A far pointer met after an observation the translation had answered
+    // without fail-closed conditions (heap/stack_address.rs
+    // `book_far_pointer_prescan`): translate again with far pointers possible
+    // from the start.
+    if !take_far_prescan_retry(&fn_name_str) {
+        return vc;
+    }
+    set_far_forced(Some(&fn_name_str));
+    let vc = mir_to_chc_internal_once(tcx, body, current_instance, Arc::clone(&fn_name_str), cfg);
+    set_far_forced(None);
+    let _ = take_far_prescan_retry(&fn_name_str);
+    vc
+}
+
+/// Inspect only actual MIR call types. Neither a diagnostic name nor a term's
+/// width establishes this ABI or the tuple's mutable-reference field.
+fn mutable_rustcall_needs_memory(body: &Body) -> bool {
+    use rustc_public::mir::{Mutability, TerminatorKind};
+    use rustc_public::ty::{Abi, RigidTy, TyKind};
+
+    body.blocks.iter().any(|block| {
+        let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
+            return false;
+        };
+        if args.len() != 2
+            || !func.ty(body.locals()).ok().is_some_and(|ty| {
+                ty.kind().fn_sig().is_some_and(|sig| sig.skip_binder().abi == Abi::RustCall)
+            })
+        {
+            return false;
+        }
+        args[1].ty(body.locals()).ok().is_some_and(|ty| {
+            matches!(ty.kind(), TyKind::RigidTy(RigidTy::Tuple(fields))
+                if fields.iter().any(|field| matches!(field.kind(),
+                    TyKind::RigidTy(RigidTy::Ref(_, _, Mutability::Mut)))))
+        })
+    })
+}
+
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+mod mutable_rustcall_model_selection_tests {
+    use super::mutable_rustcall_needs_memory;
+    use crate::callee_body::CalleeBody;
+    use crate::codegen_ay::context::with_test_ay_ctx_for_source;
+    use crate::codegen_ay::test_fixtures::find_instance_by_suffix;
+
+    #[test]
+    fn model_selection_uses_actual_abi_and_mutable_argument_type() {
+        const SOURCE: &str = r#"
+            #![allow(dead_code)]
+            fn call_mut(_: (), _: (&mut i32,)) {}
+            pub fn lookalike() { let mut value = 7; call_mut((), (&mut value,)); }
+            pub fn actual_mutable(f: &mut dyn FnMut(&mut i32)) {
+                let mut value = 7; f(&mut value);
+            }
+            pub fn actual_shared(f: &dyn Fn(&i32)) {
+                let value = 7; f(&value);
+            }
+        "#;
+        with_test_ay_ctx_for_source(SOURCE, |ctx| {
+            for (name, needed) in
+                [("lookalike", false), ("actual_mutable", true), ("actual_shared", false)]
+            {
+                let body = find_instance_by_suffix(ctx.tcx, name).callee_body().unwrap();
+                assert_eq!(mutable_rustcall_needs_memory(&body), needed, "{name}");
+            }
+        });
+    }
+}
+
+fn mir_to_chc_internal_once<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body,
+    current_instance: Option<Instance>,
+    fn_name: impl Into<Arc<str>>,
+    cfg: super::ChcConfig,
+) -> ChcVc {
     CHC_DEBUG_FLAG.store(cfg.chc_debug == ChcDebugMode::On, Ordering::Relaxed);
     let fn_name_str: Arc<str> = fn_name.into();
 
@@ -395,7 +553,10 @@ fn mir_to_chc_internal<'tcx>(
     } else {
         ChcCtx::new(tcx, body, fn_name_str.clone(), full_cfg)
     };
+    let accounting_attempt =
+        crate::codegen_ay::unstubbed_accounting::EncodingAttempt::begin(current_instance, body);
     let (vc, action) = ctx.translate();
+    accounting_attempt.finish();
 
     // Auto-promote to Mem level when Ref/AddressOf with projections was detected
     // at a lower track level (Part of #2084).
@@ -429,7 +590,10 @@ fn mir_to_chc_internal<'tcx>(
         } else {
             ChcCtx::new(tcx, body, fn_name_str, promoted_full_cfg)
         };
+        let accounting_attempt =
+            crate::codegen_ay::unstubbed_accounting::EncodingAttempt::begin(current_instance, body);
         let (vc, _) = ctx.translate();
+        accounting_attempt.finish();
         return narrow_or_reencode(
             tcx,
             body,
@@ -469,4 +633,67 @@ pub(in crate::codegen_ay) fn mir_to_chc_skip_tic<'tcx>(
     let ctx = ChcCtx::new(tcx, body, fn_name_str, resolved_cfg);
     let (vc, _action) = ctx.translate_skip_tic();
     vc
+}
+
+#[cfg(test)]
+mod lost_obligation_recovery_tests {
+    use super::{recover_lost_error_obligations, translation_lost_every_error_obligation};
+    use ay_bindings::Expr;
+    use trust_mc_core::chc::{ChcProperty, ChcVc, RelationApp, Rule, RuleBody};
+    use trust_mc_core::violation::PropertyKind;
+
+    fn registered() -> ChcVc {
+        let mut vc = ChcVc::new();
+        vc.properties.push(ChcProperty {
+            id: 0,
+            kind: PropertyKind::Assertion,
+            bb: 0,
+            relation: "error_p0".to_string(),
+            message: None,
+            location: None,
+            approximation_dependent: None,
+            discharged_at_encode: None,
+        });
+        vc
+    }
+
+    #[test]
+    fn re_encodes_only_the_lost_obligation_shape() {
+        let lost = registered();
+        assert!(translation_lost_every_error_obligation(&lost));
+        let recovered = recover_lost_error_obligations(lost, false, || {
+            let mut vc = registered();
+            vc.keep_error_obligations = true;
+            vc
+        });
+        assert!(recovered.keep_error_obligations, "the lost shape is re-encoded");
+
+        let mut kept = registered();
+        kept.add_rule(Rule::new(
+            RuleBody::new(None, vec![Expr::bool_const(false)]),
+            RelationApp::new("error", Vec::new()),
+        ));
+        assert!(!translation_lost_every_error_obligation(&kept));
+        let untouched =
+            recover_lost_error_obligations(kept, false, || panic!("must not re-encode"));
+        assert_eq!(untouched.rules.len(), 1);
+
+        let mut discharged = registered();
+        discharged.trivially_safe_discharged = true;
+        assert!(!translation_lost_every_error_obligation(&discharged));
+
+        let nothing_registered = ChcVc::new();
+        assert!(!translation_lost_every_error_obligation(&nothing_registered));
+        let _ = recover_lost_error_obligations(nothing_registered, false, || {
+            panic!("must not re-encode")
+        });
+        // The lever short-circuits before the shape test.
+        let lost_again = registered();
+        let left_alone = recover_lost_error_obligations(lost_again, true, || panic!("lever off"));
+        assert!(!left_alone.keep_error_obligations, "the lever disables the re-encode");
+        // A VC whose every property is accounted for at encode time is not lost.
+        let mut discharged_at_encode = registered();
+        discharged_at_encode.mark_property_discharged_at_encode(0, "violation_folds_to_false");
+        assert!(!translation_lost_every_error_obligation(&discharged_at_encode));
+    }
 }

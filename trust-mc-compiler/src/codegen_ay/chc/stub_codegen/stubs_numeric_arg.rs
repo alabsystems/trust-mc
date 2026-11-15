@@ -9,6 +9,7 @@
 //!
 //! Part of #2878: deduplicate stubs argument resolution.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -17,8 +18,7 @@ use tracing::debug;
 
 use crate::codegen_ay::types::int_sort;
 
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
-use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
+use super::{ChcCtx, chc_fresh_name};
 
 /// Selects the sort acceptance, coercion, and fallback behavior for numeric
 /// stub argument resolution.
@@ -184,9 +184,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // before (see VecFieldFallback/PointeeSynthesisFallback reclass) —
         // Step-C fail-closes Successes carrying it.
         debug!(?operand, label = kind.label(), "CHC: numeric arg fallback to symbolic");
-        self.diagnostics.stub_approximation.inc();
+        let booked = self.diagnostics.book_stub_approximation();
         let sym_name = chc_fresh_name(kind.fallback_prefix());
-        let result = declare_pending_var(sym_name, kind.fallback_sort());
+        let result = Havoc::booked(booked, sym_name, kind.fallback_sort());
         debug!(
             "resolve_numeric_arg({}) operand={:?} FALLBACK result={}",
             kind.label(),

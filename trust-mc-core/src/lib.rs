@@ -51,6 +51,7 @@
 pub mod artifact;
 pub mod bmc;
 pub mod chc;
+pub mod chc_admission;
 pub mod chc_api;
 pub mod chc_const_prop;
 pub mod chc_optimize;
@@ -59,7 +60,10 @@ pub mod decl;
 pub mod evidence;
 pub mod full_verifier;
 pub mod ident;
+pub mod native_request_config;
 pub mod violation;
+
+pub use native_request_config::{NativeMcExecutionConfig, NativeMcRequestExecutionBinding};
 
 // Re-export main types at crate root
 pub use artifact::{

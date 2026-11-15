@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::common::*;
-use rustc_public::mir::{AssertMessage, TerminatorKind};
+use rustc_public::mir::{AssertMessage, BinOp, TerminatorKind};
 
 fn mir_to_chc_with_config(
     tcx: TyCtxt<'_>,
@@ -70,6 +70,50 @@ fn test_chc_config_can_disable_overflow_error_checks() {
             error_rule_count(&disabled),
             0,
             "overflow_checks=false should suppress overflow error rules"
+        );
+    });
+}
+
+/// Signed `MIN / -1` is not an overflow check: rustc asserts it, and the
+/// divisor, whatever `-C overflow-checks` says, and the program panics there
+/// in every build profile. `overflow_checks=false` therefore keeps every rule
+/// of a signed division. Disabled with the overflow asserts, the division went
+/// on to its `bvsdiv(MIN, -1)` value and the panic was never reported.
+#[test]
+fn test_chc_config_overflow_off_keeps_signed_division_checks() {
+    const SOURCE: &str = r#"
+        #![allow(dead_code)]
+
+        pub fn probe_signed_div(a: i32, b: i32) -> i32 {
+            a / b
+        }
+    "#;
+
+    with_test_ay_ctx_for_source(SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_signed_div");
+        let body = instance.body().expect("function body");
+        assert_mir_pattern_found(
+            body_has_assert(&body, |msg| matches!(msg, AssertMessage::Overflow(BinOp::Div, ..))),
+            "signed-division overflow Assert terminator",
+        );
+
+        let enabled =
+            mir_to_chc_with_config(ctx.tcx, &body, "probe_signed_div", ChcConfig::default());
+        let disabled = mir_to_chc_with_config(
+            ctx.tcx,
+            &body,
+            "probe_signed_div",
+            ChcConfig { overflow_checks: false, ..ChcConfig::default() },
+        );
+
+        assert!(
+            error_rule_count(&enabled) >= 2,
+            "the divisor and MIN / -1 asserts each have an error rule"
+        );
+        assert_eq!(
+            error_rule_count(&disabled),
+            error_rule_count(&enabled),
+            "overflow_checks=false must keep the signed division's checks"
         );
     });
 }

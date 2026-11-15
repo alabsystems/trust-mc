@@ -116,6 +116,28 @@ fn vc_pre_tic(source: &str, fn_name: &str) -> trust_mc_core::chc::ChcVc {
     result.expect("vc should be produced")
 }
 
+/// TIC success leaves exactly the certified discharge obligation
+/// `(=> false error)`, never an empty rule set: with registered properties an
+/// empty rule set is the lost-checks shape the driver reports INCONCLUSIVE.
+fn assert_certified_discharge_only(vc: &trust_mc_core::chc::ChcVc, what: &str) {
+    assert_eq!(
+        vc.rules.len(),
+        1,
+        "TIC on the {what} should leave only the false error obligation, got {} rules",
+        vc.rules.len()
+    );
+    let rule = &vc.rules[0];
+    assert_eq!(rule.head.name, "error", "{what}: obligation head");
+    assert!(rule.body.relation.is_none(), "{what}: obligation must have no body relation");
+    assert_eq!(rule.body.constraints.len(), 1, "{what}: obligation body must be one conjunct");
+    assert_eq!(
+        rule.body.constraints.first(),
+        Some(&ay_bindings::Expr::bool_const(false)),
+        "{what}: obligation body must be literal false"
+    );
+    assert!(vc.trivially_safe_discharged, "{what}: discharge must be recorded");
+}
+
 // =============================================================================
 // Tests: Forward accumulator
 // =============================================================================
@@ -132,12 +154,7 @@ fn test_template_check_forward_clears_rules() {
     // After the full pipeline (including TIC), the forward accumulator
     // should have its VC cleared (TIC success → trivially safe system).
     let vc = vc_full_pipeline(FORWARD_SOURCE, "probe_tic_forward");
-    assert!(
-        vc.rules.is_empty(),
-        "TIC should clear all rules on successful forward accumulator detection, \
-         but {} rules remain",
-        vc.rules.len()
-    );
+    assert_certified_discharge_only(&vc, "forward accumulator");
 }
 
 // =============================================================================
@@ -153,12 +170,7 @@ fn test_template_check_countdown_pre_tic_has_rules() {
 #[test]
 fn test_template_check_countdown_clears_rules() {
     let vc = vc_full_pipeline(COUNTDOWN_SOURCE, "probe_tic_countdown");
-    assert!(
-        vc.rules.is_empty(),
-        "TIC should clear all rules on successful countdown accumulator detection, \
-         but {} rules remain",
-        vc.rules.len()
-    );
+    assert_certified_discharge_only(&vc, "countdown accumulator");
 }
 
 // =============================================================================

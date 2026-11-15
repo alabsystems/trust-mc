@@ -214,6 +214,17 @@ pub(in crate::codegen_ay) fn float_to_float_bv_pure(
         let zero_shift = Expr::bitvec_const(0u64, sig_width);
         let effective_shift = Expr::ite(is_subnormal_output.clone(), s_sig, zero_shift);
 
+        // Bits the subnormal shift pushes off the low end sit below the guard
+        // bit, so they are part of the sticky bit. Dropping them made an
+        // inexact subnormal result look like an exact tie and round to even
+        // when it must round up: f64 bits 0x3690_0000_0000_0001 narrowed to
+        // +0.0 instead of the least subnormal f32 (0x0000_0001). `1 << shift`
+        // is 0 once shift >= sig_width, so the mask then covers every bit.
+        let sig_one = Expr::bitvec_const(1u64, sig_width);
+        let shifted_out_mask = sig_one.clone().bvshl(effective_shift.clone()).bvsub(sig_one);
+        let shifted_out_nonzero =
+            full_sig.clone().bvand(shifted_out_mask).eq(Expr::bitvec_const(0u64, sig_width)).not();
+
         // Apply subnormal shift to full significand.
         let effective_sig = full_sig.bvlshr(effective_shift);
 
@@ -225,12 +236,12 @@ pub(in crate::codegen_ay) fn float_to_float_bv_pure(
             let lower = effective_sig.extract(dropped - 2, 0);
             let lower_zero = Expr::bitvec_const(0u64, dropped - 1);
             Expr::ite(
-                lower.eq(lower_zero),
+                lower.eq(lower_zero).and(shifted_out_nonzero.not()),
                 Expr::bitvec_const(0u64, 1),
                 Expr::bitvec_const(1u64, 1),
             )
         } else {
-            Expr::bitvec_const(0u64, 1)
+            Expr::ite(shifted_out_nonzero, Expr::bitvec_const(1u64, 1), Expr::bitvec_const(0u64, 1))
         };
 
         // RNE rounding: round up if guard=1 AND (sticky!=0 OR LSB=1).

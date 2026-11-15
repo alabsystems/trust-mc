@@ -426,7 +426,20 @@ fn assert_float_binop_rvalue_uses_fp_theory(source: &str, fn_name: &str, expecte
         };
         let matches_op = match expected_op {
             BinOp::Div => matches!(inner.value(), ExprValue::FpDiv(_, _, _)),
-            BinOp::Rem => matches!(inner.value(), ExprValue::FpRem(_, _)),
+            // Rust `%` is C `fmod`, never a bare SMT-LIB `fp.rem` (the IEEE
+            // remainder, `fp.rem(5, 3) = -1`): `ite(overshot, fp.add(RNE, r,
+            // step), r)` over one shared `r = fp.rem(x, y)` (TRUST-MC-FREM-1).
+            // Its value is pinned by `float_arithmetic_frem_tests.rs`.
+            BinOp::Rem => match inner.value() {
+                ExprValue::Ite { then_expr, else_expr, .. } => {
+                    matches!(else_expr.value(), ExprValue::FpRem(_, _))
+                        && matches!(
+                            then_expr.value(),
+                            ExprValue::FpAdd(_, r, _) if r == else_expr
+                        )
+                }
+                _ => false,
+            },
             other => panic!("unsupported float rvalue op in test helper: {other:?}"),
         };
         assert!(
@@ -671,6 +684,8 @@ fn test_ptr_metadata_wide_pointer_extracts_len_or_declares_meta_symbol() {
 // ─── Misc Rvalue variants ───────────────────────────────────────────
 
 #[test]
+// Rvalue::NullaryOp exists only in the frozen nightly MIR; see the Trust twin below.
+#[cfg(not(trust_toolchain))]
 fn test_nullary_runtime_checks_constants() {
     with_test_ay_ctx_for_source(RVALUE_PROBE_SOURCE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "rvalue_probe");
@@ -695,9 +710,120 @@ fn test_nullary_runtime_checks_constants() {
             )))
             .expect("OverflowChecks expression");
 
-        assert_bool_const(ub, true);
+        assert_bool_const(ub, false);
         assert_bool_const(contract, true);
         assert_bool_const(overflow, false);
+    });
+}
+
+/// Trust twin of `test_nullary_runtime_checks_constants`: the runtime-checks
+/// flags reach codegen as `Operand::RuntimeChecks` and must keep the nightly
+/// `NullOp::RuntimeChecks` values.
+#[test]
+#[cfg(trust_toolchain)]
+fn test_operand_runtime_checks_constants() {
+    use rustc_public::mir::{Operand, RuntimeChecks, WithRetag};
+    with_test_ay_ctx_for_source(RVALUE_PROBE_SOURCE, |mut ctx| {
+        let instance = find_instance_by_suffix(&ctx, "rvalue_probe");
+        let body = instance.body().expect("function body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+        let flag = |checks| Rvalue::Use(Operand::RuntimeChecks(checks), WithRetag::No);
+        let ub =
+            codegen.codegen_rvalue(&flag(RuntimeChecks::UbChecks)).expect("UbChecks expression");
+        let contract = codegen
+            .codegen_rvalue(&flag(RuntimeChecks::ContractChecks))
+            .expect("ContractChecks expression");
+        let overflow = codegen
+            .codegen_rvalue(&flag(RuntimeChecks::OverflowChecks))
+            .expect("OverflowChecks expression");
+
+        assert_bool_const(ub, false);
+        assert_bool_const(contract, true);
+        assert_bool_const(overflow, false);
+    });
+}
+
+/// Trust: an exclusive reborrow (`Reborrow(_, Mut, place)`) is rewritten to
+/// exactly `Use(Copy(place))` and translates like that copy; a shared
+/// `CoerceShared` reborrow fails closed and records the unsupported construct.
+#[test]
+#[cfg(trust_toolchain)]
+fn test_reborrow_exclusive_is_copy_shared_fails_closed() {
+    use crate::rustc_compat::exclusive_reborrow_as_copy;
+    use rustc_public::mir::{Mutability, Operand, Rvalue, StatementKind, WithRetag};
+    const REBORROW_PROBE_SOURCE: &str = r#"
+#![feature(reborrow)]
+use std::marker::{CoerceShared, Reborrow};
+pub struct Excl<'a>(&'a mut u32);
+#[derive(Clone, Copy)]
+pub struct Shared<'a>(&'a u32);
+impl<'a> Reborrow for Excl<'a> {}
+impl<'a> CoerceShared<Shared<'a>> for Excl<'a> {}
+fn take_excl(_e: Excl<'_>) {}
+fn take_shared(_s: Shared<'_>) {}
+// The exclusive value borrows a LOCAL: reborrowing a parameter `e: Excl<'_>`
+// would borrow `e` for the parameter's own lifetime, which outlives the body
+// (E0597 on Trust).
+pub fn reborrow_probe() {
+    let mut x = 1u32;
+    let e = Excl(&mut x);
+    take_excl(e);
+    take_shared(e);
+}
+"#;
+    with_test_ay_ctx_for_source(REBORROW_PROBE_SOURCE, |mut ctx| {
+        let instance = find_instance_by_suffix(&ctx, "reborrow_probe");
+        let body = instance.body().expect("function body");
+        ctx.set_current_fn(instance);
+        let reborrows: Vec<Rvalue> = body
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.statements.iter())
+            .filter_map(|stmt| match &stmt.kind {
+                StatementKind::Assign(_, rvalue @ Rvalue::Reborrow(..)) => Some(rvalue.clone()),
+                _ => None,
+            })
+            .collect();
+        let exclusive = reborrows
+            .iter()
+            .find(|rvalue| matches!(rvalue, Rvalue::Reborrow(_, Mutability::Mut, _)))
+            .expect("exclusive reborrow in MIR");
+        let shared = reborrows
+            .iter()
+            .find(|rvalue| matches!(rvalue, Rvalue::Reborrow(_, Mutability::Not, _)))
+            .expect("shared reborrow in MIR");
+
+        let Rvalue::Reborrow(_, _, exclusive_place) = exclusive else { unreachable!() };
+        match exclusive_reborrow_as_copy(exclusive) {
+            Some(Rvalue::Use(Operand::Copy(place), WithRetag::No)) => {
+                assert_eq!(&place, exclusive_place, "the copy must read the reborrowed place")
+            }
+            other => panic!("exclusive reborrow must become Use(Copy(place)), got {other:?}"),
+        }
+        assert!(
+            exclusive_reborrow_as_copy(shared).is_none(),
+            "a CoerceShared reborrow changes the type and must not be rewritten to a copy"
+        );
+
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        assert!(
+            codegen.codegen_rvalue(exclusive).is_some(),
+            "an exclusive reborrow translates as the copy of its place"
+        );
+        assert!(
+            codegen.codegen_rvalue(shared).is_none(),
+            "a CoerceShared reborrow must fail closed"
+        );
+        drop(codegen);
+        assert!(
+            ctx.unsupported_constructs.contains_key("Rvalue::Reborrow (CoerceShared)"),
+            "the fail-closed reborrow must record an unsupported construct: {:?}",
+            ctx.unsupported_constructs
+        );
     });
 }
 

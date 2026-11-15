@@ -106,6 +106,17 @@ pub fn replace_signedness_fallback_count_for_test(count: usize) -> usize {
     SIGNEDNESS_FALLBACK_COUNT.swap(count as u64, Ordering::Relaxed) as usize
 }
 
+/// Retain evidence of a fallback even when the counter reaches its maximum.
+fn increment_signedness_fallback_count(counter: &AtomicU64) -> u64 {
+    match counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+    {
+        Ok(previous) => previous.saturating_add(1),
+        // The update always returns Some, so it cannot reject an increment.
+        Err(current) => current,
+    }
+}
+
 /// Operation class for signedness fallback defaults.
 ///
 /// Exposed publicly so that generic entry points (e.g. `arg_signedness_or_fallback`)
@@ -176,7 +187,7 @@ pub fn signedness_fallback_with_kind(context: &str, kind: SignednessFallbackKind
         );
         return signed;
     }
-    let count = SIGNEDNESS_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = increment_signedness_fallback_count(&SIGNEDNESS_FALLBACK_COUNT);
     warn!(context, count, ?kind, signed, "signedness unknown — using operation-specific fallback");
     signed
 }
@@ -301,17 +312,60 @@ pub fn ty_signedness_shallow(ty: rustc_public::ty::Ty) -> Option<bool> {
     }
 }
 
+/// Whether `ty` is a primitive integer (`i8`..`i128`, `isize`, `u8`..`u128`,
+/// `usize`): the only operand type the BMC and CHC `div_euclid` / `rem_euclid`
+/// stubs encode (bitvector Euclidean division).
+///
+/// The float methods have the same names but are a different function:
+/// `f64::rem_euclid` is `let r = self % rhs; if r < 0.0 { r + rhs.abs() } else
+/// { r }`. Both lanes carry a float as its IEEE bit pattern, and
+/// [`ty_signedness_shallow`] reads a float as unsigned, so a stub keyed on the
+/// method name alone computed `bvurem` / `bvudiv` over the bit patterns. Its
+/// value for `5.0f64.rem_euclid(3.0)` was not 2.0, and through the trust-mc
+/// front door the false `x == 5.0 => x.rem_euclid(3.0) != 2.0` verified
+/// SUCCESSFUL on both routes (TRUST-MC-FREM-2). A float call is not claimed by
+/// the stubs and takes the ordinary call path: the BMC mini-inliner inlines
+/// std's body, whose `%` is the exact `fmod`, and the CHC lane havocs the
+/// result as a recorded sound approximation.
+pub fn is_primitive_integer_ty(ty: rustc_public::ty::Ty) -> bool {
+    matches!(ty.kind(), TyKind::RigidTy(RigidTy::Int(_) | RigidTy::Uint(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         get_into_option_dropped_count, get_signedness_fallback_count,
-        replace_into_option_dropped_count_for_test, replace_signedness_fallback_count_for_test,
-        take_into_option_dropped_count, take_signedness_fallback_count,
+        increment_signedness_fallback_count, replace_into_option_dropped_count_for_test,
+        replace_signedness_fallback_count_for_test, take_into_option_dropped_count,
+        take_signedness_fallback_count,
     };
 
     static COUNTER_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_signedness_counter_increment_stores_and_returns_new_count() {
+        let counter = AtomicU64::new(0);
+
+        assert_eq!(increment_signedness_fallback_count(&counter), 1);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(increment_signedness_fallback_count(&counter), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_signedness_counter_increment_saturates_without_losing_fallbacks() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(increment_signedness_fallback_count(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(increment_signedness_fallback_count(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(increment_signedness_fallback_count(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[test]
     fn test_signedness_counter_helpers_replace_get_take_roundtrip() {

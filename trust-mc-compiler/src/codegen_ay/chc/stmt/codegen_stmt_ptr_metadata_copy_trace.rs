@@ -25,6 +25,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         start_local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
+        // The trace is whole-body and path-insensitive, and the Range-argument
+        // re-derivation below reads the range local's CURRENT-block columns. In
+        // a block whose frame no longer carries that local the read is a free
+        // variable: tests/expected/loop-contract/for_loop_for_slice.rs rebuilt
+        // the length as `_130_fld1 - _130_fld0` in bb2 and bb72, where `_130`
+        // (the moved range) was out of frame. Such a length is not authority;
+        // the caller falls through to the slice local's own metadata.
+        self.trace_subslice_len_through_copies_any_frame(start_local, modified_locals)
+            .filter(|len| self.reads_only_framed_local_columns(len))
+    }
+
+    fn trace_subslice_len_through_copies_any_frame(
+        &self,
+        start_local: usize,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
         let mut current = start_local;
         let mut visited = HashSet::new();
         // Max 8 hops to prevent infinite loops.
@@ -32,7 +48,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // This is a whole-body, path-insensitive trace.  Selecting the
             // first producer at a CFG join would turn one predecessor's side
             // metadata into exact fat-pointer authority.
-            if self.local_has_multiple_whole_definitions(current) {
+            if !self.path_insensitive_metadata_is_stable(current) {
                 return None;
             }
             // Scan MIR for the assignment to `current`.
@@ -45,7 +61,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.projection.is_empty()
                     {
                         match rvalue {
-                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                                 if place.projection.is_empty()
                                     || (place.projection.len() == 1
                                         && matches!(
@@ -118,7 +134,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             match source_local {
                 Some(src) => {
-                    if self.local_has_multiple_whole_definitions(src) {
+                    if !self.path_insensitive_metadata_is_stable(src) {
                         return None;
                     }
                     if let Some(len) = self.ref_resolution.subslice_len.get(&src) {
@@ -140,7 +156,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         current_local: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
-        if self.local_has_multiple_whole_definitions(current_local) {
+        if !self.path_insensitive_metadata_is_stable(current_local) {
             return None;
         }
         for block in &self.body.blocks {
@@ -166,7 +182,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 _ => return None,
             };
-            if self.local_has_multiple_whole_definitions(range_local) {
+            if !self.path_insensitive_metadata_is_stable(range_local) {
                 return None;
             }
             // Get start (field 0) and end (field 1) from flattened state.
@@ -220,7 +236,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// (e.g., `my_slice[0]` → `Index::index(my_slice, 0)`), trace back through
     /// the array/slice to find the element's subslice_len.
     fn try_resolve_subslice_len_from_index_call(&self, result_local: usize) -> Option<Expr> {
-        if self.local_has_multiple_whole_definitions(result_local) {
+        if !self.path_insensitive_metadata_is_stable(result_local) {
             return None;
         }
         // Find the authenticated Call terminator for result_local.
@@ -248,7 +264,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
             _ => return None,
         };
-        if self.local_has_multiple_whole_definitions(collection_local) {
+        if !self.path_insensitive_metadata_is_stable(collection_local) {
             return None;
         }
         let array_local = self.trace_local_to_referent(collection_local)?;
@@ -287,7 +303,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     next = Some(place.local);
                                 }
                             }
-                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                                 if place.projection.is_empty() =>
                             {
                                 next = Some(place.local);
@@ -305,7 +321,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             match next {
-                Some(n) => current = n,
+                Some(n) => {
+                    if !self.path_insensitive_metadata_is_stable(current) {
+                        return None;
+                    }
+                    current = n;
+                }
+                // Locating the final storage does not read its historical
+                // contents. Array-element recovery checks those separately.
                 None => break,
             }
         }
@@ -315,7 +338,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Find element locals from an `Aggregate(Array, ...)` assignment.
     fn find_array_aggregate_elements(&self, array_local: usize) -> Vec<usize> {
-        if self.local_has_multiple_whole_definitions(array_local) {
+        if !self.path_insensitive_metadata_is_stable(array_local) {
             return Vec::new();
         }
         let mut elements = Vec::new();
@@ -347,7 +370,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         let mut found_len: Option<Expr> = None;
         for &elem_local in elements {
-            if self.local_has_multiple_whole_definitions(elem_local) {
+            if !self.path_insensitive_metadata_is_stable(elem_local) {
                 return None;
             }
             let len = self.ref_resolution.subslice_len.get(&elem_local)?;
@@ -368,7 +391,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// find the array local, look up its `Aggregate(Array, ...)` construction,
     /// and return the shared subslice_len from the aggregate elements.
     fn try_resolve_subslice_len_from_index_proj(&self, dest_local: usize) -> Option<Expr> {
-        if self.local_has_multiple_whole_definitions(dest_local) {
+        if !self.path_insensitive_metadata_is_stable(dest_local) {
             return None;
         }
         // Find the assignment to dest_local with an Index projection in the source.
@@ -381,7 +404,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     && lhs.projection.is_empty()
                 {
                     let source_place = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p),
                         Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p) => Some(p),
                         _ => None,
                     };
@@ -418,7 +441,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = start;
         let mut visited = HashSet::new();
         while visited.len() < 4 && visited.insert(current) {
-            if self.local_has_multiple_whole_definitions(current) {
+            if !self.path_insensitive_metadata_is_stable(current) {
                 return None;
             }
             let mut next = None;
@@ -437,7 +460,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     next = Some(place.local);
                                 }
                             }
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                                 if p.projection.is_empty() =>
                             {
                                 next = Some(p.local);
@@ -470,7 +493,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         array_local: usize,
         index_local: Option<usize>,
     ) -> Option<Expr> {
-        if self.local_has_multiple_whole_definitions(array_local) {
+        if !self.path_insensitive_metadata_is_stable(array_local) {
             return None;
         }
         let mut element_locals: Vec<usize> = Vec::new();
@@ -502,7 +525,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut all_same = true;
         let mut first_len: Option<Expr> = None;
         for &elem_local in &element_locals {
-            if self.local_has_multiple_whole_definitions(elem_local) {
+            if !self.path_insensitive_metadata_is_stable(elem_local) {
                 return None;
             }
             let Some(len) = self.ref_resolution.subslice_len.get(&elem_local) else {
@@ -538,7 +561,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Slow path: elements have different subslice_len. Build ITE chain
         // over the index variable: ite(idx == 0, len0, ite(idx == 1, len1, ...))
         let idx_local = index_local?;
-        if self.local_has_multiple_whole_definitions(idx_local) {
+        if !self.path_insensitive_metadata_is_stable(idx_local) {
             return None;
         }
         // Resolve the index local to a AY expression using input state vars.

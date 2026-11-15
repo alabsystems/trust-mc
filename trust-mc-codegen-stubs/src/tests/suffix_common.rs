@@ -46,6 +46,39 @@ fn extract_method_name_nested_generics() {
     );
 }
 
+#[test]
+fn extract_method_name_unicode_boundaries() {
+    for (path, expected) in [
+        ("模块::méthode", "méthode"),
+        ("<类型 as 特征>::方法", "方法"),
+        ("<类型>::方法::<模块::参数>", "方法"),
+        ("<类型>::方法::<甲::<乙", "方法"),
+        ("::é", "é"),
+        (">::方法", "方法"),
+    ] {
+        assert_eq!(StubRegistry::extract_method_name(path), Some(expected), "{path}");
+    }
+}
+
+#[test]
+fn extract_method_name_empty_and_malformed_boundaries() {
+    for path in ["", ":", ">:", "方法"] {
+        assert_eq!(StubRegistry::extract_method_name(path), None, "{path}");
+    }
+    for path in ["::", ">::", "类型::", "<类型>::", ":::", "<类型>::::<参数>"] {
+        assert_eq!(StubRegistry::extract_method_name(path), Some(""), "{path}");
+    }
+    assert_eq!(StubRegistry::extract_method_name("<类型>::方法::<"), Some("方法"));
+}
+
+#[test]
+fn extract_method_name_preserves_last_generic_separator_precedence() {
+    assert_eq!(StubRegistry::extract_method_name("<A>::<B>::方法"), Some("方法"));
+    // The generic separator takes precedence even over a later plain separator.
+    assert_eq!(StubRegistry::extract_method_name("<A>::方法::后缀"), Some("方法::后缀"));
+    assert_eq!(StubRegistry::extract_method_name("A::B::方法"), Some("方法"));
+}
+
 // =============================================================================
 // is_primitive_trait_path: edge cases (Part of #2016)
 // =============================================================================

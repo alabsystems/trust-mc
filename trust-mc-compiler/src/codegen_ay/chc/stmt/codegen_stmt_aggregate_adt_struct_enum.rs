@@ -9,12 +9,16 @@
 //! - `translate_struct_aggregate`: regular struct (Range, String, user-defined structs)
 //! - `translate_general_enum_aggregate`: multi-variant enums (Result, ControlFlow, user-defined)
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
-use rustc_public::ty::{AdtDef, GenericArgs, VariantDef};
+use rustc_public::ty::{AdtDef, GenericArgs, RigidTy, TyKind, VariantDef};
 use tracing::{debug, warn};
 
 use crate::codegen_ay::chc::call::canonical_zst_expr_for_sort;
@@ -28,7 +32,7 @@ use crate::codegen_ay::types::{
 use super::codegen_expr_signedness::ty_signedness;
 use super::codegen_types::CodegenTypes;
 use super::codegen_types_adt_sort::CodegenTypesAdtSort;
-use super::{ChcCtx, UNDEF_COUNTER, declare_pending_var};
+use super::{ChcCtx, UNDEF_COUNTER};
 use crate::codegen_ay::chc::decl::codegen_types_adt::CodegenTypesAdt;
 use crate::codegen_ay::shared::signedness_fallback_for_cast_or_coerce;
 
@@ -54,10 +58,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut field_exprs = Vec::new();
         let mut fields = Vec::new();
 
-        // Part of #3984: Compute parent ADT sort for correctly monomorphized field sorts.
-        // resolve_generic_ty is shallow -- it does not substitute Params inside nested
-        // ADT type args. The parent sort (from translate_adt_ty) uses the IntoIter handler
-        // which correctly monomorphizes. Fall back to per-field translate_ty when unavailable.
+        // Part of #3984: the parent ADT sort (from translate_adt_ty, which also
+        // handles IntoIter) is the declared sort of every field. Fall back to
+        // per-field translate_ty when unavailable.
         let parent_field_sorts: Vec<Sort> = Self::translate_adt_ty(def, args.clone())
             .and_then(|s: Sort| {
                 let dt = s.datatype_sort()?;
@@ -67,8 +70,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .unwrap_or_default();
 
         for (idx, field) in variant.fields().iter().enumerate() {
-            let field_ty = field.ty();
-            let concrete_ty = Self::resolve_generic_ty(field_ty, args)?;
+            let concrete_ty = mono_ty::field_ty(field, args)?;
             let sort = if idx < parent_field_sorts.len() {
                 parent_field_sorts[idx].clone()
             } else {
@@ -112,7 +114,54 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "translate_adt_aggregate: constructed struct"
         );
         let cons_name = names::resolve_ctor_name(&struct_sort, &adt_name);
-        Some(Expr::datatype_constructor(adt_name, cons_name, field_exprs, struct_sort))
+        match Expr::try_datatype_constructor(adt_name, cons_name, field_exprs, struct_sort) {
+            Ok(expr) => Some(expr),
+            Err(err) => {
+                // A field expression whose sort differs from the declared field sort
+                // is an encoding gap, recorded like a missing operand above.
+                debug!(?err, "translate_adt_aggregate: field sort differs from declaration");
+                self.record_aggregate_gap("adt_struct_field_sort_mismatch");
+                None
+            }
+        }
+    }
+
+    /// A WIDE-pointer value arriving at the other width.
+    ///
+    /// The BV width coercion below would zero-extend a thin BV64 into the fat
+    /// pointer's `[len | data]` layout — inventing `len == 0` — or truncate a
+    /// fat one, dropping the length outright. `let e = E::A(&b[..]); match e {
+    /// E::A(s) => assert!(s.len() == 3 && s[0] == 1), .. }` was then FAILED
+    /// [AY:CTREX_CAT:Genuine] on a program with no bug in it (adversarial
+    /// review of m3/soundness-fixes-2, 2026-09-14; red on main). Nothing can
+    /// reconstruct metadata that is not there, so the field fails closed —
+    /// the same rule `coerce_option_payload_expr` already applies to an
+    /// Option-like payload.
+    fn wide_pointer_width_mismatch(
+        sort: &Sort,
+        expr: &Expr,
+        concrete_ty: rustc_public::ty::Ty,
+    ) -> bool {
+        if expr.sort() == sort {
+            return false;
+        }
+        // A pointer to a SLICE, a `str` or a `dyn` carries metadata that no
+        // coercion below can reconstruct: a width change invents `len == 0` or
+        // drops the length, and a sort change falls through to a FRESH
+        // SYMBOLIC, which is unconstrained and certified a counterexample on a
+        // program with no bug in it.
+        let wide = |ty: rustc_public::ty::Ty| {
+            matches!(
+                ty.kind(),
+                TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..))
+            )
+        };
+        match concrete_ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => {
+                wide(pointee)
+            }
+            _ => false,
+        }
     }
 
     /// Coerce a struct field expression to match the expected sort.
@@ -130,17 +179,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if expr.sort() == sort {
             return expr;
         }
+        if Self::wide_pointer_width_mismatch(sort, &expr, concrete_ty) {
+            warn!(
+                adt_name = %adt_name,
+                idx,
+                expected = ?sort,
+                actual = ?expr.sort(),
+                "struct aggregate field: wide-pointer metadata would be invented or dropped — fail closed"
+            );
+            let booked =
+                self.record_sound_fallback_reason("aggregate_field_wide_pointer_width_mismatch");
+            let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = crate::codegen_ay::names::undef_sym_name(adt_name, undef_id);
+            return Havoc::booked(booked, name, sort.clone());
+        }
         let signed = ty_signedness(concrete_ty)
             .unwrap_or_else(|| signedness_fallback_for_cast_or_coerce("struct_field_coerce"));
         if let Some(target_w) = sort.bitvec_width() {
             return coerce_bitvec_width_safe(expr, target_w, SignExtension::for_signedness(signed));
         }
-        if expr.sort().is_bool()
-            && sort.is_array()
-            && is_zst_ty(concrete_ty)
-            && let Some(zst_array) = canonical_zst_expr_for_sort(concrete_ty, sort)
+        // A zero-sized field has exactly one value, whatever sort its operand
+        // arrived in (see `coerce_enum_field_expr`).
+        if is_zst_ty(concrete_ty)
+            && let Some(zst_value) =
+                canonical_zst_expr_for_sort(concrete_ty, sort).filter(|value| value.sort() == sort)
         {
-            return zst_array;
+            return zst_value;
         }
         if let Some(unit_expr) = coerce_bool_to_unit_datatype(&expr, sort) {
             return unit_expr;
@@ -159,7 +223,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.record_aggregate_gap("adt_struct_field_bv_to_dt_unflatten_failed");
             let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = crate::codegen_ay::names::undef_sym_name(adt_name, undef_id);
-            return declare_pending_var(name, sort.clone());
+            return Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE,
+                name,
+                sort.clone(),
+            );
         }
         if expr.sort().is_datatype()
             && sort.is_datatype()
@@ -187,7 +256,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.record_aggregate_gap("adt_struct_field_sort_mismatch");
         let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = crate::codegen_ay::names::undef_sym_name(adt_name, undef_id);
-        declare_pending_var(name, sort.clone())
+        Havoc::mint(self, sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE, name, sort.clone())
     }
 
     /// Translate a general enum ADT aggregate construction (multi-variant enums).
@@ -220,8 +289,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut fields = Vec::new();
 
         for (idx, field) in variant.fields().iter().enumerate() {
-            let field_ty = field.ty();
-            let concrete_ty = Self::resolve_generic_ty(field_ty, args)?;
+            let concrete_ty = mono_ty::field_ty(field, args)?;
             // Apply deref_ref_ty for &[T; N] fields to produce Array sort,
             // matching the Option-like path. Without this, Result<&[T; N], E>
             // uses BV64 for the field but the inline walker provides Array values.
@@ -276,6 +344,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if expr.sort() == sort {
             return expr;
         }
+        if Self::wide_pointer_width_mismatch(sort, &expr, concrete_ty) {
+            warn!(
+                variant_name = %variant_name,
+                idx,
+                expected = ?sort,
+                actual = ?expr.sort(),
+                "enum aggregate field: wide-pointer metadata would be invented or dropped — fail closed"
+            );
+            let booked =
+                self.record_sound_fallback_reason("aggregate_field_wide_pointer_width_mismatch");
+            let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = crate::codegen_ay::names::undef_sym_name(variant_name, undef_id);
+            return Havoc::booked(booked, name, sort.clone());
+        }
         if let Some(coerced) =
             Self::coerce_assignment_rhs_to_sort(expr.clone(), sort, ty_signedness(concrete_ty))
         {
@@ -287,12 +369,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .unwrap_or_else(|| signedness_fallback_for_cast_or_coerce("enum_field_coerce"));
             return coerce_bitvec_width_safe(expr, target_w, SignExtension::for_signedness(signed));
         }
-        if expr.sort().is_bool()
-            && sort.is_array()
-            && is_zst_ty(concrete_ty)
-            && let Some(zst_array) = canonical_zst_expr_for_sort(concrete_ty, sort)
+        // A zero-sized field has exactly one value, whatever sort its operand
+        // arrived in: `[T; 0]` as a const array, and `Option<Infallible>` (the
+        // `Try::branch` residual `ControlFlow::Break(None)`, whose `None` operand
+        // translates as Bool) as its one inhabited variant.
+        if is_zst_ty(concrete_ty)
+            && let Some(zst_value) =
+                canonical_zst_expr_for_sort(concrete_ty, sort).filter(|value| value.sort() == sort)
         {
-            return zst_array;
+            return zst_value;
         }
         if let Some(unit_expr) = coerce_bool_to_unit_datatype(&expr, sort) {
             debug!("  Coercing field {} Bool -> Unit datatype", idx);
@@ -309,7 +394,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.record_aggregate_gap("adt_enum_field_sort_mismatch");
         let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = crate::codegen_ay::names::undef_sym_name(variant_name, undef_id);
-        declare_pending_var(name, sort.clone())
+        Havoc::mint(self, sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE, name, sort.clone())
     }
 
     /// Build all constructors for an enum sort from its variant definitions.
@@ -328,8 +413,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let v_name = v.name();
             let mut v_fields = Vec::new();
             for (i, f) in v.fields().iter().enumerate() {
-                let f_ty = f.ty();
-                if let Some(concrete) = Self::resolve_generic_ty(f_ty, args) {
+                if let Some(concrete) = mono_ty::field_ty(f, args) {
                     // Apply deref_ref_ty for &[T; N] fields: match Option-like path.
                     // Sized-only: &str / &[T] stay BV128 fat pointers.
                     let (deref_ty, _is_ref) = Self::deref_ref_ty_sized_only(concrete);

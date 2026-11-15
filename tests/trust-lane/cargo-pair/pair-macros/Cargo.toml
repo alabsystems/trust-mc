@@ -1,0 +1,12 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# T1 cargo pair: the proc-macro dependency both packages share.
+[package]
+name = "pair-macros"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true

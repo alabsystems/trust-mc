@@ -132,30 +132,29 @@ fn test_assert_hook_has_comparison_constraint() {
 
 #[test]
 fn test_assert_hook_realloc_grow_does_not_use_untranslatable_assert_fallback() {
-    use super::super::GLOBAL_COUNTERS;
-    use std::sync::atomic::Ordering;
-
     with_test_ay_ctx_for_source(ASSERT_REALLOC_GROW_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_assert_realloc_grow");
         let body = instance.body().expect("function body");
         let name = instance.name();
 
-        let before = GLOBAL_COUNTERS.assert_untranslatable.load(Ordering::Relaxed);
-        let vc = crate::codegen_ay::chc::mir_to_chc_with_instance(
+        // Count this translation's own untranslatable-assert fallbacks. The
+        // process-global counter is moved by every test translating concurrently.
+        // The probe has no loops, so Auto step mode resolves to Small.
+        let chc_ctx = ChcCtx::new_with_instance(
             ctx.tcx,
             &body,
             instance,
             name,
             ChcConfig {
                 track_level: crate::args::ChcTrackLevel::Mem,
-                step_mode: crate::args::ChcStepMode::Auto,
+                step_mode: crate::args::ChcStepMode::Small,
                 ..ChcConfig::default()
             },
         );
-        let after = GLOBAL_COUNTERS.assert_untranslatable.load(Ordering::Relaxed);
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_eq!(
-            after, before,
+            diagnostics.assert_untranslatable.get(), 0,
             "realloc-grow assert hook should translate without conservative untranslatable-assert fallback"
         );
 
@@ -502,7 +501,7 @@ fn test_safety_check_no_assume_translatable_transition_is_unguarded() {
         let emitted = &chc_ctx.vc.rules[before_rules..];
         let transition = emitted
             .iter()
-            .find(|rule| rule.body.relation.is_some() && rule.head.name != "error")
+            .find(|rule| rule.body.relation.is_some() && !is_error_head(rule.head.name.as_str()))
             .expect("expected successor transition");
         assert_eq!(
             transition.body.constraints.len(),

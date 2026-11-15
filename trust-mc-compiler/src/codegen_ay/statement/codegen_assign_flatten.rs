@@ -7,6 +7,8 @@
 
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::types::{POINTER_WIDTH, ty_to_bv_width};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, Place, ProjectionElem};
@@ -239,8 +241,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // #3133: For Option<&T>, dereference through ref_pointees to get
             // the value (e.g., BV32(5)) instead of the address (BV64). This
             // aligns with CHC value semantics where references are transparent.
-            let Some(payload) = self.get_value_through_ref(&operands[0]) else {
-                return false;
+            //
+            // A RAW pointer is not a reference: `Option<*mut T>` carries the
+            // ADDRESS. Reading it through the pointer compared pointees, so
+            // `Some(&mut a) == Some(&mut b)` with equal pointees PROVED, and a
+            // null payload was dereferenced
+            // (tools/soundness-duals/bmc_option_rawptr_payload_dual.rs).
+            let payload = if Self::operand_is_raw_ptr(self.body, &operands[0]) {
+                match self.codegen_operand(&operands[0]) {
+                    Some(ptr) => self.coerce_to_ptr_width(ptr),
+                    None => return false,
+                }
+            } else {
+                let Some(payload) = self.get_value_through_ref(&operands[0]) else {
+                    return false;
+                };
+                payload
             };
             // A `bool` payload has Bool sort, not BitVec. Coerce it to BitVec(1)
             // so the Some arm FLATTENS (bitvec) instead of falling through to the
@@ -440,6 +456,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// (which dereferences via `get_value_through_ref`).
     ///
     /// Falls back to `POINTER_WIDTH` if the generic arg cannot be resolved.
+    /// Whether `operand`'s MIR type is a raw pointer (`*const T` / `*mut T`).
+    fn operand_is_raw_ptr(body: &rustc_public::mir::Body, operand: &Operand) -> bool {
+        operand
+            .ty(body.locals())
+            .into_option()
+            .is_some_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))))
+    }
+
     fn value_payload_width(args: &GenericArgs) -> u32 {
         let Some(first_arg) = args.0.first() else {
             return POINTER_WIDTH;
@@ -447,9 +471,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let GenericArgKind::Type(ty) = first_arg else {
             return POINTER_WIDTH;
         };
-        // For references/raw pointers, use the pointee type's width (value semantics).
+        // For references, use the pointee type's width (value semantics). A raw
+        // pointer payload is the address itself (see the Some arm above).
         match ty.kind() {
-            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => {
+            TyKind::RigidTy(RigidTy::RawPtr(..)) => POINTER_WIDTH,
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
                 ty_to_bv_width(pointee).unwrap_or(POINTER_WIDTH)
             }
             _ => ty_to_bv_width(*ty).unwrap_or(POINTER_WIDTH),

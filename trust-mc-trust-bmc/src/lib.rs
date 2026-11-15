@@ -46,18 +46,30 @@
 //! as a borrow-checker claim, so those annotations can suppress diagnostic
 //! overflow/memory error edges. They are not proof authority: the ordinary
 //! `trust-mc-driver` proof-grade native-bundle entry point rejects both. Its
-//! separate live-source entry point admits `Wrapping` only when a non-serializable
-//! source-generation authority still belongs to that exact valid bundle;
-//! `ValidBorrow` remains rejected. Callers using this crate directly receive
-//! diagnostic VCs only.
+//! live-source entry point admits source access claims only when a non-serializable
+//! source-generation authority still belongs to that exact valid bundle. Initialized
+//! scalar reference loads additionally require explicit [`SourceReferenceFacts`]
+//! and checked actual pointees; a `ValidBorrow` stamp is not that evidence.
+//! Callers using this crate directly receive diagnostic VCs only.
 //!
 //! Function-level annotations:
 //! - `BoundedOutput` → generates postcondition VCs on Return
 //!
 //! Part of #4256.
 
+mod bulk_count;
 mod coverage;
+mod input;
 mod native_bundle;
+mod native_options;
+mod source_reference;
+
+pub use source_reference::{
+    SourceInitializedParameterFact, SourceInitializedValueFact, SourceReferenceFacts,
+    SourceReferenceFactsError, SourceReferenceLoadFact, SourceReferenceParameterFact,
+    SourceReferenceValueFact,
+};
+mod signature_abi;
 mod translate;
 mod translate_chc;
 
@@ -66,20 +78,42 @@ pub use coverage::{
     family_for_inst,
 };
 pub use native_bundle::{
-    NativeTrustMcBmcVc, NativeTrustMcBundleError, NativeTrustMcChcPdrObligation,
-    trust_mc_bmc_vcs_from_native_bundle, trust_mc_chc_pdr_obligations_from_native_bundle,
+    NativeChcBundleTranslationWork, NativeMcConfiguredChcTranslation, NativeTrustMcBmcVc,
+    NativeTrustMcBundleError, NativeTrustMcChcPdrObligation, NativeUnmodeledObligation,
+    NativeUnmodeledReason, native_obligations_not_refuted_by_a_counterexample,
+    native_unmodeled_obligations, trust_mc_bmc_vcs_from_native_bundle,
+    trust_mc_chc_pdr_obligations_from_native_bundle,
+    trust_mc_chc_pdr_obligations_from_native_bundle_with_source_reference_facts,
+    trust_mc_chc_pdr_obligations_from_native_bundle_with_work,
+    trust_mc_configured_chc_pdr_obligations_from_native_bundle,
+    trust_mc_configured_chc_pdr_obligations_from_native_bundle_with_source_reference_facts,
+};
+pub use native_options::{
+    EffectiveNativeMcRequestConfig, NativeMcRequestOptionsRefusal, NativeMcTranslationConfig,
+};
+pub use signature_abi::first_typed_signature_abi;
+mod tensor_region;
+pub use tensor_region::{
+    TensorConstruct, constant_carries_tensor_blob, inst_carries_tensor_blob,
+    inst_spells_tensor_type, tensor_construct_names, tensor_region_constructs,
 };
 pub use translate::{TranslateOptions, trust_ir_function_to_bmc_vc, trust_ir_to_bmc_vc};
+#[cfg(any(test, feature = "legacy-liveness-oracle"))]
+#[doc(hidden)]
+pub use translate_chc::trust_ir_function_to_chc_translation_output_with_legacy_liveness;
 pub use translate_chc::{
     BlockLocalAllocaReject, CallSummaryAttempt, CallSummaryDeclineSite, CallSummaryOutcome,
-    ChcTranslationOutput, PromotedAllocaReject, PromotionBlocker,
-    SingleCellAllocaRejection, StackCellAdmission, TrustIrChcDiagnostic,
-    TrustIrChcUnsupportedReason, classify_aggregate_stack_cell, proof_grade_cast_is_admissible,
+    ChcTranslationOutput, ChcTranslationWork, ElementReadingFunctions, ExtractElementReject,
+    LargeBlockEdge, LargeBlockErrorSite, LargeBlockMap, LargeBlockPath, PromotedAllocaReject,
+    PromotionBlocker, ProofGradeElementReads, SingleCellAllocaRejection, StackCellAdmission,
+    TrustIrChcDiagnostic, TrustIrChcUnsupportedReason, classify_aggregate_stack_cell,
+    initialized_local_borrow_is_admissible, proof_grade_cast_is_admissible,
     single_cell_alloca_is_admissible, single_cell_alloca_rejection,
     stack_alloca_cell_accesses_match_type, stack_alloca_pointer_is_non_escaping,
-    stack_cell_is_translator_opaque,
-    trust_ir_function_to_chc_translation_output, trust_ir_function_to_chc_vc,
-    trust_ir_to_chc_translation_outputs, trust_ir_to_chc_vc,
+    stack_cell_is_translator_opaque, trust_ir_function_to_chc_translation_output,
+    trust_ir_function_to_chc_translation_output_per_block, trust_ir_function_to_chc_vc,
+    trust_ir_to_chc_translation_outputs, trust_ir_to_chc_translation_outputs_per_block,
+    trust_ir_to_chc_vc,
 };
 
 #[cfg(test)]

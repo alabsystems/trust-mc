@@ -46,7 +46,7 @@ pub(crate) fn validate_merge_args(_args: &MergeArgs) -> Result<()> {
 
 /// Parse raw coverage results from a set of files (AKA "kaniraw" files)
 fn parse_raw_results(paths: &Vec<PathBuf>) -> Result<Vec<CoverageResults>> {
-    let mut raw_results = Vec::with_capacity(paths.len());
+    let mut raw_results = Vec::new();
     for path in paths {
         let filename = path.to_string_lossy();
         let file = File::open(path).unwrap_or_else(|_| panic!("could not open file {filename}"));

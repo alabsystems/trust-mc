@@ -9,6 +9,18 @@
 //! it can't recursively inline. These classifiers detect call patterns that
 //! can be handled with specialized semantics (concrete allocation, identity
 //! passthrough, no-op) instead of falling back to nondeterministic overapprox.
+//!
+//! Every path classifier here matches TEXT of the printed callee path and
+//! replaces the callee's body with a model, so a caller must only consult
+//! them for a callee DEFINED in the standard library ([`is_std_family_crate`]):
+//! a user `mod mem { fn forget(..) }` or `Vec3::new` matches the text just as
+//! well, and treating it as a no-op drops its assertions and writes.
+
+/// Is `crate_name` one of the standard-library crates the path classifiers in
+/// this module describe (`std`, `core`, `alloc`)?
+pub(super) fn is_std_family_crate(crate_name: &str) -> bool {
+    matches!(crate_name, "std" | "core" | "alloc")
+}
 
 /// Detect allocation calls that should produce concrete addresses in the inline walker.
 ///
@@ -156,4 +168,25 @@ pub(super) fn is_nested_pointer_wrapper_deref_call(
     args.first()
         .and_then(|arg| arg.ty(outer_body.locals()).ok())
         .is_some_and(type_is_pointer_wrapper)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classifiers match path TEXT, so a user function can match them; the
+    /// crate anchor is what keeps them to the standard library.
+    #[test]
+    fn user_paths_match_the_text_classifiers_so_the_crate_anchor_is_required() {
+        assert!(is_inline_noop_call("mem::forget"));
+        assert!(is_inline_noop_call("memw::forget"));
+        assert!(is_inline_vec_internal_noop("Vec3::new"));
+        assert!(is_inline_alloc_call("MyBox::new"));
+        for name in ["std", "core", "alloc"] {
+            assert!(is_std_family_crate(name), "{name}");
+        }
+        for name in ["walker_noop_table_user_fn_dual", "kani", "hashbrown", "mem", "stdx"] {
+            assert!(!is_std_family_crate(name), "{name}");
+        }
+    }
 }

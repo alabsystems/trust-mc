@@ -159,28 +159,34 @@ fn is_violation_disjunction_line(trimmed: &str) -> bool {
 /// ENSURES: result does not contain the violation disjunction assertion
 /// ENSURES: result does not contain get-value commands
 pub(crate) fn build_cover_sat_query(smt_content: &str, cover_names: &[String]) -> String {
+    build_cover_probe_query(smt_content, cover_names, false)
+}
+
+/// Request this property's input model within its asserted scope.
+pub(crate) fn build_cover_witness_query(smt_content: &str, name: &str) -> String {
+    build_cover_probe_query(smt_content, &[name.to_owned()], true)
+}
+
+fn build_cover_probe_query(smt_content: &str, cover_names: &[String], with_model: bool) -> String {
     let mut query = String::with_capacity(smt_content.len() + cover_names.len() * 40);
+    let mut model_requests = String::new();
 
-    for line in smt_content.lines() {
-        let trimmed = line.trim();
-
-        if is_violation_disjunction_line(trimmed) {
-            continue;
+    for form in top_level_forms(smt_content) {
+        match form_head(form) {
+            "check-sat" | "exit" => continue,
+            "get-value" => {
+                if with_model {
+                    model_requests.push_str(form);
+                    model_requests.push('\n');
+                }
+                continue;
+            }
+            "assert" if is_violation_query_assertion(form) || form == "(assert false)" => {
+                continue;
+            }
+            _ => {}
         }
-        if trimmed == "(assert false)" {
-            continue;
-        }
-        if trimmed == "(check-sat)" {
-            continue;
-        }
-        if trimmed.starts_with("(get-value") {
-            continue;
-        }
-        if trimmed == "(exit)" {
-            continue;
-        }
-
-        query.push_str(line);
+        query.push_str(form);
         query.push('\n');
     }
 
@@ -188,11 +194,37 @@ pub(crate) fn build_cover_sat_query(smt_content: &str, cover_names: &[String]) -
         query.push_str("(push 1)\n");
         query.push_str(&format!("(assert {})\n", name));
         query.push_str("(check-sat)\n");
+        query.push_str(&model_requests);
         query.push_str("(pop 1)\n");
     }
 
     query.push_str("(exit)\n");
     query
+}
+
+/// Identify only the main disjunction of named violation flags. Keep program
+/// constraints, including disjunctions that merely mention a violation flag.
+fn is_violation_query_assertion(form: &str) -> bool {
+    let Some(("assert", rest)) = form.strip_prefix('(').and_then(split_token) else {
+        return false;
+    };
+    let Some(term) = rest.trim().strip_suffix(')').map(str::trim) else { return false };
+    let flags = if let Some(inner) = term.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        let Some(("or", flags)) = split_token(inner) else { return false };
+        flags
+    } else {
+        term
+    };
+    let mut remaining = flags;
+    let mut saw_flag = false;
+    while let Some((flag, rest)) = split_token(remaining) {
+        if !flag.starts_with("ay_violation_") {
+            return false;
+        }
+        saw_flag = true;
+        remaining = rest;
+    }
+    saw_flag && remaining.trim().is_empty()
 }
 
 /// Build a secondary SMT query asking whether the harness is reachable at all —
@@ -354,10 +386,7 @@ fn split_token(s: &str) -> Option<(&str, &str)> {
 
 /// The command name of a top-level form: `(declare-var x S)` -> `declare-var`.
 fn form_head(form: &str) -> &str {
-    form.strip_prefix('(')
-        .and_then(split_token)
-        .map(|(head, _)| head)
-        .unwrap_or("")
+    form.strip_prefix('(').and_then(split_token).map(|(head, _)| head).unwrap_or("")
 }
 
 /// The declared symbol of a `declare-*` form: `(declare-var x S)` -> `x`.

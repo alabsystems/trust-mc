@@ -141,6 +141,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         // Fallback: create symbolic value with appropriate sort for each field type
         let name = self.ctx.fresh_name(&Self::field_fallback_name("set_iter_", field_name));
+        self.ctx.bmc_sound_havoc("set_iter_field_fallback");
         let fallback_sort = match field_name {
             // fld_set: Array<K, Bool> - use Array<bv64, Bool> as fallback
             "fld_set" => Sort::array(ptr_sort(), bool_sort()),
@@ -168,6 +169,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Fallback: create symbolic value with appropriate sort for each field type
         // Part of #3106: fld_data + fld_present per DT-free encoding (#3057).
         let name = self.ctx.fresh_name(&Self::field_fallback_name("iter_", field_name));
+        self.ctx.bmc_sound_havoc("hashmap_iter_field_fallback");
         let fallback_sort = match field_name {
             // fld_data: Array<K, V> - use Array<bv64, bv64> as fallback
             "fld_data" => Sort::array(ptr_sort(), ptr_sort()),
@@ -194,15 +196,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 dt.constructors.iter().find(|c| names::is_some_constructor(&c.name))
                 && let Some(value_field) = some_ctor.fields.first()
             {
-                return option_expr.clone().field_select(
+                // Select by the DECLARED field name: Option sorts built by
+                // option_constructors scope the payload field name to the sort, so a
+                // literal "value" selector is undeclared there (ay checks selectors).
+                if let Ok(value) = option_expr.clone().try_field_select(
                     &dt.name,
-                    "value",
+                    &*value_field.name,
                     value_field.sort.clone(),
-                );
+                ) {
+                    return value;
+                }
             }
         }
         // Fallback: return symbolic value
         let name = self.ctx.fresh_name("option_value_fallback");
+        self.ctx.bmc_sound_havoc("option_value_fallback");
         self.ctx.declare_var(&name, ptr_sort())
     }
 
@@ -279,8 +287,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         });
         let (dt_name, ctor_name) = iter_dt.unwrap_or(("VecIntoIter", "VecIntoIter_mk"));
 
-        let vec = iter.clone().field_select(dt_name, "fld_vec", self.infer_iter_vec_sort(iter));
-        let pos = iter.clone().field_select(dt_name, "fld_pos", ptr_sort());
+        let fields = iter
+            .clone()
+            .try_field_select(dt_name, "fld_vec", self.infer_iter_vec_sort(iter))
+            .and_then(|vec| Ok((vec, iter.clone().try_field_select(dt_name, "fld_pos", ptr_sort())?)));
+        let Ok((vec, pos)) = fields else {
+            error!("UNSOUND: vec iterator next on {:?} has no fld_vec/fld_pos signature - forcing verification failure", iter.sort());
+            self.record_violation_guarded(Expr::bool_const(true), "iterator_sort_mismatch_unsound");
+            return None;
+        };
 
         let len = self.vec_field_select_declared(&vec, "fld_len", ptr_sort());
         let in_bounds = pos.clone().bvult(len);
@@ -289,8 +304,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
         let new_pos = Expr::ite(in_bounds.clone(), pos.clone().bvadd(one), pos);
 
-        let new_iter =
-            Expr::datatype_constructor(dt_name, ctor_name, vec![vec, new_pos], iter.sort().clone());
+        // Rebuild the iterator with every declared field preserved and only `fld_pos`
+        // advanced. The layout is whatever the iterator sort declares (seeded and
+        // inferred VecIntoIter sorts differ in their extra fields); a two-argument
+        // constructor is only right for a sort with exactly (fld_vec, fld_pos).
+        let rebuilt_args: Option<Vec<Expr>> = iter.sort().datatype_sort().and_then(|dt| {
+            dt.constructors.first().map(|ctor| {
+                ctor.fields
+                    .iter()
+                    .map(|field| {
+                        if &*field.name == "fld_pos" {
+                            Some(new_pos.clone())
+                        } else {
+                            iter.clone()
+                                .try_field_select(dt_name, &*field.name, field.sort.clone())
+                                .ok()
+                        }
+                    })
+                    .collect()
+            })?
+        });
+        let Some(Ok(new_iter)) = rebuilt_args.map(|args| {
+            Expr::try_datatype_constructor(dt_name, ctor_name, args, iter.sort().clone())
+        }) else {
+            error!("UNSOUND: vec iterator {:?} is not a (fld_vec, fld_pos) struct - forcing verification failure", iter.sort());
+            self.record_violation_guarded(Expr::bool_const(true), "iterator_sort_mismatch_unsound");
+            return None;
+        };
 
         let option_sort = self.option_sort_for_value(elem.sort(), expected_option_sort);
         let some_elem = self.make_option_some(&option_sort, elem);
@@ -333,6 +373,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Fallback: return symbolic boolean (conservative - allows both Some and None).
         warn!("make_option_is_some: unknown Option sort {:?}, returning symbolic", sort);
         let name = self.ctx.fresh_name("option_is_some_fallback");
+        self.ctx.bmc_sound_havoc("make_option_is_some_fallback");
         self.ctx.declare_var(&name, bool_sort())
     }
 

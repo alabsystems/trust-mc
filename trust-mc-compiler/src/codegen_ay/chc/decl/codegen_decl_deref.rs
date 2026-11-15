@@ -217,61 +217,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// Pre-declare pointer-wrapper alias arrays for type-indexed memory.
-    ///
-    /// Part of #2967: For each `ptr_T` type array already declared by
-    /// `collect_deref_type_arrays()` or `collect_local_type_arrays()`,
-    /// also pre-declare `std_ptr_NonNull_T` and `std_ptr_Unique_T` arrays.
-    /// Without this, `mirror_pointer_wrapper_store_aliases()` creates these
-    /// arrays at store time via `get_or_create_type_array()` but they are
-    /// not in the relation signature, causing Z3 "unknown constant" errors
-    /// when `drain_store_chains()` references their `__out` names.
-    pub(in crate::codegen_ay::chc) fn predeclare_pointer_wrapper_alias_arrays(&mut self) {
-        let ptr_inners: Vec<String> = self
-            .heap_state
-            .type_arrays
-            .keys()
-            .filter_map(|k| k.strip_prefix("ptr_").map(String::from))
-            .filter(|inner| {
-                !inner.starts_with("ptr_")
-                    && !inner.contains("NonNull_")
-                    && !inner.contains("Unique_")
-                    && !inner.starts_with("ref_")
-            })
-            .collect();
-
-        for inner in ptr_inners {
-            let mut nn_key = String::with_capacity(17 + inner.len());
-            nn_key.push_str("std_ptr_NonNull_");
-            nn_key.push_str(&inner);
-            let mut uq_key = String::with_capacity(16 + inner.len());
-            uq_key.push_str("std_ptr_Unique_");
-            uq_key.push_str(&inner);
-            for alias_key in [nn_key, uq_key] {
-                if self.heap_state.type_arrays.contains_key(alias_key.as_str()) {
-                    continue;
-                }
-
-                let (arr_name, arr_out_name) =
-                    crate::codegen_ay::names::mem_array_name_pair(&self.fn_name, &alias_key);
-                let elem_sort = ptr_sort();
-                let arr_sort = Sort::array(ptr_sort(), elem_sort.clone());
-
-                debug!(
-                    type_key = %alias_key,
-                    arr_name = %arr_name,
-                    "CHC: pre-declared pointer-wrapper alias array (#2967)"
-                );
-
-                self.heap_state
-                    .type_arrays
-                    .insert(alias_key.into(), (Arc::clone(&arr_name), elem_sort.clone()));
-                self.heap_state.array_name_to_elem_sort.insert(Arc::clone(&arr_name), elem_sort);
-                self.push_state_var_pair_arc(arr_name, &arr_out_name, arr_sort);
-            }
-        }
-    }
-
     // Part of #3714: predeclare_stub_internal_type_arrays and
     // predeclare_type_array_if_missing moved to codegen_decl_stub_internal.rs.
 
@@ -280,16 +225,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Part of #3222: Fix PROOF→CTREX regression for promoted constant references.
     pub(in crate::codegen_ay::chc) fn predeclare_const_ref_type_arrays(&mut self) {
-        let needed: Vec<(Arc<str>, Sort)> = self
-            .ref_resolution
-            .const_ref_memory_inits
-            .iter()
-            .filter(|(tk, _, _, _, _)| {
-                !self.heap_state.type_arrays.contains_key(&**tk)
-                    && !super::codegen_decl_static::is_uninit_shadow_type_key(tk) // Part of #4066
-            })
-            .map(|(tk, es, _, _, _)| (tk.clone(), es.clone()))
-            .collect();
+        // ONE array per type key, so ONE element sort per key. `[T; N]` shares
+        // its key with `[T]` (`slice_T`, #3318), and two readers seed it at
+        // different sorts: the per-element view (`T`) and the whole-array view
+        // (`Array<usize, T>`, #3497). With the constant-pointer rule's
+        // whole-object seeding (D2, `decl::global_objects`) both can reach one
+        // harness, and declaring the second array panicked (`duplicate state
+        // var name with different sort`; test_call_drop_terminator::
+        // test_vec_iter_state_isolation_no_unhandled_calls). The first seed's
+        // sort declares the key's array; a seed of an undeclared key at another
+        // sort is not a value that array holds, so it is dropped and its cells
+        // stay free, recorded `const_object_unseeded` (SoundHavoc: a proof
+        // stands, a counterexample is not certified). A key already declared
+        // keeps its sort and its seeds as before (the replay coerces them).
+        // `needed` keeps the seeds' first-occurrence order, so the state
+        // variables are declared in the order they always were.
+        let mut needed: Vec<(Arc<str>, Sort)> = Vec::new();
+        let mut dropped = false;
+        let type_arrays = &self.heap_state.type_arrays;
+        self.ref_resolution.const_ref_memory_inits.retain(|(tk, es, _, _, _)| {
+            if type_arrays.contains_key(&**tk)
+                || super::codegen_decl_static::is_uninit_shadow_type_key(tk)
+            // Part of #4066
+            {
+                return true;
+            }
+            let keep = match needed.iter().find(|(key, _)| key == tk) {
+                Some((_, sort)) => sort == es,
+                None => {
+                    needed.push((tk.clone(), es.clone()));
+                    true
+                }
+            };
+            dropped |= !keep;
+            keep
+        });
+        if dropped {
+            self.record_sound_fallback_reason(super::global_objects::CONST_OBJECT_UNSEEDED);
+        }
 
         for (type_key, elem_sort) in needed {
             let (arr_name, arr_out_name) =
@@ -355,7 +328,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         deref_types: &mut BTreeMap<String, rustc_public::ty::Ty>,
     ) {
         match rvalue {
-            Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
+            Rvalue::Use(op, ..) | Rvalue::Repeat(op, _) | Rvalue::Cast(_, op, _) => {
                 if let Operand::Copy(place) | Operand::Move(place) = op {
                     self.collect_deref_types_from_place(place, deref_types);
                 }
@@ -382,6 +355,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Rvalue::Discriminant(place) | Rvalue::Len(place) => {
                 self.collect_deref_types_from_place(place, deref_types);
             }
+            // Trust: `Reborrow` reads `place`, like `Use(Copy(place))`.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(_, _, place) => {
+                self.collect_deref_types_from_place(place, deref_types);
+            }
             Rvalue::Aggregate(_, ops) => {
                 for op in ops {
                     if let Operand::Copy(place) | Operand::Move(place) = op {
@@ -389,12 +367,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
                 }
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(op, _) => {
                 if let Operand::Copy(place) | Operand::Move(place) = op {
                     self.collect_deref_types_from_place(place, deref_types);
                 }
             }
-            Rvalue::NullaryOp(_) | Rvalue::ThreadLocalRef(_) => {}
+            Rvalue::ThreadLocalRef(_) => {}
+            #[cfg(not(trust_toolchain))]
+            Rvalue::NullaryOp(_) => {}
         }
     }
 

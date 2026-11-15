@@ -220,8 +220,39 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Shift distance >= bit width is UB
             self.emit_shift_distance_check(&lhs_expr, &rhs_expr, Some(false));
         }
-        // Emit overflow check (handles Add/Sub/Mul overflow + signed Div/Rem MIN/-1)
-        self.emit_overflow_check(op, &lhs_expr, &rhs_expr, is_signed);
+        // Emit overflow check (handles Add/Sub/Mul overflow + signed Div/Rem MIN/-1).
+        // The dispatcher hands over the plain `Add`/`Sub`/`Mul`; check them as
+        // the `*Unchecked` op the method body lowers to, so the UB obligation
+        // takes the unchecked label, class and ungated kind (`overflow_check`),
+        // never the safe operator's panic label.
+        match op {
+            // `BinOp` has no unchecked Div/Rem (rustc lowers `unchecked_div` to
+            // `Div`), and `overflow_check` labels a signed `Div`/`Rem` overflow
+            // as the MIR `Assert`'s panic (`overflow_check_div`/`_rem`). This
+            // `MIN / -1` is UB, the check the lowered form gets from the
+            // operator (statement/rvalue.rs): the same `binop_*` labels.
+            BinOp::Div | BinOp::Rem => {
+                if is_signed
+                    && let Some((no_overflow, _)) =
+                        self.overflow_check(op, &lhs_expr, &rhs_expr, true)
+                {
+                    if matches!(op, BinOp::Rem) {
+                        self.record_violation_guarded(no_overflow.not(), "binop_rem_overflow");
+                    } else {
+                        self.record_violation_guarded(no_overflow.not(), "binop_div_overflow");
+                    }
+                }
+            }
+            _ => {
+                let check_op = match op {
+                    BinOp::Add => BinOp::AddUnchecked,
+                    BinOp::Sub => BinOp::SubUnchecked,
+                    BinOp::Mul => BinOp::MulUnchecked,
+                    other => other,
+                };
+                self.emit_overflow_check(check_op, &lhs_expr, &rhs_expr, is_signed);
+            }
+        }
 
         // Store the result
         self.bind_ssa_result(destination, result);

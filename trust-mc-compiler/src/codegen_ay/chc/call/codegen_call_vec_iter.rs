@@ -59,12 +59,36 @@ pub(in crate::codegen_ay::chc) fn codegen_call_vec_iter_impl(
         return;
     };
     debug!("vec_iter_stub stub={:?} has_target={} dest={}", stub, target.is_some(), dest_local);
+    let address_item = matches!(stub, StubKind::IntoIterNext)
+        && ctx.borrowed_static_next_sources(dest_local).is_some();
+    let address_item_ty = address_item
+        .then(|| {
+            args.first()
+                .and_then(|arg| arg.ty(ctx.body.locals()).ok())
+                .and_then(|ty| ctx.borrowed_slice_item_ty(ty))
+        })
+        .flatten();
     if let Some(target) = target {
         let results = if matches!(stub, StubKind::IntoIterNext)
-            && let Some(branches) =
-                translate_vec_into_iter_next_branches(ctx, args, modified_locals)
-        {
+            && let Some(branches) = translate_vec_into_iter_next_branches(
+                ctx,
+                args,
+                modified_locals,
+                address_item_ty,
+                ctx.borrowed_static_next_bound(dest_local),
+            ) {
             branches
+        } else if address_item {
+            ctx.record_sound_fallback_reason("static_iterator_address_unencoded");
+            emit_sound_fallback_goto(
+                ctx,
+                from_app,
+                *target,
+                modified_locals,
+                &[dest_local],
+                stmt_constraints,
+            );
+            return;
         } else if let Some(result) =
             ctx.translate_vec_iter_call(stub, args, modified_locals, Some(dest_local))
         {
@@ -433,15 +457,66 @@ pub(in crate::codegen_ay::chc) fn codegen_call_vec_iter_impl(
             // The Downcast+Field extraction `_18 = (_16 as Some).0` propagates
             // const_ref_values from _16 to _18 via the enum-payload-field path
             // in propagate_ref_metadata_for_assign.
-            if matches!(stub, StubKind::IntoIterNext) {
+            if matches!(stub, StubKind::IntoIterNext) && !address_item {
                 // For flattened destinations, the payload is at state index
                 // dest_vec_idx + 1 (slot 0 = is_some discriminant, slot 1 = value).
                 let payload_idx = dest_vec_idx + 1;
                 if let Some((ref in_name, ref in_sort)) =
                     ctx.state_var_mgr.state_vars.get(payload_idx).cloned()
                 {
+                    // The fact reads the slot as the ELEMENT on every path. A
+                    // statement that also writes the destination's payload
+                    // (`if b { a.iter().next() } else { Some(&m) }`) stores
+                    // another convention there: a `Some(&m)` aggregate keeps the
+                    // address in a pointer-wide slot, and `*r` then read the
+                    // address as `m`'s value (review probe vrp64.rs
+                    // `v64_iter_mix_safe`, FAILED certified Genuine where Kani
+                    // proves it). Fail closed for that mix.
+                    if ctx.local_has_statement_payload_producer(dest_local) {
+                        ctx.record_sound_fallback_reason("payload_value_fact_producer_mix");
+                    }
+                    // The slot holds the ELEMENT, not its address, so a reference
+                    // taken out of it is not the element's address either:
+                    // `ptr::eq(a.iter().next().unwrap(), &a[0])` FAILED certified
+                    // Genuine (lib_opt.rs `iter_ptr_eq64_safe`). Every reader must
+                    // be an admitted value reader (an allowlist; a `map` closure,
+                    // `black_box` or a move into a struct escaped the denylist it
+                    // replaces). `Some` is `Option`'s variant 1.
+                    let payload_is_reference =
+                        ctx.body
+                            .locals()
+                            .get(dest_local)
+                            .map(|decl| ctx.resolve_body_ty(decl.ty))
+                            .is_some_and(|ty| match ty.kind() {
+                                rustc_public::ty::TyKind::RigidTy(
+                                    rustc_public::ty::RigidTy::Adt(_, args),
+                                ) => matches!(
+                                    args.0.first(),
+                                    Some(rustc_public::ty::GenericArgKind::Type(inner))
+                                        if matches!(
+                                            inner.kind(),
+                                            rustc_public::ty::TyKind::RigidTy(
+                                                rustc_public::ty::RigidTy::Ref(..)
+                                            )
+                                        )
+                                ),
+                                _ => false,
+                            });
+                    if payload_is_reference
+                        && !ctx.payload_call_result_readers_closed(dest_local, 1)
+                    {
+                        ctx.record_sound_fallback_reason("payload_value_fact_address_reader");
+                    }
                     let state_var_ref = Expr::var(&**in_name, in_sort.clone());
                     ctx.ref_resolution.const_ref_values.insert(dest_local, state_var_ref);
+                    // The producer block that established the slot fact:
+                    // `verify_kept_payload_value_facts` requires every producer of
+                    // a fact kept across duplicated producers to be one of these.
+                    ctx.ref_resolution
+                        .payload_slot_fact_sites
+                        .entry(dest_local)
+                        .or_default()
+                        .insert(dcx.bb_idx);
                 }
 
                 // Part of #4255: When extra_pointer_checks is on, emit provenance

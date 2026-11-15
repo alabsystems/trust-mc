@@ -20,6 +20,8 @@
 //! attribute claims: whatever representation rustc actually chose must agree,
 //! byte for byte, with the platform C ABI layout of the C struct.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
 use rustc_public::abi::FieldsShape;
 use rustc_public::ty::{AdtKind, FnSig, IntTy, RigidTy, Ty, TyKind, UintTy};
@@ -275,7 +277,8 @@ fn nullable_pointer_matches(
     }
     // The field's declared type is the GENERIC parameter (`T`); it has to be
     // instantiated with this `Option`'s arguments before it can be compared.
-    pointer_matches(c, payload.ty_with_args(&args), program, target, depth)
+    crate::codegen_ay::shared::mono_ty::field_ty(&payload, &args)
+        .is_some_and(|payload_ty| pointer_matches(c, payload_ty, program, target, depth))
 }
 
 fn pointee_matches(c: &CTy, rust: Ty, program: &CProgram, target: CTarget, depth: u32) -> bool {
@@ -331,8 +334,11 @@ fn struct_matches(tag: &str, rust: Ty, program: &CProgram, target: CTarget, dept
         }
         // Instantiated with the ADT's own arguments: a generic field's
         // declared type is a parameter, which matches nothing.
-        if !pointee_matches(&cfield.ty, fields[idx].ty_with_args(&args), program, target, depth + 1)
-        {
+        let Some(field_ty) = crate::codegen_ay::shared::mono_ty::field_ty(&fields[idx], &args)
+        else {
+            return false;
+        };
+        if !pointee_matches(&cfield.ty, field_ty, program, target, depth + 1) {
             return false;
         }
     }

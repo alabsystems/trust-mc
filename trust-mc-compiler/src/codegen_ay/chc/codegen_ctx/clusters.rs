@@ -33,11 +33,27 @@ pub(in crate::codegen_ay::chc) struct LivenessState {
     /// Initialized from `dead_locals_at_entry[bb]` and updated as statements
     /// are processed in order.
     pub(in crate::codegen_ay::chc) dead_locals: HashSet<usize>,
+    /// Locals dead on at least one incoming path. A may/must disagreement is
+    /// unknown lifetime evidence, never a proof that storage is live.
+    pub(in crate::codegen_ay::chc) maybe_dead_locals_at_entry: Vec<HashSet<usize>>,
+    pub(in crate::codegen_ay::chc) maybe_dead_locals: HashSet<usize>,
+    /// Reusing an address-taken local needs allocation generations. None is a
+    /// bounded-analysis refusal; Some contains the conservatively refused locals.
+    pub(in crate::codegen_ay::chc) reused_stack_locals: std::cell::OnceCell<Option<HashSet<usize>>>,
 }
 
 impl LivenessState {
-    pub(in crate::codegen_ay::chc) fn new(dead_locals_at_entry: Vec<HashSet<usize>>) -> Self {
-        Self { dead_locals_at_entry, dead_locals: HashSet::new() }
+    pub(in crate::codegen_ay::chc) fn new(
+        dead_locals_at_entry: Vec<HashSet<usize>>,
+        maybe_dead_locals_at_entry: Vec<HashSet<usize>>,
+    ) -> Self {
+        Self {
+            dead_locals_at_entry,
+            dead_locals: HashSet::new(),
+            maybe_dead_locals_at_entry,
+            maybe_dead_locals: HashSet::new(),
+            reused_stack_locals: std::cell::OnceCell::new(),
+        }
     }
 }
 
@@ -208,7 +224,11 @@ impl StateVarManager {
 
     /// Push a state/output variable pair and update name-to-index maps.
     /// INVARIANT: `out_name` must equal `in_name + "__out"` (#3478).
-    /// See `propagate_to_unconstrained_out_vars()` in chc_const_prop_eval.rs.
+    /// A head argument `out_name` that no constraint of its rule binds is a
+    /// HAVOC of the slot (a universally quantified clause variable); an
+    /// unchanged slot is the INPUT variable in the head or an explicit
+    /// `out = in`. No pass reads an unbound `__out` as an identity frame
+    /// (`trust_mc_core` `chc_const_prop_havoc_tests.rs`).
     /// Part of #2730, #2267 D3.
     /// Part of #3587: idempotent for same-sort duplicates — when MIR inlining
     /// decisions differ (e.g., unwrap panic path present), multiple pre-declaration
@@ -422,6 +442,11 @@ pub(in crate::codegen_ay::chc) struct CollectionState {
     /// Part of #1037 V1: RawVec deduplication.
     pub(in crate::codegen_ay::chc) vec_cap_stubs_fired: HashSet<usize>,
 
+    /// `vec![e; n]` destinations whose fill is NOT in the byte image (a fresh
+    /// buffer, the elements only in the collection's `data` array): a raw read
+    /// through their `as_ptr` / `as_mut_ptr` fails closed (`vec_op_as_ptr`).
+    pub(in crate::codegen_ay::chc) unfilled_from_elem_vecs: HashSet<usize>,
+
     /// Remaining element count for iterator adapter locals whose sort was flattened
     /// to BV64 (preventing structural `fld_pos`/`fld_len` extraction at IterCollect
     /// time). IterMap/IterFilter store the remaining_len extracted from the inner
@@ -452,6 +477,12 @@ pub(in crate::codegen_ay::chc) struct CollectionState {
     /// the start fact until a `next`/state update consumes the adapter.
     pub(in crate::codegen_ay::chc) adapter_at_start: HashSet<usize>,
 
+    /// The number of strings a concrete `flat_map(|s| s.chars())` iterator
+    /// (keyed by its local) was built over (`codegen_iter_constructor`): each
+    /// `FlatMap::next` fetches at most that many inner iterators, one back
+    /// edge each (`codegen_call_model_unwind.rs`).
+    pub(in crate::codegen_ay::chc) flatten_outer_len: HashMap<usize, usize>,
+
     /// Explicit embedded-map aux ownership for struct locals (Part of #3348).
     ///
     /// Maps `(struct_local, field_idx)` → aux state (`present_var`, `len_var`).
@@ -475,10 +506,12 @@ impl CollectionState {
         Self {
             len_state: ChcCollectionLenState::new(),
             projection_locals: HashMap::new(),
+            unfilled_from_elem_vecs: HashSet::new(),
             vec_cap_stubs_fired: HashSet::new(),
             adapter_remaining_len: HashMap::new(),
             adapter_source_data: HashMap::new(),
             adapter_at_start: HashSet::new(),
+            flatten_outer_len: HashMap::new(),
             embedded_map_aux: HashMap::new(),
             array_solver_aux: HashMap::new(),
         }

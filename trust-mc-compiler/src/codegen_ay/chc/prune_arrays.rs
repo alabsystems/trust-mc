@@ -28,6 +28,7 @@
 //! Removing those declarations causes Z3 "unknown constant" errors.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use ay_bindings::{Expr, ExprFold, ExprValue, fold_expr, rebuild_with_children};
 use tracing::debug;
@@ -45,15 +46,59 @@ fn is_heap_metadata_var(name: &str) -> bool {
         || name.starts_with("obj_size__")
 }
 
-fn expr_mentions_heap_metadata(expr: &Expr) -> bool {
+/// Does any node of `expr` satisfy `matches`?
+///
+/// Walks the expression as the DAG it is: a shared subterm (an `Arc`-shared
+/// `ExprValue`, identified by address) is visited once. The answer is an
+/// any-node-matches over the node set, so skipping a node already seen cannot
+/// change it. The tree walks this replaces cost each constraint its unshared
+/// size; expected/derive-bounded-arbitrary/boxed_slice.rs spent 8 of 14 sampled
+/// stops in them (chc_prune_type_arrays, ~14 s).
+fn any_node(expr: &Expr, matches: impl Fn(&ExprValue) -> bool) -> bool {
+    let mut seen: HashSet<*const ExprValue> = HashSet::new();
     let mut stack = vec![expr];
     while let Some(node) = stack.pop() {
-        match node.value() {
-            ExprValue::Var { name } if is_heap_metadata_var(name) => return true,
-            _ => stack.extend(node.children()),
+        if !seen.insert(std::ptr::from_ref(node.value())) {
+            continue;
         }
+        if matches(node.value()) {
+            return true;
+        }
+        stack.extend(node.children());
     }
     false
+}
+
+/// Add to `out` every name in `arrays` that `expr` selects from: the base
+/// variable of a `select`, looked through any chain of `store`s on it.
+fn collect_selected_arrays<'a>(
+    expr: &Expr,
+    arrays: &HashMap<&'a str, &Arc<str>>,
+    out: &mut HashSet<&'a str>,
+) {
+    let mut seen: HashSet<*const ExprValue> = HashSet::new();
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(node.value())) {
+            continue;
+        }
+        if let ExprValue::Select { array, .. } = node.value() {
+            let mut base = array;
+            while let ExprValue::Store { array: inner, .. } = base.value() {
+                base = inner;
+            }
+            if let ExprValue::Var { name } = base.value()
+                && let Some((&key, _)) = arrays.get_key_value(name.as_str())
+            {
+                out.insert(key);
+            }
+        }
+        stack.extend(node.children());
+    }
+}
+
+fn expr_mentions_heap_metadata(expr: &Expr) -> bool {
+    any_node(expr, |value| matches!(value, ExprValue::Var { name } if is_heap_metadata_var(name)))
 }
 
 fn is_flat_mem_var(name: &str) -> bool {
@@ -87,27 +132,13 @@ fn is_pure_array_identity_copy(expr: &Expr) -> bool {
 
 /// Check whether an expression tree references the flat memory array (`mem` or `mem__out`).
 fn expr_mentions_flat_mem(expr: &Expr) -> bool {
-    let mut stack = vec![expr];
-    while let Some(node) = stack.pop() {
-        match node.value() {
-            ExprValue::Var { name } if is_flat_mem_var(name) => return true,
-            _ => stack.extend(node.children()),
-        }
-    }
-    false
+    any_node(expr, |value| matches!(value, ExprValue::Var { name } if is_flat_mem_var(name)))
 }
 
 fn expr_mentions_prunable_relation_app(expr: &Expr, keep_map: &HashMap<&str, Vec<bool>>) -> bool {
-    let mut stack = vec![expr];
-    while let Some(node) = stack.pop() {
-        if let ExprValue::FuncApp { name, .. } = node.value()
-            && keep_map.contains_key(name.as_str())
-        {
-            return true;
-        }
-        stack.extend(node.children());
-    }
-    false
+    any_node(expr, |value| {
+        matches!(value, ExprValue::FuncApp { name, .. } if keep_map.contains_key(name.as_str()))
+    })
 }
 
 fn prune_relation_apps_in_expr(expr: &Expr, keep_map: &HashMap<&str, Vec<bool>>) -> (Expr, bool) {
@@ -144,6 +175,52 @@ impl ExprFold for PruneRelationAppsInExpr<'_, '_> {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The type-array read marks of rule generation, extended with every block
+    /// whose emitted rule SELECTS from a type or region array's pre-state.
+    ///
+    /// `mark_type_array_read` records the block where a select is BUILT, but a
+    /// value built in one block can be substituted into a later block's rule: a
+    /// closure's result `(select mem_u8 r) == 1`, built at the call, reappears in
+    /// the assertion's rule two blocks on. Liveness seeded only from the marks
+    /// dropped `mem_u8` from that block's relation while its rule still read
+    /// it, so the read was an unbound variable — any value — and
+    /// `review_r13_closure.rs::closure_capture_refjoin_safe` FAILED certified
+    /// Genuine (fix/chc-false-certificates).
+    fn read_used_with_emitted_selects(&self) -> HashMap<Arc<str>, HashSet<usize>> {
+        let mut read_used = self.heap_state.read_used_type_arrays.clone();
+        let arrays: HashMap<&str, &Arc<str>> = self
+            .heap_state
+            .type_arrays
+            .values()
+            .chain(self.heap_state.region_arrays.values())
+            .map(|(name, _)| (&**name, name))
+            .collect();
+        if arrays.is_empty() {
+            return read_used;
+        }
+        let relation_to_bb: HashMap<String, usize> = self
+            .block_relations
+            .iter()
+            .map(|(&bb_idx, rel_name)| (rel_name.to_string(), bb_idx))
+            .collect();
+        for rule in &self.vc.rules {
+            let Some(body_rel) = rule.body.relation.as_ref() else { continue };
+            let Some(&bb) = relation_to_bb.get(body_rel.name.to_string().as_str()) else {
+                continue;
+            };
+            let mut selected: HashSet<&str> = HashSet::new();
+            for expr in rule.body.constraints.iter().chain(rule.head.args.iter()) {
+                collect_selected_arrays(expr, &arrays, &mut selected);
+            }
+            for name in selected {
+                if let Some(arc) = arrays.get(name) {
+                    read_used.entry(Arc::clone(arc)).or_default().insert(bb);
+                }
+            }
+        }
+        read_used
+    }
+
     /// Remove dead state variables from the built CHC VC.
     ///
     /// Called after `generate_transition_rules()` completes, before returning
@@ -166,7 +243,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Part of #3184: dead array parameter elimination with read-only criterion.
     /// Part of #3436: error-path-aware pruning for panic formatting state.
     pub(super) fn prune_vc_unused_type_arrays(&mut self) {
+        // Global pruning (Phase A) keeps the marks rule generation left: an
+        // array no mark names is dropped, and a select of it that survives into
+        // a rule is an unbound read the driver's havoc gate refuses to certify
+        // (proofs stay sound over a free value). Per-block liveness (Phase B')
+        // of a SURVIVING array also counts every block whose emitted rule
+        // selects from it (`read_used_with_emitted_selects`): a read the marks
+        // missed must keep the array in that block's relation. Seeding the
+        // global phase from the emitted selects too kept arrays whose only
+        // select sits in an assignment the scalarizer later drops, and grew
+        // realloc_stale_pointer_fail.rs's relations by half (88 KB -> 130 KB of
+        // SMT) until its counterexample no longer fit the budget.
         let read_used = &self.heap_state.read_used_type_arrays;
+        let read_used_blocks_owned = self.read_used_with_emitted_selects();
+        let read_used_blocks = &read_used_blocks_owned;
         let write_used = &self.heap_state.write_used_type_arrays;
 
         // --- Phase A: Dead type array identification ---
@@ -475,7 +565,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let mut ta_live: Vec<HashSet<usize>> = vec![HashSet::new(); block_count];
             for (&idx, &arr_name) in &state_idx_to_type_arr {
                 // Type arrays and region arrays: use read_used/write_used tracking.
-                let read_blocks = read_used.get(arr_name);
+                let read_blocks = read_used_blocks.get(arr_name);
                 let write_blocks = write_used.get(arr_name);
                 for (bb, bb_live) in ta_live.iter_mut().enumerate() {
                     let read_here = read_blocks.map_or(false, |bs| bs.contains(&bb));

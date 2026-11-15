@@ -379,6 +379,9 @@ pub struct NativeTypedChcObligationMetadata {
     pub function_id: u32,
     pub proof_obligation_ids: Vec<u32>,
     pub lineage_root_ids: Vec<u32>,
+    /// Exact original native request and its enforced execution profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_config: Option<crate::NativeMcRequestExecutionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compiler_facts_digest: Option<NativeArtifactDigest>,
     #[serde(default)]
@@ -426,12 +429,31 @@ pub struct NativeTypedChcObligationMetadata {
     /// Unknown, so it can neither mint nor strengthen proof authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fail_closed_lowering_reasons: Vec<String>,
+    /// Number of direct SELF-call sites the translator modeled by the INDUCTIVE
+    /// HYPOTHESIS: results havoc'd, entry preconditions re-asserted over the
+    /// actuals, and — unlike a fail-closed lowering site — NO error rule.
+    ///
+    /// DEMOTE-ONLY: a nonzero count holds a Refuted verdict at Unknown (a
+    /// counterexample may pass through a havoc'd self-call result) and declines
+    /// the pre-solve refutation lanes; it never mints or strengthens proof
+    /// authority. UNLIKE `fail_closed_lowering_site_count`, an absent or forged
+    /// ZERO is NOT harmless: the site left no error rule in the VC, so a
+    /// refutation through the havoc'd result would surface as REFUTED — a false
+    /// refutation (over-rejection, the fail-closed direction), never a false
+    /// proof. The field is serialized whenever it is set; a consumer of an
+    /// obligation whose metadata it cannot see must not report Refuted on it.
+    #[serde(default)]
+    pub inductive_hypothesis_site_count: u32,
 }
 
 impl NativeTypedChcObligationMetadata {
+    /// Legacy generic metadata wire schema; preserved byte-for-byte without a
+    /// canonical native request execution binding.
     pub const SCHEMA_VERSION: u32 = 3;
+    /// Native request metadata additionally binds original and effective options.
+    pub const REQUEST_CONFIG_SCHEMA_VERSION: u32 = 4;
 
-    /// Build native typed CHC metadata with the current schema version.
+    /// Build generic typed CHC metadata with its stable legacy schema version.
     #[must_use]
     pub fn new(
         producer: impl Into<String>,
@@ -457,6 +479,7 @@ impl NativeTypedChcObligationMetadata {
             function_id,
             proof_obligation_ids,
             lineage_root_ids,
+            request_config: None,
             compiler_facts_digest: None,
             compiler_fact_counts: NativeCompilerFactCounts::default(),
             compiler_fact_sources: Vec::new(),
@@ -467,7 +490,16 @@ impl NativeTypedChcObligationMetadata {
             structural_reachability_complete: false,
             fail_closed_lowering_site_count: 0,
             fail_closed_lowering_reasons: Vec::new(),
+            inductive_hypothesis_site_count: 0,
         }
+    }
+
+    /// Bind the original canonical request and its actual execution profile.
+    #[must_use]
+    pub fn with_request_config(mut self, config: crate::NativeMcRequestExecutionBinding) -> Self {
+        self.schema_version = Self::REQUEST_CONFIG_SCHEMA_VERSION;
+        self.request_config = Some(config);
+        self
     }
 
     /// Set the diagnostic structural-completeness claim.
@@ -506,6 +538,14 @@ impl NativeTypedChcObligationMetadata {
         reasons.sort_unstable();
         reasons.dedup();
         self.fail_closed_lowering_reasons = reasons;
+        self
+    }
+
+    /// Record how many direct self-call sites were modeled by the inductive
+    /// hypothesis. Demote-only; see the field documentation.
+    #[must_use]
+    pub fn with_inductive_hypothesis_site_count(mut self, count: u32) -> Self {
+        self.inductive_hypothesis_site_count = count;
         self
     }
 
@@ -556,11 +596,15 @@ impl NativeTypedChcObligationMetadata {
     /// obligation/lineage membership, and the canonical request/proof id.
     pub fn validate_for_obligation_id(&self, obligation_id: &str) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if self.schema_version != Self::SCHEMA_VERSION {
+        let expected_schema = if self.request_config.is_some() {
+            Self::REQUEST_CONFIG_SCHEMA_VERSION
+        } else {
+            Self::SCHEMA_VERSION
+        };
+        if self.schema_version != expected_schema {
             errors.push(format!(
                 "unsupported native typed CHC metadata schema version: expected {}, got {}",
-                Self::SCHEMA_VERSION,
-                self.schema_version
+                expected_schema, self.schema_version
             ));
         }
         if self.producer.trim().is_empty() {
@@ -587,6 +631,21 @@ impl NativeTypedChcObligationMetadata {
         );
         if let Some(source_digest) = &self.source_digest {
             validate_native_artifact_digest("source_digest", source_digest, &mut errors);
+        }
+        if let Some(config) = &self.request_config {
+            validate_native_artifact_digest(
+                "request_config.request_digest",
+                &config.request_digest,
+                &mut errors,
+            );
+            validate_native_artifact_digest(
+                "request_config.effective_config_digest",
+                &config.effective_config_digest,
+                &mut errors,
+            );
+            if !config.is_consistent() {
+                errors.push("native request execution binding is inconsistent".into());
+            }
         }
         if self.proof_obligation_ids.is_empty() {
             errors.push(
@@ -2285,6 +2344,23 @@ fn linked_proof_binding_id(
             "native.lineage_manifest",
             &metadata.lineage_manifest_digest,
         );
+        if let Some(config) = &metadata.request_config {
+            push_proof_binding_native_hash(
+                &mut hasher,
+                "native.original_request",
+                &config.request_digest,
+            );
+            push_proof_binding_native_hash(
+                &mut hasher,
+                "native.effective_config",
+                &config.effective_config_digest,
+            );
+            push_proof_binding_component(
+                &mut hasher,
+                "native.execution",
+                &config.execution.canonical_bytes(),
+            );
+        }
         if let Some(source_digest) = &metadata.source_digest {
             push_proof_binding_native_hash(&mut hasher, "native.source", source_digest);
         }

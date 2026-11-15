@@ -62,6 +62,9 @@ pub(crate) struct ApproximationEvidence {
     /// Per-property (`error_p{id}`) data-dependence verdict, keyed by property
     /// id. `Some(false)` means the check is independent of every freed var.
     pub dependent_by_id: HashMap<u32, Option<bool>>,
+    /// The `error_p{id}` relation of each property in `dependent_by_id`, for
+    /// the replay that confirms a table-independent counterexample.
+    pub relation_by_id: HashMap<u32, String>,
 }
 
 /// Load [`ApproximationEvidence`] from a VC artifact sidecar (Task #78).
@@ -77,9 +80,11 @@ pub(crate) fn load_approximation_evidence(path: &Path) -> Option<ApproximationEv
     let artifact: VcArtifact = serde_json::from_reader(reader).ok()?;
 
     let mut dependent_by_id = HashMap::new();
+    let mut relation_by_id = HashMap::new();
     for prop in &artifact.properties {
-        if prop.smt_var.as_deref().is_some_and(|v| v.starts_with("error_p")) {
+        if let Some(relation) = prop.smt_var.as_deref().filter(|v| v.starts_with("error_p")) {
             dependent_by_id.insert(prop.id.id, prop.approximation_dependent);
+            relation_by_id.insert(prop.id.id, relation.to_string());
         }
     }
     Some(ApproximationEvidence {
@@ -87,6 +92,7 @@ pub(crate) fn load_approximation_evidence(path: &Path) -> Option<ApproximationEv
         accounted: artifact.accounted_approximations,
         approximated_vars: artifact.approximated_vars,
         dependent_by_id,
+        relation_by_id,
     })
 }
 
@@ -121,6 +127,27 @@ pub(crate) fn artifact_registers_no_obligations(path: &Path) -> bool {
         return false;
     };
     artifact.properties.is_empty()
+}
+
+/// Whether this harness may have REGISTERED a checked (non-cover) obligation.
+///
+/// The fail-closed reading [`artifact_registers_no_obligations`] deliberately
+/// avoids: a missing, unreadable or unparseable artifact answers `true`,
+/// because nothing shows the obligation set was empty. Used by the CHC lane's
+/// no-derivation paths, where "registered checks, yet no rule derives `error`"
+/// is lost checks and must never be reported as a proof. `cover` entries are
+/// excluded: a cover is SAT-checked on its own and never owns an error rule.
+pub(crate) fn artifact_may_register_checked_obligations(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return true;
+    };
+    let Ok(artifact): Result<VcArtifact, _> = serde_json::from_reader(BufReader::new(file)) else {
+        return true;
+    };
+    artifact
+        .properties
+        .iter()
+        .any(|prop| !matches!(prop.kind, trust_mc_core::violation::PropertyKind::Cover))
 }
 
 /// The message prefixes the loop-contract instrumentation stamps on its
@@ -224,19 +251,21 @@ fn is_loop_contract_property(p: &trust_mc_core::artifact::PropertyMetadata) -> b
     })
 }
 
-/// The loop-contract obligation messages present in an artifact, deduplicated
-/// by prefix. The two-lane merge uses this to require that the obligations were
-/// actually PRESENT in the obligations lane — "no failing checks" alone would
-/// let a lane whose obligations were dropped pass vacuously.
-/// Did the compiler certify that this harness's body has NO obligation site?
+/// Did the compiler certify that NO obligation site is reachable from this
+/// harness's body (`ArtifactMetadata.obligation_free_body`)?
 ///
-/// Positive evidence for the vacuity decision: an encoded body with no `Call`
-/// and no `Assert` terminator cannot have HAD an obligation to drop, so zero
-/// checks is the `fn check() {}` shape Kani reports as a clean `0 of 0 failed`.
-/// Anything that can panic — including `Option::unwrap`, which stays a `Call`
-/// because the inliner preserves the boundary — is never certified.
+/// `harness_runner`'s no-checks gate reads the answer once the obligation set
+/// is EMPTY (D16, second step): a certified harness exits 0 as it does under
+/// Kani, carrying `OBLIGATION_FREE_CERTIFIED_QUALIFIER` so that no channel
+/// reads it as a clean proof; an uncertified one is `INCONCLUSIVE (no checks)`
+/// with exit 1, because an obligation may have been dropped. The answer never
+/// SKIPS the gate — from 886f60544 until 2026-09-11 a `true` here did, and
+/// printed a bare clean SUCCESSFUL while the walk behind the certificate read
+/// terminators only. The walk counts statement sites since f5305896b
+/// (`codegen_ay/obligation_free_walk.rs`), which is what makes this evidence
+/// a verdict may rest on.
 ///
-/// Fail-closed: a missing, unreadable, or unmarked artifact answers `false`.
+/// Answers `false` for a missing, unreadable or unmarked artifact.
 pub(crate) fn artifact_body_is_obligation_free(path: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -251,6 +280,10 @@ pub(crate) fn artifact_body_is_obligation_free(path: &Path) -> bool {
     artifact.metadata.as_ref().and_then(|m| m.obligation_free_body).unwrap_or(false)
 }
 
+/// The loop-contract obligation messages present in an artifact, deduplicated
+/// by prefix. The two-lane merge uses this to require that the obligations were
+/// actually PRESENT in the obligations lane — "no failing checks" alone would
+/// let a lane whose obligations were dropped pass vacuously.
 pub(crate) fn artifact_loop_obligation_kinds(path: &Path) -> Vec<&'static str> {
     let mut found: Vec<&'static str> = Vec::new();
     if !path.exists() {

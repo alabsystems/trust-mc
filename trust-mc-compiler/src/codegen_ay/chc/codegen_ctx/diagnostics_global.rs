@@ -2,13 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //
-//! Process-global diagnostic counter registry for CHC encoding.
+//! The compilation's diagnostic counter registry for CHC encoding.
 //!
-//! Consolidates all process-global AtomicUsize/AtomicU64 diagnostic counters
-//! and OnceLock<Mutex<BTreeMap>> maps that were previously scattered across 8+
-//! files. Per-context counters mirror into these globals at increment-time.
-//! reset_all() drains globals for session reset.
+//! Consolidates the AtomicUsize/AtomicU64 diagnostic counters and
+//! OnceLock<Mutex<BTreeMap>> maps that were previously scattered across 8+
+//! files. Per-context counters mirror into this registry at increment-time.
+//! reset_all() drains it for session reset.
 //! Metadata emission (unsoundness_fields.rs) reads Tier 2 via take_*/get_*.
+//!
+//! **One registry per compilation.** The registry is the diagnostic state of
+//! ONE compilation, and [`GLOBAL_COUNTERS`] resolves to that compilation's
+//! instance ([`compilation_counters`]):
+//! - a production process runs one compilation, so its registry is one
+//!   process-wide instance (codegen and the metadata drain run on whatever
+//!   thread rustc gives them and all see it);
+//! - the test build runs thousands of compilations in one process, so each
+//!   test thread owns an instance, and a test hands its own instance to the
+//!   compilation thread it starts (`context::testing`'s `with_tcx`). A test
+//!   therefore reads and drains exactly the diagnostics of the compilations
+//!   it started: another test's drain cannot remove them and another test's
+//!   records cannot add to them. Before, one process-wide instance was shared
+//!   by every concurrent test, so a test that drained the maps before its
+//!   codegen also drained a sibling's records between that sibling's codegen
+//!   and its read (`test_vec_resize_shrink_eq_no_translation_drop` passed in
+//!   suite runs only that way).
 //!
 //! Extracted from `diagnostics.rs` — Part of #4206.
 
@@ -107,6 +124,11 @@ pub(in crate::codegen_ay) struct GlobalDiagnosticCounters {
     /// counter's `per_harness.is_empty()` fallback in the driver.
     pub(in crate::codegen_ay) offset_provenance_unresolved_by_fn:
         OnceLock<Mutex<BTreeMap<String, usize>>>,
+    /// Per-function untranslatable-assertion counts. Fail-closed counters are
+    /// charged crate-wide without this map, which let one harness's
+    /// untranslatable assert demote every sibling's counterexample.
+    pub(in crate::codegen_ay) assert_untranslatable_by_fn:
+        OnceLock<Mutex<BTreeMap<String, usize>>>,
     /// Per-function PtrMetadata unconstrained counts (Part of #3447).
     pub(in crate::codegen_ay) ptr_metadata_unconstrained_by_fn:
         OnceLock<Mutex<BTreeMap<String, usize>>>,
@@ -148,62 +170,151 @@ pub(in crate::codegen_ay) struct GlobalDiagnosticCounters {
     pub(in crate::codegen_ay) vacuous_checks_by_fn: OnceLock<Mutex<BTreeMap<String, usize>>>,
 }
 
-/// Single process-global instance of all diagnostic counters (Part of #2906).
-pub(in crate::codegen_ay) static GLOBAL_COUNTERS: GlobalDiagnosticCounters =
-    GlobalDiagnosticCounters {
-        place_translation_drop: AtomicUsize::new(0),
-        sound_havoc_drop: AtomicUsize::new(0),
-        const_translation_drop: AtomicUsize::new(0),
-        unsupported_field_projection: AtomicUsize::new(0),
-        unhandled_call: AtomicUsize::new(0),
-        error_blocked_fmt: AtomicUsize::new(0),
-        known_stdlib_unconstrained: AtomicUsize::new(0),
-        inferable_predicate: AtomicUsize::new(0),
-        diverging_call_drop: AtomicUsize::new(0),
-        offset_provenance_unresolved: AtomicUsize::new(0),
-        coerce_eq_dropped_constraint: AtomicUsize::new(0),
-        assume_dropped_transition: AtomicUsize::new(0),
-        assert_untranslatable: AtomicUsize::new(0),
-        heap_check_untranslatable: AtomicUsize::new(0),
-        heap_check_unknown_layout: AtomicUsize::new(0),
-        store_dropped_transition: AtomicUsize::new(0),
-        iterator_unsound_skip: AtomicUsize::new(0),
-        bigint_unsound_skip: AtomicUsize::new(0),
-        kani_mem_overapprox: AtomicUsize::new(0),
-        ptr_metadata_unconstrained: AtomicUsize::new(0),
-        static_init_incomplete: AtomicUsize::new(0),
-        fp_bitvector_encoding: AtomicUsize::new(0),
-        aggregate_encoding_gap: AtomicUsize::new(0),
-        stub_approximation: AtomicUsize::new(0),
-        recursive_unwind_exhausted: AtomicUsize::new(0),
-        rounding_assertion_bypass: AtomicUsize::new(0),
-        type_sort_fallback: AtomicUsize::new(0),
-        range_spec_next_datatype_path: AtomicU64::new(0),
-        range_spec_next_flattened_path: AtomicU64::new(0),
-        range_spec_next_fail_closed_path: AtomicU64::new(0),
-        vec_builder_pattern: AtomicU64::new(0),
-        coerce_eq_dropped_by_fn: OnceLock::new(),
-        chc_fallback_counts: OnceLock::new(),
-        signedness_fallback_by_fn: OnceLock::new(),
-        type_sort_fallback_by_fn: OnceLock::new(),
-        store_dropped_by_fn: OnceLock::new(),
-        unhandled_call_by_fn: OnceLock::new(),
-        translation_drop_by_fn: OnceLock::new(),
-        sound_havoc_drop_by_fn: OnceLock::new(),
-        kani_mem_overapprox_by_fn: OnceLock::new(),
-        offset_provenance_unresolved_by_fn: OnceLock::new(),
-        ptr_metadata_unconstrained_by_fn: OnceLock::new(),
-        static_init_incomplete_by_fn: OnceLock::new(),
-        fp_bitvector_encoding_by_fn: OnceLock::new(),
-        aggregate_encoding_gap_by_fn: OnceLock::new(),
-        stub_approximation_by_fn: OnceLock::new(),
-        drop_fallback_reasons_by_fn: OnceLock::new(),
-        translation_drop_site_reasons_by_fn: OnceLock::new(),
-        inferable_summary_names_by_fn: OnceLock::new(),
-        aggregate_gap_reasons_by_fn: OnceLock::new(),
-        recursive_unwind_by_fn: OnceLock::new(),
-        vacuous_checks_by_fn: OnceLock::new(),
-    };
+/// The diagnostic counters of the running compilation (Part of #2906): every
+/// access resolves through [`compilation_counters`], so the 300-odd recording
+/// and draining sites name one registry and the module docs' ownership rule
+/// decides which instance that is.
+pub(in crate::codegen_ay) static GLOBAL_COUNTERS: CompilationCounters = CompilationCounters;
+
+/// Handle to the running compilation's [`GlobalDiagnosticCounters`].
+pub(in crate::codegen_ay) struct CompilationCounters;
+
+impl std::ops::Deref for CompilationCounters {
+    type Target = GlobalDiagnosticCounters;
+
+    fn deref(&self) -> &GlobalDiagnosticCounters {
+        compilation_counters()
+    }
+}
+
+/// The production registry: one compilation per process.
+#[cfg(not(test))]
+static PROCESS_COUNTERS: GlobalDiagnosticCounters = GlobalDiagnosticCounters::new();
+
+/// The registry of the compilation this thread belongs to.
+#[cfg(not(test))]
+pub(in crate::codegen_ay) fn compilation_counters() -> &'static GlobalDiagnosticCounters {
+    &PROCESS_COUNTERS
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The test build's per-thread registry slot: a test thread's own
+    /// instance, or, on a compilation thread, the instance of the test that
+    /// started the compilation (installed by [`enter_compilation_counters`]).
+    static THREAD_COUNTERS: std::cell::Cell<Option<&'static GlobalDiagnosticCounters>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The registry of the compilation this thread belongs to (test build): the
+/// instance installed on this thread, created on first use. Each instance is
+/// leaked: it lives as long as the test process, a few hundred bytes per test
+/// thread.
+#[cfg(test)]
+pub(in crate::codegen_ay) fn compilation_counters() -> &'static GlobalDiagnosticCounters {
+    THREAD_COUNTERS
+        .try_with(|slot| {
+            slot.get().unwrap_or_else(|| {
+                let counters: &'static GlobalDiagnosticCounters =
+                    Box::leak(Box::new(GlobalDiagnosticCounters::new()));
+                slot.set(Some(counters));
+                counters
+            })
+        })
+        .unwrap_or_else(|_| {
+            // Reached only from another thread-local's destructor after this
+            // slot was torn down: such a record belongs to no test's reads.
+            static TEARDOWN_COUNTERS: GlobalDiagnosticCounters = GlobalDiagnosticCounters::new();
+            &TEARDOWN_COUNTERS
+        })
+}
+
+/// Restores the previous registry of a thread when a compilation scope ends.
+#[cfg(test)]
+pub(in crate::codegen_ay) struct CompilationCountersScope {
+    previous: Option<&'static GlobalDiagnosticCounters>,
+}
+
+/// Make `counters` this thread's registry until the returned scope drops. The
+/// test harness calls it on the compilation thread with the registry of the
+/// test that started the compilation.
+#[cfg(test)]
+#[must_use]
+pub(in crate::codegen_ay) fn enter_compilation_counters(
+    counters: &'static GlobalDiagnosticCounters,
+) -> CompilationCountersScope {
+    let previous = THREAD_COUNTERS.with(|slot| slot.replace(Some(counters)));
+    CompilationCountersScope { previous }
+}
+
+#[cfg(test)]
+impl Drop for CompilationCountersScope {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        let _ = THREAD_COUNTERS.try_with(|slot| slot.set(previous));
+    }
+}
+
+impl GlobalDiagnosticCounters {
+    /// An all-zero registry.
+    pub(in crate::codegen_ay) const fn new() -> Self {
+        GlobalDiagnosticCounters {
+            place_translation_drop: AtomicUsize::new(0),
+            sound_havoc_drop: AtomicUsize::new(0),
+            const_translation_drop: AtomicUsize::new(0),
+            unsupported_field_projection: AtomicUsize::new(0),
+            unhandled_call: AtomicUsize::new(0),
+            error_blocked_fmt: AtomicUsize::new(0),
+            known_stdlib_unconstrained: AtomicUsize::new(0),
+            inferable_predicate: AtomicUsize::new(0),
+            diverging_call_drop: AtomicUsize::new(0),
+            offset_provenance_unresolved: AtomicUsize::new(0),
+            coerce_eq_dropped_constraint: AtomicUsize::new(0),
+            assume_dropped_transition: AtomicUsize::new(0),
+            assert_untranslatable: AtomicUsize::new(0),
+            heap_check_untranslatable: AtomicUsize::new(0),
+            heap_check_unknown_layout: AtomicUsize::new(0),
+            store_dropped_transition: AtomicUsize::new(0),
+            iterator_unsound_skip: AtomicUsize::new(0),
+            bigint_unsound_skip: AtomicUsize::new(0),
+            kani_mem_overapprox: AtomicUsize::new(0),
+            ptr_metadata_unconstrained: AtomicUsize::new(0),
+            static_init_incomplete: AtomicUsize::new(0),
+            fp_bitvector_encoding: AtomicUsize::new(0),
+            aggregate_encoding_gap: AtomicUsize::new(0),
+            stub_approximation: AtomicUsize::new(0),
+            recursive_unwind_exhausted: AtomicUsize::new(0),
+            rounding_assertion_bypass: AtomicUsize::new(0),
+            type_sort_fallback: AtomicUsize::new(0),
+            range_spec_next_datatype_path: AtomicU64::new(0),
+            range_spec_next_flattened_path: AtomicU64::new(0),
+            range_spec_next_fail_closed_path: AtomicU64::new(0),
+            vec_builder_pattern: AtomicU64::new(0),
+            coerce_eq_dropped_by_fn: OnceLock::new(),
+            chc_fallback_counts: OnceLock::new(),
+            signedness_fallback_by_fn: OnceLock::new(),
+            type_sort_fallback_by_fn: OnceLock::new(),
+            store_dropped_by_fn: OnceLock::new(),
+            unhandled_call_by_fn: OnceLock::new(),
+            translation_drop_by_fn: OnceLock::new(),
+            sound_havoc_drop_by_fn: OnceLock::new(),
+            kani_mem_overapprox_by_fn: OnceLock::new(),
+            offset_provenance_unresolved_by_fn: OnceLock::new(),
+            assert_untranslatable_by_fn: OnceLock::new(),
+            ptr_metadata_unconstrained_by_fn: OnceLock::new(),
+            static_init_incomplete_by_fn: OnceLock::new(),
+            fp_bitvector_encoding_by_fn: OnceLock::new(),
+            aggregate_encoding_gap_by_fn: OnceLock::new(),
+            stub_approximation_by_fn: OnceLock::new(),
+            drop_fallback_reasons_by_fn: OnceLock::new(),
+            translation_drop_site_reasons_by_fn: OnceLock::new(),
+            inferable_summary_names_by_fn: OnceLock::new(),
+            aggregate_gap_reasons_by_fn: OnceLock::new(),
+            recursive_unwind_by_fn: OnceLock::new(),
+            vacuous_checks_by_fn: OnceLock::new(),
+        }
+    }
+}
 
 impl GlobalDiagnosticCounters {
     fn usize_counters(&self) -> [&AtomicUsize; 26] {
@@ -306,6 +417,11 @@ impl GlobalDiagnosticCounters {
             guard.clear();
         }
         if let Some(map) = self.offset_provenance_unresolved_by_fn.get()
+            && let Ok(mut guard) = map.lock()
+        {
+            guard.clear();
+        }
+        if let Some(map) = self.assert_untranslatable_by_fn.get()
             && let Ok(mut guard) = map.lock()
         {
             guard.clear();

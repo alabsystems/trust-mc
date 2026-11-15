@@ -186,12 +186,21 @@ pub(super) fn codegen_assert(
 }
 
 fn assert_check_disabled(ctx: &ChcCtx<'_, '_>, msg: &rustc_public::mir::AssertMessage) -> bool {
-    use rustc_public::mir::AssertMessage;
+    use rustc_public::mir::{AssertMessage, BinOp};
     match msg {
+        // Signed `MIN / -1` (`Overflow(Div|Rem)`) is not an overflow check:
+        // rustc asserts it whatever `-C overflow-checks` says
+        // (rustc_mir_build as_rvalue.rs `build_binary_op`, outside its
+        // `check_overflow` branch), and the program panics there in every build
+        // profile. Disabled with the others, the division went on to its
+        // `bvsdiv(MIN, -1)` value and the panic was never reported.
+        AssertMessage::Overflow(BinOp::Div | BinOp::Rem, ..) => false,
         AssertMessage::Overflow(..) | AssertMessage::OverflowNeg(..) => !ctx.overflow_checks,
         AssertMessage::BoundsCheck { .. }
         | AssertMessage::NullPointerDereference
         | AssertMessage::MisalignedPointerDereference { .. } => !ctx.memory_safety_checks,
+        #[cfg(trust_toolchain)]
+        AssertMessage::NullReferenceConstructed => !ctx.memory_safety_checks,
         _ => false,
     }
 }

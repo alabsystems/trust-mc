@@ -44,10 +44,11 @@ const FOLD_STACK_SIZE: usize = 1024 * 1024;
 /// defining constraints were dropped (false CTREX). Candidates that fail the
 /// check are skipped entirely — failing to fold is always sound.
 pub(super) fn apply_const_folding(vc: &mut ChcVc, fold_infos: &[ConstFoldInfo]) {
+    let conjuncts = FlatConjuncts::new(vc);
     let fold_infos: Vec<&ConstFoldInfo> = fold_infos
         .iter()
         .filter(|info| {
-            let ok = fold_preconditions_hold(vc, info);
+            let ok = fold_preconditions_hold_indexed(vc, &conjuncts, info);
             if !ok {
                 debug!(
                     array = %info.input_name,
@@ -357,6 +358,92 @@ struct UniformRuleFacts {
 /// and never re-examines selects that miss `const_map` (#4097's unchecked
 /// precondition). Any use this function cannot prove sound rejects the array
 /// from folding — failing to fold is always sound.
+/// Every flattened conjunct of the VC, once, with the positions of the
+/// conjuncts mentioning each variable.
+///
+/// `fold_preconditions_hold` used to re-flatten and walk EVERY conjunct of
+/// EVERY rule for EACH folded array (O(arrays x VC), the `apply_const_folding`
+/// share of multiple_loops.rs / conditional-drop.rs samples). A conjunct that
+/// mentions neither the array's input nor its output name is `Kept` by
+/// `conjunct_drop_kind` and folds away in `conjunct_folds_away` with no site
+/// recorded, so visiting only the mentioning conjuncts, in VC order, is the
+/// same check.
+struct FlatConjuncts {
+    /// `(rule index, is entry rule, conjunct)` in VC order.
+    items: Vec<(usize, bool, Expr)>,
+    mentions: HashMap<String, Vec<usize>>,
+}
+
+impl FlatConjuncts {
+    fn new(vc: &ChcVc) -> Self {
+        let mut items = Vec::new();
+        let mut mentions: HashMap<String, Vec<usize>> = HashMap::new();
+        for (rule_idx, rule) in vc.rules.iter().enumerate() {
+            let is_entry_rule = rule.body.relation.is_none();
+            for constraint in rule.body.constraints.iter() {
+                let mut conjuncts = Vec::new();
+                flatten_and_tree(constraint, &mut conjuncts);
+                for conjunct in conjuncts {
+                    let pos = items.len();
+                    let mut vars: Vec<&str> = Vec::new();
+                    let mut stack = vec![&conjunct];
+                    while let Some(node) = stack.pop() {
+                        match node.value() {
+                            ExprValue::Var { name } => vars.push(name.as_str()),
+                            _ => stack.extend(node.children()),
+                        }
+                    }
+                    vars.sort_unstable();
+                    vars.dedup();
+                    for var in vars {
+                        mentions.entry(var.to_string()).or_default().push(pos);
+                    }
+                    items.push((rule_idx, is_entry_rule, conjunct.clone()));
+                }
+            }
+        }
+        Self { items, mentions }
+    }
+
+    fn mentioning(&self, info: &ConstFoldInfo) -> Vec<usize> {
+        let empty: &[usize] = &[];
+        let a = self.mentions.get(info.input_name.as_str()).map_or(empty, Vec::as_slice);
+        let b = self.mentions.get(info.output_name.as_str()).map_or(empty, Vec::as_slice);
+        let mut merged: Vec<usize> = a.iter().chain(b).copied().collect();
+        merged.sort_unstable();
+        merged.dedup();
+        merged
+    }
+}
+
+fn fold_preconditions_hold_indexed(vc: &ChcVc, conjuncts: &FlatConjuncts, info: &ConstFoldInfo) -> bool {
+    // Inlined `const_map` values must not themselves resurrect the array.
+    if info.const_map.values().any(|value| expr_mentions_folded_array(value, info)) {
+        return false;
+    }
+
+    // Pass 1: per-conjunct residual analysis, over the mentioning conjuncts.
+    let mut uniform_sites: Vec<UniformSelectSite> = Vec::new();
+    let mut output_const_sites: Vec<usize> = Vec::new();
+    for pos in conjuncts.mentioning(info) {
+        let (rule_idx, is_entry_rule, conjunct) = &conjuncts.items[pos];
+        if !conjunct_folds_away(
+            conjunct,
+            info,
+            *rule_idx,
+            *is_entry_rule,
+            &mut uniform_sites,
+            &mut output_const_sites,
+        ) {
+            return false;
+        }
+    }
+    fold_preconditions_tail(vc, info, &uniform_sites, &output_const_sites)
+}
+
+/// The pre-index full scan, kept as the reference the indexed check is tested
+/// against.
+#[cfg(test)]
 fn fold_preconditions_hold(vc: &ChcVc, info: &ConstFoldInfo) -> bool {
     // Inlined `const_map` values must not themselves resurrect the array.
     if info.const_map.values().any(|value| expr_mentions_folded_array(value, info)) {
@@ -385,6 +472,15 @@ fn fold_preconditions_hold(vc: &ChcVc, info: &ConstFoldInfo) -> bool {
             }
         }
     }
+    fold_preconditions_tail(vc, info, &uniform_sites, &output_const_sites)
+}
+
+fn fold_preconditions_tail(
+    vc: &ChcVc,
+    info: &ConstFoldInfo,
+    uniform_sites: &[UniformSelectSite],
+    output_const_sites: &[usize],
+) -> bool {
 
     // `const_map`-hit reads of the POST-state name are only justified when the
     // rule ties the post-state to the (read-only) pre-state via an identity.
@@ -408,7 +504,7 @@ fn fold_preconditions_hold(vc: &ChcVc, info: &ConstFoldInfo) -> bool {
     if !info.const_map.values().all(|value| value == default) {
         return false;
     }
-    uniform_default_reaches_all_sites(vc, info, default, &uniform_sites)
+    uniform_default_reaches_all_sites(vc, info, default, uniform_sites)
 }
 
 /// How `apply_const_folding` treats one flattened conjunct for this array.
@@ -776,4 +872,109 @@ fn remove_folded_args(
         .cloned()
         .collect();
     RelationApp::new(app.name.as_str(), new_args)
+}
+
+#[cfg(test)]
+mod indexed_precondition_tests {
+    //! The indexed precondition check must agree with the full scan it replaced.
+    use super::*;
+    use std::collections::BTreeMap;
+    use trust_mc_core::chc::{RelationDecl, Rule, RuleBody, VarDecl};
+
+    fn arr() -> Sort {
+        Sort::array(Sort::bitvec(64), Sort::bitvec(32))
+    }
+
+    fn info(name: &str, const_map: &[(u64, u64)], uniform: Option<u64>) -> ConstFoldInfo {
+        ConstFoldInfo {
+            input_name: name.to_string(),
+            output_name: format!("{name}__out"),
+            const_map: const_map
+                .iter()
+                .map(|&(i, v)| {
+                    (try_extract_const_idx(&Expr::bitvec_const(i, 64)).unwrap(), Expr::bitvec_const(v, 32))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            uniform_default: uniform.map(|v| Expr::bitvec_const(v, 32)),
+        }
+    }
+
+    /// Two arrays and an unrelated scalar; `b` has a symbolic read and a raw
+    /// whole-array mention, `a` only constant reads plus an identity passthrough.
+    fn vc() -> ChcVc {
+        let a = Expr::var("a", arr());
+        let a_out = Expr::var("a__out", arr());
+        let b = Expr::var("b", arr());
+        let b_out = Expr::var("b__out", arr());
+        let x = Expr::var("x", Sort::bitvec(32));
+        let i = Expr::var("i", Sort::bitvec(64));
+        let mut vc = ChcVc::new();
+        for (n, s) in [("a", arr()), ("a__out", arr()), ("b", arr()), ("b__out", arr())] {
+            vc.add_var(VarDecl::new(n, s));
+        }
+        vc.add_var(VarDecl::new("x", Sort::bitvec(32)));
+        vc.add_var(VarDecl::new("i", Sort::bitvec(64)));
+        vc.add_relation(RelationDecl::new("bb0", vec![arr(), arr()]));
+        vc.add_relation(RelationDecl::new("bb1", vec![arr(), arr(), Sort::bitvec(32)]));
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                None,
+                vec![a.clone().select(Expr::bitvec_const(0, 64)).eq(Expr::bitvec_const(7, 32))
+                    .and(b.clone().eq(Expr::const_array(Sort::bitvec(64), Expr::bitvec_const(1, 32))))],
+            ),
+            RelationApp::new("bb0", vec![a.clone(), b.clone()]),
+        ));
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb0", vec![a.clone(), b.clone()])),
+                vec![
+                    a_out.clone().eq(a.clone()),
+                    x.clone().eq(a.clone().select(Expr::bitvec_const(0, 64))),
+                    x.clone().eq(b.clone().select(i)),
+                    b_out.clone().eq(b.clone()),
+                ],
+            ),
+            RelationApp::new("bb1", vec![a_out, b_out, x]),
+        ));
+        vc
+    }
+
+    #[test]
+    fn indexed_check_agrees_with_the_full_scan() {
+        let vc = vc();
+        let conjuncts = FlatConjuncts::new(&vc);
+        let cases = [
+            info("a", &[(0, 7)], None),
+            info("a", &[(0, 8)], None),
+            info("a", &[], Some(7)),
+            info("b", &[], None),
+            info("b", &[], Some(1)),
+            info("b", &[(3, 1)], Some(1)),
+            info("unrelated", &[], None),
+        ];
+        for case in &cases {
+            assert_eq!(
+                fold_preconditions_hold_indexed(&vc, &conjuncts, case),
+                fold_preconditions_hold(&vc, case),
+                "{} const_map={:?} uniform={:?}",
+                case.input_name,
+                case.const_map.len(),
+                case.uniform_default
+            );
+        }
+    }
+
+    #[test]
+    fn mentioning_lists_input_and_output_conjuncts_once_in_order() {
+        let vc = vc();
+        let conjuncts = FlatConjuncts::new(&vc);
+        let positions = conjuncts.mentioning(&info("a", &[], None));
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+        for pos in &positions {
+            let text = conjuncts.items[*pos].2.to_string();
+            assert!(text.contains('a'), "{text}");
+        }
+        // entry select def, identity, and the constant read.
+        assert_eq!(positions.len(), 3, "{positions:?}");
+    }
 }

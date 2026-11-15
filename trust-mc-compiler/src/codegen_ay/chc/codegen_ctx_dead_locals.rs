@@ -46,6 +46,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Computes dead locals at each block entry using forward must-analysis.
     pub(super) fn compute_dead_locals_at_block_entry(body: &Body) -> Vec<HashSet<usize>> {
+        Self::compute_dead_locals_with_meet(body, true)
+    }
+
+    /// May-dead evidence is separate: absence from the must-dead set does not
+    /// prove liveness at a join reached through both live and dead storage.
+    pub(super) fn compute_maybe_dead_locals_at_block_entry(body: &Body) -> Vec<HashSet<usize>> {
+        Self::compute_dead_locals_with_meet(body, false)
+    }
+
+    fn compute_dead_locals_with_meet(body: &Body, must: bool) -> Vec<HashSet<usize>> {
         let block_count = body.blocks.len();
         if block_count == 0 {
             return Vec::new();
@@ -81,8 +91,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Must analysis domain:
         // - entry starts with no dead locals,
         // - all other reachable blocks start at top (all dead) then monotonically decrease.
-        let mut dead_in = vec![vec![true; local_count]; block_count];
+        let mut dead_in = vec![vec![must; local_count]; block_count];
         dead_in[0] = vec![false; local_count];
+        // Explicitly scoped non-argument storage does not exist before its
+        // first StorageLive. Arguments and the caller's return place start live.
+        let argument_count = body.arg_locals().len();
+        for block in &body.blocks {
+            for statement in &block.statements {
+                if let StatementKind::StorageLive(local) = statement.kind
+                    && local > argument_count
+                    && let Some(dead) = dead_in[0].get_mut(local)
+                {
+                    *dead = true;
+                }
+            }
+        }
         for bb in 0..block_count {
             if !reachable[bb] {
                 dead_in[bb] = vec![false; local_count];
@@ -117,7 +140,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
 
                 let mut has_reachable_pred = false;
-                new_in.fill(true);
+                new_in.fill(must);
 
                 for &pred in &predecessors[bb] {
                     if !reachable[pred] {
@@ -125,7 +148,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
                     has_reachable_pred = true;
                     for local in 0..local_count {
-                        new_in[local] &= dead_out[pred][local];
+                        if must {
+                            new_in[local] &= dead_out[pred][local];
+                        } else {
+                            new_in[local] |= dead_out[pred][local];
+                        }
                     }
                 }
 
@@ -183,7 +210,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Collect locals used as source operands in a statement.
-    fn collect_statement_used_locals(kind: &StatementKind, used: &mut HashSet<usize>) {
+    pub(super) fn collect_statement_used_locals(kind: &StatementKind, used: &mut HashSet<usize>) {
         match kind {
             StatementKind::Assign(place, rvalue) => {
                 // RHS locals are source operands.
@@ -216,7 +243,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Collect locals used as source operands in a terminator.
-    fn collect_terminator_used_locals(kind: &TerminatorKind, used: &mut HashSet<usize>) {
+    pub(super) fn collect_terminator_used_locals(kind: &TerminatorKind, used: &mut HashSet<usize>) {
         match kind {
             TerminatorKind::SwitchInt { discr, .. } => {
                 Self::collect_operand_local(discr, used);
@@ -254,6 +281,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Self::collect_place_index_locals(place, used);
             }
             Operand::Constant(_) => {}
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {}
         }
     }
 
@@ -267,9 +296,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Extract locals from Rvalue source operands.
-    fn collect_rvalue_used_locals(rvalue: &Rvalue, used: &mut HashSet<usize>) {
+    pub(super) fn collect_rvalue_used_locals(rvalue: &Rvalue, used: &mut HashSet<usize>) {
         match rvalue {
-            Rvalue::Use(op)
+            Rvalue::Use(op, ..)
             | Rvalue::Repeat(op, _)
             | Rvalue::Cast(_, op, _)
             | Rvalue::UnaryOp(_, op) => {
@@ -287,15 +316,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 used.insert(place.local);
                 Self::collect_place_index_locals(place, used);
             }
+            // Trust: `Reborrow` reads `place`, like `Use(Copy(place))`.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(_, _, place) => {
+                used.insert(place.local);
+                Self::collect_place_index_locals(place, used);
+            }
             Rvalue::Aggregate(_, operands) => {
                 for op in operands {
                     Self::collect_operand_local(op, used);
                 }
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(op, _) => {
                 Self::collect_operand_local(op, used);
             }
-            Rvalue::NullaryOp(_) | Rvalue::ThreadLocalRef(_) => {}
+            Rvalue::ThreadLocalRef(_) => {}
+            #[cfg(not(trust_toolchain))]
+            Rvalue::NullaryOp(_) => {}
         }
     }
 

@@ -48,21 +48,73 @@ fn container_identity(container: &Expr) -> String {
 fn variant_conflicted_containers(exprs: &[Expr]) -> HashSet<String> {
     let mut seen_ctors: std::collections::HashMap<String, HashSet<String>> =
         std::collections::HashMap::new();
+    let mut visited: HashSet<*const ExprValue> = HashSet::new();
     let mut stack: Vec<&Expr> = exprs.iter().collect();
     while let Some(e) = stack.pop() {
+        if !visited.insert(std::ptr::from_ref(e.value())) {
+            continue;
+        }
         if let ExprValue::DatatypeSelector { selector_name, expr: container, .. } = e.value()
             && let SortInner::Datatype(dt) = container.sort().inner()
             && dt.constructors.len() > 1
             && let Some(cons) = dt.constructors.iter().find(|c| c.has_field(selector_name))
         {
-            seen_ctors
-                .entry(container_identity(container))
-                .or_default()
-                .insert(cons.name.clone());
+            seen_ctors.entry(container_identity(container)).or_default().insert(cons.name.clone());
         }
         stack.extend(e.value().children());
     }
     seen_ctors.into_iter().filter(|(_, cs)| cs.len() > 1).map(|(k, _)| k).collect()
+}
+
+/// `(container pointer, constructor)` keys of selectors that sit in the ELSE
+/// branch of an `ite` testing their own container.
+///
+/// Flattening an enum to a bitvector builds a tester chain over EVERY
+/// constructor, `ite(is_None(o), enc_None, enc_Some(value(o)))`, and the last
+/// constructor's encoding is an else branch. A selector there is evaluated only
+/// when the tester fails — the then-branch argument of #3886, mirrored — so a
+/// standalone `((_ is Some) o)` guard asserts that constructor on every path
+/// through the block and prunes the others. Observed on
+/// `prusti/Fibonacci_sequence.rs`: storing a rebuilt
+/// `ControlFlow<Option<Infallible>, NonZero<usize>>` to memory flattened its
+/// `Break(None)` payload, the guard demanded `Some`, the `?` residual path died,
+/// and every check was reported UNREACHABLE (VACUOUS). Dropping a guard only
+/// leaves the accessor uninterpreted — UNKNOWN at worst, never a fabricated
+/// proof.
+fn tester_else_guarded_selector_keys(exprs: &[Expr]) -> HashSet<(usize, String)> {
+    let mut keys = HashSet::new();
+    let mut visited: HashSet<*const ExprValue> = HashSet::new();
+    let mut stack: Vec<&Expr> = exprs.iter().collect();
+    while let Some(e) = stack.pop() {
+        if !visited.insert(std::ptr::from_ref(e.value())) {
+            continue;
+        }
+        if let ExprValue::Ite { cond, else_expr, .. } = e.value()
+            && let ExprValue::DatatypeTester { expr: tested, .. } = cond.value()
+        {
+            let mut inner_visited: HashSet<*const ExprValue> = HashSet::new();
+            let mut inner: Vec<&Expr> = vec![else_expr];
+            while let Some(node) = inner.pop() {
+                if !inner_visited.insert(std::ptr::from_ref(node.value())) {
+                    continue;
+                }
+                if let ExprValue::DatatypeSelector { selector_name, expr: container, .. } =
+                    node.value()
+                    && (std::ptr::eq(container.value(), tested.value()) || container == tested)
+                    && let SortInner::Datatype(dt) = container.sort().inner()
+                    && let Some(cons) = dt.constructors.iter().find(|c| c.has_field(selector_name))
+                {
+                    keys.insert((
+                        std::ptr::from_ref(container.value()) as usize,
+                        cons.name.clone(),
+                    ));
+                }
+                inner.extend(node.value().children());
+            }
+        }
+        stack.extend(e.value().children());
+    }
+    keys
 }
 
 pub(in crate::codegen_ay) fn collect_constructor_guards(exprs: &[Expr]) -> Vec<Expr> {
@@ -70,14 +122,16 @@ pub(in crate::codegen_ay) fn collect_constructor_guards(exprs: &[Expr]) -> Vec<E
     // Deduplicate by container pointer identity + constructor name to avoid
     // emitting redundant guards when the same variable is accessed multiple
     // times in one block. We use the raw pointer of the container's ExprValue
-    // Arc as a cheap identity key.
-    let mut seen: HashSet<(usize, String)> = HashSet::new();
+    // Arc as a cheap identity key. Seeded with the selectors a tester's else
+    // branch already guards, which must never be asserted as facts.
+    let mut seen: HashSet<(usize, String)> = tester_else_guarded_selector_keys(exprs);
     // Constructors this block PINS by a sibling constraint. See
     // `pinned_constructors`.
     let pinned = pinned_constructors(exprs);
     let conflicted = variant_conflicted_containers(exprs);
+    let mut visited = HashSet::new();
     for expr in exprs {
-        collect_guards_recursive(expr, &mut guards, &mut seen, &pinned, &conflicted);
+        collect_guards_recursive(expr, &mut guards, &mut seen, &mut visited, &pinned, &conflicted);
     }
     if !guards.is_empty() {
         debug!(
@@ -167,9 +221,17 @@ fn collect_guards_recursive(
     expr: &Expr,
     guards: &mut Vec<Expr>,
     seen: &mut HashSet<(usize, String)>,
+    visited: &mut HashSet<*const ExprValue>,
     pinned: &std::collections::HashMap<String, Expr>,
     conflicted: &HashSet<String>,
 ) {
+    // All roots stay alive for the complete collection. Node identities are
+    // stable, and a repeated node has the same pinned/conflicted context.
+    // Skipped tester-guarded branches never enter this function, so they do
+    // not suppress a later unguarded occurrence of a shared selector.
+    if !visited.insert(std::ptr::from_ref(expr.value())) {
+        return;
+    }
     match expr.value() {
         ExprValue::DatatypeSelector { datatype_name, selector_name, expr: container } => {
             // Check if the container is a multi-constructor datatype.
@@ -232,7 +294,9 @@ fn collect_guards_recursive(
                             let container_is_data_dependent =
                                 matches!(container.value(), ExprValue::Ite { .. });
                             if container_is_data_dependent || peel_bool_const(&guard).is_some() {
-                                collect_guards_recursive(container, guards, seen, pinned, conflicted);
+                                collect_guards_recursive(
+                                    container, guards, seen, visited, pinned, conflicted,
+                                );
                                 return;
                             }
                             // Dedup by container identity (pointer) + constructor name.
@@ -250,7 +314,9 @@ fn collect_guards_recursive(
                                      variant-conflicted (selectors of >1 constructor)",
                                     cons.name
                                 );
-                                collect_guards_recursive(container, guards, seen, pinned, conflicted);
+                                collect_guards_recursive(
+                                    container, guards, seen, visited, pinned, conflicted,
+                                );
                                 return;
                             }
                             let container_ptr = std::ptr::from_ref(container.value()) as usize;
@@ -267,7 +333,7 @@ fn collect_guards_recursive(
                 }
             }
             // Recurse into the container expression (may have nested selectors).
-            collect_guards_recursive(container, guards, seen, pinned, conflicted);
+            collect_guards_recursive(container, guards, seen, visited, pinned, conflicted);
         }
         // For all other variants, recurse into sub-expressions.
         ExprValue::Not(e)
@@ -283,11 +349,11 @@ fn collect_guards_recursive(
         | ExprValue::BvSignExtend { expr: e, .. }
         | ExprValue::BvExtract { expr: e, .. }
         | ExprValue::ConstArray { value: e, .. } => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::And(es) | ExprValue::Or(es) | ExprValue::Distinct(es) => {
             for e in es {
-                collect_guards_recursive(e, guards, seen, pinned, conflicted);
+                collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
             }
         }
         ExprValue::Eq(a, b)
@@ -339,11 +405,11 @@ fn collect_guards_recursive(
         | ExprValue::RealLe(a, b)
         | ExprValue::RealGt(a, b)
         | ExprValue::RealGe(a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::Ite { cond, then_expr, else_expr } => {
-            collect_guards_recursive(cond, guards, seen, pinned, conflicted);
+            collect_guards_recursive(cond, guards, seen, visited, pinned, conflicted);
             // Part of #3886: When the ITE condition is a DatatypeTester
             // `((_ is C) container)`, the then-branch is already guarded
             // by the tester — selectors inside it are only evaluated when
@@ -356,34 +422,34 @@ fn collect_guards_recursive(
             // (fld_data x))` injected into the rule body kills the rule
             // when x.data is None, causing false PROOF.
             if !matches!(cond.value(), ExprValue::DatatypeTester { .. }) {
-                collect_guards_recursive(then_expr, guards, seen, pinned, conflicted);
+                collect_guards_recursive(then_expr, guards, seen, visited, pinned, conflicted);
             }
-            collect_guards_recursive(else_expr, guards, seen, pinned, conflicted);
+            collect_guards_recursive(else_expr, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::Select { array, index } => {
-            collect_guards_recursive(array, guards, seen, pinned, conflicted);
-            collect_guards_recursive(index, guards, seen, pinned, conflicted);
+            collect_guards_recursive(array, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(index, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::Store { array, index, value } => {
-            collect_guards_recursive(array, guards, seen, pinned, conflicted);
-            collect_guards_recursive(index, guards, seen, pinned, conflicted);
-            collect_guards_recursive(value, guards, seen, pinned, conflicted);
+            collect_guards_recursive(array, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(index, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(value, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::DatatypeConstructor { args, .. } => {
             for arg in args {
-                collect_guards_recursive(arg, guards, seen, pinned, conflicted);
+                collect_guards_recursive(arg, guards, seen, visited, pinned, conflicted);
             }
         }
         ExprValue::DatatypeTester { expr: e, .. } => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::FuncApp { args, .. } => {
             for arg in args {
-                collect_guards_recursive(arg, guards, seen, pinned, conflicted);
+                collect_guards_recursive(arg, guards, seen, visited, pinned, conflicted);
             }
         }
         ExprValue::Forall { body, .. } | ExprValue::Exists { body, .. } => {
-            collect_guards_recursive(body, guards, seen, pinned, conflicted);
+            collect_guards_recursive(body, guards, seen, visited, pinned, conflicted);
         }
         // Leaf nodes: no sub-expressions to recurse into.
         ExprValue::BoolConst(_)
@@ -394,7 +460,7 @@ fn collect_guards_recursive(
         // Sort conversions: recurse into sub-expression (soundness-critical).
         // Bv2Int/Int2Bv wrap DatatypeSelector in production CHC encoding.
         ExprValue::Bv2Int(e) | ExprValue::Int2Bv(e, _) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         // FP unary operations: recurse into sub-expression.
         ExprValue::FpAbs(e)
@@ -407,7 +473,7 @@ fn collect_guards_recursive(
         | ExprValue::FpIsPositive(e)
         | ExprValue::FpIsNegative(e)
         | ExprValue::FpToReal(e) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         // FP operations with RoundingMode + single expression.
         ExprValue::FpSqrt(_, e)
@@ -417,7 +483,7 @@ fn collect_guards_recursive(
         | ExprValue::BvToFp(_, e, _, _)
         | ExprValue::BvToFpUnsigned(_, e, _, _)
         | ExprValue::FpToFp(_, e, _, _) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         // FP binary operations (plain two-expr).
         ExprValue::FpRem(a, b)
@@ -428,27 +494,27 @@ fn collect_guards_recursive(
         | ExprValue::FpLe(a, b)
         | ExprValue::FpGt(a, b)
         | ExprValue::FpGe(a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         // FP binary operations with RoundingMode.
         ExprValue::FpAdd(_, a, b)
         | ExprValue::FpSub(_, a, b)
         | ExprValue::FpMul(_, a, b)
         | ExprValue::FpDiv(_, a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         // FP ternary operations.
         ExprValue::FpFromBvs(a, b, c) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
-            collect_guards_recursive(c, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(c, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::FpFma(_, a, b, c) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
-            collect_guards_recursive(c, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(c, guards, seen, visited, pinned, conflicted);
         }
         // FP leaf constants: no sub-expressions.
         ExprValue::FpPlusInfinity { .. }
@@ -461,7 +527,7 @@ fn collect_guards_recursive(
         | ExprValue::StrToInt(e)
         | ExprValue::StrFromInt(e)
         | ExprValue::StrToRe(e) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         // String binary operations.
         ExprValue::StrConcat(a, b)
@@ -470,31 +536,31 @@ fn collect_guards_recursive(
         | ExprValue::StrPrefixOf(a, b)
         | ExprValue::StrSuffixOf(a, b)
         | ExprValue::StrInRe(a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         // String ternary operations.
         ExprValue::StrSubstr(a, b, c)
         | ExprValue::StrIndexOf(a, b, c)
         | ExprValue::StrReplace(a, b, c)
         | ExprValue::StrReplaceAll(a, b, c) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
-            collect_guards_recursive(c, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(c, guards, seen, visited, pinned, conflicted);
         }
         // Regex operations.
         ExprValue::ReStar(e) | ExprValue::RePlus(e) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         ExprValue::ReUnion(a, b) | ExprValue::ReConcat(a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         // Sequence leaf: no sub-expressions.
         ExprValue::SeqEmpty(_) => {}
         // Sequence unary operations.
         ExprValue::SeqUnit(e) | ExprValue::SeqLen(e) => {
-            collect_guards_recursive(e, guards, seen, pinned, conflicted);
+            collect_guards_recursive(e, guards, seen, visited, pinned, conflicted);
         }
         // Sequence binary operations.
         ExprValue::SeqConcat(a, b)
@@ -502,16 +568,16 @@ fn collect_guards_recursive(
         | ExprValue::SeqContains(a, b)
         | ExprValue::SeqPrefixOf(a, b)
         | ExprValue::SeqSuffixOf(a, b) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
         }
         // Sequence ternary operations.
         ExprValue::SeqExtract(a, b, c)
         | ExprValue::SeqIndexOf(a, b, c)
         | ExprValue::SeqReplace(a, b, c) => {
-            collect_guards_recursive(a, guards, seen, pinned, conflicted);
-            collect_guards_recursive(b, guards, seen, pinned, conflicted);
-            collect_guards_recursive(c, guards, seen, pinned, conflicted);
+            collect_guards_recursive(a, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(b, guards, seen, visited, pinned, conflicted);
+            collect_guards_recursive(c, guards, seen, visited, pinned, conflicted);
         }
         // Catch-all for future ExprValue variants (#[non_exhaustive]).
         // All 146 known variants are handled explicitly above.
@@ -649,6 +715,59 @@ mod variant_conflict_tests {
                 ("Err_Result", vec![("Err_field_0", Sort::bitvec(32))]),
             ],
         )
+    }
+
+    fn shared_sum(mut expr: Expr) -> Expr {
+        // 64 new nodes encode over 2^64 tree visits if sharing is ignored.
+        for _ in 0..64 {
+            expr = expr.clone().bvadd(expr);
+        }
+        expr
+    }
+
+    #[test]
+    fn shared_dag_emits_one_constructor_guard() {
+        let container = Expr::var("shared", result_sort());
+        let selector =
+            container.clone().field_select("Result_t_u32", "Err_field_0", Sort::bitvec(32));
+        let expr = shared_sum(selector);
+        let guards = collect_constructor_guards(&[expr.clone(), expr]);
+
+        assert_eq!(guards, vec![container.is_constructor("Result_t_u32", "Err_Result")]);
+    }
+
+    #[test]
+    fn shared_dag_preserves_variant_conflicts_across_roots() {
+        // Separate Var allocations with the same name must still conflict.
+        let ok = Expr::var("shared", result_sort()).field_select(
+            "Result_t_u32",
+            "Ok_field_0",
+            Sort::bitvec(8),
+        );
+        let err = Expr::var("shared", result_sort()).field_select(
+            "Result_t_u32",
+            "Err_field_0",
+            Sort::bitvec(32),
+        );
+
+        let guards = collect_constructor_guards(&[shared_sum(ok), shared_sum(err)]);
+
+        assert!(guards.is_empty(), "shared nodes must not hide a constructor conflict");
+    }
+
+    #[test]
+    fn shared_selector_in_guarded_branch_does_not_hide_unguarded_use() {
+        let container = Expr::var("shared", result_sort());
+        let selector =
+            container.clone().field_select("Result_t_u32", "Err_field_0", Sort::bitvec(32));
+        let tester = container.is_constructor("Result_t_u32", "Err_Result");
+        let guarded = Expr::ite(tester.clone(), selector.clone(), Expr::bitvec_const(0u64, 32));
+
+        assert!(collect_constructor_guards(std::slice::from_ref(&guarded)).is_empty());
+        let guards = collect_constructor_guards(&[guarded.clone(), selector.clone()]);
+        assert_eq!(guards, vec![tester.clone()]);
+        let guards = collect_constructor_guards(&[selector, guarded]);
+        assert_eq!(guards, vec![tester]);
     }
 
     /// A container read through selectors of TWO different constructors has an

@@ -13,9 +13,11 @@
 //! Part of #2304 cleanup decomposition. Part of #3928 decomposition.
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_public::mir::{Operand, ProjectionElem};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
@@ -24,7 +26,6 @@ use super::ChcCtx;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_call_vec::ChcVecFields;
 use super::codegen_call_vec_ops::ProjectedVecState;
-use super::codegen_ctx::globals::declare_pending_var;
 use super::codegen_ctx::types::CollectionProjectionKind;
 
 /// Maximum number of source bytes unrolled into `store` constraints by
@@ -74,6 +75,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         };
 
+        // A zero-sized element's capacity is `usize::MAX`, which the tracked
+        // capacity does not hold: stating `cap >= new_len` against it made
+        // `set_len` on a `Vec<()>` vacuous.
+        let zero_sized_elem = collection_local.is_some_and(|local| {
+            self.vec_capacity_elem_size(self.body.locals()[local].ty) == Some(0)
+        });
+
         // Sidecar len tracking
         if let Some(coll_local) = collection_local
             && let Some(len_var_name) = self.collections.len_state.get_len_var(coll_local).cloned()
@@ -89,7 +97,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let Some((ptr, _old_len, cap, data)) =
                 self.extract_projected_vec_fields(coll_local, modified_locals)
             {
-                Self::emit_cap_ge_len(cap.clone(), new_len.clone(), acc.constraints);
+                if !zero_sized_elem {
+                    Self::emit_cap_ge_len(cap.clone(), new_len.clone(), acc.constraints);
+                }
                 if !self.constrain_projected_vec_fields_for_call(
                     coll_local,
                     ProjectedVecState { ptr, len: new_len, cap, data },
@@ -123,7 +133,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let vec_in = Expr::var(&*name, sort);
                     if let Some(fields) = ChcVecFields::extract(vec_in) {
                         let ChcVecFields { vec_sort, ptr, len: _, cap, data } = fields;
-                        Self::emit_cap_ge_len(cap.clone(), new_len.clone(), acc.constraints);
+                        if !zero_sized_elem {
+                            Self::emit_cap_ge_len(cap.clone(), new_len.clone(), acc.constraints);
+                        }
                         if let Some((out_name, out_sort)) =
                             self.state_var_mgr.output_state_vars.get(idx).cloned()
                         {
@@ -144,11 +156,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// VecClone: propagate data array + len + cap from source to dest.
+    /// VecClone: propagate data array + len from source to dest; the clone's
+    /// capacity is its length.
     ///
     /// Part of #3348: previously only copied sidecar len, leaving dest data
     /// unconstrained. Now propagates the full Vec structure (ptr fresh, data
-    /// and len/cap copied) so that `clone().len()` and element equality work.
+    /// and len copied) so that `clone().len()` and element equality work.
+    ///
+    /// `<[T]>::to_vec_in` allocates `RawVec::with_capacity(len)`, exactly the
+    /// length, whatever the source's capacity (a zero-sized element reads
+    /// `usize::MAX` through `vec_op_capacity` whatever is tracked). Copying
+    /// the source's capacity made a `Vec::with_capacity(10)` of two elements
+    /// clone to capacity 10: `w.capacity() == 10` verified clean on both
+    /// lanes where Kani fails, and `w.capacity() == 2`, which Kani proves,
+    /// failed certified Genuine (walker fail-closed review, round 3 of the
+    /// repair after the merge with main, `vec_capacity_elem_layout_dual.rs`).
     pub(in crate::codegen_ay::chc) fn vec_op_clone(
         &mut self,
         collection_local: Option<usize>,
@@ -163,19 +185,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             let src_len = self.collection_current_len(&src_len_var);
             if let Some(dst_len_var) = self.collections.len_state.get_len_var(dest_local).cloned() {
-                self.collection_len_set(&dst_len_var, src_len, acc);
+                self.collection_len_set(&dst_len_var, src_len.clone(), acc);
             }
-            if let Some(src_cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
-                let src_cap = self.collection_current_cap(&src_cap_var);
-                if let Some(dst_cap_var) =
-                    self.collections.len_state.get_cap_var(dest_local).cloned()
-                {
-                    self.collection_cap_set(&dst_cap_var, src_cap, acc);
-                }
+            if let Some(dst_cap_var) = self.collections.len_state.get_cap_var(dest_local).cloned() {
+                self.collection_cap_set(&dst_cap_var, src_len, acc);
             }
         }
 
-        // Projected path: copy all 4 fields (fresh ptr, same len/cap/data).
+        // Projected path: fresh ptr, same len/data, capacity = len.
         if let Some(coll_local) = collection_local
             && self.collections.projection_locals.get(&coll_local).copied()
                 == Some(CollectionProjectionKind::Vec)
@@ -185,15 +202,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let Some((_src_ptr, src_len, src_cap, src_data)) =
                 self.extract_projected_vec_fields(coll_local, modified_locals)
             {
-                let clone_ptr =
-                    declare_pending_var(format!("vec_clone_ptr_{dest_local}"), ptr_sort());
-                Self::emit_cap_ge_len(src_cap.clone(), src_len.clone(), acc.constraints);
+                let clone_ptr = Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
+                    format!("vec_clone_ptr_{dest_local}"),
+                    ptr_sort(),
+                );
+                Self::emit_cap_ge_len(src_cap, src_len.clone(), acc.constraints);
                 if !self.constrain_projected_vec_fields_for_call(
                     dest_local,
                     ProjectedVecState {
                         ptr: clone_ptr,
-                        len: src_len,
-                        cap: src_cap,
+                        len: src_len.clone(),
+                        cap: src_len,
                         data: src_data,
                     },
                     acc.constraints,
@@ -232,14 +253,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             let dt_name = vec_sort.datatype_name().expect(
                                 "invariant: ChcVecFields::extract ensures datatype Vec sort",
                             );
-                            let clone_ptr = declare_pending_var(
+                            let clone_ptr = Havoc::mint(
+                                self,
+                                sound_havoc::UNTRACKED_POINTER_VALUE,
                                 format!("vec_clone_ptr_{dest_local}"),
                                 ptr_sort(),
                             );
-                            Self::emit_cap_ge_len(cap.clone(), len.clone(), acc.constraints);
+                            Self::emit_cap_ge_len(cap, len.clone(), acc.constraints);
                             acc.constraints.push(Self::build_vec_datatype_eq(
                                 dt_name,
-                                vec![clone_ptr, len, cap, data],
+                                vec![clone_ptr, len.clone(), len, data],
                                 &out_name,
                                 &out_sort,
                             ));
@@ -269,9 +292,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         //   constraining it in this rule — a universally quantified havoc that
         //   only ADDS behaviors (monotone; can never remove an error edge).
         // - The only accompanying constraints on this path are the sidecar
-        //   pins emitted above: dst_len := src_len (exact real Vec::clone
-        //   semantics) and dst_cap := src_cap (the uniform VecClone stub
-        //   semantics, identical to the fully-modeled projected/datatype
+        //   pins emitted above: dst_len := src_len and dst_cap := src_len
+        //   (exact real Vec::clone semantics: `to_vec_in` allocates exactly
+        //   the length; identical to the fully-modeled projected/datatype
         //   paths; satisfies cap >= len). Neither ties the havocked dest var
         //   to stale input.
         // - Both partially-attempted paths above bail out BEFORE pushing any
@@ -310,7 +333,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && let Some(coll_local) = collection_local
             && let Some(len_var_name) = self.collections.len_state.get_len_var(coll_local).cloned()
         {
-            let len_expr = self.collection_current_len(&len_var_name);
+            let len_expr = self.collection_len_for_query(&len_var_name);
             if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
                 if let Some(eq) = self.make_coerced_eq_constraint(
                     &dest_var,
@@ -335,8 +358,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !field_projections.is_empty()
             && let Some(coll_local) = collection_local
         {
-            let mut len_via_ref = None;
-            let mut matched_vec_local = None;
+            // Every tracked local that references this field is a candidate;
+            // the choice among them must not follow the map's iteration order.
+            // `assert!(w.v.len() <= 2)` has two: the call's receiver `_7 = &w.v`,
+            // whose sidecar this very block wrote, and a later `_12 = &w.v`
+            // (for the drop) whose sidecar is still its entry value here. The
+            // first match won, so the harness passed or FAILED certified Genuine
+            // from run to run (bounded_any_model_dual.rs, derived_len_bound_safe).
+            let mut candidates: Vec<(usize, Arc<str>)> = Vec::new();
             for (&tracked_local, len_var) in &self.collections.len_state.len_var_names {
                 let Some(rt) = self.ref_resolution.ref_targets.get(&tracked_local) else {
                     continue;
@@ -355,6 +384,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         }
                     });
                 if !projs_match {
+                    continue;
+                }
+                // Only a field that holds a REFERENCE to the Vec (a closure's
+                // captured `&Vec`): a tracked local whose target is a by-value
+                // Vec field is a borrow taken at some earlier point, and its
+                // length was propagated when it was taken. `s.v = vec![1, 2]`
+                // after a drop-glue reborrow of the old `s.v` left that
+                // reborrow's length at 0, and `s.v.len() == 0` verified clean
+                // where Kani fails (walker fail-closed repair round 4,
+                // finding 7's class, `r6_bmc_field_stale.rs`
+                // `s3_vec_field_direct_store_bug`). A by-value field is read
+                // where it lives (the struct-embedded path below).
+                if !Self::field_projection_holds_reference(rt.projections.last()) {
                     continue;
                 }
 
@@ -383,11 +425,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
                 }
 
-                matched_vec_local = Some(tracked_local);
-                len_via_ref = Some(len_var.clone());
-                break;
+                candidates.push((tracked_local, len_var.clone()));
             }
-            if let Some((len_var_name, matched_vec_local)) = len_via_ref.zip(matched_vec_local) {
+            candidates.sort_by_key(|(local, _)| *local);
+            // The receiver's sidecar is the one written in this block; a lone
+            // candidate is unambiguous; several with none fresh go to the
+            // struct-embedded path, which reads the field itself.
+            let fresh: Vec<&(usize, Arc<str>)> = candidates
+                .iter()
+                .filter(|(_, len_var)| {
+                    self.collections.len_state.modified_len_vars.contains(&**len_var)
+                })
+                .collect();
+            let chosen = match (fresh.as_slice(), candidates.as_slice()) {
+                ([one], _) => Some((*one).clone()),
+                ([], [one]) => Some(one.clone()),
+                _ => None,
+            };
+            if candidates.len() > 1 && chosen.is_none() {
+                debug!(
+                    fn_name = %self.fn_name,
+                    coll_local,
+                    candidates = candidates.len(),
+                    "VecLen: ref-chase ambiguous; struct-embedded path"
+                );
+            }
+            if let Some((matched_vec_local, len_var_name)) = chosen {
                 // Part of #4057: When the matched tracked local's ref_target
                 // field type is &Vec<T> (closure-captured reference), the
                 // tracked len_var (e.g., vec_main_len_40) may be uninitialized
@@ -404,7 +467,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     %effective_len_var,
                     "VecLen: ref-chase through Vec-shaped field projections (#3924, #4046, #4057)"
                 );
-                let len_expr = self.collection_current_len(&effective_len_var);
+                let len_expr = self.collection_len_for_query(&effective_len_var);
                 if let Some((_, dest_var)) = self.resolve_destination(dest_local) {
                     if let Some(eq) = self.make_coerced_eq_constraint(
                         &dest_var,
@@ -498,6 +561,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             concrete_bytes.as_ref().map(|vals| Expr::bitvec_const(vals.len() as u64, POINTER_WIDTH))
         });
 
+        let known_count = source_len.clone();
         let new_len = if let Some(src_len) = source_len {
             tracing::debug!(coll_local, "VecExtendFromSlice: old_len + source_len");
             let sum = old_len.clone().bvadd(src_len);
@@ -505,20 +569,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             acc.constraints.push(sum.clone().bvuge(old_len.clone()));
             sum
         } else {
-            // Source length unknown — leave dest len unconstrained.
-            // This is a sound over-approximation: the solver will consider
-            // all possible lengths, which includes the correct one.
+            // Source length unknown: the new length is a fresh value no smaller
+            // than the old one. Returning here left the length var UNWRITTEN,
+            // so it kept its old value: `vec![9]` extended by
+            // `[1, 2, 3].iter().copied()` still had length 1, the true
+            // `v.len() == 4` was certified a Genuine failure and `v.len() == 1`
+            // would have verified (walker fail-closed repair round 4, finding
+            // 8's class, `r8_extend_adapter.rs` `e5_extend_copied_slice_safe`).
+            // The fresh length is an identified sound havoc: a counterexample
+            // that reads it is not certified.
             tracing::debug!(coll_local, "VecExtendFromSlice: source length unresolved");
-            return;
+            let fresh = Havoc::mint(
+                self,
+                sound_havoc::VEC_EXTEND_SOURCE_LEN_UNRESOLVED,
+                super::codegen_ctx::globals::chc_fresh_name("vec_extend_len"),
+                ptr_sort(),
+            );
+            acc.constraints.push(fresh.clone().bvuge(old_len.clone()));
+            fresh
         };
 
         self.collection_len_set(&len_var_name, new_len.clone(), acc);
 
-        // Capacity growth: cap = max(cap, new_len).
+        // Capacity growth: `extend_trusted` reserves the slice's length,
+        // RawVec's amortized growth (`shared::vec_capacity`).
         if let Some(cap_var_name) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let old_cap = self.collection_current_cap(&cap_var_name);
-            let grow_needed = old_cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap);
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &old_cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var_name, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, new_len, acc.constraints);
         }
@@ -527,10 +610,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // the appended slots return the real bytes instead of the construction
         // fill. Adds only genuine facts; anything unresolved above is skipped
         // (unconstrained over-approximation, sound).
-        if let Some(values) = concrete_bytes
-            && (1..=MAX_APPEND_MOVE_ELEMS).contains(&values.len())
-        {
-            self.vec_store_appended_elements(coll_local, &old_len, &values, modified_locals, acc);
+        let stored = match concrete_bytes {
+            Some(values) if (1..=MAX_APPEND_MOVE_ELEMS).contains(&values.len()) => self
+                .vec_store_appended_elements(coll_local, &old_len, &values, modified_locals, acc),
+            _ => false,
+        };
+        if !stored && let Some(count) = known_count {
+            // The source's length is known and its values are not: the Vec's
+            // own `len` field still moves by the count (an index check reads
+            // it), and `data` is a fresh array, an identified sound havoc.
+            // The fields were left as they were, so `v.extend_from_slice(&a);
+            // v[2]` for a symbolic `a: [u8; 3]` failed `index out of bounds`,
+            // certified Genuine on main (walker fail-closed review, round 1 of
+            // the repair after the merge with main, `range_extend_index_dual.rs`
+            // `s1`-`s3`).
+            self.write_appended_vec_fields(
+                coll_local,
+                &count,
+                super::codegen_call_vec_ops_extend_range::AppendedElements::Fresh(
+                    sound_havoc::VEC_EXTEND_SLICE_ELEMENTS_UNMODELLED,
+                ),
+                "vec_extend_slice_fields_unwritten",
+                modified_locals,
+                acc,
+            );
         }
     }
 
@@ -569,7 +672,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             slice.bytes
         } else {
-            Self::const_byte_slice_operand_bytes(&args[1])?
+            self.const_byte_slice_operand_bytes(&args[1])?
         };
         let count = bytes.len();
         if count == 0 || count > MAX_APPEND_MOVE_ELEMS {
@@ -578,46 +681,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some(bytes.iter().map(|&b| Expr::bitvec_const(u64::from(b), 8)).collect())
     }
 
-    /// Read the concrete data bytes of a `Constant` fat-pointer `&[u8]` operand
-    /// (e.g. a `b"..."` byte-string literal). The constant's own allocation
-    /// holds the fat pointer `(data_ptr, len)`; the actual bytes live in the
-    /// allocation named by its provenance. Returns `None` for any operand that
-    /// is not such a constant (sound — the caller then stores nothing).
-    fn const_byte_slice_operand_bytes(arg: &Operand) -> Option<Vec<u8>> {
-        use rustc_public::mir::alloc::GlobalAlloc;
-        use rustc_public::ty::{ConstantKind, TyConstKind};
+    /// Read the concrete data bytes of a `Constant` `&[u8]` / `&[u8; N]`
+    /// operand (e.g. a `b"..."` byte-string literal): the pointee WINDOW its
+    /// pointer names (`const_pointer::fixed_pointee`) — at the pointer's offset
+    /// in its target, for the length its metadata word carries — every byte
+    /// initialized data. It read the target from byte 0 and filled
+    /// uninitialized bytes with 0: `BS = b"hello".split_at(2).1` extended a
+    /// Vec with `b"he"`. Returns `None` for any operand that is not such a
+    /// constant (sound — the caller then stores nothing).
+    fn const_byte_slice_operand_bytes(&self, arg: &Operand) -> Option<Vec<u8>> {
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+        use rustc_public::ty::{RigidTy, TyKind};
 
         let Operand::Constant(const_op) = arg else {
             return None;
         };
-        let alloc = match const_op.const_.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_ty, alloc) => alloc,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        // Follow provenance to the data allocation.
-        let alloc_id = alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(inner) = GlobalAlloc::from(alloc_id) else {
+        let TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) =
+            const_op.const_.ty().kind()
+        else {
             return None;
         };
-        // Length from the fat-pointer metadata (little-endian usize at offset
-        // `ptr_bytes`), falling back to the inner allocation size.
-        let ptr_bytes = (POINTER_WIDTH / 8) as usize;
-        let len = if alloc.bytes.len() >= 2 * ptr_bytes {
-            let mut v: u64 = 0;
-            for i in 0..ptr_bytes.min(8) {
-                v |= u64::from(alloc.bytes[ptr_bytes + i].unwrap_or(0)) << (8 * i);
-            }
-            usize::try_from(v).ok()?
-        } else {
-            inner.bytes.len()
-        };
-        if len == 0 || len > inner.bytes.len() {
+        let bytes = const_pointer::const_bytes(&const_op.const_)?;
+        let (_, window) = const_pointer::fixed_pointee(self.tcx, &bytes, 0, pointee)?;
+        let len = window.len();
+        if len == 0 {
             return None;
         }
-        Some(inner.bytes.iter().take(len).map(|opt| opt.unwrap_or(0)).collect())
+        window.read_data_bytes(0, len)
     }
 }

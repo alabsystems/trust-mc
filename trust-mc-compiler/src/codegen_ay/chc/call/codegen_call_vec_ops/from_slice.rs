@@ -4,6 +4,7 @@
 
 //! VecFromSlice (slice::to_vec): rebuild an owned Vec from borrowed slice backing.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -15,7 +16,6 @@ use crate::codegen_ay::types::{CtorFieldExt, ptr_sort};
 
 use super::super::ChcCtx;
 use super::super::codegen_call_slice_helpers::SLICE_BACKING_REBASE_MAX_ELEMS;
-use super::super::codegen_ctx::globals::declare_pending_var;
 use super::super::codegen_ctx::types::CollectionProjectionKind;
 use super::shared::ProjectedVecState;
 
@@ -115,7 +115,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .then(|| self.heap_state.fresh_valid_backing_ptr())
                 .flatten()
                 .unwrap_or_else(|| {
-                    declare_pending_var(
+                    Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_POINTER_VALUE,
                         {
                             let mut n = String::with_capacity(ptr_name.len() + 15);
                             n.push_str(&ptr_name);
@@ -138,7 +140,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     SLICE_BACKING_REBASE_MAX_ELEMS,
                 )
                 .unwrap_or_else(|| {
-                    declare_pending_var(
+                    Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_COLLECTION_STATE,
                         {
                             let mut n = String::with_capacity(data_name.len() + 16);
                             n.push_str(&data_name);
@@ -149,7 +153,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     )
                 })
             } else {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(data_name.len() + 16);
                         n.push_str(&data_name);
@@ -160,7 +166,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 )
             };
             let len_val = input_len.clone().unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(len_name.len() + 15);
                         n.push_str(&len_name);
@@ -171,7 +179,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 )
             });
             let cap_val = input_len.unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(cap_name.len() + 15);
                         n.push_str(&cap_name);
@@ -211,7 +221,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .unwrap_or_else(ptr_sort);
             // Same fresh-allocation pin as the projected-Vec path above.
             let ptr = self.heap_state.fresh_valid_backing_ptr().unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 15);
                         n.push_str(&out_name);
@@ -239,7 +251,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     SLICE_BACKING_REBASE_MAX_ELEMS,
                 )
                 .unwrap_or_else(|| {
-                    declare_pending_var(
+                    Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_COLLECTION_STATE,
                         {
                             let mut n = String::with_capacity(out_name.len() + 16);
                             n.push_str(&out_name);
@@ -250,7 +264,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     )
                 })
             } else {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 16);
                         n.push_str(&out_name);
@@ -261,7 +277,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 )
             };
             let len_val = input_len.clone().unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 15);
                         n.push_str(&out_name);
@@ -272,7 +290,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 )
             });
             let cap_val = input_len.unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 15);
                         n.push_str(&out_name);

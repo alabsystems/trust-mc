@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "fork_commit": "c4d858036efec56e02caa743f8732582da973d5a",
+  "historical_total": 818,
+  "corrections": [
+    {
+      "file": "tests/expected/niche/main.rs",
+      "harness": "main",
+      "before": "CTREX",
+      "after": "PROOF",
+      "source_blob": "710ee19049d4a94f92b30c02f3213db238b0889b",
+      "source_sha256": "24d0bf85e842a50128f1ce982c9a543126ba460176e0c4110f067d4fdac848e0",
+      "expectation_file": "tests/expected/niche/expected",
+      "expectation_blob": "2a1aa6fe2401b96f99d3db1d31d1c39c1906d9ea",
+      "expectation_sha256": "bdbf204045aa65d5f3885bb1678d6612ede8f5988ac78d6795606f6c7f8c88b4",
+      "expected_property_statuses": [
+        "UNREACHABLE",
+        "UNREACHABLE",
+        "SUCCESS"
+      ],
+      "reason": "The source constructs None followed by Some((10, &10)); the rejected arms are unreachable and the reachable assertion compares the original 10 with its own reference. The original output requires UNREACHABLE, UNREACHABLE and SUCCESS. The phrase assertion failed occurs only in property descriptions, not in an expected failure status."
+    },
+    {
+      "file": "tests/expected/niche2/main.rs",
+      "harness": "main",
+      "before": "CTREX",
+      "after": "PROOF",
+      "source_blob": "c1379eabce578d5e9771329017bb002f9a2b95ce",
+      "source_sha256": "6a45f3908c7a8b4f333bb77dffb15ab55ba27fed3ad28da8bf0bdde361e42bf6",
+      "expectation_file": "tests/expected/niche2/expected",
+      "expectation_blob": "5fe5ba3575af5af01b7d6cd73024aaf633e7b63f",
+      "expectation_sha256": "e557ed69e82796a6912a24d6e76ab109796457b51d8cb555d4420af4510c38e0",
+      "expected_property_statuses": [
+        "UNREACHABLE",
+        "SUCCESS",
+        "UNREACHABLE",
+        "UNREACHABLE"
+      ],
+      "reason": "The source explicitly constructs None, Some(Foo::A(10)) and Some(Foo::B([])); each match selects the asserted variant and the sole value assertion checks 10 == 10. The original output requires UNREACHABLE, SUCCESS, UNREACHABLE and UNREACHABLE. No program failure is expected."
+    }
+  ],
+  "partition": {
+    "proof": 479,
+    "negative": 339,
+    "active_proof": 447,
+    "active_negative": 339
+  },
+  "scope": "Correct two safe enum harness oracles using unchanged source and original property-status expectations. All identities remain; positive proof requirements are retained. Reachability-specific rows are not changed by this audit."
+}

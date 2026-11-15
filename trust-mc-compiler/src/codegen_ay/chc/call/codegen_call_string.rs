@@ -18,6 +18,7 @@ mod codegen_call_string_utf8;
 mod codegen_call_string_whitespace;
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 
 use crate::codegen_ay::names;
@@ -27,7 +28,7 @@ use crate::codegen_ay::types::{POINTER_WIDTH, bool_sort};
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 use codegen_call_string_conversion::CallStringConversion;
 use codegen_call_string_lifecycle::CallStringLifecycle;
 use codegen_call_string_parse::CallStringParse;
@@ -263,7 +264,9 @@ impl<'tcx, 'body> CallString for ChcCtx<'tcx, 'body> {
                         .unwrap_or_else(|| {
                             // Part of #3447: string alloc size is unconstrained.
                             self.record_aggregate_gap("string_alloc_size_unconstrained");
-                            declare_pending_var(
+                            Havoc::mint(
+                                self,
+                                sound_havoc::UNTRACKED_COLLECTION_STATE,
                                 chc_fresh_name("__string_alloc_size"),
                                 ay_bindings::Sort::bitvec(32),
                             )
@@ -354,6 +357,27 @@ impl<'tcx, 'body> CallString for ChcCtx<'tcx, 'body> {
                     &mut extra_dests,
                 );
             }
+            StubKind::StringFromUtf8 => {
+                // String::from_utf8(Vec<u8>) -> Result<String, FromUtf8Error>: the
+                // same concrete-fast-path / symbolic-Result shape as StrFromUtf8.
+                // When the Vec's bytes cannot be resolved as a concrete slice the
+                // destination stays an unconstrained Result (sound over-approximation).
+                self.codegen_str_from_utf8(
+                    dest_local,
+                    args,
+                    modified_locals,
+                    &mut extra_constraints,
+                    &mut extra_dests,
+                );
+            }
+            StubKind::StringIntoBytes => {
+                // String::into_bytes(self) -> Vec<u8>: CHC keeps the destination
+                // an unconstrained Vec (sound over-approximation), recorded as a
+                // sound fallback so the verdict quality reflects it. The precise
+                // layout-identity model lives in the BMC lane (string_utf8.rs).
+                self.record_sound_fallback_reason("string_into_bytes_symbolic");
+                extra_dests.push(dest_local);
+            }
             StubKind::IntParse => {
                 self.codegen_int_parse(
                     dest_local,
@@ -379,7 +403,29 @@ impl<'tcx, 'body> CallString for ChcCtx<'tcx, 'body> {
                     "codegen_call_string_core::StrBytesNth::const_fold"
                 };
                 let mut emitted = false;
-                if let Some(backing) = self.resolve_string_backing(&args[0], modified_locals)
+                // A `&str` whose bytes are known decodes exactly: the byte
+                // model below is right for ASCII only (walker fail-closed
+                // repair round 5, `str_chars_nth_multibyte_dual.rs`).
+                if is_chars
+                    && let Some((bytes, str_len)) = self.try_extract_const_str_bytes(&args[0])
+                    && let Some(index_expr) =
+                        self.translate_operand_with_modified(&args[1], modified_locals)
+                    && let Some(dest_sort) = self.str_nth_result_sort(destination)
+                    && let Some(result) =
+                        self.str_chars_nth_from_bytes(&bytes[..str_len], &index_expr, &dest_sort)
+                    && self.bind_str_nth_result(
+                        dest_local,
+                        result,
+                        &mut extra_constraints,
+                        const_fold_reason,
+                    )
+                {
+                    emitted = true;
+                    extra_dests.push(dest_local);
+                    debug!(dest_local, "str_nth: chars decoded from the known bytes");
+                }
+                if !emitted
+                    && let Some(backing) = self.resolve_string_backing(&args[0], modified_locals)
                     && let Some(index_expr) =
                         self.translate_operand_with_modified(&args[1], modified_locals)
                     && let Some(dest_sort) = self.str_nth_result_sort(destination)
@@ -452,9 +498,9 @@ impl<'tcx, 'body> CallString for ChcCtx<'tcx, 'body> {
                     let result = self
                         .try_codegen_precise_string_eq(args, modified_locals)
                         .unwrap_or_else(|| {
-                            self.record_sound_fallback_reason("string_eq_imprecise");
+                            let booked = self.record_sound_fallback_reason("string_eq_imprecise");
                             let sym_name = chc_fresh_name("str_eq");
-                            declare_pending_var(sym_name, bool_sort())
+                            Havoc::booked(booked, sym_name, bool_sort())
                         });
                     if let Some(eq) = self.make_coerced_eq_constraint(
                         &dest_var,

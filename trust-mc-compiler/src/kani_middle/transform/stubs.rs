@@ -80,16 +80,39 @@ impl FnStubPass {
     }
 }
 
-/// Replace the body of a function that is stubbed by the other.
+/// Rewrite every CALL SITE of a stubbed function into a call of its stub
+/// (`#[kani::stub(f, g)]`: `f(x)` becomes `g(x)`), and every `f` fn-item
+/// operand into `g`.
 ///
-/// This pass will replace the function call, since one of the functions do not have a body to
-/// replace.
+/// Kani's own pass did this only for the pairs `FnStubPass` cannot serve (the
+/// original or the stub has no body) and left every other call site naming
+/// `f`, whose BODY `FnStubPass` replaces. That is the same program only for a
+/// consumer that runs `f`'s transformed body. trust-mc's encoders do not
+/// always: both lanes model standard-library functions by the path the call
+/// site names (`Option::unwrap`, `u8::wrapping_add`, `mem::forget`, the
+/// known-call and no-op tables, ...) and never fetch the body. So
+/// `#[kani::stub(u8::wrapping_add, stub)]` with a panicking stub proved clean,
+/// and a stub that makes `unwrap` total left a certified Genuine
+/// counterexample on `None` (`tools/soundness-duals/stub_modelled_std_dual.rs`).
+/// Rewriting the call site makes every path-keyed handler see the stub, a
+/// function none of them claims, which is then inlined or walked as the
+/// unit's own code. `FnStubPass` still replaces the original's body, for the
+/// calls no call site names (a virtual call, drop glue).
+///
+/// A call resolves through the stub map in two steps
+/// ([`stubbed_callee_instance`]): the callee `def` itself, then the instance a
+/// trait-method call resolves to (`Clone::clone` on `Foo` runs
+/// `<Foo as Clone>::clone`, which the unit may stub).
+///
+/// The CHC walker fetches most callee bodies RAW, outside this pipeline; it
+/// applies the same rewrite through `CalleeBody::callee_body`
+/// ([`crate::kani_middle::transform::stub_aware_instance_body`]).
 #[derive(Debug, Clone)]
-pub(crate) struct ExternFnStubPass {
+pub(crate) struct CallSiteStubPass {
     stubs: Stubs,
 }
 
-impl TransformPass for ExternFnStubPass {
+impl TransformPass for CallSiteStubPass {
     fn transformation_type() -> TransformationType
     where
         Self: Sized,
@@ -104,32 +127,150 @@ impl TransformPass for ExternFnStubPass {
         query_db.args().stubbing_enabled && !self.stubs.is_empty()
     }
 
-    /// Search for calls to extern functions that should be stubbed.
-    ///
-    /// We need to find function calls and function pointers.
-    /// We should replace this with a visitor once rustc_public includes a mutable one.
+    /// Search for calls to stubbed functions and fn-item operands naming them.
     fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         trace!(function=?instance.name(), "transform");
-        let mut new_body = MutableBody::from(body);
-        let changed = false;
-        let locals = new_body.locals().to_vec();
-        let mut visitor = ExternFnStubVisitor { changed, locals, stubs: &self.stubs };
-        visitor.visit_body(&mut new_body);
-        (visitor.changed, new_body.into())
+        rewrite_stubbed_call_sites(body, &self.stubs)
     }
 }
 
-impl ExternFnStubPass {
-    /// Build the pass with the extern function stubs.
-    ///
-    /// This will cover any case where the stub doesn't have a body.
-    pub(crate) fn new(all_stubs: &Stubs) -> ExternFnStubPass {
-        let stubs = all_stubs
-            .iter()
-            .filter_map(|(from, to)| (!has_body(*from) || !has_body(*to)).then_some((*from, *to)))
-            .collect::<HashMap<_, _>>();
-        ExternFnStubPass { stubs }
+impl CallSiteStubPass {
+    /// Build the pass with every stub of the unit.
+    pub(crate) fn new(all_stubs: &Stubs) -> CallSiteStubPass {
+        CallSiteStubPass { stubs: all_stubs.clone() }
     }
+}
+
+/// [`CallSiteStubPass`] on one body, outside the pipeline: returns whether a
+/// call site or operand was rewritten, and the body.
+pub(crate) fn rewrite_stubbed_call_sites(body: Body, stubs: &Stubs) -> (bool, Body) {
+    if stubs.is_empty() {
+        return (false, body);
+    }
+    let mut new_body = MutableBody::from(body);
+    let locals = new_body.locals().to_vec();
+    let mut visitor = CallSiteStubVisitor { changed: false, locals, stubs };
+    visitor.visit_body(&mut new_body);
+    (visitor.changed, new_body.into())
+}
+
+/// The instance a call of `def` with `args` runs when the unit stubs it: the
+/// stub's, resolved at the stubbed function's own generic arguments. The call
+/// is resolved first and the stub map is consulted for the function the call
+/// RUNS, exactly as `FnStubPass` keys on the resolved instance: a
+/// trait-method call that resolves to a stubbed impl item is stubbed, and a
+/// trait default method the unit stubs (`#[kani::stub(Tr::m, s)]`) is not
+/// applied to an impl that overrides it. `def` itself is consulted only when
+/// the call does not resolve (a polymorphic body). `None` when nothing is
+/// stubbed (or the stub does not resolve, which the stub validation reports
+/// as a compile error). `for_fn_ptr` resolves for a reified fn-item operand.
+pub(crate) fn stubbed_callee_instance(
+    stubs: &Stubs,
+    def: FnDef,
+    args: &GenericArgs,
+    for_fn_ptr: bool,
+) -> Option<Instance> {
+    let resolve = |def: FnDef, args: &GenericArgs| {
+        if for_fn_ptr { Instance::resolve_for_fn_ptr(def, args) } else { Instance::resolve(def, args) }
+    };
+    let (orig, stub_instance) = match resolve(def, args) {
+        Ok(instance) => {
+            let TyKind::RigidTy(RigidTy::FnDef(resolved, resolved_args)) = instance.ty().kind()
+            else {
+                return None;
+            };
+            let new_def = stubs.get(&resolved)?;
+            (resolved, resolve(*new_def, &resolved_args).ok()?)
+        }
+        Err(_) => (def, resolve(*stubs.get(&def)?, args).ok()?),
+    };
+    stub_instance_is_valid(orig, stub_instance).then_some(stub_instance)
+}
+
+thread_local! {
+    /// [`stub_instance_is_valid`]'s answers, one per stub instance, so each
+    /// invalid stub is reported once.
+    static STUB_INSTANCE_VALIDITY: std::cell::RefCell<HashMap<Instance, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Does the stub instance `stub_instance`, replacing `orig`, pass Kani's stub
+/// validation (`FnStubValidator`: its constants evaluate at these generic
+/// arguments and every call in it resolves)? `FnStubPass` replaces a body
+/// only with a valid stub and reports an invalid one as a compile error; a
+/// call site is rewritten, and a raw fetch applies the stub, on the same
+/// terms. Fetching an invalid stub's body ICEs in `rustc_public`'s body
+/// builder (`tests/expected/issue-2589/issue_2589.rs`: `stub::<String>`
+/// with an unmet `T: Dummy` bound evaluating `T::TRUE`). A stub without a
+/// body (an extern replacement) is not validated, as Kani's
+/// `ExternFnStubPass` never did. Runs in the compiler's implicit context,
+/// where every pipeline pass and codegen fetch runs.
+fn stub_instance_is_valid(orig: FnDef, stub_instance: Instance) -> bool {
+    if !stub_instance.has_body() {
+        return true;
+    }
+    if let Some(known) = STUB_INSTANCE_VALIDITY.with(|cache| cache.borrow().get(&stub_instance).copied())
+    {
+        return known;
+    }
+    let TyKind::RigidTy(RigidTy::FnDef(stub_def, _)) = stub_instance.ty().kind() else {
+        return false;
+    };
+    let valid = rustc_middle::ty::tls::with(|tcx| {
+        FnStubValidator::validate(tcx, (orig, stub_def), stub_instance).is_some()
+    });
+    STUB_INSTANCE_VALIDITY.with(|cache| cache.borrow_mut().insert(stub_instance, valid));
+    valid
+}
+
+/// `instance`'s MIR as a unit stubbing `unit_stubs` runs it
+/// (`kani_middle::transform::stub_aware_instance_body`): the stub's body for a
+/// stubbed instance (`FnStubPass`), with every call site and lowered method
+/// the unit stubs rewritten ([`apply_call_site_stubs`]). The raw body when
+/// `unit_stubs` is `None`.
+pub(crate) fn unit_instance_body(unit_stubs: Option<&Stubs>, instance: &Instance) -> Option<Body> {
+    let Some(unit_stubs) = unit_stubs else {
+        return instance.body();
+    };
+    let body = match stub_replacement_instance(unit_stubs, instance) {
+        // The renamed-float-intrinsic rule of `CalleeBody` holds for the stub too.
+        Some(stub_instance) if crate::intrinsics::is_modelled_renamed_intrinsic(&stub_instance) => {
+            return None;
+        }
+        Some(stub_instance) => stub_instance.body()?,
+        None => instance.body()?,
+    };
+    Some(apply_call_site_stubs(unit_stubs, body))
+}
+
+/// [`unit_instance_body`] for a polymorphic def.
+pub(crate) fn unit_def_body(unit_stubs: Option<&Stubs>, def: &FnDef) -> Option<Body> {
+    let Some(unit_stubs) = unit_stubs else {
+        return def.body();
+    };
+    let body = match unit_stubs.get(def) {
+        Some(stub_def) => stub_def.body()?,
+        None => def.body()?,
+    };
+    Some(apply_call_site_stubs(unit_stubs, body))
+}
+
+/// `CallSiteStubPass` and `LoweredMethodStubPass` on one body.
+pub(crate) fn apply_call_site_stubs(unit_stubs: &Stubs, body: Body) -> Body {
+    let (_, body) = rewrite_stubbed_call_sites(body, unit_stubs);
+    let (_, body) = LoweredMethodStubPass::new(unit_stubs).rewrite(body);
+    body
+}
+
+/// The stub instance `FnStubPass` gives `instance` the body of: `Some` when
+/// the unit stubs the function `instance` is an item of.
+pub(crate) fn stub_replacement_instance(stubs: &Stubs, instance: &Instance) -> Option<Instance> {
+    let TyKind::RigidTy(RigidTy::FnDef(def, args)) = instance.ty().kind() else {
+        return None;
+    };
+    let new_def = stubs.get(&def)?;
+    let stub_instance = Instance::resolve(*new_def, &args).ok()?;
+    stub_instance_is_valid(def, stub_instance).then_some(stub_instance)
 }
 
 /// Reconstruct user stubs for methods that rustc lowered away before normal
@@ -137,7 +278,7 @@ impl ExternFnStubPass {
 ///
 /// The motivating case is `<[T]>::len`: rustc's `LowerSliceLenCalls` turns
 /// calls into `Rvalue::Len(place)`, leaving no `TerminatorKind::Call` for
-/// `FnStubPass` or `ExternFnStubPass` to rewrite. When the active harness has
+/// `FnStubPass` or `CallSiteStubPass` to rewrite. When the active harness has
 /// `#[kani::stub(<[T]>::len, replacement)]`, insert a call to `replacement`
 /// before the lowered `Len` assignment and turn the lowered assignment into a
 /// no-op copy of the replacement result.
@@ -163,6 +304,17 @@ impl TransformPass for LoweredMethodStubPass {
 
     fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         trace!(function=?instance.name(), "LoweredMethodStubPass::transform");
+        self.rewrite(body)
+    }
+}
+
+impl LoweredMethodStubPass {
+    /// The pass on one body, outside the pipeline (the CHC walker's raw
+    /// fetches, `stub_aware_instance_body`).
+    pub(crate) fn rewrite(&self, body: Body) -> (bool, Body) {
+        if self.slice_len_stubs.is_empty() {
+            return (false, body);
+        }
         let mut new_body = MutableBody::from(body);
         let mut changed = false;
         let original_blocks = new_body.blocks().len();
@@ -180,7 +332,7 @@ impl TransformPass for LoweredMethodStubPass {
                 );
                 let noop = StatementKind::Assign(
                     rewrite.destination.clone(),
-                    Rvalue::Use(Operand::Copy(rewrite.destination.clone())),
+                    rvalue_use!(Rvalue::Use(Operand::Copy(rewrite.destination.clone()))),
                 );
                 new_body.replace_statement_kind(bb_idx, stmt_idx, noop);
                 let mut source = SourceInstruction::Statement { bb: bb_idx, idx: stmt_idx };
@@ -196,9 +348,7 @@ impl TransformPass for LoweredMethodStubPass {
         }
         (changed, new_body.into())
     }
-}
 
-impl LoweredMethodStubPass {
     pub(crate) fn new(all_stubs: &Stubs) -> Self {
         let slice_len_stubs: Vec<FnDef> = all_stubs
             .iter()
@@ -300,6 +450,8 @@ fn copyable_receiver(operand: &Operand) -> Option<Operand> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => Some(Operand::Copy(place.clone())),
         Operand::Constant(_) => None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -358,25 +510,22 @@ impl MirVisitor for FnStubValidator<'_, '_> {
     }
 }
 
-struct ExternFnStubVisitor<'a> {
+struct CallSiteStubVisitor<'a> {
     changed: bool,
     locals: Vec<LocalDecl>,
     stubs: &'a Stubs,
 }
 
-impl MutMirVisitor for ExternFnStubVisitor<'_> {
+impl MutMirVisitor for CallSiteStubVisitor<'_> {
     fn visit_terminator(&mut self, term: &mut Terminator) {
         // Replace direct calls
         if let TerminatorKind::Call { func, .. } = &mut term.kind
-            && let TyKind::RigidTy(RigidTy::FnDef(def, args)) =
-                func.ty(&self.locals).expect("func should have type").kind()
-            && let Some(new_def) = self.stubs.get(&def)
+            && let Ok(func_ty) = func.ty(&self.locals)
+            && let TyKind::RigidTy(RigidTy::FnDef(def, args)) = func_ty.kind()
+            && let Some(instance) = stubbed_callee_instance(self.stubs, def, &args, false)
+            && let Ok(literal) = MirConst::try_new_zero_sized(instance.ty())
         {
-            let instance =
-                Instance::resolve(*new_def, &args).expect("stub replacement should be resolvable");
-            let literal = MirConst::try_new_zero_sized(instance.ty())
-                .expect("instance type should be zero-sized");
-            let span = term.span;
+            let span = mir_span!(term);
             let new_func = ConstOperand { span, user_ty: None, const_: literal };
             *func = Operand::Constant(new_func);
             self.changed = true;
@@ -385,18 +534,19 @@ impl MutMirVisitor for ExternFnStubVisitor<'_> {
     }
 
     fn visit_operand(&mut self, operand: &mut Operand) {
-        let func_ty = operand.ty(&self.locals).expect("operand should have type");
-        if let TyKind::RigidTy(RigidTy::FnDef(orig_def, args)) = func_ty.kind()
-            && let Some(new_def) = self.stubs.get(&orig_def)
+        // A fn item reified or passed as a value. Only a constant names the
+        // function: a copy of a local of fn-item type reads the constant this
+        // visitor rewrote where the local was assigned.
+        let Operand::Constant(ConstOperand { span, .. }) = operand else {
+            return;
+        };
+        let span = *span;
+        if let Ok(func_ty) = operand.ty(&self.locals)
+            && let TyKind::RigidTy(RigidTy::FnDef(orig_def, args)) = func_ty.kind()
+            && let Some(instance) = stubbed_callee_instance(self.stubs, orig_def, &args, true)
+            && let Ok(literal) = MirConst::try_new_zero_sized(instance.ty())
         {
-            let Operand::Constant(ConstOperand { span, .. }) = operand else {
-                unreachable!("operand with FnDef type must be Operand::Constant, got Copy/Move");
-            };
-            let instance = Instance::resolve_for_fn_ptr(*new_def, &args)
-                .expect("stub replacement for fn ptr should be resolvable");
-            let literal = MirConst::try_new_zero_sized(instance.ty())
-                .expect("instance type should be zero-sized");
-            let new_func = ConstOperand { span: *span, user_ty: None, const_: literal };
+            let new_func = ConstOperand { span, user_ty: None, const_: literal };
             *operand = Operand::Constant(new_func);
             self.changed = true;
         }
@@ -413,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extern_fn_stub_pass_transformation_type_is_stubbing() {
-        assert_eq!(ExternFnStubPass::transformation_type(), TransformationType::Stubbing);
+    fn test_call_site_stub_pass_transformation_type_is_stubbing() {
+        assert_eq!(CallSiteStubPass::transformation_type(), TransformationType::Stubbing);
     }
 
     #[test]
@@ -425,9 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extern_fn_stub_pass_new_empty_stubs() {
+    fn test_call_site_stub_pass_new_empty_stubs() {
         let empty: Stubs = HashMap::new();
-        let pass = ExternFnStubPass::new(&empty);
+        let pass = CallSiteStubPass::new(&empty);
         assert!(pass.stubs.is_empty());
     }
 
@@ -440,10 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extern_fn_stub_pass_debug() {
+    fn test_call_site_stub_pass_debug() {
         let empty: Stubs = HashMap::new();
-        let pass = ExternFnStubPass::new(&empty);
+        let pass = CallSiteStubPass::new(&empty);
         let dbg = format!("{:?}", pass);
-        assert!(dbg.contains("ExternFnStubPass"));
+        assert!(dbg.contains("CallSiteStubPass"));
     }
 }

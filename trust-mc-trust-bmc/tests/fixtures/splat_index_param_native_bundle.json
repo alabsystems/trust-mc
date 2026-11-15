@@ -1,0 +1,1187 @@
+{
+  "schema_version": 7,
+  "producer": "TrustIr",
+  "input": {
+    "RustMir": {
+      "body_digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          86,
+          16,
+          11,
+          130,
+          243,
+          64,
+          143,
+          66,
+          158,
+          18,
+          59,
+          22,
+          151,
+          10,
+          16,
+          131,
+          198,
+          42,
+          198,
+          211,
+          236,
+          12,
+          209,
+          253,
+          183,
+          7,
+          185,
+          159,
+          82,
+          166,
+          201,
+          173
+        ]
+      }
+    }
+  },
+  "provenance": {
+    "producer_version": "0.9.0",
+    "source_language": "Rust",
+    "source_digest": {
+      "algorithm": "Sha256",
+      "bytes": [
+        86,
+        16,
+        11,
+        130,
+        243,
+        64,
+        143,
+        66,
+        158,
+        18,
+        59,
+        22,
+        151,
+        10,
+        16,
+        131,
+        198,
+        42,
+        198,
+        211,
+        236,
+        12,
+        209,
+        253,
+        183,
+        7,
+        185,
+        159,
+        82,
+        166,
+        201,
+        173
+      ]
+    },
+    "toolchain": [
+      {
+        "name": "TrustIr",
+        "version": "0.9.0",
+        "revision": "native-request-schema-v1"
+      }
+    ]
+  },
+  "serialization": {
+    "schema_version": 7,
+    "canonical_order": true,
+    "sort_unordered_sets": true,
+    "messagepack_named_fields": true,
+    "unknown_fields": "Reject"
+  },
+  "diagnostics": {
+    "level": "Info",
+    "include_source_spans": true,
+    "include_lineage": true,
+    "emit_counterexamples": true,
+    "emit_unsat_cores": true,
+    "emit_proof_traces": false,
+    "max_counterexamples": 1
+  },
+  "trust_ir_module_digest": {
+    "algorithm": "Sha256",
+    "bytes": [
+      238,
+      43,
+      227,
+      248,
+      192,
+      154,
+      113,
+      201,
+      120,
+      18,
+      49,
+      144,
+      103,
+      53,
+      234,
+      86,
+      59,
+      25,
+      9,
+      17,
+      169,
+      15,
+      147,
+      33,
+      107,
+      160,
+      217,
+      21,
+      252,
+      104,
+      101,
+      226
+    ]
+  },
+  "compiler_facts": {
+    "monomorphizations": [
+      {
+        "id": 0,
+        "source_item": "splat_index_param",
+        "symbol": "splat_index_param",
+        "generic_args": [],
+        "function": 0,
+        "stable_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            210,
+            235,
+            8,
+            154,
+            149,
+            17,
+            252,
+            148,
+            38,
+            145,
+            136,
+            180,
+            129,
+            49,
+            130,
+            120,
+            122,
+            73,
+            31,
+            41,
+            39,
+            174,
+            50,
+            226,
+            187,
+            202,
+            204,
+            25,
+            96,
+            67,
+            66,
+            37
+          ]
+        }
+      }
+    ],
+    "obligation_sources": [
+      {
+        "obligation": 0,
+        "public_obligation_id": "vc:arrays_corpus__splat_index_param:trust_mc_default_function:0",
+        "function": 0,
+        "span": {
+          "file": 0,
+          "line": 10,
+          "col": 0
+        },
+        "assertion_id": 1131068857,
+        "cause": "Panic",
+        "monomorphization": 0,
+        "facts": [
+          {
+            "Monomorphization": 0
+          }
+        ]
+      }
+    ]
+  },
+  "module": {
+    "name": "arrays_corpus::splat_index_param",
+    "functions": [
+      {
+        "id": 0,
+        "name": "splat_index_param",
+        "ty": 0,
+        "entry": 0,
+        "blocks": [
+          {
+            "id": 0,
+            "params": [
+              [
+                0,
+                "U64"
+              ]
+            ],
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  4
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Uge",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 4
+                  }
+                },
+                "results": [
+                  5
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 18446744073709551615
+                    }
+                  }
+                },
+                "results": [
+                  6
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ule",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 6
+                  }
+                },
+                "results": [
+                  7
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "Bool",
+                    "value": {
+                      "Bool": false
+                    }
+                  }
+                },
+                "results": [
+                  8
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "ty": "Bool",
+                    "cond": 5,
+                    "then_val": 7,
+                    "else_val": 8
+                  }
+                },
+                "results": [
+                  9
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assume": {
+                    "cond": 9
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U32",
+                    "value": {
+                      "Int": 7
+                    }
+                  }
+                },
+                "results": [
+                  10
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Undef": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    }
+                  }
+                },
+                "results": [
+                  11
+                ],
+                "proofs": [
+                  "FreshSymbolicHavoc"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "results": [
+                  12
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 11,
+                    "index": 12,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  13
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "results": [
+                  14
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 13,
+                    "index": 14,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  15
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 2
+                    }
+                  }
+                },
+                "results": [
+                  16
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 15,
+                    "index": 16,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  17
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 3
+                    }
+                  }
+                },
+                "results": [
+                  18
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 17,
+                    "index": 18,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  19
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 4
+                    }
+                  }
+                },
+                "results": [
+                  20
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 19,
+                    "index": 20,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  21
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 5
+                    }
+                  }
+                },
+                "results": [
+                  22
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 21,
+                    "index": 22,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  23
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 6
+                    }
+                  }
+                },
+                "results": [
+                  24
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 23,
+                    "index": 24,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  25
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 7
+                    }
+                  }
+                },
+                "results": [
+                  26
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "InsertElement": {
+                    "ty": {
+                      "Array": [
+                        1,
+                        8
+                      ]
+                    },
+                    "array": 25,
+                    "index": 26,
+                    "value": 10
+                  }
+                },
+                "results": [
+                  27
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 8
+                    }
+                  }
+                },
+                "results": [
+                  29
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "op": "Ult",
+                    "ty": "U64",
+                    "lhs": 0,
+                    "rhs": 29
+                  }
+                },
+                "results": [
+                  28
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Assert": {
+                    "cond": 28
+                  }
+                },
+                "results": [],
+                "proofs": [
+                  "InBounds"
+                ],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Br": {
+                    "target": 1,
+                    "args": []
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "params": [],
+            "body": [
+              {
+                "inst": {
+                  "ExtractElement": {
+                    "ty": "U32",
+                    "array": 27,
+                    "index": 0
+                  }
+                },
+                "results": [
+                  30
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Copy": {
+                    "ty": "U32",
+                    "operand": 30
+                  }
+                },
+                "results": [
+                  31
+                ],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      31
+                    ]
+                  }
+                },
+                "results": [],
+                "proofs": [],
+                "span": null,
+                "proof_context": null
+              }
+            ]
+          }
+        ],
+        "proofs": [
+          "Pure"
+        ],
+        "calling_conv": "C",
+        "linkage": "External",
+        "attrs": {
+          "readonly": false,
+          "readnone": false,
+          "inlinehint": false,
+          "cold": false
+        },
+        "summary": null,
+        "producer": "TrustIr",
+        "value_names": null,
+        "scopes": null
+      }
+    ],
+    "structs": [],
+    "enums": [],
+    "records": [],
+    "closure_types": [],
+    "globals": [],
+    "func_types": [
+      {
+        "params": [
+          "U64"
+        ],
+        "returns": [
+          "U32"
+        ],
+        "is_vararg": false
+      }
+    ],
+    "types": [
+      "U8",
+      "U32"
+    ],
+    "proof_obligations": [
+      {
+        "id": 0,
+        "kind": "PanicFreedom",
+        "status": "Pending",
+        "description": "default trust-mc typed CHC function admission (public verifier obligation vc:arrays_corpus__splat_index_param:trust_mc_default_function:0)",
+        "formula": {
+          "schema": "trust.spec-predicate.v1",
+          "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+          "smtlib": "false",
+          "sort": "Bool"
+        },
+        "function": 0,
+        "source": {
+          "source_id": "vc:arrays_corpus__splat_index_param:trust_mc_default_function:0",
+          "assertion_id": "trust-assertion:vc:arrays_corpus__splat_index_param:trust_mc_default_function:0",
+          "range": {
+            "file": 0,
+            "start_line": 10,
+            "start_col": 0,
+            "end_line": 13,
+            "end_col": 1
+          },
+          "public": {
+            "obligation_id": "vc:arrays_corpus__splat_index_param:trust_mc_default_function:0",
+            "semantic_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                119,
+                27,
+                40,
+                191,
+                63,
+                26,
+                22,
+                15,
+                97,
+                249,
+                53,
+                56,
+                246,
+                49,
+                17,
+                47,
+                108,
+                164,
+                22,
+                191,
+                161,
+                147,
+                217,
+                253,
+                68,
+                203,
+                246,
+                95,
+                168,
+                231,
+                104,
+                196
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "proof_certificates": [],
+    "target_info": {
+      "triple": "aarch64-apple-darwin",
+      "pointer_size": 8,
+      "endianness": "Little",
+      "abi": null,
+      "struct_passing": "NativeC"
+    },
+    "files": [
+      "arrays_corpus.rs"
+    ],
+    "obligation_diagnostics": [],
+    "spec_modules": [],
+    "universes": []
+  },
+  "lineage": {
+    "schema_version": 2,
+    "nodes": [
+      {
+        "id": 0,
+        "transform": {
+          "stage": "TrustIrLowering",
+          "name": "rustc-mir-to-trust_ir",
+          "producer": "TrustIr",
+          "version": "native-request-schema-v1"
+        },
+        "source_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            86,
+            16,
+            11,
+            130,
+            243,
+            64,
+            143,
+            66,
+            158,
+            18,
+            59,
+            22,
+            151,
+            10,
+            16,
+            131,
+            198,
+            42,
+            198,
+            211,
+            236,
+            12,
+            209,
+            253,
+            183,
+            7,
+            185,
+            159,
+            82,
+            166,
+            201,
+            173
+          ]
+        },
+        "target_module": {
+          "algorithm": "Sha256",
+          "bytes": [
+            238,
+            43,
+            227,
+            248,
+            192,
+            154,
+            113,
+            201,
+            120,
+            18,
+            49,
+            144,
+            103,
+            53,
+            234,
+            86,
+            59,
+            25,
+            9,
+            17,
+            169,
+            15,
+            147,
+            33,
+            107,
+            160,
+            217,
+            21,
+            252,
+            104,
+            101,
+            226
+          ]
+        },
+        "obligations": [
+          0
+        ],
+        "certificates": [],
+        "replay": {
+          "engine": "Trust.native-admission",
+          "invocation": "trust-ir-bridge emit-native-verification-bundle --trust_mc-admission-contract trust-mc-native-admission-contract-v1",
+          "transcript_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              186,
+              121,
+              209,
+              3,
+              202,
+              194,
+              33,
+              13,
+              85,
+              221,
+              150,
+              65,
+              100,
+              183,
+              108,
+              85,
+              186,
+              117,
+              242,
+              106,
+              55,
+              195,
+              178,
+              192,
+              9,
+              164,
+              63,
+              2,
+              105,
+              111,
+              222,
+              232
+            ]
+          }
+        }
+      }
+    ],
+    "roots": [
+      0
+    ]
+  },
+  "requests": [
+    {
+      "TrustMc": {
+        "id": 0,
+        "mode": "Chc",
+        "function": 0,
+        "obligations": [
+          0
+        ],
+        "lineage_roots": [
+          0
+        ],
+        "options": {
+          "memory_model": "TrustIrPlaces",
+          "arithmetic_model": "FixedWidthBitvectors",
+          "bmc": {
+            "unwind_limit": 1,
+            "unwinding_assertions": true
+          },
+          "chc": {
+            "engine": "Spacer",
+            "invariant_source": "TrustIrProofObligations",
+            "pdr": {
+              "enabled": false,
+              "generalization": "Cubes"
+            },
+            "emit_horn_clauses": true
+          },
+          "slicing": "ObligationBackwardSlice"
+        },
+        "diagnostics": {
+          "level": "Info",
+          "include_source_spans": true,
+          "include_lineage": true,
+          "emit_counterexamples": true,
+          "emit_unsat_cores": true,
+          "emit_proof_traces": false,
+          "max_counterexamples": 1
+        },
+        "provenance": {
+          "verifier_suite": "TrustMc",
+          "expected_verifier": {
+            "name": "trust_mc",
+            "version": "trust-mc-native-admission-contract-v1",
+            "revision": "native-request-schema-v1"
+          },
+          "solvers": [
+            {
+              "name": "ay"
+            }
+          ],
+          "replay": {
+            "engine": "trust_mc",
+            "invocation": "trust_mc-driver native-bundle --mode chc --trust-native-admission-contract trust-mc-native-admission-contract-v1",
+            "transcript_digest": {
+              "algorithm": "Sha256",
+              "bytes": [
+                224,
+                104,
+                15,
+                204,
+                173,
+                7,
+                255,
+                250,
+                23,
+                232,
+                54,
+                111,
+                77,
+                139,
+                76,
+                171,
+                105,
+                40,
+                27,
+                151,
+                135,
+                84,
+                121,
+                62,
+                93,
+                40,
+                95,
+                140,
+                225,
+                79,
+                252,
+                235
+              ]
+            }
+          },
+          "replay_context": {
+            "atoms": [
+              {
+                "id": 0,
+                "kind": "Assertion",
+                "formula": {
+                  "schema": "trust.spec-predicate.v1",
+                  "payload": "{\"schema_version\":\"trust.spec-predicate.v1\",\"root\":{\"sort\":\"bool\",\"kind\":{\"node\":\"bool_literal\",\"value\":false}},\"root_sort\":\"bool\"}",
+                  "smtlib": "false",
+                  "sort": "Bool"
+                },
+                "payload_digest": {
+                  "algorithm": "Sha256",
+                  "bytes": [
+                    5,
+                    193,
+                    223,
+                    13,
+                    65,
+                    93,
+                    40,
+                    10,
+                    89,
+                    175,
+                    68,
+                    70,
+                    28,
+                    10,
+                    214,
+                    181,
+                    61,
+                    135,
+                    73,
+                    53,
+                    158,
+                    213,
+                    243,
+                    77,
+                    208,
+                    37,
+                    49,
+                    15,
+                    21,
+                    111,
+                    139,
+                    57
+                  ]
+                },
+                "obligation": 0,
+                "assertion_id": 1131068857,
+                "span": {
+                  "file": 0,
+                  "line": 10,
+                  "col": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

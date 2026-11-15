@@ -9,6 +9,7 @@
 //! These are helper methods on ChcCtx used by stub translation functions
 //! in stubs_util.rs, stubs_iterators.rs, stubs_hashmap.rs, etc.
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort, SortInner};
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
@@ -19,9 +20,7 @@ use super::codegen_ctx::record_translation_drop_site_reason_for_fn;
 use super::names::{self, enum_sort};
 use super::stubs_util::extract_payload_from_option_reconstruction_ite;
 use super::types::{SignExtension, bool_sort, coerce_bitvec_width_safe};
-use super::{
-    ChcCtx, UNDEF_COUNTER, chc_fresh_name, declare_pending_var, push_pending_datatype_sort,
-};
+use super::{ChcCtx, UNDEF_COUNTER, chc_fresh_name, push_pending_datatype_sort};
 
 /// Extension trait for Option/Result/Ordering datatype helpers on ChcCtx.
 pub(in crate::codegen_ay::chc) trait OptionHelpers {
@@ -154,15 +153,14 @@ fn predicate_sort_fallback(
     diagnostics: &super::codegen_ctx::diagnostics::ChcDiagnostics,
     prefix: &str,
 ) -> Expr {
-    diagnostics.stub_approximation.inc();
-    declare_pending_var(chc_fresh_name(prefix), bool_sort())
+    let booked = diagnostics.book_stub_approximation();
+    Havoc::booked(booked, chc_fresh_name(prefix), bool_sort())
 }
 
 fn option_like_struct_field_indices(dt: &ay_bindings::DatatypeSort) -> Option<(usize, usize)> {
     let ctor = dt.constructors.first()?;
     let discr_field = ctor.fields.first()?;
-    let option_named =
-        dt.name == "Option" || dt.name.starts_with("Option_") || dt.name.ends_with("::Option");
+    let option_named = crate::codegen_ay::names::is_option_sort_name(&dt.name);
     (dt.constructors.len() == 1
         && ctor.fields.len() == 2
         && discr_field.sort.is_bool()
@@ -218,10 +216,12 @@ impl<'tcx, 'body> OptionHelpers for ChcCtx<'tcx, 'body> {
         }
 
         let inner_sort = option_value_sort(&sort)?;
+        // A payload this read cannot resolve is a value it does not compute: a
+        // booked havoc (Rule E; deferred identity, the context is shared here).
         let fresh_payload = || {
             self.record_aggregate_gap("option_unwrap_unchecked_symbolic");
             let name = chc_fresh_name("unwrap_unchecked");
-            declare_pending_var(name, inner_sort.clone())
+            Havoc::mint_deferred(self, sound_havoc::UNTRACKED_CALL_RESULT, name, inner_sort.clone())
         };
         let coerce_payload = |payload: Expr| self.coerce_value_to_sort(payload, &inner_sort, false);
 
@@ -331,7 +331,7 @@ impl<'tcx, 'body> OptionHelpers for ChcCtx<'tcx, 'body> {
             self.record_aggregate_gap("option_none_payload_unconstrained");
             let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::SeqCst);
             let undef_name = crate::codegen_ay::names::undef_sym_name(&dt.name, undef_id);
-            let undef_val = declare_pending_var(undef_name, value_sort);
+            let undef_val = ExactVar::unobserved(undef_name, value_sort);
             let cons_name: Cow<'_, str> = match option_sort.datatype_default_constructor() {
                 Some(name) => Cow::Borrowed(name),
                 None => Cow::Owned(crate::codegen_ay::names::cons_name(&dt.name)),

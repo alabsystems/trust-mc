@@ -4,6 +4,9 @@
 //
 //! Array and slice `PartialOrd` support for BMC comparison codegen.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue};
 use num_bigint::BigInt;
 use rustc_public::mir::{Operand, Place, Rvalue, StatementKind};
@@ -126,7 +129,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
                 let variants = adt_def.variants();
                 if variants.len() == 1 && variants[0].fields().len() == 1 {
-                    let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                    let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                     Self::partial_ord_extract_array_len_from_ty(field_ty, elem_ty)
                 } else {
                     None
@@ -158,6 +161,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -206,7 +211,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 match rvalue {
                     Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return Some(src.local);
@@ -227,7 +232,7 @@ fn extract_partial_ord_array_data(expr: &Expr) -> Option<Expr> {
         return Some(expr.clone());
     }
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let data_field = dt.constructors[0].fields.iter().find(|field| &*field.name == "fld_data")?;
@@ -245,7 +250,7 @@ fn slice_len_from_expr(expr: &Expr) -> Option<usize> {
     }
 
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let len_field = dt.constructors[0].fields.iter().find(|field| &*field.name == "fld_len")?;

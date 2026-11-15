@@ -92,7 +92,7 @@ fn find_unsize_cast_dest(body: &rustc_public::mir::Body) -> Option<usize> {
 fn find_const_str_operand(body: &rustc_public::mir::Body) -> Option<Operand> {
     for block in &body.blocks {
         for stmt in &block.statements {
-            if let StatementKind::Assign(_, Rvalue::Use(operand)) = &stmt.kind {
+            if let StatementKind::Assign(_, Rvalue::Use(operand, ..)) = &stmt.kind {
                 if let Operand::Constant(const_op) = operand {
                     let ty = const_op.ty();
                     if matches!(

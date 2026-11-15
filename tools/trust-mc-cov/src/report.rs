@@ -10,7 +10,7 @@
 use std::io::{BufRead, IsTerminal};
 use std::{fs::File, io::BufReader, path::PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::args::ReportFormat;
 use crate::coverage::{
@@ -127,7 +127,7 @@ pub(crate) fn output_coverage_results(
     let mut must_highlight = false;
 
     for (i, line) in reader.lines().enumerate() {
-        let idx = i + 1;
+        let idx: LineNumber = i.checked_add(1).context("line number does not fit in usize")?;
         let line = line?;
 
         let cur_line_result = flattened_results.iter().find(|(num, _)| *num == idx);
@@ -145,7 +145,10 @@ pub(crate) fn output_coverage_results(
                             m.times_covered == 0 && m.region.start.0 == idx && m.region.end.0 == idx
                         })
                         .flat_map(|m| {
-                            vec![((m.region.start.1 - 1), true), ((m.region.end.1 - 1), false)]
+                            vec![
+                                (column_offset(m.region.start.1), true),
+                                (column_offset(m.region.end.1), false),
+                            ]
                         })
                         .collect();
                     // Escapes for the regions which only start in this line
@@ -154,7 +157,7 @@ pub(crate) fn output_coverage_results(
                         .filter(|m| {
                             m.times_covered == 0 && m.region.start.0 == idx && m.region.end.0 != idx
                         })
-                        .flat_map(|m| vec![((m.region.start.1 - 1), true)])
+                        .flat_map(|m| vec![(column_offset(m.region.start.1), true)])
                         .collect();
                     // Escapes for the regions which only finish in this line
                     let mut closing_escapes: Vec<(ColumnNumber, bool)> = results
@@ -162,7 +165,7 @@ pub(crate) fn output_coverage_results(
                         .filter(|m| {
                             m.times_covered == 0 && m.region.start.0 != idx && m.region.end.0 == idx
                         })
-                        .flat_map(|m| vec![((m.region.end.1 - 1), false)])
+                        .flat_map(|m| vec![(column_offset(m.region.end.1), false)])
                         .collect();
 
                     // Emit an opening escape if there was a closing one and we
@@ -233,10 +236,20 @@ fn results_with_nonexisting_regions_in_line(
     let results_with_oob_regions = results.iter().filter(|m| {
         m.region.start.0 == idx
             && m.region.end.0 == idx
-            && (m.region.end.1 - m.region.start.1 == 1)
+            && m.region.end.1.checked_sub(m.region.start.1) == Some(1)
             && (m.region.end.1) > line.len()
     });
     results_with_oob_regions.count() > 0
+}
+
+/// The 0-based byte offset of a 1-based coverage column.
+///
+/// Coverage columns start at 1. A column of 0 (malformed coverage data) is
+/// clamped to the start of the line instead of underflowing: that was an
+/// overflow panic, or without overflow checks an offset of `usize::MAX` that
+/// `insert_escapes` then rejected with a panic.
+fn column_offset(column: ColumnNumber) -> ColumnNumber {
+    column.saturating_sub(1)
 }
 
 /// Inserts opening/closing escape strings into `str` given a set of `markers`.
@@ -246,6 +259,11 @@ fn results_with_nonexisting_regions_in_line(
 ///    escape.
 ///
 /// The specific escape to be used are determined by the report format.
+///
+/// Markers are placed in offset order (at one offset, in the sort order of
+/// their escape strings, as before). A marker past the end of `str` is placed at its end, and one that
+/// is not on a UTF-8 character boundary is placed right after the text emitted
+/// so far; both used to panic in `String::insert_str`.
 fn insert_escapes(str: &str, markers: Vec<(ColumnNumber, bool)>, format: &ReportFormat) -> String {
     // Determine the escape strings based on the format
     let (open_escape, close_escape) = match format {
@@ -257,16 +275,92 @@ fn insert_escapes(str: &str, markers: Vec<(ColumnNumber, bool)>, format: &Report
         markers.iter().map(|(i, b)| (i, if *b { open_escape } else { close_escape })).collect();
     escape_markers.sort();
 
-    let mut escaped_str = str.to_owned();
-    let mut offset = 0;
-
-    // Iteratively insert the escape strings into the original string
-    for (i, b) in escape_markers {
-        escaped_str.insert_str(i + offset, b);
-        // `offset` keeps track of the bytes we've already inserted so the original
-        // index is shifted by the appropriate amount in subsequent insertions.
-        // Note that b.len() returns the length of the string in bytes, c.f. https://doc.rust-lang.org/std/string/struct.String.html#method.len
-        offset += b.len();
+    // Copy `str` segment by segment, emitting each escape at its offset. The
+    // markers are sorted, so each segment starts where the previous one ended.
+    let mut escaped_str = String::new();
+    let mut copied = 0;
+    for (i, escape) in escape_markers {
+        let at = (*i).min(str.len());
+        if let Some(segment) = str.get(copied..at) {
+            escaped_str.push_str(segment);
+            copied = at;
+        }
+        escaped_str.push_str(escape);
     }
+    escaped_str.push_str(str.get(copied..).unwrap_or_default());
     escaped_str
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coverage::CoverageRegion;
+
+    fn region(start: (LineNumber, ColumnNumber), end: (LineNumber, ColumnNumber)) -> CovResult {
+        CovResult {
+            function: "f".to_string(),
+            region: CoverageRegion { file: "f.rs".to_string(), start, end },
+            times_covered: 0,
+            total_times: 1,
+        }
+    }
+
+    #[test]
+    fn insert_escapes_places_markers_at_their_offsets() {
+        let escaped = insert_escapes(
+            "let x = 1;",
+            vec![(8, true), (9, false), (0, true), (3, false)],
+            &ReportFormat::Escapes,
+        );
+        assert_eq!(escaped, "```let''' x = ```1''';");
+    }
+
+    #[test]
+    fn insert_escapes_keeps_the_sorted_order_of_escapes_at_one_offset() {
+        // Ties sort by escape string, as before: "'''" < "```".
+        let escaped = insert_escapes("ab", vec![(1, true), (1, false)], &ReportFormat::Escapes);
+        assert_eq!(escaped, "a'''```b");
+    }
+
+    #[test]
+    fn insert_escapes_covers_the_whole_line() {
+        let line = "fn f() {}";
+        let escaped =
+            insert_escapes(line, vec![(0, true), (line.len(), false)], &ReportFormat::Terminal);
+        assert_eq!(escaped, "\x1b[41mfn f() {}\x1b[0m");
+    }
+
+    #[test]
+    fn insert_escapes_places_a_marker_past_the_end_at_the_end() {
+        let escaped = insert_escapes("ab", vec![(0, true), (7, false)], &ReportFormat::Escapes);
+        assert_eq!(escaped, "```ab'''");
+    }
+
+    #[test]
+    fn insert_escapes_places_a_marker_inside_a_character_after_the_emitted_text() {
+        // 'é' is two bytes; offset 2 is inside it, and nothing was emitted yet.
+        let escaped = insert_escapes("aé", vec![(2, true), (3, false)], &ReportFormat::Escapes);
+        assert_eq!(escaped, "```aé'''");
+    }
+
+    #[test]
+    fn column_offset_is_zero_based_and_clamps_column_zero() {
+        assert_eq!(column_offset(1), 0);
+        assert_eq!(column_offset(12), 11);
+        assert_eq!(column_offset(0), 0);
+    }
+
+    #[test]
+    fn nonexisting_region_detection_needs_one_column_past_the_line() {
+        let line = "abc";
+        assert!(results_with_nonexisting_regions_in_line(&[region((2, 4), (2, 5))], line, 2));
+        assert!(!results_with_nonexisting_regions_in_line(&[region((2, 1), (2, 2))], line, 2));
+        assert!(!results_with_nonexisting_regions_in_line(&[region((2, 4), (2, 5))], line, 3));
+    }
+
+    #[test]
+    fn nonexisting_region_detection_rejects_a_region_ending_before_it_starts() {
+        // end column < start column used to underflow `end - start`.
+        assert!(!results_with_nonexisting_regions_in_line(&[region((2, 9), (2, 4))], "abc", 2));
+    }
 }

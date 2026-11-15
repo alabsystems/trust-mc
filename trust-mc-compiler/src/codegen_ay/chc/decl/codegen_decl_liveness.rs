@@ -117,8 +117,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn build_state_idx_to_local_map(&self) -> HashMap<usize, usize> {
         // Build reverse map: state_var_idx -> MIR local (if any).
         // Only MIR-local-backed state vars have entries in local_to_state_idx.
+        //
+        // Each source is visited in ascending key order. `insert` is
+        // last-writer-wins, and several keys can name one state variable (two
+        // ref locals aliasing one static, say), so visiting a `HashMap` in its
+        // own order attributed the column to a per-run random local -- and with
+        // it the liveness decision: measured 2026-10-01, the same harness got a
+        // relation with or without a column from run to run.
         let mut state_idx_to_local: HashMap<usize, usize> = HashMap::new();
-        for (&local_idx, &vec_idx) in &self.state_var_mgr.local_to_state_idx {
+        let sorted = |map: &HashMap<usize, usize>| -> Vec<(usize, usize)> {
+            let mut pairs: Vec<(usize, usize)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+            pairs.sort_unstable();
+            pairs
+        };
+        for (local_idx, vec_idx) in sorted(&self.state_var_mgr.local_to_state_idx) {
             state_idx_to_local.insert(vec_idx, local_idx);
             // For flattened locals, mark all field slots too.
             if self.flatten.flattened_tuple_locals.contains(&local_idx) {
@@ -132,12 +144,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #2978: Associate auxiliary pointee state vars with their
         // argument locals so they are treated as "local-backed" and survive
         // the non-local pruning.
-        for (&arg_local, &pointee_vec_idx) in &self.ref_resolution.ref_arg_pointee_idx {
+        for (arg_local, pointee_vec_idx) in sorted(&self.ref_resolution.ref_arg_pointee_idx) {
             state_idx_to_local.insert(pointee_vec_idx, arg_local);
         }
 
         // Part of #2978: Protect static mut state vars from non-local pruning.
-        for (&ref_local, &state_idx) in &self.ref_resolution.static_ref_to_state_idx {
+        for (ref_local, state_idx) in sorted(&self.ref_resolution.static_ref_to_state_idx) {
             state_idx_to_local.insert(state_idx, ref_local);
         }
 
@@ -171,7 +183,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let state_count = self.state_var_mgr.state_vars.len();
 
         // Part of #112: Build per-block used-local sets via backward use analysis.
-        let used_locals_per_block = Self::compute_used_locals_per_block(self.body);
+        let mut used_locals_per_block = Self::compute_used_locals_per_block(self.body);
+        // A wrapping step's base and count stay in the frame while the stepped
+        // local is read (heap/stack_address.rs `wrapping_operand_t64`).
+        self.extend_used_with_wrapping_bases(&mut used_locals_per_block);
 
         // Part of #3728: Heap metadata must stay live in every block relation.
         // MEMUB-24/25/27: shadow-memory init state (when declared) is ambient
@@ -311,6 +326,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .collect();
         let mut iterations = 0;
         while let Some(bb) = worklist.pop_front() {
+            // Translation deadline check point (sampled). This worklist had
+            // none: kani/Coroutines/rustc-coroutine-tests/smoke-resume-args.rs
+            // spent its budget here and ran on into the driver watchdog, which
+            // reported DriverTimeout instead of a typed TranslationTimeout.
+            crate::codegen_ay::translation_deadline::check("chc_backward_liveness");
             iterations += 1;
             if iterations > max_iters {
                 tracing::warn!(
@@ -345,20 +365,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
         }
-        for (live_set, live_locs) in result.iter_mut().zip(live_locals.iter()) {
-            for idx in 0..state_count {
-                if let Some(&local) = state_idx_to_local.get(&idx) {
-                    if live_locs.contains(&local) && !live_set.contains(&idx) {
-                        live_set.push(idx);
-                    }
-                }
-            }
-            live_set.sort_unstable();
-        }
-        for live_set in result.iter_mut() {
-            live_set.sort_unstable();
-            live_set.dedup();
-        }
+        merge_live_locals_into_state_indices(result, &live_locals, state_idx_to_local, state_count);
     }
 
     /// Phase 4: Enforce atomic liveness for flattened locals.
@@ -518,7 +525,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if block_count == 0 || result.len() != block_count {
             return;
         }
-        let used_per_block = Self::compute_used_locals_per_block(self.body);
+        let mut used_per_block = Self::compute_used_locals_per_block(self.body);
+        self.extend_used_with_wrapping_bases(&mut used_per_block);
         let killed_per_block: Vec<HashSet<usize>> = self
             .body
             .blocks
@@ -690,5 +698,110 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         trace!(block_count, state_count, "computed per-block live state indices");
         self.state_var_mgr.live_state_indices = result;
+    }
+}
+
+/// Add every state index whose MIR local is live at a block to that block's
+/// live set, then sort and dedup each set.
+///
+/// The per-block membership test was `Vec::contains` inside a loop over every
+/// state index: O(blocks x state vars x live columns).
+/// kani/Coroutines/rustc-coroutine-tests/smoke-resume-args.rs spent 7 of 10
+/// sampled stops on that line after its other translation hotspots were fixed.
+/// A bitmap per block gives the same set: the result is the sorted, deduped
+/// union of the incoming set and the live-local indices, in both versions.
+fn merge_live_locals_into_state_indices(
+    result: &mut [Vec<usize>],
+    live_locals: &[HashSet<usize>],
+    state_idx_to_local: &HashMap<usize, usize>,
+    state_count: usize,
+) {
+    for (live_set, live_locs) in result.iter_mut().zip(live_locals.iter()) {
+        crate::codegen_ay::translation_deadline::check("chc_backward_liveness");
+        let mut present = vec![false; state_count];
+        for &idx in live_set.iter() {
+            if idx < state_count {
+                present[idx] = true;
+            }
+        }
+        for (idx, seen) in present.iter_mut().enumerate() {
+            if let Some(&local) = state_idx_to_local.get(&idx)
+                && live_locs.contains(&local)
+                && !*seen
+            {
+                live_set.push(idx);
+                *seen = true;
+            }
+        }
+    }
+    for live_set in result.iter_mut() {
+        live_set.sort_unstable();
+        live_set.dedup();
+    }
+}
+
+#[cfg(test)]
+mod merge_live_locals_tests {
+    use super::merge_live_locals_into_state_indices;
+    use std::collections::{HashMap, HashSet};
+
+    /// The loop this replaced, kept as the reference.
+    fn reference(
+        result: &mut [Vec<usize>],
+        live_locals: &[HashSet<usize>],
+        state_idx_to_local: &HashMap<usize, usize>,
+        state_count: usize,
+    ) {
+        for (live_set, live_locs) in result.iter_mut().zip(live_locals.iter()) {
+            for idx in 0..state_count {
+                if let Some(&local) = state_idx_to_local.get(&idx) {
+                    if live_locs.contains(&local) && !live_set.contains(&idx) {
+                        live_set.push(idx);
+                    }
+                }
+            }
+            live_set.sort_unstable();
+        }
+        for live_set in result.iter_mut() {
+            live_set.sort_unstable();
+            live_set.dedup();
+        }
+    }
+
+    /// Deterministic xorshift, so the test needs no RNG dependency.
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn bitmap_merge_equals_reference_merge() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for case in 0..400 {
+            let state_count = (next(&mut seed) % 40) as usize;
+            let blocks = 1 + (next(&mut seed) % 6) as usize;
+            let mut state_idx_to_local = HashMap::new();
+            for idx in 0..state_count {
+                if next(&mut seed) % 4 != 0 {
+                    // Several state indices may share a local (flattened fields).
+                    state_idx_to_local.insert(idx, (next(&mut seed) % 12) as usize);
+                }
+            }
+            let mut result: Vec<Vec<usize>> = Vec::new();
+            let mut live_locals: Vec<HashSet<usize>> = Vec::new();
+            for _ in 0..blocks {
+                // Incoming sets may be unsorted, contain duplicates, and name
+                // indices past state_count.
+                let len = (next(&mut seed) % 10) as usize;
+                result.push((0..len).map(|_| (next(&mut seed) % (state_count as u64 + 3)) as usize).collect());
+                live_locals.push((0..(next(&mut seed) % 8)).map(|_| (next(&mut seed) % 12) as usize).collect());
+            }
+            let mut expected = result.clone();
+            reference(&mut expected, &live_locals, &state_idx_to_local, state_count);
+            merge_live_locals_into_state_indices(&mut result, &live_locals, &state_idx_to_local, state_count);
+            assert_eq!(result, expected, "case {case}");
+        }
     }
 }

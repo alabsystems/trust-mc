@@ -189,6 +189,22 @@ impl GlobalDiagnosticCounters {
         Self::take_map(&self.offset_provenance_unresolved_by_fn)
     }
 
+    // --- Untranslatable-assertion per-function map ---
+
+    pub(in crate::codegen_ay) fn record_assert_untranslatable_for_fn(
+        &self,
+        fn_name: &str,
+        count: usize,
+    ) {
+        Self::record_for_fn(&self.assert_untranslatable_by_fn, fn_name, count);
+    }
+
+    pub(in crate::codegen_ay) fn take_assert_untranslatable_by_fn(
+        &self,
+    ) -> BTreeMap<String, usize> {
+        Self::take_map(&self.assert_untranslatable_by_fn)
+    }
+
     // --- PtrMetadata unconstrained per-function map (Part of #3447) ---
 
     pub(in crate::codegen_ay) fn record_ptr_metadata_unconstrained_for_fn(

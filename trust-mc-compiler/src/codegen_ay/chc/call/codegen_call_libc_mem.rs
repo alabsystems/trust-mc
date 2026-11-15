@@ -27,10 +27,11 @@
 //!
 //! Part of #3175.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use tracing::debug;
 
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 use crate::codegen_ay::chc::codegen_ctx::types::AllocCallResult;
 use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::POINTER_WIDTH;
@@ -433,7 +434,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     None
                 }
                 .unwrap_or_else(|| {
-                    declare_pending_var(chc_fresh_name("__memset_opaque"), elem_sort.clone())
+                    Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_CALL_RESULT,
+                        chc_fresh_name("__memset_opaque"),
+                        elem_sort.clone(),
+                    )
                 });
                 let addr = if byte_offset == 0 {
                     base_addr.clone()

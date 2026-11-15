@@ -94,6 +94,15 @@ fn seeded_slice_view_expr() -> Expr {
     Expr::bool_const(true)
 }
 
+fn seeded_const_ref_object() -> crate::codegen_ay::chc::codegen_ctx::ConstRefObject {
+    crate::codegen_ay::chc::codegen_ctx::ConstRefObject {
+        obj_id: SEEDED_PROMOTED_OBJ_ID,
+        offset: 0,
+        ptr: None,
+        nested: None,
+    }
+}
+
 fn seed_ref_metadata(
     chc_ctx: &mut ChcCtx<'_, '_>,
     src_local: usize,
@@ -112,7 +121,7 @@ fn seed_ref_metadata(
     }
     chc_ctx.ref_resolution.const_ref_values.insert(src_local, value_expr.clone());
     chc_ctx.ref_resolution.const_ref_discriminants.insert(src_local, SEEDED_DISCRIMINANT);
-    chc_ctx.ref_resolution.const_ref_promoted_obj_ids.insert(src_local, SEEDED_PROMOTED_OBJ_ID);
+    chc_ctx.ref_resolution.const_ref_objects.insert(src_local, seeded_const_ref_object());
     chc_ctx.ref_resolution.subslice_len.insert(src_local, len_expr.clone());
     chc_ctx.ref_resolution.subslice_offset.insert(src_local, offset_expr.clone());
 
@@ -172,9 +181,9 @@ fn assert_seeded_metadata(
         "local {local} should preserve const_ref_discriminants"
     );
     assert_eq!(
-        chc_ctx.ref_resolution.const_ref_promoted_obj_ids.get(&local).copied(),
-        Some(SEEDED_PROMOTED_OBJ_ID),
-        "local {local} should preserve const_ref_promoted_obj_ids"
+        chc_ctx.ref_resolution.const_ref_objects.get(&local).copied(),
+        Some(seeded_const_ref_object()),
+        "local {local} should preserve const_ref_objects"
     );
     assert_eq!(
         chc_ctx.ref_resolution.call_forwarded_raw_ptrs.contains(&local),
@@ -200,7 +209,7 @@ fn find_copy_cast_dests(body: &rustc_public::mir::Body) -> (usize, usize, usize,
                 continue;
             }
             match rhs {
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                 | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                     if src.projection.is_empty() =>
                 {
@@ -256,7 +265,7 @@ fn find_aggregate_field_dest(body: &rustc_public::mir::Body) -> (usize, usize, u
             block.statements.iter().find_map(|stmt| {
                 let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                 else {
                     return None;
@@ -285,7 +294,7 @@ fn find_option_payload_dest(body: &rustc_public::mir::Body) -> (usize, usize, us
             block.statements.iter().find_map(|stmt| {
                 let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                 else {
                     return None;
@@ -452,7 +461,7 @@ fn test_encode_block_statements_call_forwarded_copy_cast_keeps_subslice_len() {
 }
 
 #[test]
-fn test_encode_block_statements_offset_propagates_const_side_tables() {
+fn value_fact_does_not_survive_pointer_arithmetic() {
     with_test_ay_ctx_for_source(OFFSET_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_offset");
         let body = instance.body().expect("function body");
@@ -486,21 +495,40 @@ fn test_encode_block_statements_offset_propagates_const_side_tables() {
             })
             .expect("expected MIR BinOp::Offset assignment");
 
-        let (value_expr, len_expr, base_offset_expr) =
+        let (_value_expr, len_expr, base_offset_expr) =
             seed_ref_metadata(&mut chc_ctx, base_local, false);
         let expected_offset = base_offset_expr
             .bvadd(Expr::bitvec_const(2u64, crate::codegen_ay::types::POINTER_WIDTH));
 
         let _ = chc_ctx.encode_block_statements(bb_idx);
 
-        assert_seeded_metadata(
-            &chc_ctx,
-            stepped_local,
-            &value_expr,
-            &len_expr,
-            &expected_offset,
-            true,
+        // D10: the seeded value and discriminant facts describe the u8 AT the
+        // base pointer's window. `offset(base, 2)` addresses another window,
+        // so neither fact may reach `stepped` (on main both were copied, and
+        // `*ONE.add(1)` answered with ONE's value: a false proof). The object
+        // moves with the pointer: same object, offset + 2.
+        assert!(
+            !chc_ctx.ref_resolution.const_ref_values.contains_key(&stepped_local),
+            "a value fact about the base window must not survive a nonzero delta"
         );
+        assert!(
+            !chc_ctx.ref_resolution.const_ref_discriminants.contains_key(&stepped_local),
+            "a discriminant fact about the base window must not survive a nonzero delta"
+        );
+        assert_eq!(
+            chc_ctx.ref_resolution.const_ref_objects.get(&stepped_local).copied(),
+            seeded_const_ref_object().moved(2),
+            "the object record moves with the pointer"
+        );
+        assert_eq!(
+            chc_ctx.ref_resolution.subslice_len.get(&stepped_local).map(ToString::to_string),
+            Some(len_expr.to_string()),
+        );
+        assert_eq!(
+            chc_ctx.ref_resolution.subslice_offset.get(&stepped_local).map(ToString::to_string),
+            Some(expected_offset.to_string()),
+        );
+        assert!(chc_ctx.ref_resolution.call_forwarded_raw_ptrs.contains(&stepped_local));
     });
 }
 

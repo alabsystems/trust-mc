@@ -101,7 +101,7 @@ fn test_translation_drop_simd_manual_arbitrary_compare_eliminates_live_bucket() 
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
 

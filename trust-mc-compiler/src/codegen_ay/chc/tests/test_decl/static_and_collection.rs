@@ -42,12 +42,15 @@ fn test_static_copy_chain_requires_pointer_propagation() {
         );
         chc_ctx.declare_block_relations();
 
+        // The state variable's name carries the static's crate-qualified path
+        // (`common::is_static_state_var`); this lookup spelled the short name
+        // and failed on main before reaching what it tests.
         let static_idx = chc_ctx
             .state_var_mgr
             .state_vars
             .iter()
             .position(|(name, _)| {
-                name.contains("_static_probe_copy_chain_requires_propagation_GLOBAL")
+                is_static_state_var(name, "probe_copy_chain_requires_propagation", "GLOBAL")
             })
             .expect("expected static state var for GLOBAL");
 
@@ -71,6 +74,7 @@ fn test_static_copy_chain_requires_pointer_propagation() {
                     rustc_public::mir::Rvalue::Use(
                         rustc_public::mir::Operand::Copy(place)
                         | rustc_public::mir::Operand::Move(place),
+                        ..,
                     ) if place.projection.is_empty() => Some(place.local),
                     rustc_public::mir::Rvalue::Cast(
                         _,

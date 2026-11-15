@@ -27,7 +27,7 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::{AggregateKind, Body, ConstOperand, Operand, Rvalue, StatementKind};
-use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 
 /// The scalar shadow state for one program point: the tracked byte's
 /// coordinates and its current initialization value.
@@ -204,6 +204,8 @@ pub(in crate::codegen_ay) fn layout_mask_from_operand(
     let place = match operand {
         Operand::Move(place) | Operand::Copy(place) => place,
         Operand::Constant(_) => return None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
     if !place.projection.is_empty() {
         return None;
@@ -242,10 +244,7 @@ pub(in crate::codegen_ay) fn layout_mask_from_local(
 
 fn const_bool_from_operand(op: &Operand) -> Option<bool> {
     let Operand::Constant(ConstOperand { const_, .. }) = op else { return None };
-    match const_.kind() {
-        ConstantKind::Allocated(alloc) => alloc.read_bool().ok(),
-        _ => None,
-    }
+    crate::codegen_ay::shared::const_pointer::const_bool(const_)
 }
 
 #[cfg(test)]

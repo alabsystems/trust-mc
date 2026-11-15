@@ -8,15 +8,18 @@ mod artifact;
 mod config;
 mod heap;
 mod memory;
+mod playback;
 mod properties;
 mod shadow_mem_ctx;
 #[cfg(test)]
 mod testing;
 
+use crate::callee_body::CalleeBody;
+use crate::kani_middle::std_abstraction::StdAbstraction;
 use crate::kani_middle::transform::BodyTransformation;
 use crate::kani_queries::QueryDb;
 use ay_bindings::{AYProgram, Expr, Sort, SortInner};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +31,8 @@ use trust_mc_core::chc::ChcVc;
 use trust_mc_core::decl::Decl;
 
 pub(in crate::codegen_ay) use config::AYConfig;
-pub(in crate::codegen_ay) use heap::HeapState;
+pub(in crate::codegen_ay) use heap::{BoxPointerOrigin, HeapState};
+pub(in crate::codegen_ay) use properties::CheckGate;
 pub(in crate::codegen_ay) use properties::get_unconstrained_assignment_count;
 pub(in crate::codegen_ay) use properties::get_unsupported_construct_fallback_count;
 #[cfg(test)]
@@ -84,8 +88,10 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     /// certificate to a first harness that does — a false-Safe channel — and
     /// the reverse cost parity. Measured on `obligation_free_walk_dual_safe.rs`,
     /// where both safe twins went VACUOUS.
-    pub(in crate::codegen_ay) obligation_free_body_by_fn:
-        std::collections::HashMap<String, bool>,
+    pub(in crate::codegen_ay) obligation_free_body_by_fn: std::collections::HashMap<String, bool>,
+    /// The standard-library code the inline gate keeps as calls, resolved
+    /// once for the unit (`kani_middle::std_abstraction`).
+    pub(in crate::codegen_ay) std_abstraction: StdAbstraction,
     /// The AY program being constructed (holds SMT commands).
     pub(in crate::codegen_ay) program: AYProgram,
     /// Abstract BMC verification condition (dual-write for migration).
@@ -155,7 +161,7 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     /// subsequent violation/cover/reach flags conjoin. `None` = no suffix
     /// assumptions recorded yet (context is trivially `true`).
     assumption_context: Option<Expr>,
-    /// Symbolic variables introduced by kani::any_raw (in order of creation).
+    /// Guard, value and replayability queries for each playback input, in creation order.
     any_vars: Vec<Expr>,
     /// Cover property predicates for reachability checks (kani::cover).
     ///
@@ -209,6 +215,82 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     /// declines to inline and the caller falls through to a non-inlining path.
     /// Part of #recursive-sum-stack-overflow.
     pub(in crate::codegen_ay) bmc_mini_inline_stack: Vec<String>,
+    /// Name of the ROOT function of the BMC codegen unit — the body
+    /// `codegen_function` entered — recorded by `set_current_fn` only while no
+    /// inline frame is active (no frame salt, empty `bmc_mini_inline_stack`).
+    /// Per-harness unsoundness records made inside an inlined callee are
+    /// charged to this name rather than to the callee's salted frame name, so
+    /// the driver attributes the taint to the harness that executes it.
+    pub(in crate::codegen_ay) bmc_root_fn_name: Option<String>,
+    /// BMC lane: the `memory` array as first declared for this harness, before
+    /// any store. Global allocations (statics, constant memory) constrain their
+    /// initializer bytes on it, not on the current store chain.
+    pub(in crate::codegen_ay) initial_memory: Option<Expr>,
+    /// BMC lane: THE address symbol of each global allocation (a static or
+    /// constant memory) this harness names, keyed by
+    /// `shared::const_pointer::TargetKey` (`statement::global_alloc`). Shared by the raw-pointer
+    /// lane and the constant-reference lane, so one static never gets two
+    /// unrelated addresses. It lives exactly as long as `alloc_roots` and the
+    /// heap's registered stack objects, which hold the same symbols: clearing
+    /// it alone would re-register a symbol and make its disjointness
+    /// constraint contradict itself.
+    pub(in crate::codegen_ay) global_alloc_addrs:
+        HashMap<crate::codegen_ay::shared::const_pointer::TargetKey, Expr>,
+    /// BMC lane: the keys of `global_alloc_addrs` whose initializer bytes are
+    /// constrained on `initial_memory`.
+    pub(in crate::codegen_ay) global_alloc_bytes:
+        HashSet<crate::codegen_ay::shared::const_pointer::TargetKey>,
+    /// Byte extent of every allocation the BMC lane can NAME, keyed by the
+    /// SMT variable that is its base: the stable address symbol minted for an
+    /// address-taken local (`rvalue_address_of`), registered from the local's
+    /// sized layout. The pointer-offset obligations (`ptr::offset` /
+    /// `add` / `sub` / `offset_from`) read it to decide Kani's same-allocation
+    /// check structurally; a base that is not here is an allocation the encoder
+    /// cannot name, and those sites fail closed (`bmc_offset_provenance_unresolved`).
+    pub(in crate::codegen_ay) alloc_views: HashMap<String, AllocView>,
+    /// Root local -> (allocation base term, extent) of the first registered
+    /// view, so a second view of the same local is tied to the same base.
+    /// Insertion-ordered: each new root is asserted apart from the roots
+    /// registered before it in this order, so the SMT text is the same on every
+    /// run. A std `HashMap` here emitted those assertions in a per-process
+    /// random order, and BMC verdicts that are sensitive to assertion order
+    /// flipped from run to run on one bundle (measured 2026-10-01 on
+    /// `loop_contract_register_walk_dual.rs::inv_oob_bug`: two runs of main's
+    /// bundle handed `ay` the same assertions in two orders, FAILED once and
+    /// INCONCLUSIVE once).
+    ///
+    /// Any fixed order is a choice, because `ay` is not order-blind
+    /// (`docs/ay-asks/2026-10-01-bmc-assertion-order-sensitivity-48c98a43d/`).
+    /// At `ay` 48c98a43d this order left
+    /// `dual_p3_splice_stale_cex.rs::splice_stale_cex` undecided and the earlier
+    /// roots sorted by printed base term decided it, so `88cac3af1` used that
+    /// order. Re-measured at `ay` d80d17a90 (2026-10-14) on the 146 dual
+    /// harnesses whose texts the two orders change, it no longer pays: one CLI
+    /// round gave every one the same answer in both orders, four rounds of the
+    /// 28 slowest moved only two budget-edge rows, and those trade:
+    /// `splice_stale_cex` [bmc] was decided in 17 of 17 driver runs in this
+    /// order and 9 of 17 sorted, `safe_clamp_through_generic` [bmc] in 4 of 6
+    /// here and 6 of 6 sorted. Registration order is main's and is kept.
+    pub(in crate::codegen_ay) alloc_roots: FxIndexMap<Arc<str>, (Expr, u128)>,
+    /// Address symbols whose view changed on reuse: never a named allocation.
+    pub(in crate::codegen_ay) alloc_views_poisoned: HashSet<String>,
+    /// Merge (phi) definitions `phi_var = ite(pred, v1, ite(..))`, keyed by the
+    /// phi variable. Read ONLY by the allocation resolver (alloc_view.rs): the
+    /// phi RHS is not cached in `ssa_concrete_values`, whose other readers
+    /// would change meaning on an `ite` root.
+    pub(in crate::codegen_ay) alloc_phi_defs: HashMap<String, Expr>,
+}
+
+/// Where an address symbol sits inside the allocation it points into
+/// (BMC lane, `statement/alloc_view.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::codegen_ay) struct AllocView {
+    /// SSA base name of the root local: equal roots are one allocation.
+    pub(in crate::codegen_ay) root: Arc<str>,
+    /// Byte offset of the symbol's place from the start of the root local.
+    pub(in crate::codegen_ay) offset: u128,
+    /// Size of the root local in bytes.
+    pub(in crate::codegen_ay) extent: u128,
 }
 
 /// Context for the function currently being code-generated.
@@ -221,6 +303,19 @@ pub(in crate::codegen_ay) struct CurrentFnCtx {
 }
 
 impl<'tcx, 't> AYCtx<'tcx, 't> {
+    /// The names of the property-violation predicates recorded so far
+    /// (`ay_violation_<label>_<n>`), for tests.
+    #[cfg(test)]
+    pub(in crate::codegen_ay) fn property_violation_names(&self) -> Vec<String> {
+        self.property_violations
+            .iter()
+            .filter_map(|pred| match pred.value() {
+                ay_bindings::ExprValue::Var { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Create a new AY codegen context.
     ///
     /// Initializes the AYProgram with the appropriate mode (BMC or CHC)
@@ -256,6 +351,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             queries,
             config,
             obligation_free_body_by_fn: std::collections::HashMap::new(),
+            std_abstraction: StdAbstraction::resolve(tcx),
             program,
             bmc_vc,
             chc_vc: None,
@@ -282,6 +378,14 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             shadow_mem: shadow_mem_ctx::BmcShadowMemState::default(),
             chc_local_to_state_idx: HashMap::new(),
             bmc_mini_inline_stack: Vec::new(),
+            bmc_root_fn_name: None,
+            initial_memory: None,
+            global_alloc_addrs: HashMap::new(),
+            global_alloc_bytes: HashSet::new(),
+            alloc_views: HashMap::new(),
+            alloc_roots: FxIndexMap::default(),
+            alloc_views_poisoned: HashSet::new(),
+            alloc_phi_defs: HashMap::new(),
         }
     }
 
@@ -289,10 +393,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     pub(in crate::codegen_ay) fn transformer_stub_map(
         &self,
     ) -> crate::codegen_ay::obligation_free_walk::StubMap {
-        self.transformer
-            .as_ref()
-            .map(|t| t.stub_map_for_walk())
-            .unwrap_or_default()
+        self.transformer.as_ref().map(|t| t.stub_map_for_walk()).unwrap_or_default()
     }
 
     /// Get the MIR body for an instance.
@@ -312,13 +413,25 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         &mut self,
         instance: Instance,
     ) -> Option<rustc_public::mir::Body> {
+        // A float intrinsic Trust core renamed reaches trust-mc's model or fails closed; it
+        // never runs Trust's fallback body. On the frozen nightly the call has no body at all,
+        // and on Trust `minimum_number_nsz_*` / `maximum_number_nsz_*` carry one that returns
+        // a single one of the results the intrinsic may produce (`y` whenever the arguments
+        // compare equal), so executing it proved `(-0.0f16).min(0.0).is_sign_positive()`,
+        // which fails when the program runs. Every codegen consumer of callee bodies (the BMC
+        // mini-inliner and its closure, fn-pointer and iterator-adapter callers) comes through
+        // here, so none of them can reach that body. See
+        // `intrinsics::is_modelled_renamed_intrinsic`; always false on the nightly.
+        if crate::intrinsics::is_modelled_renamed_intrinsic(&instance) {
+            return None;
+        }
         if let Some(transformer) = self.transformer.as_mut() {
             // `try_body`, not `body`: the latter panics on an instance with no
             // MIR, which made this function's `Option` a promise it could not
             // keep on the transformer path. Callers already handle `None`.
             return transformer.try_body(self.tcx, instance);
         }
-        instance.body()
+        instance.callee_body()
     }
 
     /// Install a thread-local snapshot of the body transformer for the CHC
@@ -332,6 +445,12 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         self.transformer
             .as_deref()
             .map(crate::kani_middle::transform::WalkerTransformerScope::install)
+    }
+
+    /// The unit's stub map (`#[kani::stub]`), for scans that must inspect the
+    /// body the unit runs; empty without a transformer (lightweight tests).
+    pub(in crate::codegen_ay) fn unit_stub_map(&self) -> crate::kani_middle::codegen_units::Stubs {
+        self.transformer.as_deref().map(|t| t.stub_map_for_walk()).unwrap_or_default()
     }
 
     pub(in crate::codegen_ay) fn record_chc_local_to_state_idx(
@@ -490,6 +609,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             use std::fmt::Write;
             let _ = write!(name, "#f{salt}");
         }
+        if self.inline_frame_salt.is_none() && self.bmc_mini_inline_stack.is_empty() {
+            self.bmc_root_fn_name = Some(name.clone());
+        }
         self.current_fn = Some(CurrentFnCtx { instance, name });
     }
 
@@ -524,9 +646,11 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// multi-harness verification. Part of #2372.
     pub(in crate::codegen_ay) fn reset_current_fn(&mut self) {
         self.current_fn = None;
+        self.bmc_root_fn_name = None;
         self.var_map.clear();
         self.symbolic_memory_stores.clear();
         self.memory = None;
+        self.initial_memory = None;
     }
 
     /// Get the current function context, if any.
@@ -540,6 +664,16 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// pattern that allocates a new String on every call.
     pub(in crate::codegen_ay) fn current_fn_name(&self) -> &str {
         self.current_fn.as_ref().map_or("unknown", |f| f.name.as_str())
+    }
+
+    /// Attribution key for a per-harness unsoundness record made from BMC
+    /// statement codegen: the root function of the unit when known, else the
+    /// current frame name. A key that names no proof harness is still counted
+    /// by the driver against EVERY harness of the crate
+    /// (`demotion::attributable_to_harness`, fail-closed), so a wrong key costs
+    /// precision, never soundness.
+    pub(in crate::codegen_ay) fn bmc_attribution_fn_name(&self) -> &str {
+        self.bmc_root_fn_name.as_deref().unwrap_or_else(|| self.current_fn_name())
     }
 
     /// Finalize using the abstract IR path (emit_bmc).
@@ -558,7 +692,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         // Populate model queries for concrete playback.
         // emit_bmc automatically handles violation predicates (ay_viol_*),
         // so we only need to add the kani::any_raw symbolic variables here.
-        self.bmc_vc.model_queries.extend(self.any_vars.iter().cloned());
+        let queries = self.playback_model_queries();
+        self.bmc_vc.model_queries.extend(queries);
     }
 
     /// Split the context into diagnostics and the generated program.
@@ -578,10 +713,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     ///
     /// Call `finalize_emit_bmc()` before this to populate model queries.
     pub(in crate::codegen_ay) fn split_emit_bmc(self) -> (MinimalAYCtx, AYProgram) {
-        use super::emit_bmc;
-
         // emit_bmc takes BmcVc by value — move self.bmc_vc (no clone)
-        let program = emit_bmc(self.bmc_vc);
+        let program =
+            super::emitter::emit_bmc_with_logic_override(self.bmc_vc, self.config.logic_override);
         (MinimalAYCtx { unsupported_constructs: self.unsupported_constructs }, program)
     }
 
@@ -662,78 +796,43 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // fixup cannot re-permute). If canonicalization fails to restore a
             // sort-consistent VC, we emit this snapshot (un-optimized but
             // well-formed) rather than an ill-sorted program AY would reject.
-            let pre_opt_snapshot = chc_vc.clone();
+            let mut pre_opt_snapshot = chc_vc.clone();
             super::chc::report_slot_layout(&chc_vc, "00_pre_opt");
-            if !const_prop_disabled {
-                let propagated = chc_vc.propagate_constants();
-                if propagated > 0 {
-                    tracing::debug!(
-                        propagated,
-                        "CHC: propagated constant relation arguments (#3371)"
-                    );
-                }
-                // Part of #3793: Constant propagation may eliminate rules
-                // (via eliminate_trivially_false_rules), creating new orphan
-                // blocks whose body relations are no longer targeted as heads.
-                // Prune these to prevent PDR from freely instantiating them.
-                chc_vc.prune_orphan_block_rules();
-
-                // Second-pass dead scalar elimination: after const_prop +
-                // trivially-false rule elimination + orphan pruning, scalars
-                // that were previously live (constrained in now-eliminated
-                // rules) may become pure identity passthroughs.
-                let pruned = chc_vc.prune_dead_identity_scalars();
-                if pruned > 0 {
-                    tracing::debug!(pruned, "CHC: post-constprop dead scalar pruning");
-                }
+            run_emit_time_chc_passes(&mut chc_vc, const_prop_disabled);
+            // Lost-checks recovery (#67 shape), the FALLBACK path. When const-prop,
+            // false-rule elimination and orphan pruning erase the LAST error
+            // obligation of a VC with registered properties, nothing was proved: the
+            // checks may be dead, folded, or never reached by a broken encoding, and
+            // all three look the same afterwards (the straight-line discharge below
+            // refuses the shape, and the driver reports it INCONCLUSIVE). Re-run the
+            // passes over the pre-optimization VC with the error obligations kept, so
+            // the discharge and the solver decide them.
+            //
+            // FIRST CHOICE is the out-of-band record, not this: a check whose guard
+            // folds to `false` is marked `discharged_at_encode` by
+            // `eliminate_trivially_false_rules` (which const-prop runs inside the
+            // passes above), and the gate further down turns a fully accounted VC
+            // into the canonical `false => error` obligation with no solver run.
+            // `passes_lost_every_error_obligation` therefore exempts a VC whose every
+            // property carries that reason, and this fallback takes only what is left:
+            // an obligation NOBODY accounted for (an orphaned block relation, an
+            // aggregate `error` edge, or a mix where one property was marked and
+            // another was pruned).
+            if !super::chc::lost_obligation_recovery_disabled()
+                && trust_mc_core::chc::passes_lost_every_error_obligation(
+                    &pre_opt_snapshot,
+                    &chc_vc,
+                )
+            {
+                tracing::warn!(
+                    properties = chc_vc.properties.len(),
+                    "CHC: emit-time passes erased every error obligation of a VC with registered \
+                     properties; re-running them with error obligations kept"
+                );
+                pre_opt_snapshot.keep_error_obligations = true;
+                chc_vc = pre_opt_snapshot.clone();
+                run_emit_time_chc_passes(&mut chc_vc, const_prop_disabled);
             }
-
-            // Normalize free-variable array bases: the encoder creates
-            // `__chc_array_N` free vars as store chain bases for local
-            // array initialization (e.g., `let arr = [1,2,3,4]`).
-            // Replace these with `const_array(...)` so the scalarizer
-            // can decompose the store chains into per-index scalars.
-            let normalized = chc_vc.normalize_free_array_bases();
-            if normalized > 0 {
-                tracing::debug!(normalized, "CHC: normalized free-var array bases to const_array");
-            }
-
-            // Second-pass scalarization: after constant propagation
-            // resolves array indices to constants and dead-identity
-            // pruning removes passthrough arrays, run the scalarizer
-            // again. Arrays that were non-scalarizable before (symbolic
-            // indices or ≥2 surviving arrays blocking each other) may
-            // now qualify. Also re-runs const-folding and dead-scalar
-            // pruning internally.
-            super::chc::scalarize_vc(&mut chc_vc);
-            super::chc::report_slot_layout(&chc_vc, "02_scalarize");
-
-            // Strip dead constraints that reference only universally
-            // quantified free variables (not in any relation's args).
-            // Also prune stale declare-var entries. Array-sorted vars
-            // removed from relations by prune_vc_unused_type_arrays
-            // leave behind store constraints that force the solver
-            // into Array theory unnecessarily.
-            let dead_stripped = chc_vc.prune_dead_vars_and_constraints();
-            if dead_stripped > 0 {
-                tracing::debug!(dead_stripped, "CHC: dead constraint/var pruning");
-            }
-
-            // Part of #4286: later CHC optimization passes can leave embedded
-            // relation FuncApps with stale arity in constraints even after the
-            // relation declarations were rewritten. Repair the final VC just
-            // before emission so the emitted HORN program matches its decls.
-            super::chc::fixup_relation_app_arities(&mut chc_vc);
-            super::chc::report_slot_layout(&chc_vc, "04_fixup_arities");
-            super::chc::prune_dead_array_relation_args(&mut chc_vc);
-            // Part of #argorder: the passes above can leave a relation
-            // application mis-permuted relative to its declaration (a column
-            // run of identical sorts defeats the sort-only arity fixup).
-            // Re-permute divergent applications by slot name, then re-run the
-            // arity fixup as the downstream safety net.
-            super::chc::canonicalize_block_relation_apps(&mut chc_vc);
-            super::chc::report_slot_layout(&chc_vc, "05_canonicalize");
-            super::chc::fixup_relation_app_arities(&mut chc_vc);
 
             // SOUNDNESS fail-close: slot MISALIGNMENT must be caught HERE, before
             // anything reasons about the VC. The canonicalizer only rewrites
@@ -777,6 +876,44 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // relation prefix) so any PROOF verdict becomes FAILURE. VCs whose
             // rules were LEGITIMATELY cleared by a discharge (TIC,
             // straightline) carry `trivially_safe_discharged` and are exempt.
+            // Every obligation discharged at encode time: emit the CANONICAL
+            // discharge so the driver can see it, instead of leaving an absence
+            // it must read as a lost check.
+            //
+            // A registered property with no rule is ambiguous — "the encoder
+            // proved it cannot fire" and "the encoder dropped it" look
+            // identical — so the driver fails closed with
+            // `[AY:UNKNOWN_REASON:LostErrorRules]`. Measured 2026-09-17: that
+            // was 32 of 32 unparked CHC `unknown` rows, and the driver is right
+            // to refuse. The cure is to stop producing the ambiguity.
+            //
+            // `all_properties_discharged_at_encode` is the soundness gate: at
+            // least one property, EVERY one carrying a reason, and no
+            // `error_p{id}`-headed rule surviving. A check whose rule was
+            // deleted downstream was never marked, so the test fails and this
+            // does nothing.
+            //
+            // `replace_with_unsat_error_obligation` is the same shape TIC and
+            // the straight-line proof already emit, and the same one
+            // `eliminate_trivially_false_rules` deliberately RETAINS (a literal
+            // `false` body with no body relation). The driver recognises it via
+            // `smt_error_query_has_false_error_obligation` and reports a clean
+            // proof WITHOUT running a solver — so, unlike the in-band marker
+            // this replaces (reverted in 0b89f4734 after it cost five real
+            // proofs and a 1.8x slowdown), it costs the solver nothing.
+            if chc_vc.all_properties_discharged_at_encode() {
+                let reasons: std::collections::BTreeSet<&str> =
+                    chc_vc.properties.iter().filter_map(|p| p.discharged_at_encode).collect();
+                tracing::debug!(
+                    properties = chc_vc.properties.len(),
+                    ?reasons,
+                    "CHC: every obligation discharged at encode time; emitting the canonical \
+                     `false => error` obligation"
+                );
+                super::chc::straightline_proof::replace_with_unsat_error_obligation(&mut chc_vc);
+                chc_vc.trivially_safe_discharged = true;
+            }
+
             if !chc_vc.trivially_safe_discharged && !chc_vc.properties.is_empty() {
                 let has_program_rule = chc_vc.rules.iter().any(|r| {
                     let head: &str = r.head.name.as_ref();
@@ -811,7 +948,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
                     super::chc::set_chc_fallback_count_for_fn(&fn_name, cur + 1);
                 }
             }
-            if !super::chc::straightline_discharge_disabled()
+            if self.config.chc_straightline_discharge
                 && super::chc::discharge_straightline_safety(&mut chc_vc)
             {
                 tracing::debug!("CHC: bounded straight-line proof discharged scalarized VC");
@@ -850,6 +987,33 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
                 chc_vc = pre_opt_snapshot;
             }
 
+            // LAST: project unconstrained relation arguments when AY's executor
+            // admission would otherwise reject the emitted problem outright
+            // (`ChcParseError`, no solver run). Runs after the discharge and
+            // the consistency nets above and re-checks them itself; see
+            // `chc::admission_prune`.
+            super::chc::prune_unconstrained_relation_args_for_admission(&mut chc_vc);
+
+            // After every pass that can drop a sort's last user: keep only the
+            // datatype declarations the emitted problem reaches. Exact; the
+            // `TRUST_MC_CHC_PRUNE_DATATYPES=off` lever exists for A/B measurement.
+            if std::env::var("TRUST_MC_CHC_PRUNE_DATATYPES").as_deref() != Ok("off") {
+                let dropped = chc_vc.prune_unreachable_datatype_decls();
+                if dropped > 0 {
+                    tracing::debug!("CHC: pruned {dropped} unreachable datatype declarations");
+                }
+            }
+
+            // Last of all, so no pass substitutes the definitions back: name the
+            // links of a bitvector `ite` chain too deep for AY to decide quickly
+            // (the inline walker's replay of a loop to a caller's bound). Exact;
+            // `TRUST_MC_CHC_NAME_ITE_CHAINS=off` is the A/B lever. See
+            // trust-mc-core `chc_optimize_ite_chains.rs`.
+            let named = chc_vc.name_deep_ite_chains();
+            if named > 0 {
+                tracing::debug!("CHC: named {named} links of deep bitvector ite chains");
+            }
+
             emit_chc(&chc_vc)
         } else {
             tracing::warn!(
@@ -863,10 +1027,87 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 }
 
 // Re-export test helpers for use by other test modules in the crate.
-#[cfg(all(test, feature = "compiler-corpus-tests"))]
-pub(in crate::codegen_ay) use testing::with_test_ay_ctx_for_source_with_edition;
 #[cfg(test)]
-pub(in crate::codegen_ay) use testing::{with_test_ay_ctx, with_test_ay_ctx_for_source};
+pub(in crate::codegen_ay) use testing::{
+    with_test_ay_ctx, with_test_ay_ctx_for_source, with_test_ay_ctx_for_source_with_edition,
+    with_test_ay_ctx_for_source_with_rustc_flags,
+};
 
 #[cfg(test)]
 mod tests;
+
+/// The emit-time optimization passes (const-prop, orphan prune, dead scalars,
+/// scalarization, dead constraints, arity fixup, canonicalization), factored out
+/// of `split_emit` so the lost-checks recovery can re-run them over the
+/// pre-optimization VC in keep-error-obligations mode.
+fn run_emit_time_chc_passes(chc_vc: &mut trust_mc_core::chc::ChcVc, const_prop_disabled: bool) {
+    if !const_prop_disabled {
+        let propagated = chc_vc.propagate_constants();
+        if propagated > 0 {
+            tracing::debug!(propagated, "CHC: propagated constant relation arguments (#3371)");
+        }
+        // Part of #3793: Constant propagation may eliminate rules
+        // (via eliminate_trivially_false_rules), creating new orphan
+        // blocks whose body relations are no longer targeted as heads.
+        // Prune these to prevent PDR from freely instantiating them.
+        chc_vc.prune_orphan_block_rules();
+
+        // Second-pass dead scalar elimination: after const_prop +
+        // trivially-false rule elimination + orphan pruning, scalars
+        // that were previously live (constrained in now-eliminated
+        // rules) may become pure identity passthroughs.
+        let pruned = chc_vc.prune_dead_identity_scalars();
+        if pruned > 0 {
+            tracing::debug!(pruned, "CHC: post-constprop dead scalar pruning");
+        }
+    }
+
+    // Normalize free-variable array bases: the encoder creates
+    // `__chc_array_N` free vars as store chain bases for local
+    // array initialization (e.g., `let arr = [1,2,3,4]`).
+    // Replace these with `const_array(...)` so the scalarizer
+    // can decompose the store chains into per-index scalars.
+    let normalized = chc_vc.normalize_free_array_bases();
+    if normalized > 0 {
+        tracing::debug!(normalized, "CHC: normalized free-var array bases to const_array");
+    }
+
+    // Second-pass scalarization: after constant propagation
+    // resolves array indices to constants and dead-identity
+    // pruning removes passthrough arrays, run the scalarizer
+    // again. Arrays that were non-scalarizable before (symbolic
+    // indices or ≥2 surviving arrays blocking each other) may
+    // now qualify. Also re-runs const-folding and dead-scalar
+    // pruning internally.
+    super::translation_deadline::check_now("chc_emit_optimize");
+    super::chc::scalarize_vc(chc_vc);
+    super::translation_deadline::check_now("chc_emit_optimize");
+    super::chc::report_slot_layout(chc_vc, "02_scalarize");
+
+    // Strip dead constraints that reference only universally
+    // quantified free variables (not in any relation's args).
+    // Also prune stale declare-var entries. Array-sorted vars
+    // removed from relations by prune_vc_unused_type_arrays
+    // leave behind store constraints that force the solver
+    // into Array theory unnecessarily.
+    let dead_stripped = chc_vc.prune_dead_vars_and_constraints();
+    if dead_stripped > 0 {
+        tracing::debug!(dead_stripped, "CHC: dead constraint/var pruning");
+    }
+
+    // Part of #4286: later CHC optimization passes can leave embedded
+    // relation FuncApps with stale arity in constraints even after the
+    // relation declarations were rewritten. Repair the final VC just
+    // before emission so the emitted HORN program matches its decls.
+    super::chc::fixup_relation_app_arities(chc_vc);
+    super::chc::report_slot_layout(chc_vc, "04_fixup_arities");
+    super::chc::prune_dead_array_relation_args(chc_vc);
+    // Part of #argorder: the passes above can leave a relation
+    // application mis-permuted relative to its declaration (a column
+    // run of identical sorts defeats the sort-only arity fixup).
+    // Re-permute divergent applications by slot name, then re-run the
+    // arity fixup as the downstream safety net.
+    super::chc::canonicalize_block_relation_apps(chc_vc);
+    super::chc::report_slot_layout(chc_vc, "05_canonicalize");
+    super::chc::fixup_relation_app_arities(chc_vc);
+}

@@ -91,6 +91,7 @@
 //! `assert(false)` semantics exactly — that is what `ForeignItems/
 //! missing_fn_fail.rs` (`// kani-verify-fail`) pins.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::Expr;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -102,7 +103,7 @@ use super::super::chc_call_context::DispatchCallContext;
 use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_call_kani_model::CallKaniModel;
 use super::super::codegen_rules::CodegenRules;
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 
 /// Sound-fallback reason recorded by every foreign effect frame.
 ///
@@ -205,17 +206,18 @@ impl<'tcx, 'body> CallDispatchForeign for ChcCtx<'tcx, 'body> {
         // Bind every havocked slot to a FRESH variable that appears nowhere
         // else, rather than leaving its `__out` unconstrained in the head.
         //
-        // Both readings of a bare unconstrained `__out` are in use in this
-        // encoder: "identity pass-through" and "havoc". The constant folder
-        // resolves that ambiguity toward pass-through —
-        // `chc_const_prop_eval::propagate_to_unconstrained_out_vars` copies a
-        // known constant from `X` onto an unconstrained `X__out` — so a bare
-        // `__out` havoc of a slot the folder has pinned is silently UNDONE and
-        // the callee's write disappears. An explicit `X__out = <fresh>` states
-        // the havoc in the encoding instead of leaving it to a convention:
-        // `X__out` is then constrained (the folder skips it) and the fresh
-        // right-hand side is never known, so nothing propagates through.
-        // `kani::write_any_slim` binds its havoc the same way.
+        // An unbound `__out` is itself a havoc (a clause variable is
+        // universally quantified); constant propagation used to read it as an
+        // identity pass-through and copy a known constant from `X` onto it,
+        // silently UNDOING the callee's write. That reading is gone, but an
+        // explicit `X__out = <fresh>` still states the havoc in the encoding
+        // rather than leaving it to a convention. `kani::write_any_slim` binds
+        // its havoc the same way.
+        // (5) DIVERGENCE + honesty. Fail-closed: the frame keeps the successor
+        // edge without having established that `f` returns, and an unresolved
+        // pointee above would leave stale contents, so no `Success` verdict may
+        // rest on this encoding. The havocked slots below stand on this booking.
+        let booked = self.record_sound_fallback_reason(FOREIGN_EFFECT_FRAME_REASON);
         for &idx in &havoc_slots {
             self.mark_state_var_modified(idx);
             let Some((out_name, out_sort)) = self.state_var_mgr.output_state_vars.get(idx).cloned()
@@ -224,15 +226,9 @@ impl<'tcx, 'body> CallDispatchForeign for ChcCtx<'tcx, 'body> {
             };
             let out_var = Expr::var(&*out_name, out_sort.clone());
             let fresh =
-                declare_pending_var(chc_fresh_name("__foreign_effect_havoc"), out_sort.clone());
+                Havoc::booked(booked, chc_fresh_name("__foreign_effect_havoc"), out_sort.clone());
             extra.push(out_var.eq(fresh));
         }
-
-        // (5) DIVERGENCE + honesty. Fail-closed: the frame keeps the successor
-        // edge without having established that `f` returns, and an unresolved
-        // pointee above would leave stale contents, so no `Success` verdict may
-        // rest on this encoding.
-        self.record_sound_fallback_reason(FOREIGN_EFFECT_FRAME_REASON);
 
         let new_output_args = self.build_output_args(dcx.modified_locals, &[]);
         self.emit_goto_rule_extra(

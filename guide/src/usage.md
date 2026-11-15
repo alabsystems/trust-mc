@@ -58,7 +58,7 @@ Common to both `trust-mc` and `targo trust-mc` are many command-line flags:
    root) for that.
 
    For repository-level replacement accounting, use the Rust progress reporter:
-   `cargo run --manifest-path tools/replacement-audit/Cargo.toml --bin replacement-progress --`.
+   `targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --bin replacement-progress --`.
    Use `--require-complete --report <proof-report>` when the command should
    fail unless the supplied evidence reaches the 100% Kani replacement gate.
    It complements the strict replacement audit; it does not weaken the
@@ -295,10 +295,10 @@ This adds the kani dependency as a dependency that is conditional on `kani_ra`.
 ```
     "rust-analyzer.cargo.extraEnv": {
         "RUSTFLAGS": "--cfg kani_ra --cfg kani",
-        "RUSTUP_TOOLCHAIN": "nightly"
+        "RUSTUP_TOOLCHAIN": "trust"
     },
 ```
 Explanation:
 - Enabling the `kani_ra` configuration allows Rust Analyzer to see the kani definitions in the crate added in the `Cargo.toml` file.
 - Enabling the `kani` configuration enables blocks guarded by `#[cfg(kani)]`.
-- Finally, using the nightly toolchain is necessary for Rust Analyzer to be able to handle the code in the kani dependency, many of which requires nightly features.
+- Finally, the `trust` toolchain (the one the kani library is built with; a stock-Rust user names a nightly instead) is necessary for Rust Analyzer to be able to handle the code in the kani dependency, many of which requires nightly features.

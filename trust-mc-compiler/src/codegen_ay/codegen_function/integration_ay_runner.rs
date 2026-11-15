@@ -7,8 +7,6 @@
 //! Extracted from duplicated code in `integration_bmc_tests.rs` and
 //! `integration_chc_tests.rs` (Part of #2596).
 
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -18,6 +16,12 @@ use ay_dpll::Executor;
 use ay_frontend::parse;
 
 const AY_DEFAULT_TIMEOUT_SECS: u64 = 10;
+/// The ay CHC fallback's budget. A PDR solve near a 10 s budget flips to
+/// `unknown` under the parallel suite's load — measured 2026-09-16:
+/// `test_chc_e2e_std_alloc_realloc_grow_full_proves_unsat` failed once in
+/// 1714 and passed twice in isolation. A regression to `unknown` still shows
+/// at 30 s; a proof that merely needed the machine to itself no longer does.
+const AY_CHC_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Extra wall-clock slack added on top of the solve budget before the hard
 /// guard fires. The portfolio's internal deadline (`time_budget`) is the
@@ -28,57 +32,55 @@ const AY_CHC_GUARD_SLACK_SECS: u64 = 5;
 
 pub(super) fn ay_test_timeout_secs() -> u64 {
     std::env::var("TRUST_MC_AY_TEST_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("TRUST_MC_Z3_TEST_TIMEOUT_SECS"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(AY_DEFAULT_TIMEOUT_SECS)
 }
 
 /// Solve an SMT-LIB problem (plain SMT or the CHC dialect) and return the
-/// verdict.
+/// verdict, with ay — trust-mc's only verification backend (CLAUDE.md).
 ///
-/// Routing: z3 is the PRIMARY oracle for BOTH shapes — plain SMT goes to z3's
-/// SMT engine, the CHC dialect (`declare-rel`/`declare-var`/`rule`/`query`)
-/// goes to z3's PDR — each under a hard wall-clock timeout enforced by
-/// killing the child. z3 is the engine these e2e tests were originally written
-/// and validated against. We fall back to ay's own (also hard-bounded) engine
-/// ONLY when no `z3` binary is on PATH (`Z3Unavailable`): the ay SMT `Executor`
-/// for plain SMT, the ay CHC portfolio for the CHC dialect.
+/// Plain SMT goes to ay's SMT `Executor`, the CHC dialect
+/// (`declare-rel`/`declare-var`/`rule`/`query`) to ay's CHC portfolio, each
+/// under a hard wall-clock guard. The `sat`/`unsat`/`unknown` whitelist is
+/// enforced on every path: a timeout or any other output is an `Err` (or, for
+/// the CHC guard, an honest "unknown"), never a fabricated verdict.
 ///
-/// Why z3-primary: the ay backends currently return `unknown` (not the
-/// validated `sat`/`unsat`) on several of these counterexample-finding cases
-/// (the `Tuple_bv32_bool` / branch-overflow encodings; the BV+Array memory
-/// model), so a pure-ay route cannot reproduce the verdicts the tests assert.
-/// z3 discharges every one of these in milliseconds. Soundness is preserved
-/// regardless of which solver answers: both are trusted engines, and the
-/// `sat`/`unsat`/`unknown` whitelist is enforced on every path — any timeout,
-/// non-zero exit, or other output is surfaced as an `Err` (or, for the ay CHC
-/// guard, an honest "unknown"), NEVER a fabricated verdict.
+/// These tests used to ask a `z3` found on PATH first and fall back to ay only
+/// when none was there, on the claim that ay returned `unknown` on several of
+/// them. That claim was falsified (design trust-mc-reds-final §7.1, E1: all 69
+/// such engine tests decided by ay), and a solver taken by bare name from PATH
+/// is not the one a measurement names: on a host where the name resolves to a
+/// launcher that refuses it, every one of those tests failed.
 ///
 /// This is the production trust-mc-driver path's test-harness analogue only;
 /// the driver's own solver selection is untouched.
 pub(in crate::codegen_ay) fn run_ay_on_smt2(smt: &str) -> Result<String, String> {
     if smt.contains("(query ") || smt.contains("(rule ") || smt.contains("(declare-rel ") {
-        return run_chc_on_smt2(smt);
+        return run_ay_chc(smt);
     }
-
-    match run_z3_smt2(smt) {
-        Ok(verdict) => Ok(verdict),
-        // z3 not on PATH: degrade to ay's bounded SMT executor. Any other z3
-        // error (timeout, crash, malformed output) is surfaced rather than
-        // silently retried, so a regression in the primary oracle cannot be
-        // masked by the fallback.
-        Err(ChcSolveError::Z3Unavailable) => run_ay_smt2(smt),
-        Err(ChcSolveError::Other(msg)) => Err(msg),
-    }
+    run_ay_smt2(smt)
 }
 
-/// Fallback plain-SMT solver: ay's own `Executor` under a hard wall-clock
-/// guard. Used only when z3 is unavailable.
-fn run_ay_smt2(smt: &str) -> Result<String, String> {
+/// Plain-SMT solver: ay's own `Executor` under a hard wall-clock guard (the
+/// plain-SMT half of [`run_ay_on_smt2`]; the float `%` regression tests,
+/// `float_arithmetic_frem_tests.rs`, call it directly).
+pub(in crate::codegen_ay) fn run_ay_smt2(smt: &str) -> Result<String, String> {
     let commands = parse(smt).map_err(|err| format!("AY failed to parse SMT-LIB: {err}"))?;
 
     let mut executor = Executor::new();
+    // Verdict only: nothing here consumes a proof artifact. ay's bare
+    // `Executor::new()` posture at 10bc4b185 does search-time proof tracking
+    // that turned this emitter's BMC VCs from a 0.26 s `unsat` into a 10 s
+    // `unknown` in-process, while the pinned ay CLI — the oracle for every
+    // counted BMC row — decides the identical text in 0.26 s. Competition mode
+    // is ay's own switch for "no search-time proof unless demanded"; it sheds
+    // that work and nothing about the decision. Measured, one knob at a time:
+    //   bare 9.84 s unknown · strict_logic_compliance(false) 10.07 s unknown ·
+    //   best_effort_produce_proofs 8.01 s unknown · retain_parsed(false) 10.68 s
+    //   unknown · produce_proofs(true) 10.45 s unknown ·
+    //   competition_mode(true) 0.26 s UNSAT.
+    executor.set_competition_mode(true);
     let interrupt = Arc::new(AtomicBool::new(false));
     executor.set_interrupt(Arc::clone(&interrupt));
 
@@ -91,9 +93,55 @@ fn run_ay_smt2(smt: &str) -> Result<String, String> {
         }
     });
 
-    let outputs = executor
-        .execute_all(&commands)
-        .map_err(|err| format!("AY failed to execute SMT-LIB: {err}"));
+    // Hand ay the budget itself, as the driver's `ay_direct` path does: the
+    // interrupt flag only stops a solver that polls it, a deadline lets every
+    // budgeted pass bail on its own. The std wall instant enters ay through
+    // ay's own `From`, as in `ay_direct`.
+    #[expect(
+        clippy::useless_conversion,
+        reason = "identity while ay's Instant re-exports std's; delete once ay's clock seam makes it a newtype"
+    )]
+    executor.set_deadline(Some((std::time::Instant::now() + timeout).into()));
+
+    // Execute command by command and STOP at the first verdict. A VC ends in
+    // `(get-value …)` / `(get-model)` after `(check-sat)`; after `unsat` those
+    // cannot change the verdict, they can only fail or stall. Measured at ay
+    // 10bc4b185: `execute_all` on the emitted BMC VC timed out at 10 s
+    // in-process while the pinned ay CLI answered `unsat` for the identical
+    // text in 0.2 s — so the stall is not in the decision. Any single command
+    // that takes a second or more is named on stderr, so a stall is a finding,
+    // not a mystery.
+    let mut verdict: Option<String> = None;
+    let mut exec_err: Option<String> = None;
+    for cmd in &commands {
+        let started = std::time::Instant::now();
+        let step = executor.execute(cmd);
+        let took = started.elapsed();
+        if took >= Duration::from_secs(1) {
+            eprintln!(
+                "run_ay_smt2: `{}` took {:.2}s",
+                format!("{cmd:?}").chars().take(60).collect::<String>(),
+                took.as_secs_f64()
+            );
+        }
+        match step {
+            Ok(Some(output)) => {
+                let v = output.trim();
+                if matches!(v, "sat" | "unsat" | "unknown") {
+                    verdict = Some(v.to_string());
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                exec_err = Some(format!("AY failed to execute SMT-LIB: {err}"));
+                break;
+            }
+        }
+        if interrupt.load(Ordering::Relaxed) {
+            break;
+        }
+    }
     let timed_out = interrupt.load(Ordering::Relaxed);
     let _ = cancel_tx.send(());
     let _ = timer.join();
@@ -101,144 +149,14 @@ fn run_ay_smt2(smt: &str) -> Result<String, String> {
     if timed_out {
         return Err(format!("AY timed out after {}s", timeout.as_secs()));
     }
-
-    for output in outputs? {
-        let verdict = output.trim();
-        if matches!(verdict, "sat" | "unsat" | "unknown") {
-            return Ok(verdict.to_string());
-        }
+    if let Some(err) = exec_err {
+        return Err(err);
+    }
+    if let Some(v) = verdict {
+        return Ok(v);
     }
 
     Err("AY returned no sat/unsat/unknown verdict".to_string())
-}
-
-/// Solve a CHC problem: z3's PDR (primary) under a hard timeout, falling
-/// back to ay's own hard-bounded CHC engine when z3 is not available.
-///
-/// See [`run_ay_on_smt2`] for the rationale behind the z3-primary routing.
-fn run_chc_on_smt2(smt: &str) -> Result<String, String> {
-    match run_z3_chc(smt) {
-        Ok(verdict) => Ok(verdict),
-        // z3 not on PATH: degrade to ay's bounded CHC engine. Any other z3
-        // error (timeout, crash) is surfaced rather than silently retried,
-        // so a regression in the primary oracle cannot be masked.
-        Err(ChcSolveError::Z3Unavailable) => run_ay_chc(smt),
-        Err(ChcSolveError::Other(msg)) => Err(msg),
-    }
-}
-
-enum ChcSolveError {
-    /// No `z3` binary was found on PATH.
-    Z3Unavailable,
-    /// z3 was found but failed (timeout, non-zero exit, malformed output).
-    Other(String),
-}
-
-/// Run z3 on a plain SMT-LIB problem under a hard wall-clock timeout.
-///
-/// Identical transport to [`run_z3_chc`] (z3 routes plain SMT to its SMT
-/// engine and the CHC dialect to PDR based on the script itself), so both
-/// delegate to the shared [`run_z3`] helper. The first stdout line is taken as
-/// the verdict and validated against the `sat`/`unsat`/`unknown` whitelist;
-/// anything else is an `Err`, never a fabricated verdict.
-fn run_z3_smt2(smt: &str) -> Result<String, ChcSolveError> {
-    run_z3(smt)
-}
-
-/// Run z3's CHC/PDR engine on the SMT-LIB CHC problem under a hard
-/// wall-clock timeout enforced by killing the child process.
-fn run_z3_chc(smt: &str) -> Result<String, ChcSolveError> {
-    run_z3(smt)
-}
-
-/// Shared z3 transport: spawn `z3 -in`, write the SMT-LIB script to stdin,
-/// drain stdout/stderr on reader threads (so z3 can't block on a full pipe),
-/// and enforce a hard wall-clock deadline by polling `try_wait` and killing
-/// the child if it overruns. The first stdout line is the verdict; it is
-/// validated against the `sat`/`unsat`/`unknown` whitelist before being
-/// returned, so a timeout, non-zero exit, or any other output yields an
-/// `Err` rather than a fabricated verdict.
-fn run_z3(smt: &str) -> Result<String, ChcSolveError> {
-    let mut child = match Command::new("z3")
-        .arg("-in")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ChcSolveError::Z3Unavailable);
-        }
-        Err(err) => return Err(ChcSolveError::Other(format!("failed to spawn z3: {err}"))),
-    };
-
-    {
-        let mut stdin = child.stdin.take().expect("z3 child should expose stdin");
-        stdin.write_all(smt.as_bytes()).map_err(|e| {
-            ChcSolveError::Other(format!("failed to write SMT-LIB to z3 stdin: {e}"))
-        })?;
-    }
-
-    // Drain stdout/stderr on reader threads (so z3 can't block on a full pipe),
-    // and enforce the deadline on the main thread by polling `try_wait` and
-    // killing the child if it overruns. Retaining the child handle here is what
-    // lets us actually terminate a hung solve rather than leak it.
-    let mut stdout_pipe = child.stdout.take().expect("z3 child should expose stdout");
-    let mut stderr_pipe = child.stderr.take().expect("z3 child should expose stderr");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let timeout = Duration::from_secs(ay_test_timeout_secs());
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(ChcSolveError::Other(format!(
-                        "z3 timed out after {}s",
-                        timeout.as_secs()
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(ChcSolveError::Other(format!("failed waiting on z3: {e}")));
-            }
-        }
-    };
-
-    let stdout_buf = stdout_reader.join().unwrap_or_default();
-    let stderr_buf = stderr_reader.join().unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_buf).trim().to_string();
-    let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
-    let result = stdout.lines().next().unwrap_or("").trim().to_string();
-    if matches!(result.as_str(), "sat" | "unsat" | "unknown") {
-        return Ok(result);
-    }
-    if !status.success() {
-        return Err(ChcSolveError::Other(format!(
-            "z3 exited with status {status}; stdout={stdout:?}; stderr={stderr:?}"
-        )));
-    }
-    if result.is_empty() {
-        return Err(ChcSolveError::Other(format!("z3 returned empty output; stderr={stderr:?}")));
-    }
-    Err(ChcSolveError::Other(format!("z3 returned unexpected verdict {result:?}")))
 }
 
 /// Map a validated portfolio result to an SMT verdict string.
@@ -254,13 +172,18 @@ fn verified_result_to_verdict(result: &ay_chc::VerifiedChcResult) -> &'static st
     }
 }
 
-/// Fallback: solve a CHC problem via ay's production `AdaptivePortfolio` engine
-/// under a hard wall-clock guard. Used only when z3 is unavailable.
+/// Solve a CHC problem via ay's production `AdaptivePortfolio` engine under a
+/// hard wall-clock guard (the CHC half of [`run_ay_on_smt2`]).
 fn run_ay_chc(smt: &str) -> Result<String, String> {
     let problem = ay_chc::ChcParser::parse(smt)
         .map_err(|err| format!("AY failed to parse CHC SMT-LIB: {err}"))?;
 
-    let budget = Duration::from_secs(ay_test_timeout_secs());
+    let budget = Duration::from_secs(
+        std::env::var("TRUST_MC_AY_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(AY_CHC_DEFAULT_TIMEOUT_SECS),
+    );
     let config = ay_chc::AdaptiveConfig::with_budget(budget, false);
 
     // Run the solve on a worker thread so the test runner can enforce a hard

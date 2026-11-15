@@ -321,10 +321,17 @@ pub(super) fn is_selector_named(expr: &Expr, name: &str) -> bool {
     )
 }
 
+/// A struct field read: the `name` selector, or the flattened field variable it folds
+/// to. ay folds a selector over a constructor to the field value (8a7c063209), and a
+/// collection iterator rebuilt from its flattened columns reads as those variables.
+pub(super) fn is_field_read_named(expr: &Expr, name: &str) -> bool {
+    is_selector_named(expr, name) || matches!(expr.value(), ExprValue::Var { .. })
+}
+
 pub(super) fn is_keys_pos_select(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::Select { array, index } => {
-            is_selector_named(array, "fld_keys") && is_selector_named(index, "fld_pos")
+            is_field_read_named(array, "fld_keys") && is_field_read_named(index, "fld_pos")
         }
         _ => false,
     }
@@ -334,7 +341,7 @@ pub(super) fn is_keys_pos_select(expr: &Expr) -> bool {
 pub(super) fn is_present_key_select(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::Select { array, index } => {
-            is_selector_named(array, "fld_present") && is_keys_pos_select(index)
+            is_field_read_named(array, "fld_present") && is_keys_pos_select(index)
         }
         _ => false,
     }
@@ -343,7 +350,7 @@ pub(super) fn is_present_key_select(expr: &Expr) -> bool {
 pub(super) fn is_set_key_select(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::Select { array, index } => {
-            is_selector_named(array, "fld_set") && is_keys_pos_select(index)
+            is_field_read_named(array, "fld_set") && is_keys_pos_select(index)
         }
         _ => false,
     }
@@ -352,7 +359,7 @@ pub(super) fn is_set_key_select(expr: &Expr) -> bool {
 pub(super) fn is_iter_bounds_check(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::BvULt(lhs, rhs) => {
-            is_selector_named(lhs, "fld_pos") && is_selector_named(rhs, "fld_len")
+            is_field_read_named(lhs, "fld_pos") && is_field_read_named(rhs, "fld_len")
         }
         _ => false,
     }
@@ -365,6 +372,16 @@ pub(super) fn is_hashmap_is_member(expr: &Expr) -> bool {
     is_present_key_select(expr)
 }
 
+/// The `pos` of `bvult(pos, len)` is the index of the inner `keys[pos]` select.
+fn membership_indexes_bounded_pos(cond: &Expr, member: &Expr) -> bool {
+    let (ExprValue::BvULt(pos, _), ExprValue::Select { index: key_sel, .. }) =
+        (cond.value(), member.value())
+    else {
+        return false;
+    };
+    matches!(key_sel.value(), ExprValue::Select { index, .. } if index == pos)
+}
+
 pub(super) fn is_hashmap_iter_membership_constraint(expr: &Expr) -> bool {
     match expr.value() {
         ExprValue::Ite { cond, then_expr, else_expr } => {
@@ -372,6 +389,7 @@ pub(super) fn is_hashmap_iter_membership_constraint(expr: &Expr) -> bool {
                 && is_iter_bounds_check(cond)
                 && then_expr.sort().is_bool()
                 && is_hashmap_is_member(then_expr)
+                && membership_indexes_bounded_pos(cond, then_expr)
         }
         _ => false,
     }
@@ -384,6 +402,7 @@ pub(super) fn is_hashset_iter_membership_constraint(expr: &Expr) -> bool {
                 && is_iter_bounds_check(cond)
                 && then_expr.sort().is_bool()
                 && is_set_key_select(then_expr)
+                && membership_indexes_bounded_pos(cond, then_expr)
         }
         _ => false,
     }
@@ -491,6 +510,21 @@ pub(super) fn assert_relation_has_arg_sort(
         in_relations || in_vars,
         "{fn_name}: expected at least one relation with a {sort_desc} argument sort"
     );
+}
+
+/// An array read, or the per-lane scalar that replaced it.
+///
+/// `scalarize_const_index_arrays` rewrites an array whose reads and writes all
+/// use constant indices into one scalar per index, named `{array}_at_0x{idx}_bv{w}`
+/// (`scalarize_arrays::scalarized_cell_name`), and turns a symbolic read over a store chain into
+/// `ite(idx = k, lane_k, ..)`. That is equisatisfiable with the array form, so
+/// a test pinning "the array view survives" must accept either shape.
+pub(super) fn is_array_read_or_scalarized_lane(expr: &Expr) -> bool {
+    match expr.value() {
+        ExprValue::Select { array, .. } => array.sort().is_array(),
+        ExprValue::Var { name } => name.contains("_at_0x"),
+        _ => false,
+    }
 }
 
 /// Assert that at least one rule across all rules contains the given
@@ -785,8 +819,52 @@ pub(super) fn expr_mentions_obj_size_metadata(expr: &Expr) -> bool {
 
 /// True if `name` heads an error obligation: either the aggregate `error`
 /// relation or a per-property `error_p{id}` relation (BSEM-18).
+/// The VC as translated, before the post-translation passes.
+///
+/// `translate` runs orphan/array pruning, const-folding (write-only arrays, read-only
+/// constant arrays), constant-index scalarization, dead-scalar pruning and the
+/// straight-line discharge. Each is equisatisfiable, and together they remove the
+/// stores, selects and transition constraints a structural encoding test looks for.
+/// This builds the same rules the translation emits and stops there.
+pub(super) fn pre_pass_vc(mut chc_ctx: ChcCtx<'_, '_>) -> trust_mc_core::chc::ChcVc {
+    chc_ctx.declare_block_relations();
+    chc_ctx.declare_error_relation();
+    chc_ctx.emit_entry_rule();
+    chc_ctx.generate_transition_rules();
+    chc_ctx.vc
+}
+
 pub(super) fn is_error_head(name: &str) -> bool {
     name == "error" || name.starts_with("error_p")
+}
+
+/// An error-family rule that encodes a check, as opposed to the BSEM-18 bridge
+/// `error_p{id} -> error` that `register_error_head` adds with an empty body.
+/// A check rule's body is a block relation (or none); a bridge's body is an
+/// `error_p{id}` relation. Selecting on `head == "error"` alone finds the bridge.
+pub(super) fn is_error_check_rule(rule: &trust_mc_core::chc::Rule) -> bool {
+    is_error_head(rule.head.name.as_str())
+        && !rule.body.relation.as_ref().is_some_and(|rel| rel.name.as_str().starts_with("error_p"))
+}
+
+/// The head argument that carries state variable `state_idx`.
+///
+/// Block relations are projected onto each block's live columns (frame narrowing
+/// is on by default), so a head's argument position is the index of `state_idx`
+/// within that block's `live_state_indices`, not `state_idx` itself.
+pub(super) fn head_arg_for_state_idx<'a>(
+    chc_ctx: &ChcCtx<'_, '_>,
+    rule: &'a trust_mc_core::chc::Rule,
+    state_idx: usize,
+) -> Option<&'a Expr> {
+    let head_name = rule.head.name.as_str();
+    let bb = chc_ctx
+        .block_relations
+        .iter()
+        .find_map(|(bb, name)| (name.as_ref() == head_name).then_some(*bb))?;
+    let live = chc_ctx.state_var_mgr.live_state_indices.get(bb)?;
+    let pos = live.iter().position(|&idx| idx == state_idx)?;
+    rule.head.args.get(pos)
 }
 
 pub(super) fn vc_error_rules_contain_obj_size_metadata(vc: &trust_mc_core::chc::ChcVc) -> bool {
@@ -871,7 +949,6 @@ pub(super) const Z3_TEST_TIMEOUT_SECS: u64 = 5;
 /// A zero value retains the historical helper's immediate-timeout semantics.
 pub(super) fn z3_test_timeout_secs_or(default_secs: u64) -> u64 {
     std::env::var("TRUST_MC_AY_TEST_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("TRUST_MC_Z3_TEST_TIMEOUT_SECS"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_secs)
@@ -884,7 +961,7 @@ pub(super) struct Z3RunOutput {
     pub status_success: bool,
 }
 
-fn ay_adaptive_config_with_timeout(timeout_secs: u64) -> ay_chc::AdaptiveConfig {
+pub(super) fn ay_adaptive_config_with_timeout(timeout_secs: u64) -> ay_chc::AdaptiveConfig {
     let mut config =
         ay_chc::AdaptiveConfig::with_budget(std::time::Duration::from_secs(timeout_secs), false);
     // Use the AdaptivePortfolio route used by trust-mc's CHC integrations, but
@@ -1185,4 +1262,146 @@ pub(super) fn update_field_val(
         Val::of_value(new_val),
     )
     .map(Val::into_expr)
+}
+
+/// Install the dyn-coercion universe of `instance` for the rest of the
+/// caller's scope, as a per-harness codegen does (design 3, D2:
+/// `kani_middle/dyn_universe.rs`). A body encoded without one treats every
+/// dyn candidate set as possibly incomplete, which no production encoding
+/// sees.
+#[must_use]
+pub(super) fn install_harness_dyn_universe(
+    tcx: TyCtxt<'_>,
+    instance: rustc_public::mir::mono::Instance,
+) -> crate::kani_middle::dyn_universe::HarnessUniverseGuard {
+    let mut transformer = crate::kani_middle::transform::BodyTransformation::new_for_tests();
+    let boundary = crate::codegen_ay::abstraction_boundary::AYAbstractionBoundary::new();
+    let (_items, graph) = crate::kani_middle::reachability::collect_reachable_items(
+        tcx,
+        &mut transformer,
+        &[rustc_public::mir::mono::MonoItem::Fn(instance)],
+        &boundary,
+    );
+    crate::kani_middle::dyn_universe::HarnessUniverseGuard::install(std::sync::Arc::new(
+        graph.dyn_universe,
+    ))
+}
+
+/// The short name of a static: the last segment of its path. `rustc_public`'s
+/// `StaticDef::name()` is crate-qualified (`testcrate_4::FOO`), and the test
+/// crate's name carries a per-run counter.
+pub(super) fn static_short_name(def: rustc_public::mir::mono::StaticDef) -> String {
+    let name = def.name();
+    name.rsplit("::").next().unwrap_or(&name).to_string()
+}
+
+/// The locals a body assigns a constant pointer to a static (`_N = const &S`,
+/// `&raw const S`, `&raw mut S`), keyed by the static's SHORT name
+/// ([`static_short_name`]). The pointer is the relocation at the constant's
+/// own byte 0 (`shared::const_pointer`); the first assignment wins.
+///
+/// The three static test files each spelled this lookup by the crate-qualified
+/// `name()`, so `get("FOO")` found nothing and ten tests failed on their own
+/// helper before reaching what they test.
+pub(super) fn referenced_static_locals(
+    body: &rustc_public::mir::Body,
+) -> std::collections::HashMap<String, usize> {
+    use crate::codegen_ay::shared::const_pointer::{self, ConstRead, ConstTarget};
+    use rustc_public::mir::{Rvalue, StatementKind};
+
+    let mut locals = std::collections::HashMap::new();
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(lhs, Rvalue::Use(Operand::Constant(c), ..)) = &stmt.kind
+            else {
+                continue;
+            };
+            let Some(ptr) =
+                const_pointer::const_bytes(&c.const_).and_then(|bytes| bytes.stored_pointer(0))
+            else {
+                continue;
+            };
+            let ConstTarget::Static(def) = ptr.kind() else { continue };
+            locals.entry(static_short_name(def)).or_insert(lhs.local);
+        }
+    }
+    locals
+}
+
+/// The state-variable form of the shared name helpers
+/// (`codegen_ay::test_support`); see [`static_short_name`] for the path form.
+pub(super) use crate::codegen_ay::test_support::is_static_state_var;
+
+/// Whether `text` spells a constructor of `variant` on an instantiation of one
+/// of `def_paths` whose sort name ends with `args_suffix` (`""`: any
+/// arguments). An enum constructor is `{variant}_{sort}`, and the sort is named
+/// by the definition's path (`names::adt_sort_name`), so this recognizes it by
+/// identity: `Yielded_std_ops_CoroutineState_i32_i32` is a `Yielded` of
+/// `CoroutineState<i32, i32>`; `Yielded_field_0` is not a constructor of it.
+pub(super) fn spells_variant_ctor(
+    text: &str,
+    variant: &str,
+    def_paths: &[&str],
+    args_suffix: &str,
+) -> bool {
+    let prefix = format!("{variant}_");
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(|token| token.strip_prefix(prefix.as_str()))
+        .any(|sort| names::adt_sort_is(sort, def_paths) && sort.ends_with(args_suffix))
+}
+
+/// `core::ops::CoroutineState`, as rustc prints it with and without `std`.
+pub(super) const COROUTINE_STATE: &[&str] =
+    &["std::ops::CoroutineState", "core::ops::CoroutineState"];
+
+#[test]
+fn spells_variant_ctor_reads_the_sort_identity() {
+    let smt = "(= x (Yielded_std_ops_CoroutineState_i32_i32 Yielded_field_0))";
+    assert!(spells_variant_ctor(smt, "Yielded", COROUTINE_STATE, "_i32_i32"));
+    assert!(spells_variant_ctor(smt, "Yielded", COROUTINE_STATE, ""));
+    assert!(!spells_variant_ctor(smt, "Yielded", COROUTINE_STATE, "_u8_u8"));
+    assert!(!spells_variant_ctor(smt, "Complete", COROUTINE_STATE, ""));
+    assert!(!spells_variant_ctor(
+        "Yielded_testcrate_1_CoroutineState",
+        "Yielded",
+        COROUTINE_STATE,
+        ""
+    ));
+    assert!(!spells_variant_ctor("Some_std_option_Option_bool", "Some", COROUTINE_STATE, ""));
+}
+
+/// What a translation step booked, read before and after it by
+/// [`assert_precise_up_to_attributed_havocs`].
+pub(super) struct Bookings {
+    fail_closed: usize,
+    havocs: usize,
+    accounted: usize,
+}
+
+pub(super) fn bookings(ctx: &ChcCtx<'_, '_>) -> Bookings {
+    Bookings {
+        fail_closed: ctx.diagnostics.place_translation_drop.get(),
+        havocs: ctx.diagnostics.sound_havoc_drop.get(),
+        accounted: ctx.vc.accounted_approximations
+            + ctx.deferred_approximation_identities.borrow().len(),
+    }
+}
+
+/// The step stayed on its precise path: it booked no fail-closed fallback, and
+/// every value it left uncomputed (Rule E: `Havoc::mint`, an audited reason)
+/// carries its identity, so a counterexample that does not read one can still
+/// be certified. A step that leaves no value uncomputed passes too; one that
+/// fell back, or minted a havoc without its identity, fails.
+pub(super) fn assert_precise_up_to_attributed_havocs(
+    ctx: &ChcCtx<'_, '_>,
+    before: &Bookings,
+    what: &str,
+) {
+    let after = bookings(ctx);
+    assert_eq!(after.fail_closed, before.fail_closed, "{what}: a fail-closed fallback was booked");
+    assert_eq!(
+        after.havocs - before.havocs,
+        after.accounted - before.accounted,
+        "{what}: a sound havoc was booked without its identity"
+    );
 }

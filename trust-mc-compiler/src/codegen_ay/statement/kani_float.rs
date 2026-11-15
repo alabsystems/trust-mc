@@ -14,7 +14,8 @@ use rustc_public::ty::{GenericArgKind, GenericArgs, RigidTy, TyKind};
 use tracing::debug;
 
 use super::StatementCodegen;
-use crate::codegen_ay::float_range_check::eval_float_in_int_range;
+use super::cast_float::{float_ty_width, int_ty_width_signedness};
+use crate::codegen_ay::float_range_check::{eval_float_in_int_range, float_to_int_in_range_expr};
 use crate::codegen_ay::types::{bool_sort, int_ty_to_bitvec_width, uint_ty_to_bitvec_width};
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -78,7 +79,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 debug!("codegen_float_to_int_in_range: couldn't extract generic types");
                 let name = self.ctx.fresh_name("ay_float_in_range");
                 let expr = self.ctx.declare_var(&name, bool_sort());
-                self.ctx.record_kani_any_var(expr.clone());
+                self.ctx.bmc_sound_havoc("float_to_int_in_range_no_generics");
+                self.ctx.record_unreplayable_playback_value(
+                    expr.clone(),
+                    self.current_path_condition.clone(),
+                );
+                // A free boolean explores both answers, so a proof over it holds;
+                // a counterexample may read the wrong answer and must not be
+                // certified Genuine.
+                self.ctx.bmc_sound_havoc("float_to_int_in_range_fresh_bool");
                 self.env_update(base_name, expr);
                 return;
             };
@@ -97,14 +106,39 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
-        // Symbolic fallback: fresh symbolic boolean (sound over-approximation).
-        // Precise symbolic constraints require FP rounding modes (#1397).
+        // Non-literal operand: encode the predicate exactly. Before this, any
+        // operand that was not a MIR literal (`let f: f32 = 5.6; ...(f)`) got a
+        // free boolean, which failed true claims about the intrinsic.
+        if let Some(operand) = args.first()
+            && let Some(float_width) = float_ty_width(float_ty)
+            && let Some((int_width, int_signed)) = int_ty_width_signedness(int_ty)
+            && let Some(value) = self.codegen_operand(operand)
+            && value.sort().bitvec_width() == Some(float_width)
+            && let Some(result) = float_to_int_in_range_expr(&value, int_width, int_signed)
+        {
+            debug!(
+                "codegen_float_to_int_in_range: {:?} -> {:?}, exact bitvector predicate",
+                float_ty, int_ty
+            );
+            self.env_update(base_name, result);
+            return;
+        }
+
+        // Fallback when the operand does not codegen to a float bitvector:
+        // fresh symbolic boolean. That over-approximation keeps a proof valid
+        // but can manufacture a counterexample, so it taints the certificate
+        // (SAT only; an UNSAT result stays a clean proof).
         let name = self.ctx.fresh_name("ay_float_in_range");
         let result = self.ctx.declare_var(&name, bool_sort());
-        self.ctx.record_kani_any_var(result.clone());
+        self.ctx.bmc_sound_havoc("float_to_int_in_range");
+        self.ctx.record_unreplayable_playback_value(
+            result.clone(),
+            self.current_path_condition.clone(),
+        );
+        self.ctx.bmc_sound_havoc("float_to_int_in_range_fresh_bool");
 
         debug!(
-            "codegen_float_to_int_in_range: {:?} -> {:?}, using symbolic bool (FP theory not available)",
+            "codegen_float_to_int_in_range: {:?} -> {:?}, symbolic bool fallback",
             float_ty, int_ty
         );
 

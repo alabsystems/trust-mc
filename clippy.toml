@@ -1,7 +1,18 @@
 # Clippy configuration for trust-mc
 #
-# This file lives in the repo root and is loaded by cargo/clippy.
-# Run: cargo clippy --all-targets
+# This file lives in the repo root and is loaded by targo tippy.
+# Run: targo tippy --workspace --all-targets --exclude trust-mc-compiler
+#        --exclude trust-mc-engine --exclude trust-mc-backend --exclude scanner
+#        --exclude trust-mc-kani-types --exclude trust-mc-codegen-shared
+#        --exclude trust-mc-codegen-types
+# (2026-09-28, seal 9192: exit 0, warnings only.) The seven rustc_private
+# crates are excluded because tippy lints them only through its
+# TRUST_TIPPY_RUSTC_PRIVATE_HOST_DIR/_TARGET_DIR overlay, which it accepts only
+# from a Trust bootstrap build tree (a `rustc-private-sysroots` root beside the
+# stage sysroot) and allowlists for five of them (not trust_mc_engine or
+# rustc_codegen_trust_mc): a sealed toolchain supplies none (tippy 321aaeda7,
+# src/tools/tippy/src/rustc_private_overlay.rs). They are type-checked by
+# `targo --unverified check --workspace --all-targets` instead.
 #
 # Note: lint levels (warn/deny) are configured in Cargo.toml [workspace.lints.*]
 # This file only contains clippy threshold/behavior settings.

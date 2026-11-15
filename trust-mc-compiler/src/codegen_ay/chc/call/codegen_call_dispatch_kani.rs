@@ -14,6 +14,7 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_fn_inline::CallDispatchFnInline;
 use super::codegen_call_kani::CallKani;
+use super::codegen_call_kani_any_vec::CallKaniAnyVec;
 use super::codegen_call_kani_model::CallKaniModel;
 use crate::kani_middle::kani_functions::{KaniHook, KaniModel};
 use rustc_public::ty::{FloatTy, IntTy, RigidTy, TyKind, UintTy};
@@ -42,6 +43,12 @@ impl<'tcx, 'body> CallDispatchKani for ChcCtx<'tcx, 'body> {
         // Kani models: any()
         if let Some(kani_model) = self.detect_kani_model(dcx.func) {
             self.codegen_call_kani_model(dcx, kani_model);
+            return true;
+        }
+
+        // `kani::vec::{any_vec, exact_vec}`: native Vec model. The library body
+        // runs through RawVecInner / Layout internals the walker cannot inline.
+        if self.try_dispatch_kani_vec_ctor(dcx) {
             return true;
         }
 

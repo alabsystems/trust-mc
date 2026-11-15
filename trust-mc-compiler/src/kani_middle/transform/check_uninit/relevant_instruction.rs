@@ -159,6 +159,10 @@ impl MemoryInitOp {
                     Operand::Constant(_) => unreachable!(
                         "SetRef/CheckRef/CreateUnion/LoadArgument/StoreArgument operand must be Copy or Move, not Constant"
                     ),
+                    #[cfg(trust_toolchain)]
+                    Operand::RuntimeChecks(_) => unreachable!(
+                        "SetRef/CheckRef/CreateUnion/LoadArgument/StoreArgument operand must be Copy or Move, not RuntimeChecks"
+                    ),
                 };
                 let rvalue = Rvalue::AddressOf(RawPtrKind::Const, place.clone());
                 rvalue.ty(body.locals()).expect("operand should have type")
@@ -329,11 +333,18 @@ fn mk_ref(
             Operand::Constant(_) => {
                 unreachable!("mk_ref requires a place operand (Copy or Move), not Constant")
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {
+                unreachable!("mk_ref requires a place operand (Copy or Move), not RuntimeChecks")
+            }
         };
         let rvalue = Rvalue::AddressOf(RawPtrKind::Const, place.clone());
         let ret_ty = rvalue.ty(body.locals()).expect("operand should have type");
         let result = body.new_local(ret_ty, span, Mutability::Not);
-        let stmt = Statement { kind: StatementKind::Assign(Place::from(result), rvalue), span };
+        let stmt = crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(result), rvalue),
+            span,
+        );
         statements.push(stmt);
         result
     };

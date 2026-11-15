@@ -125,6 +125,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 KaniFunction::Hook(KaniHook::UnsupportedCheck) => {
                     self.record_violation_guarded(Expr::bool_const(true), "unsupported_check");
+                    // The forced failure reports missing encoding support;
+                    // it cannot certify a counterexample to the program.
+                    self.ctx.bmc_sound_havoc("kani_unsupported_construct_check");
                     CallDispatchOutcome::from_handled_target(target)
                 }
                 KaniFunction::Hook(KaniHook::SafetyCheck) => {
@@ -194,6 +197,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 KaniFunction::Model(KaniModel::Any)
                 | KaniFunction::Intrinsic(KaniIntrinsic::AnyModifies) => {
+                    if matches!(kani_fn, KaniFunction::Model(KaniModel::Any)) {
+                        self.bmc_kani_any_unwinding_check(destination);
+                    }
                     self.codegen_kani_any_raw(destination);
                     CallDispatchOutcome::from_handled_target(target)
                 }
@@ -230,10 +236,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let ptr_expr = if !args.is_empty() {
                         self.codegen_operand(&args[0]).unwrap_or_else(|| {
                             let name = self.ctx.fresh_name("ay_is_alloc_ptr");
+                            self.ctx.bmc_sound_havoc("kani_is_allocated_ptr");
                             self.ctx.declare_var(&name, ptr_sort())
                         })
                     } else {
                         let name = self.ctx.fresh_name("ay_is_alloc_ptr");
+                        self.ctx.bmc_sound_havoc("kani_is_allocated_ptr");
                         self.ctx.declare_var(&name, ptr_sort())
                     };
 
@@ -252,10 +260,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let ptr_expr = if !args.is_empty() {
                         self.codegen_operand(&args[0]).unwrap_or_else(|| {
                             let name = self.ctx.fresh_name("ay_ptr_obj_arg");
+                            self.ctx.bmc_sound_havoc("kani_pointer_object_ptr");
                             self.ctx.declare_var(&name, ptr_sort())
                         })
                     } else {
                         let name = self.ctx.fresh_name("ay_ptr_obj_arg");
+                        self.ctx.bmc_sound_havoc("kani_pointer_object_ptr");
                         self.ctx.declare_var(&name, ptr_sort())
                     };
 
@@ -271,10 +281,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let ptr_expr = if !args.is_empty() {
                         self.codegen_operand(&args[0]).unwrap_or_else(|| {
                             let name = self.ctx.fresh_name("ay_ptr_off_arg");
+                            self.ctx.bmc_sound_havoc("kani_pointer_offset_ptr");
                             self.ctx.declare_var(&name, ptr_sort())
                         })
                     } else {
                         let name = self.ctx.fresh_name("ay_ptr_off_arg");
+                        self.ctx.bmc_sound_havoc("kani_pointer_offset_ptr");
                         self.ctx.declare_var(&name, ptr_sort())
                     };
 
@@ -301,7 +313,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 KaniFunction::Model(KaniModel::PtrOffsetFrom) => {
                     debug!("codegen KaniModel::PtrOffsetFrom");
-                    CallDispatchOutcome::from_handled_target(self.codegen_ptr_offset_from(
+                    CallDispatchOutcome::from_fallthrough_result(self.codegen_ptr_offset_from(
                         args,
                         destination,
                         target,
@@ -310,7 +322,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 KaniFunction::Model(KaniModel::PtrOffsetFromUnsigned) => {
                     debug!("codegen KaniModel::PtrOffsetFromUnsigned");
-                    CallDispatchOutcome::from_handled_target(self.codegen_ptr_offset_from(
+                    CallDispatchOutcome::from_fallthrough_result(self.codegen_ptr_offset_from(
                         args,
                         destination,
                         target,
@@ -324,7 +336,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // IntoIter::next() which uses ptr::offset to advance the
                     // read pointer.
                     debug!("codegen KaniModel::Offset");
-                    CallDispatchOutcome::from_handled_target(self.codegen_model_offset(
+                    CallDispatchOutcome::from_fallthrough_result(self.codegen_model_offset(
                         args,
                         destination,
                         target,
@@ -353,7 +365,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
                 KaniFunction::Model(KaniModel::WriteAnySlim) => {
                     if !self.codegen_kani_write_any_slim(args) {
-                        let location = format!("{:?} ({:?})", term.span, kani_fn);
+                        let location = format!("{:?} ({:?})", mir_span!(term), kani_fn);
                         self.ctx.unsupported_with_fallback("trust_mc intrinsic", location);
                     }
                     CallDispatchOutcome::from_handled_target(target)
@@ -374,7 +386,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             )
                         });
                     if is_dst || !self.codegen_kani_write_any_slim(args) {
-                        let location = format!("{:?} ({:?})", term.span, kani_fn);
+                        let location = format!("{:?} ({:?})", mir_span!(term), kani_fn);
                         self.ctx.unsupported_with_fallback("trust_mc intrinsic", location);
                     }
                     CallDispatchOutcome::from_handled_target(target)
@@ -384,7 +396,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     if self.codegen_kani_bounded_quantifier(func, args, destination, is_forall) {
                         debug!(is_forall, "BMC kani quantifier hook -> unrolled expression");
                     } else {
-                        let location = format!("{:?} ({:?})", term.span, kani_fn);
+                        let location = format!("{:?} ({:?})", mir_span!(term), kani_fn);
                         self.ctx.unsupported_with_fallback("trust_mc intrinsic", location);
                     }
                     CallDispatchOutcome::from_handled_target(target)
@@ -426,7 +438,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 | KaniFunction::Model(KaniModel::WriteAnySlice)
                 | KaniFunction::Model(KaniModel::WriteAnyStr)
                 | KaniFunction::Intrinsic(KaniIntrinsic::AutomaticHarness) => {
-                    let location = format!("{:?} ({:?})", term.span, kani_fn);
+                    let location = format!("{:?} ({:?})", mir_span!(term), kani_fn);
                     self.ctx.unsupported_with_fallback("trust_mc intrinsic", location);
                     CallDispatchOutcome::from_handled_target(target)
                 }
@@ -471,7 +483,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return None;
                         }
                         match rhs {
-                            Rvalue::Use(c @ Operand::Constant(_)) => found = Some(c.clone()),
+                            Rvalue::Use(c @ Operand::Constant(_), ..) => found = Some(c.clone()),
                             _ => return None,
                         }
                     }
@@ -540,6 +552,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let Some(closure_body) = resolve_quantifier_closure_body(func, &caller_locals) else {
             return false;
         };
+        // Trust: the CHC translator fails `Rvalue::Reborrow` closed by recording
+        // a reason on `chc_ctx`, a helper context whose reasons never reach this
+        // harness's verdict. Decline instead, here and after translation (a
+        // `Reborrow` in an inlined callee), so the caller's
+        // `unsupported_with_fallback` demotes the verdict (`chc::trust_reborrow`).
+        #[cfg(trust_toolchain)]
+        if crate::codegen_ay::chc::body_has_reborrow(&closure_body) {
+            return false;
+        }
         let captures = self.extract_bmc_quantifier_captures(&args[2]);
 
         let mut chc_ctx = ChcCtx::new(
@@ -566,6 +587,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if let Some(guard) = no_panic_guard {
                 safety_guards.push(guard);
             }
+        }
+        #[cfg(trust_toolchain)]
+        if chc_ctx.recorded_reborrow_unsupported() {
+            return false;
         }
 
         let quantifier_result = if predicates.is_empty() {

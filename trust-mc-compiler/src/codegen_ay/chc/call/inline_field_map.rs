@@ -10,6 +10,10 @@
 //! Part of #3241: neutral home for generic inline infrastructure extracted
 //! from `codegen_call_virtual_inline`.
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{Operand, ProjectionElem};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -22,7 +26,7 @@ use super::codegen_call_ptr_identity::trace_pointer_identity_ref_target;
 use super::codegen_decl_flatten::collect_leaf_sorts;
 use super::codegen_types::CodegenTypes;
 use super::inline_field_map_reconstruct::try_reconstruct_adt_from_scalar_loads;
-use crate::codegen_ay::chc::{UNDEF_COUNTER, declare_pending_var};
+use crate::codegen_ay::chc::UNDEF_COUNTER;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 // Re-export for external consumers.
@@ -93,6 +97,41 @@ fn resolve_flattened_self_source_local<'tcx, 'body>(
 /// Part of #3159: Fixes Box<dyn Trait> dispatch for primitive implementors.
 pub(in crate::codegen_ay::chc) const DIRECT_DEREF_FIELD: usize = usize::MAX;
 
+/// Sentinel field index holding the parameter term the self-field map was
+/// built from. A read through the map for a local whose term is no longer that
+/// term (the local was rebound: a plain reassignment, a W2 write, an alias
+/// write-back) is served from a stale snapshot and fails closed
+/// (`inline_walk_guard.rs`, `walker_self_field_map_stale`).
+pub(in crate::codegen_ay::chc) const SELF_FIELD_MAP_ROOT_TERM: usize = usize::MAX - 1;
+
+/// Name prefix of the value a self-field entry gets when the builder could not
+/// load the field. It used to be the field's ADDRESS, read as its value; it is
+/// now a fresh value, and a read of it fails closed
+/// (`walker_self_field_unloaded`).
+const UNLOADED_SELF_FIELD_PREFIX: &str = "__walker_self_field_unloaded";
+
+/// Whether `entry` is the placeholder of a self-field the builder could not
+/// load.
+pub(in crate::codegen_ay::chc) fn is_unloaded_self_field_entry(entry: &Expr) -> bool {
+    matches!(
+        entry.value(),
+        ay_bindings::ExprValue::Var { name } if name.starts_with(UNLOADED_SELF_FIELD_PREFIX)
+    )
+}
+
+/// A fresh placeholder for a self-field of type `field_ty` the builder could
+/// not load (see [`UNLOADED_SELF_FIELD_PREFIX`]).
+fn unloaded_self_field_entry(field_ty: rustc_public::ty::Ty, addr: &Expr) -> Expr {
+    let sort = ChcCtx::translate_ty(field_ty).unwrap_or_else(|| addr.sort().clone());
+    ExactVar::unobserved(
+        format!(
+            "{UNLOADED_SELF_FIELD_PREFIX}_{}",
+            UNDEF_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        sort,
+    )
+}
+
 /// Build a map of (self_local, field_idx) → Expr for memory-backed field access.
 ///
 /// When the self parameter (local 1) is BV64 (a pointer), the method body
@@ -107,6 +146,12 @@ pub(in crate::codegen_ay::chc) fn build_self_field_map<'tcx, 'body>(
     body: &rustc_public::mir::Body,
     params: &[Expr],
 ) -> HashMap<(usize, usize), Expr> {
+    // Exact native drop loads are made at the actual MIR read, against the
+    // current memory expression. An eager field-map would cache entry values.
+    if ctx.native_drop_memory.is_some() {
+        ctx.inline_self_field_hints = None;
+        return HashMap::new();
+    }
     let mut map = ctx.inline_self_field_hints.take().unwrap_or_default();
     if !map.is_empty() {
         debug!(
@@ -132,6 +177,13 @@ pub(in crate::codegen_ay::chc) fn build_self_field_map<'tcx, 'body>(
             field_count = map.len(),
             "virtual inline: built memory-backed field map for inline params"
         );
+        // F1 (inline_walk_guard.rs): the entries were read from memory or the
+        // host's state at this walk's entry; after a write since the outermost
+        // walk mark they may be stale.
+        ctx.note_inline_walk_memory_read();
+        if let Some(self_expr) = params.first() {
+            map.insert((1, SELF_FIELD_MAP_ROOT_TERM), self_expr.clone());
+        }
     }
 
     debug!(entries = map.len(), "build_self_field_map: complete");
@@ -139,7 +191,35 @@ pub(in crate::codegen_ay::chc) fn build_self_field_map<'tcx, 'body>(
     map
 }
 
+/// Read the fields of the receiver `param_expr` points at into `map`, ahead
+/// of the body (`build_self_field_map`).
+///
+/// These reads are eager: every field of the pointee type is read, whether
+/// the body reads it or not, at whatever address the receiver term holds. A
+/// dispatch candidate that is not the runtime type is walked too, and its
+/// fields are read at the runtime object's address (a `Box<DV>` read as a
+/// `DA`, whose array field runs past the two bytes of a `DV`), and a walked
+/// `<Box<dyn FnMut> as FnMut>::call_mut` read the 16-byte `Unique<dyn FnMut>`
+/// field at the 8-byte box payload. So these accesses take no bound through a
+/// symbolic object lane (`preloading_self_fields`): bounding them certified
+/// nothing and cost proofs (`test_unsize_after_box_new_is_not_a_field_store`,
+/// `test_box_new_dyn_fn_mut_promoted_ref_solver_produces_proof`, review of
+/// lostwrite round 1). A field the body reads through the map is not
+/// bounds-checked at a symbolic lane, as before that round; a scalar field
+/// never was, at any lane.
 fn extend_field_map_for_param<'tcx, 'body>(
+    ctx: &mut ChcCtx<'tcx, 'body>,
+    body: &rustc_public::mir::Body,
+    local_idx: usize,
+    param_expr: &Expr,
+    map: &mut HashMap<(usize, usize), Expr>,
+) {
+    let preloading = std::mem::replace(&mut ctx.heap_state.preloading_self_fields, true);
+    extend_field_map_for_param_eagerly(ctx, body, local_idx, param_expr, map);
+    ctx.heap_state.preloading_self_fields = preloading;
+}
+
+fn extend_field_map_for_param_eagerly<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     body: &rustc_public::mir::Body,
     local_idx: usize,
@@ -161,6 +241,19 @@ fn extend_field_map_for_param<'tcx, 'body>(
         TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => ctx.resolve_body_ty(inner),
         _ => return,
     };
+    // A THIN pointer's term is pointer-width. A wider bitvector bound to a
+    // reference to a sized type is the referent's VALUE (references are
+    // transparent), a packed one such as `Layout`'s `bv128 = concat(size,
+    // align)`: reading its low half as the self pointer loaded the fields
+    // from an unrelated address, and a `__rust_dealloc` check over them was
+    // certified on those bits (package round 2 item e). No memory-backed map
+    // for it; the walk reads the value.
+    if param_expr.sort().bitvec_width().is_some_and(|width| width != POINTER_WIDTH)
+        && pointee_ty.layout().ok().is_some_and(|layout| !layout.shape().is_unsized())
+    {
+        debug!(local_idx, "build_self_field_map: wide value for a thin pointer — no memory map");
+        return;
+    }
 
     // Fix A (UnsizedCoercion basic_inner): only reuse a flattened local's whole
     // layout when its type actually matches the callee's `self` pointee type.
@@ -214,7 +307,12 @@ fn extend_field_map_for_param<'tcx, 'body>(
         // arrays as read, preventing the pruner from eliminating them.
         if ctx.should_stub_spawn_type_array(&type_key) {
             let elem_sort = ctx.elem_sort_for_memory_array(pointee_ty);
-            let sym = declare_pending_var(
+            // The same booking as the load lane's stub read
+            // (`load_from_type_array`): this path bypassed it and minted the
+            // stub value unbooked.
+            let booked = ctx.record_sound_fallback_reason("spawn_type_array_load_stub");
+            let sym = Havoc::booked(
+                booked,
                 format!(
                     "__spawn_stub_field_{}",
                     UNDEF_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -254,11 +352,15 @@ fn extend_field_map_for_param<'tcx, 'body>(
             // producing unconstrained field_select free variables. The
             // per-field loads below are sufficient and more precise.
             // The old code (pre-9ef17cceb1) did not have this insertion.
-            variants[0]
+            let Some(tys) = variants[0]
                 .fields()
                 .iter()
-                .map(|field| ctx.resolve_body_ty(field.ty_with_args(&args)))
-                .collect::<Vec<_>>()
+                .map(|field| mono_ty::field_ty(field, &args).map(|t| ctx.resolve_body_ty(t)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return;
+            };
+            tys
         }
         TyKind::RigidTy(RigidTy::Tuple(elems)) => {
             // Part of #4132: Do NOT add DIRECT_DEREF_FIELD for Tuples via
@@ -350,12 +452,12 @@ fn extend_field_map_for_param<'tcx, 'body>(
                 map.insert((local_idx, field_idx), loaded);
                 continue;
             }
-            map.insert((local_idx, field_idx), addr);
+            map.insert((local_idx, field_idx), unloaded_self_field_entry(*field_ty, &addr));
             continue;
         }
 
         let Some(type_key) = scalar_type_key(*field_ty) else {
-            map.insert((local_idx, field_idx), addr);
+            map.insert((local_idx, field_idx), unloaded_self_field_entry(*field_ty, &addr));
             continue;
         };
         let elem_sort = ctx.elem_sort_for_memory_array(*field_ty);
@@ -573,14 +675,30 @@ fn flattened_self_field_hints_for_target<'tcx, 'body>(
                     )
                 })
                 .collect();
-            if let Some(sub_exprs) = sub_exprs {
-                let constructed = Expr::datatype_constructor(
+            // Each inner field is read from exactly ONE flattened slot at
+            // `slot_offset + sub_idx`, which is only the right slot when every inner
+            // field is a single leaf. A nested multi-leaf field (IndexRange, Slice,
+            // Vec) would pair slots with the wrong fields; the hint is optional, so
+            // skip it rather than build an ill-sorted or mis-paired term.
+            let single_leaf_fields =
+                cons.fields.iter().all(|sub| collect_leaf_sorts(&sub.sort, 0).len() == 1);
+            if single_leaf_fields && let Some(sub_exprs) = sub_exprs {
+                match Expr::try_datatype_constructor(
                     &inner_dt.name,
                     &cons.name,
                     sub_exprs,
                     field.sort.clone(),
-                );
-                hints.insert((self_local, field_idx), constructed);
+                ) {
+                    Ok(constructed) => {
+                        hints.insert((self_local, field_idx), constructed);
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            ?err,
+                            "flattened self field hint: constructor signature mismatch; skipping hint"
+                        );
+                    }
+                }
             }
         }
         slot_offset += leaf_count;

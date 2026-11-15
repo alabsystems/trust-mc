@@ -166,9 +166,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // In BMC mode, BigInt may be encoded as a Datatype rather than Int.
             // This handles the conversion to avoid ITE sort mismatch panic.
             (SortInner::Datatype(dt), SortInner::Int)
-                if dt.name.contains("BigInt")
-                    || dt.name.contains("BigUint")
-                    || dt.name.contains("Ratio") =>
+                if crate::codegen_ay::names::is_bignum_sort_name(&dt.name) =>
             {
                 // Part of #2267: pre-allocate instead of format!().
                 let make_fresh_int = |reason: &str| {

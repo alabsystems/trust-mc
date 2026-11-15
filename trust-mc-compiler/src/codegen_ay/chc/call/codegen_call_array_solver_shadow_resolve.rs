@@ -101,7 +101,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             current = target.local;
                             found = true;
                         }
-                        rustc_public::mir::Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                        rustc_public::mir::Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                             if p.projection.is_empty() =>
                         {
                             current = p.local;

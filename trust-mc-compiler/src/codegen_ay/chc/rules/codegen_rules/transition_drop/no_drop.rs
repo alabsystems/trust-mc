@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
 
 use crate::codegen_ay::chc::ChcCtx;
+use crate::codegen_ay::shared::mono_ty;
 
 /// Returns true when ALL concrete dyn-trait candidates for this dyn type are
 /// trivially no-drop. Used to suppress sound-fallback recording when the
@@ -173,9 +176,6 @@ fn adt_no_drop_with<F>(
 where
     F: Fn(rustc_public::ty::Ty) -> bool,
 {
-    use rustc_public::mir::mono::Instance;
-    use rustc_public::ty::TyKind;
-
     // Part of #3348: Collection types have Drop impls that only deallocate
     // heap memory — no program-visible side effects in CHC mode.
     // Part of #3589: Rc/Arc drops only decrement refcount and deallocate.
@@ -225,13 +225,11 @@ where
         return true;
     }
 
-    // Part of #3942: If the type still has unresolved generic params (e.g.,
-    // `MaybeUninit<[u8; BYTES/#0]>` from cross-function const generics),
-    // `resolve_drop_in_place` triggers a rustc ICE. Conservatively return false.
-    if ty_has_unresolved_params(ty) {
-        return false;
-    }
-    if !Instance::resolve_drop_in_place(ty).is_empty_shim() {
+    // Part of #3942 and Rule A: a type that still names a parameter (e.g.
+    // `MaybeUninit<[u8; BYTES/#0]>` from cross-function const generics, or a
+    // projection of one) has no drop glue rustc can resolve; conservatively
+    // not no-drop (`shared::mono_ty::drop_in_place` refuses it).
+    if !mono_ty::drop_in_place(ty).is_some_and(|glue| glue.is_empty_shim()) {
         return false;
     }
 
@@ -245,22 +243,13 @@ where
     // dealloc-only Drop impls are caught by the allowlist above.
     let variants = def.variants();
     variants.iter().all(|variant| {
-        // Part of #3589: f.ty() returns unsubstituted generic types (e.g., `T`
-        // not `dyn Identity` for `Outer<dyn Identity>`). Resolve ParamTy first.
+        // Part of #3589 and Rule A (`shared::mono_ty::field_ty`): each field's
+        // type at the ADT's own arguments (`dyn Identity`, not `T`, for
+        // `Outer<dyn Identity>`); a field whose type does not instantiate is
+        // not no-drop (fail closed).
         variant.fields().iter().all(|f| {
-            let field_ty = f.ty();
-            let resolved = if let TyKind::Param(param) = field_ty.kind() {
-                args.0
-                    .get(param.index as usize)
-                    .and_then(|ga| match ga {
-                        rustc_public::ty::GenericArgKind::Type(t) => Some(*t),
-                        _ => None,
-                    })
-                    .unwrap_or(field_ty)
-            } else {
-                field_ty
-            };
-            ty_no_drop_rec_with(resolved, depth + 1, dyn_ty_is_no_drop)
+            mono_ty::field_ty(f, &args)
+                .is_some_and(|resolved| ty_no_drop_rec_with(resolved, depth + 1, dyn_ty_is_no_drop))
         })
     })
 }
@@ -288,29 +277,4 @@ pub(super) fn is_box_with_dyn_inner(ty: rustc_public::ty::Ty) -> bool {
         }
     }
     false
-}
-
-/// Returns true if the type contains unresolved generic params (type or const).
-/// Part of #3942: prevents rustc ICE when `resolve_drop_in_place` encounters
-/// types like `MaybeUninit<[u8; BYTES/#0]>` from cross-function const generics.
-fn ty_has_unresolved_params(ty: rustc_public::ty::Ty) -> bool {
-    use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
-    match ty.kind() {
-        TyKind::Param(_) => true,
-        TyKind::RigidTy(RigidTy::Array(elem, len)) => {
-            ty_has_unresolved_params(elem) || matches!(len.kind(), TyConstKind::Param(_))
-        }
-        TyKind::RigidTy(RigidTy::Slice(elem)) => ty_has_unresolved_params(elem),
-        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => ty_has_unresolved_params(pointee),
-        TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => ty_has_unresolved_params(pointee),
-        TyKind::RigidTy(RigidTy::Tuple(fields)) => {
-            fields.iter().any(|f| ty_has_unresolved_params(*f))
-        }
-        TyKind::RigidTy(RigidTy::Adt(_, ref args)) => args.0.iter().any(|arg| match arg {
-            GenericArgKind::Type(arg_ty) => ty_has_unresolved_params(*arg_ty),
-            GenericArgKind::Const(c) => matches!(c.kind(), TyConstKind::Param(_)),
-            _ => false,
-        }),
-        _ => false,
-    }
 }

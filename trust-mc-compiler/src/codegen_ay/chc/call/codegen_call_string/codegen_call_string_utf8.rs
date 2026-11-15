@@ -163,7 +163,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                             if src.projection.is_empty() =>
                         {
@@ -171,8 +171,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             found_source = true;
                             break;
                         }
-                        Rvalue::Use(Operand::Constant(const_op)) => {
-                            return Self::bytes_from_mir_const(&const_op.const_, expected_len);
+                        Rvalue::Use(Operand::Constant(const_op), ..) => {
+                            return self.bytes_from_mir_const(&const_op.const_, expected_len);
                         }
                         Rvalue::Ref(_, _, ref_place) if ref_place.projection.is_empty() => {
                             current = ref_place.local;
@@ -193,42 +193,38 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
-    /// Extract raw bytes from a MIR constant allocation.
+    /// Extract `expected_len` data bytes from a MIR constant.
+    ///
+    /// A VALUE constant (`[u8; N]`) is its own bytes. A POINTER constant
+    /// (`&[u8]`, `&[u8; N]`, `&str`) is the pointee WINDOW its pointer names
+    /// (`const_pointer::fixed_pointee`), never its own bytes: the "direct" read
+    /// took a reference constant's own pointer bytes (the offset and length
+    /// words) as the data whenever they were long enough, and the indirect
+    /// read took the target from byte 0. Every byte must be initialized data.
     fn bytes_from_mir_const(
+        &self,
         mir_const: &rustc_public::ty::MirConst,
         expected_len: usize,
     ) -> Option<Vec<u8>> {
-        use rustc_public::mir::alloc::GlobalAlloc;
-        use rustc_public::ty::{ConstantKind, TyConstKind};
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+        use rustc_public::ty::{RigidTy, TyKind};
 
-        let alloc = match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_ty, alloc) => alloc,
-                _ => return None,
-            },
-            _ => return None,
-        };
-
-        // Direct: allocation bytes are the data (e.g., [u8; N] literal).
-        if alloc.bytes.len() >= expected_len {
-            let bytes: Vec<u8> =
-                alloc.bytes.iter().take(expected_len).map(|opt| opt.unwrap_or(0)).collect();
-            return Some(bytes);
+        let bytes = const_pointer::const_bytes(mir_const)?;
+        match mir_const.ty().kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => {
+                let (_, window) = const_pointer::fixed_pointee(self.tcx, &bytes, 0, pointee)?;
+                if window.len() < expected_len {
+                    return None;
+                }
+                window.read_data_bytes(0, expected_len)
+            }
+            _ => {
+                if bytes.len() < expected_len {
+                    return None;
+                }
+                bytes.read_data_bytes(0, expected_len)
+            }
         }
-
-        // Indirect: follow provenance to the inner allocation.
-        let alloc_id = alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(inner_alloc) = GlobalAlloc::from(alloc_id) else {
-            return None;
-        };
-        if inner_alloc.bytes.len() >= expected_len {
-            let bytes: Vec<u8> =
-                inner_alloc.bytes.iter().take(expected_len).map(|opt| opt.unwrap_or(0)).collect();
-            return Some(bytes);
-        }
-
-        None
     }
 
     pub(in crate::codegen_ay::chc) fn build_slice_value_for_sort(
@@ -308,12 +304,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 ("fld_data", slice.data.sort().clone()),
             ],
         );
-        let slice_view = Expr::datatype_constructor(
+        // The view is an optional precision aid. A pointer or length term whose sort
+        // is not the declared pointer width cannot form the Slice view; skip it.
+        let Ok(slice_view) = Expr::try_datatype_constructor(
             slice_name,
             ctor_name,
             vec![slice.ptr.clone(), slice.len.clone(), slice.data.clone()],
             slice_sort,
-        );
+        ) else {
+            return;
+        };
         self.ref_resolution.const_ref_slice_views.insert(local, slice_view);
     }
 

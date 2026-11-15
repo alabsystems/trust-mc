@@ -27,7 +27,7 @@ const INTRINSIC_ASSUME_SWITCHINT_INLINE_PROBE: &str = r#"
 "#;
 
 #[test]
-fn test_inline_intrinsic_assume_survives_switchint_translation() {
+fn test_inline_intrinsic_assume_is_checked_across_switchint_translation() {
     with_test_ay_ctx_for_source(INTRINSIC_ASSUME_SWITCHINT_INLINE_PROBE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_inline_intrinsic_assume_switch");
         let body = instance.body().expect("function body");
@@ -72,11 +72,24 @@ fn test_inline_intrinsic_assume_survives_switchint_translation() {
         )
         .expect("inline body should translate");
 
+        // `intrinsics::assume(P)` is CHECKED, as Kani ("Rust intrinsic assumption
+        // failed"), not assumed: the walk records a deferred check and keeps
+        // translating across the SwitchInt instead of pruning the return value.
+        let assume_checks: Vec<_> = inline_result
+            .deferred_checks
+            .iter()
+            .filter(|c| c.message.as_deref() == Some("Rust intrinsic assumption failed"))
+            .collect();
+        assert_eq!(assume_checks.len(), 1, "one assume check");
         assert!(
-            constraint_tree_contains(&inline_result.value, &|expr| {
+            assume_checks[0].kind == trust_mc_core::violation::PropertyKind::Assumption,
+            "assume check has Kani's class `assume`"
+        );
+        assert!(
+            !constraint_tree_contains(&inline_result.value, &|expr| {
                 matches!(expr.value(), ExprValue::Var { name } if name.contains("__assume_pruned_inline"))
             }),
-            "false intrinsic assume should prune the returned value across SwitchInt, got {:?}",
+            "a checked intrinsic assume does not prune the returned value, got {:?}",
             inline_result.value
         );
     });

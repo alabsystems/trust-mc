@@ -111,6 +111,25 @@ pub(super) fn chc_success_properties(
     Some(properties)
 }
 
+/// Per-property `Undetermined` list for a CHC harness whose registered checks
+/// never reached a solver (`SolverUnknownReason::LostErrorRules`).
+///
+/// Returns `None` when the artifact carries no per-property CHC table, so the
+/// caller keeps a single aggregate line.
+pub(super) fn chc_undetermined_properties(
+    smt_file: &Path,
+    harness: &HarnessMetadata,
+) -> Option<Vec<Property>> {
+    let table = load_chc_property_table(&vc_artifact_path_for_smt(smt_file));
+    if table.is_empty() {
+        return None;
+    }
+    let mut properties: Vec<Property> =
+        table.iter().map(|e| build_property(e, harness, CheckStatus::Undetermined)).collect();
+    apply_loop_contract_naming(&mut properties);
+    Some(properties)
+}
+
 /// Per-property list for a failing CHC harness (BSEM-18).
 ///
 /// Properties whose relation appears in `failing_relations` are reported as

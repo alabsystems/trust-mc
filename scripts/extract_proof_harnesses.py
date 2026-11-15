@@ -31,6 +31,7 @@ FN_DECL = re.compile(
     r"^\s*(?:(?:pub(?:\([^)]*\))?\s+|unsafe\s+|async\s+|const\s+)*)fn\s+([A-Za-z0-9_]+)\s*\("
 )
 MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*\{")
+INHERENT_IMPL_DECL = re.compile(r"^\s*impl\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 
 # `macro_rules! <name> { ... }` declaration.
 MACRO_RULES_DECL = re.compile(r"^\s*macro_rules!\s+([A-Za-z0-9_]+)\s*\{")
@@ -261,9 +262,11 @@ def _update_mod_stack(
     brace_depth: int,
 ) -> int:
     """Push/pop ``mod_stack`` based on this line and return new ``brace_depth``."""
-    mod_match = MOD_DECL.match(line)
-    if mod_match:
-        mod_stack.append((mod_match.group(1), brace_depth))
+    scope_match = MOD_DECL.match(line) or INHERENT_IMPL_DECL.match(line)
+    if scope_match:
+        # Inherent methods use the type's name in the compiler's harness path.
+        # Exact runtime selection still authenticates the resulting name.
+        mod_stack.append((scope_match.group(1), brace_depth))
     brace_depth += stripped.count("{") - stripped.count("}")
     while mod_stack and brace_depth <= mod_stack[-1][1]:
         mod_stack.pop()

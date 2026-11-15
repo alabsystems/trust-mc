@@ -12,6 +12,9 @@
 mod range_contains;
 mod range_full;
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place, Rvalue, StatementKind};
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
@@ -259,6 +262,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let place = match option_arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -339,7 +344,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // SIMD types: single-variant, single-field ADTs wrapping [T; N]
                 let variants = adt_def.variants();
                 if variants.len() == 1 && variants[0].fields().len() == 1 {
-                    let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                    let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                     Self::extract_array_len_from_ty(field_ty, elem_ty)
                 } else {
                     None
@@ -363,6 +368,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -424,7 +431,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     {
                         return Some(src.local);
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return Some(src.local);
@@ -453,7 +460,7 @@ fn extract_array_data(expr: &Expr) -> Option<Expr> {
     }
     // Slice Datatype: Slice_bvN { fld_ptr: BV64, fld_len: BV64, fld_data: Array<BV64, BVN> }
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let cons = &dt.constructors[0];

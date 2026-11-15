@@ -73,7 +73,7 @@ pub(in crate::codegen_ay::chc) fn scan_map_store_pattern(body: &Body) -> Option<
                         field_refs.insert(dest.local, (src.local, field_idx));
                     }
                 }
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                     if dest.local == 0
                         && dest.projection.is_empty()
                         && src.projection.is_empty() =>
@@ -132,7 +132,7 @@ fn scan_map_statement_patterns(body: &Body) -> Option<(usize, Option<DefaultSour
             if let Rvalue::Ref(_, _, src_place) = rvalue {
                 map_field_idx = map_field_idx.or_else(|| scan_self_field_ref(src_place));
             }
-            if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
+            if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rvalue {
                 default_source =
                     default_source.or_else(|| scan_self_field_default(src, map_field_idx));
             }
@@ -244,7 +244,7 @@ fn resolve_key_through_refs(body: &Body, mut local: usize, arg_count: usize) -> 
             }
             let next_local = match rvalue {
                 Rvalue::Ref(_, _, src) if src.projection.is_empty() => Some(src.local),
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                     if src.projection.is_empty() =>
                 {
                     Some(src.local)
@@ -264,7 +264,7 @@ fn scan_default_from_field_access(body: &Body) -> Option<DefaultSource> {
     for block in &body.blocks {
         for stmt in &block.statements {
             let StatementKind::Assign(_place, rvalue) = &stmt.kind else { continue };
-            let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else { continue };
+            let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rvalue else { continue };
             if src.local != 1 {
                 continue;
             }

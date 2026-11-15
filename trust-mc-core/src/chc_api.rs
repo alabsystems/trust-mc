@@ -8,6 +8,7 @@
 //! metadata as SMT-LIB strings. Callers provide a typed [`ChcVc`] plus MIR
 //! obligation identity; solvers return typed verdicts and evidence metadata.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::chc::ChcVc;
@@ -30,7 +31,15 @@ pub struct MirChcPdrObligation {
     /// Optional native bundle metadata for trust_ir request/proof-lineage consumers.
     pub native_metadata: Option<NativeTypedChcObligationMetadata>,
     /// Typed CHC verification condition.
-    pub vc: ChcVc,
+    ///
+    /// Shared, because it is a function of the FUNCTION, not of the obligation:
+    /// a native bundle asks one question per obligation of the same function,
+    /// and every such request carries the same whole-function CHC. Sharing it
+    /// keeps a bundle's retained CHC linear in the program instead of
+    /// obligations × function size. Every other field stays per obligation, so
+    /// each request's identity is its own. Mutate through `Arc::make_mut`, which
+    /// clones first when the VC is shared.
+    pub vc: Arc<ChcVc>,
 }
 
 impl MirChcPdrObligation {
@@ -40,7 +49,7 @@ impl MirChcPdrObligation {
         obligation_id: impl Into<String>,
         function_name: impl Into<String>,
         kind: MirObligationKind,
-        vc: ChcVc,
+        vc: impl Into<Arc<ChcVc>>,
     ) -> Self {
         Self {
             obligation_id: obligation_id.into(),
@@ -48,7 +57,7 @@ impl MirChcPdrObligation {
             kind,
             origin: ObligationOrigin::MirDerived,
             native_metadata: None,
-            vc,
+            vc: vc.into(),
         }
     }
 
@@ -58,7 +67,7 @@ impl MirChcPdrObligation {
         obligation_id: impl Into<String>,
         function_name: impl Into<String>,
         kind: MirObligationKind,
-        vc: ChcVc,
+        vc: impl Into<Arc<ChcVc>>,
     ) -> Self {
         Self {
             obligation_id: obligation_id.into(),
@@ -66,7 +75,7 @@ impl MirChcPdrObligation {
             kind,
             origin: ObligationOrigin::RouterPlaceholder,
             native_metadata: None,
-            vc,
+            vc: vc.into(),
         }
     }
 
@@ -97,7 +106,11 @@ impl MirChcPdrObligation {
         let Some(target) = self.vc.query.target.as_deref() else {
             return Err(MirChcPdrObligationError::MissingQueryTarget);
         };
-        if !self.vc.relations.iter().any(|rel| rel.name == target) {
+        // Searched from the END: a translator declares the query relation last,
+        // so this finds it in O(1) rather than scanning every block relation —
+        // which, run once per row of a bundle sharing one VC, would cost
+        // rows × relations. `any` is order-independent, so the answer is the same.
+        if !self.vc.relations.iter().rev().any(|rel| rel.name == target) {
             return Err(MirChcPdrObligationError::UndeclaredQueryTarget {
                 target: target.to_string(),
             });
@@ -176,6 +189,9 @@ pub struct ChcPdrSolveOptions {
     pub engine: ChcPdrEngine,
     pub timeout: Option<Duration>,
     pub produce_proof_certificate: bool,
+    /// Present only after deriving the exact supported native request profile.
+    /// Generic CHC callers retain their existing configuration and wire identity.
+    pub native_request: Option<crate::NativeMcRequestExecutionBinding>,
 }
 
 impl ChcPdrSolveOptions {

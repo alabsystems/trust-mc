@@ -1,0 +1,45 @@
+# Reconstructed transcript: the results-verification-bmc unit log this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_stub_len...
+[AY:PROOF] BMC verification: no violation within bound
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_stub_len.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: s.len() == 42"
+	 - Location: /corpus/kani/Stubbing/StubPrimitives/stub_slice_methods.rs:25:5 in function check_stub_len
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_stub_is_empty...
+[AY:PROOF] BMC verification: no violation within bound
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_stub_is_empty.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: !s.is_empty()"
+	 - Location: /corpus/kani/Stubbing/StubPrimitives/stub_slice_methods.rs:32:5 in function check_stub_is_empty
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_stub_first...
+[AY:UNKNOWN_QUALITY:EncodingGap:unconstrained_assignment=3]
+Check 1: check_stub_first.assertion.1
+	 - Status: UNDETERMINED
+	 - Description: "assertion failed: s.first().is_some()"
+	 - Location: /corpus/kani/Stubbing/StubPrimitives/stub_slice_methods.rs:39:5 in function check_stub_first
+
+SUMMARY:
+ ** 0 of 1 failed (1 undetermined)
+
+VERIFICATION:- INCONCLUSIVE (solver undecided)
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_stub_first
+Complete - 2 successfully verified harnesses, 1 failures, 3 total.

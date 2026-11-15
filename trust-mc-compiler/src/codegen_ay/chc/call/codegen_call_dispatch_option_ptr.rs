@@ -29,7 +29,8 @@ use super::codegen_call_raw_ptr_as_ref::try_dispatch_raw_ptr_as_ref;
 use super::codegen_call_vec::CallVec;
 use super::codegen_call_virtual_inline::nested_option_state::shape_option_as_mut_result;
 use super::codegen_call_virtual_inline::{
-    InlineReturn, attach_spawn_task_slot_vtable, is_option_like_sort,
+    CoreOptionStateMethod, InlineReturn, attach_spawn_task_slot_vtable, core_option_state_method,
+    is_option_like_sort,
 };
 use super::codegen_rules::CodegenRules;
 use super::codegen_types::CodegenTypes;
@@ -49,6 +50,26 @@ impl<'tcx, 'body> CallDispatchOptionPtr for ChcCtx<'tcx, 'body> {
         }
 
         if try_dispatch_raw_ptr_as_ref(self, dcx) {
+            return true;
+        }
+
+        if let Some(result) = self.promoted_option_predicate(dcx.func, dcx.args)
+            && let Some(stub) = self.detect_stub(dcx.func)
+            && stub.is_option_predicate()
+            && let Some(target) = *dcx.target
+        {
+            self.emit_stub_call_result(
+                Some(result),
+                &ChcCallContext {
+                    stub,
+                    args: dcx.args,
+                    destination: dcx.destination,
+                    target,
+                    from_app: dcx.from_app,
+                    stmt_constraints: dcx.stmt_constraints,
+                    modified_locals: dcx.modified_locals,
+                },
+            );
             return true;
         }
 
@@ -118,9 +139,13 @@ fn try_dispatch_option_state_fast_path(
         path
     };
 
-    let is_as_mut = callee_path.ends_with("::as_mut");
-    let is_take = callee_path.ends_with("::take");
-    if !callee_path.contains("Option") || (!is_as_mut && !is_take) || dcx.args.len() != 1 {
+    // Core's own `Option::as_mut`/`Option::take` only: a method that shares the
+    // name has a body of its own (`core_option_state_method`).
+    let Some(method) = core_option_state_method(callee_path) else {
+        return false;
+    };
+    let is_take = method == CoreOptionStateMethod::Take;
+    if dcx.args.len() != 1 {
         return false;
     }
 

@@ -64,20 +64,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for (bb_idx, bb_data) in self.body.blocks.iter().enumerate() {
             if let TerminatorKind::Call { func, args, destination, target, .. } =
                 &bb_data.terminator.kind
-                && let Some(stub) = self.detect_alloc_stub(func)
+                && let Some(stub) = self.detect_alloc_stub(func).or_else(|| {
+                    crate::codegen_ay::shared::native_box_uninit::native_box_new_uninit_site(
+                        self.tcx, self.body, bb_idx,
+                    )?;
+                    Some(StubKind::RustAlloc)
+                })
             {
                 match stub {
                     StubKind::BoxNew
                     | StubKind::RustAlloc
                     | StubKind::RustAllocZeroed
                     | StubKind::RustRealloc => {
-                        let Some(obj_id) = self.heap_state.reserve_heap_alloc_id() else {
+                        let native_site=self.detect_alloc_stub(func).is_none()
+                            && crate::codegen_ay::shared::native_box_uninit::native_box_new_uninit_site(self.tcx,self.body,bb_idx).is_some();
+                        let reserved = if native_site {
+                            self.heap_state.next_alloc_id()
+                        } else {
+                            self.heap_state.reserve_heap_alloc_id()
+                        };
+                        let Some(obj_id) = reserved else {
                             warn!(
                                 ?bb_idx,
                                 "CHC: allocation ID overflow during alloc stub pre-declaration"
                             );
                             continue;
                         };
+                        if native_site {
+                            self.heap_state.native_uninit_reservations.insert(bb_idx, obj_id);
+                        }
                         // Part of #3714: Predict the typed element sort for the region.
                         // BoxNew: the first arg's type IS the boxed element type (Box::new(val)).
                         // RustAlloc/RustAllocZeroed: if the call target immediately wraps or casts
@@ -85,8 +100,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // This keeps the allocator's real obj_id typed from declaration time
                         // without reserving a phantom wrapper obj_id.
                         // RustRealloc keeps BV8: it preserves or aliases existing regions later.
-                        let elem_sort =
-                            self.alloc_stub_elem_sort(stub, args, destination.local, *target);
+                        let elem_sort = if native_site {
+                            let native=crate::codegen_ay::shared::native_box_uninit::native_box_new_uninit_site(self.tcx,self.body,bb_idx).expect("admitted native site");
+                            let payload = match native.payload.kind() {
+                                TyKind::RigidTy(RigidTy::Array(element, _)) => element,
+                                _ => native.payload,
+                            };
+                            self.elem_sort_for_memory_array(payload)
+                        } else {
+                            self.alloc_stub_elem_sort(stub, args, destination.local, *target)
+                        };
                         self.predeclare_region_state_var(obj_id, elem_sort.clone());
                         debug!(
                             ?bb_idx,
@@ -193,6 +216,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
 
             match rvalue {
+                #[cfg(not(trust_toolchain))]
                 Rvalue::ShallowInitBox(operand, boxed_ty)
                     if Self::operand_is_unprojected_local(operand, alloc_local) =>
                 {

@@ -82,23 +82,33 @@ pub(crate) mod direct_smt_cex;
 mod soundness_oracle;
 
 pub use native::{
-    AuthorizedNativeTypedChcPdrProof, NativeEncodedArtifact, NativeOperation, NativeProofMode,
-    NativeProofProvenance, NativeSolveError, NativeSolveRequest, NativeSolveResult,
-    NativeSolveUnsupported, NativeSolvedArtifact, NativeSolverVerdict,
+    AuthorizedNativeTypedChcPdrProof, NativeBundleSolveWork, NativeEncodedArtifact,
+    NativeOperation, NativeProofMode, NativeProofProvenance, NativeSolveError, NativeSolveRequest,
+    NativeSolveResult, NativeSolveUnsupported, NativeSolvedArtifact, NativeSolverVerdict,
     NativeTypedChcPdrNormalizedInput, NativeTypedChcPdrProofTransport, NativeTypedChcPdrRunner,
     NativeTypedProofArtifactRef, NativeTypedProofStatus, NativeTypedProofStrength, NativeVcKind,
     TypedChcPdrFullVerification, TypedChcPdrRoute, classify_native_full_verification_verdict,
     is_proof_grade_native_full_verification_verdict, normalized_typed_chc_pdr_input, solve_native,
     solve_typed_chc_pdr, solve_typed_chc_pdr_full_verification,
     solve_typed_chc_pdr_native_proof_grade, typed_chc_pdr_semantic_config,
-    typed_chc_pdr_semantic_config_sha256,
+    typed_chc_pdr_semantic_config_for_options, typed_chc_pdr_semantic_config_sha256,
+    typed_chc_pdr_semantic_config_sha256_for_options,
 };
 
 #[cfg(feature = "ay-chc-native")]
-pub use native::independently_replay_typed_chc_pdr_refutation_witness;
+pub use native::{
+    independently_replay_typed_chc_pdr_refutation_witness,
+    independently_replay_typed_chc_pdr_refutation_witness_with_options,
+};
+
+// The CLI's counterexample recertification (`harness_runner`) replays a
+// derivation that never reads a named over-approximation variable.
+#[cfg(feature = "ay-chc-native")]
+pub use direct_smt_cex::replay_error_derivation_free_of;
+pub use direct_smt_cex::{HavocCertificate, certify_error_free_of_havoc};
 
 #[cfg(feature = "native-trust-ir-bundle")]
 pub use native::{
-    NativeTrustIrChcPdrBundleEvidence, NativeTrustIrChcPdrEvidence, NativeTrustIrChcPdrNotProved,
-    NativeTrustIrChcPdrRefuted, NativeTrustIrChcPdrRunner,
+    NativeRefutationDemotion, NativeTrustIrChcPdrBundleEvidence, NativeTrustIrChcPdrEvidence,
+    NativeTrustIrChcPdrNotProved, NativeTrustIrChcPdrRefuted, NativeTrustIrChcPdrRunner,
 };

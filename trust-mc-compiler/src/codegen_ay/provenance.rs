@@ -421,6 +421,13 @@
 //! widening and fail-closed by the driver's Step-C. A fat-pointer slot keeps its
 //! coverage and gains a correctly-sized data half.
 //!
+//! (Round 10 deleted `unresolved_relocation_address` itself: every constant's
+//! bytes now enter through `shared/const_pointer.rs`, whose `ConstRead`
+//! accessors answer a pointer-width read AT a relocation with that relocation
+//! (`Slot::Pointer`, resolved by the CHC object table to `base + offset`) and
+//! refuse any other read of relocated bytes. The establishing reader above is
+//! that slot clause, stated once for both lanes.)
+//!
 //! The same audit question — *does the code establish what it reports?* — found
 //! one more fabrication on the write side of the same decoder, and it is the
 //! `Val` half rather than the `Loc` half.

@@ -5,6 +5,7 @@
 //! Vec constructor and conversion operations: VecNew, VecWithCapacity,
 //! VecFromElem (vec![elem; n]). VecFromSlice lives in `from_slice.rs`.
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -17,7 +18,6 @@ use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH, ptr_sort};
 
 use super::super::ChcCtx;
-use super::super::codegen_ctx::globals::declare_pending_var;
 use super::super::codegen_ctx::types::CollectionProjectionKind;
 use super::super::codegen_types::CodegenTypes;
 use super::shared::{ProjectedVecState, coerce_array_element};
@@ -30,7 +30,124 @@ pub(in crate::codegen_ay::chc) struct VecOpNewContext<'a> {
     pub(in crate::codegen_ay::chc) dest_vec_idx: usize,
 }
 
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Whether the body can change the `Vec` in `local` after building it: a
+    /// mutable borrow or raw address of it (`push`, `reserve`, `as_mut_ptr`
+    /// take `&mut self`), or a move of it (into a call, an aggregate, another
+    /// local). A `Vec` the body only reads keeps the buffer its constructor
+    /// allocated. The borrow that only feeds the `drop_in_place` or
+    /// `Drop::drop` a `Drop` terminator is lowered to frees the buffer and
+    /// grows nothing.
+    fn vec_local_may_change(&self, local: usize) -> bool {
+        use rustc_public::CrateDef;
+        use rustc_public::mir::{
+            BorrowKind, ProjectionElem, RawPtrKind, Rvalue, StatementKind, TerminatorKind,
+        };
+        use rustc_public::ty::{RigidTy, TyKind};
+        let moves_it = |operand: &Operand| {
+            matches!(operand, Operand::Move(place) if place.local == local
+                && !matches!(place.projection.first(), Some(ProjectionElem::Deref)))
+        };
+        let drop_arguments: HashSet<usize> = self
+            .body
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.terminator.kind {
+                TerminatorKind::Call { func, args, .. } => {
+                    let is_drop = func.ty(self.body.locals()).ok().is_some_and(|ty| {
+                        let TyKind::RigidTy(RigidTy::FnDef(def, _)) = ty.kind() else {
+                            return false;
+                        };
+                        let name = def.name();
+                        name.ends_with("drop_in_place")
+                            || name == "std::ops::Drop::drop"
+                            || name == "core::ops::Drop::drop"
+                    });
+                    match args.as_slice() {
+                        [Operand::Move(place) | Operand::Copy(place)]
+                            if is_drop && place.projection.is_empty() =>
+                        {
+                            Some(place.local)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        // The locals the drop argument is copied, cast or reborrowed from
+        // (`_10 = &raw mut _1; _11 = &mut (*_10); drop(move _11)`).
+        let mut drop_arguments = drop_arguments;
+        loop {
+            let before = drop_arguments.len();
+            for statement in self.body.blocks.iter().flat_map(|b| b.statements.iter()) {
+                let StatementKind::Assign(dest, rvalue) = &statement.kind else { continue };
+                if !dest.projection.is_empty() || !drop_arguments.contains(&dest.local) {
+                    continue;
+                }
+                let source = match rvalue {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+                    | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
+                        if src.projection.is_empty() =>
+                    {
+                        Some(src.local)
+                    }
+                    Rvalue::Ref(_, _, src) | Rvalue::AddressOf(_, src)
+                        if matches!(src.projection.as_slice(), [ProjectionElem::Deref]) =>
+                    {
+                        Some(src.local)
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    drop_arguments.insert(source);
+                }
+            }
+            if drop_arguments.len() == before {
+                break;
+            }
+        }
+        self.body.blocks.iter().any(|block| {
+            block.statements.iter().any(|statement| match &statement.kind {
+                StatementKind::Assign(dest, rvalue) => match rvalue {
+                    Rvalue::Ref(_, BorrowKind::Mut { .. }, place)
+                    | Rvalue::AddressOf(RawPtrKind::Mut, place) => {
+                        place.local == local
+                            && !matches!(place.projection.first(), Some(ProjectionElem::Deref))
+                            && !(dest.projection.is_empty() && drop_arguments.contains(&dest.local))
+                    }
+                    Rvalue::Use(operand, ..) | Rvalue::Cast(_, operand, _) => moves_it(operand),
+                    Rvalue::Aggregate(_, operands) => operands.iter().any(moves_it),
+                    _ => false,
+                },
+                _ => false,
+            }) || match &block.terminator.kind {
+                TerminatorKind::Call { args, .. } => args.iter().any(moves_it),
+                _ => false,
+            }
+        })
+    }
+
+    /// A `Vec::with_capacity` buffer's byte size is recorded for its bounds
+    /// checks, but the record is the CAPACITY's: a `push` past it reallocates
+    /// (the `Vec` stubs keep the pointer and the record), and a read through
+    /// the new `as_ptr` within the new length then failed its bound with a
+    /// Genuine certificate on a program Kani proves (`Vec::with_capacity(1)`,
+    /// three pushes, `*v.as_ptr().add(2)`; review of fix/chc-lost-writes,
+    /// lostwrite track round 2, finding 5, on main as well). The bound such a
+    /// buffer is checked against becomes `ite(t, 0, bytes)` for a fresh `t`
+    /// recorded as this event's freed variable: `t` may be false, so a
+    /// violation of the recorded bound is still reachable and every proof is
+    /// unchanged, but a counterexample through it reads `t` and is not
+    /// certified.
+    fn taint_vec_capacity_size(&mut self, obj_id: u32) {
+        let name = super::super::chc_fresh_name("__vec_capacity_size_uncertified");
+        let taint =
+            Havoc::mint(self, sound_havoc::VEC_CAPACITY_SIZE_UNCERTIFIED, name, Sort::bool());
+        self.heap_state.vec_capacity_size_taints.insert(obj_id, taint);
+    }
+
     /// The capacity operand of `Vec::new` / `Vec::with_capacity`.
     ///
     /// A [`Val`] by the callee's signature: `Vec::with_capacity(capacity: usize)`
@@ -109,7 +226,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 invalidated
             };
             extra_constraints.push(super::super::codegen_expr_heap::obj_valid_out().eq(next_valid));
-            self.mark_heap_metadata_modified();
+            self.mark_obj_valid_modified();
         }
     }
 
@@ -199,8 +316,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         bytes,
                         "CHC: Vec::with_capacity buffer bound to fresh heap object (P3-uninit)"
                     );
-                    Some(Expr::bitvec_const((obj_id as u64) << 32, POINTER_WIDTH))
+                    Some((obj_id, Expr::bitvec_const((obj_id as u64) << 32, POINTER_WIDTH)))
                 });
+            if let Some((obj_id, _)) = &concrete_ptr
+                && self.vec_local_may_change(dest_local)
+            {
+                self.taint_vec_capacity_size(*obj_id);
+            }
+            let concrete_ptr = concrete_ptr.map(|(_, ptr)| ptr);
             // Part of #2267: pre-allocate instead of format!().
             // Both lanes MINT this Vec's buffer base here: either the offset-0
             // base of the heap object just registered above, or a freshly
@@ -208,7 +331,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // allocation. An ADDRESS by construction — nothing downstream has to
             // re-derive it.
             let ptr = Loc::of_address(concrete_ptr.unwrap_or_else(|| {
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
                     {
                         let mut n = String::with_capacity(ptr_name.len() + 10);
                         n.push_str(&ptr_name);
@@ -230,7 +355,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // with a fresh default element mirrors vec_op_from_elem.
             let data = if let Some(arr) = data_sort.array_sort() {
                 let elem_sort = arr.element_sort.clone();
-                let default_elem = declare_pending_var(
+                let default_elem = ExactVar::nondet(
                     {
                         let mut n = String::with_capacity(data_name.len() + 11);
                         n.push_str(&data_name);
@@ -241,7 +366,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 Expr::const_array(crate::codegen_ay::types::ptr_sort(), default_elem)
             } else {
-                declare_pending_var(
+                ExactVar::nondet(
                     {
                         let mut n = String::with_capacity(data_name.len() + 11);
                         n.push_str(&data_name);
@@ -282,7 +407,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             ptr_name.push_str(&out_name);
             ptr_name.push_str("_init_ptr");
             // Minted here, same as the projected lane above: an ADDRESS.
-            let ptr = Loc::of_address(declare_pending_var(ptr_name, ptr_sort()));
+            let ptr = Loc::of_address(Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                ptr_name,
+                ptr_sort(),
+            ));
             let data_sort = dt
                 .constructors
                 .first()
@@ -291,7 +421,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let mut data_name = String::with_capacity(out_name.len() + 10);
             data_name.push_str(&out_name);
             data_name.push_str("_init_data");
-            let data = declare_pending_var(data_name, data_sort);
+            let data = ExactVar::nondet(data_name, data_sort);
             self.emit_vec_dangling_provenance_constraints(stub, &cap_expr, &ptr, acc.constraints);
             // Part of #1037 V2: cap >= len background invariant.
             Self::emit_cap_ge_len(cap_expr.as_expr().clone(), zero_len.clone(), acc.constraints);
@@ -369,6 +499,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// VecFromElem: `vec![elem; n]` → Vec with data = const_array(elem), len = n, cap = n.
+    ///
+    /// When the fill is not materialized into memory (a count that does not
+    /// fold, `try_materialize_from_elem_backing`), the returned pointer is a
+    /// fresh live object (`fresh_valid_backing_ptr`), and a raw read through
+    /// `as_ptr()` fails closed (`vec_from_elem_fill_unmaterialized`, main's
+    /// e78a23537). That also covers the free word fix/chc-lost-writes booked
+    /// as `vec_from_elem_pointer_unbound` in its round 1 (finding 10:
+    /// `vec![3u8; n].as_ptr().wrapping_add(n - 1)` failed its null check,
+    /// certified Genuine on a program Kani proves), so that reason is gone.
     /// Part of #3348: models alloc::vec::from_elem(elem, n) as a populated Vec.
     pub(in crate::codegen_ay::chc) fn vec_op_from_elem(
         &mut self,
@@ -399,6 +538,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // For projected path
         let materialized_base =
             self.try_materialize_from_elem_backing(args, elem_expr.as_ref(), &count_expr);
+        // An unmaterialized fill (a symbolic count, too many slots, an element
+        // with no byte image) still gets a FRESH buffer: the allocator returns a
+        // live object aliasing nothing, which `fresh_valid_backing_ptr` pins.
+        // The free word it used to be could name any object, a tracked stack
+        // local included: `!ptr::eq(vec![7u8; n].as_ptr(), &x)` FAILED certified
+        // Genuine and its `should_panic` twin passed (on main c22e1022e and the
+        // branch alike; found probing the third review's heap-address findings,
+        // 2026-09-28). Its byte image holds no fill, so a raw read through
+        // `as_ptr` fails closed (`vec_op_as_ptr`).
+        let unfilled_base = if materialized_base.is_none() {
+            let base = self.heap_state.fresh_valid_backing_ptr();
+            if base.is_some() {
+                self.collections.unfilled_from_elem_vecs.insert(dest_local);
+            }
+            base
+        } else {
+            None
+        };
         if materialized_base.is_some() {
             // The fill lives in an accumulated store chain; a call handler emits
             // its own rule, so the chain has to be drained INTO that rule (the
@@ -408,19 +565,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.collections.projection_locals.get(&dest_local).copied()
             == Some(CollectionProjectionKind::Vec)
         {
-            let ptr = materialized_base.clone().unwrap_or_else(|| {
-                declare_pending_var(
-                    {
-                        use std::fmt::Write;
-                        let mut n = String::with_capacity(24);
-                        n.push_str("from_elem_");
-                        let _ = write!(n, "{dest_local}");
-                        n.push_str("_ptr");
-                        n
-                    },
-                    ptr_sort(),
-                )
-            });
+            let ptr =
+                materialized_base.clone().or_else(|| unfilled_base.clone()).unwrap_or_else(|| {
+                    Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_POINTER_VALUE,
+                        {
+                            use std::fmt::Write;
+                            let mut n = String::with_capacity(24);
+                            n.push_str("from_elem_");
+                            let _ = write!(n, "{dest_local}");
+                            n.push_str("_ptr");
+                            n
+                        },
+                        ptr_sort(),
+                    )
+                });
             let data_sort = self
                 .state_var_mgr
                 .output_state_vars
@@ -431,12 +591,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // Part of #3496 Bug D: coerce element to match declared data array
                 // element sort. translate_operand may produce a different sort than
                 // translate_ty used at declaration (e.g., Bool vs BV8 for Rust bool).
-                let coerced_elem = coerce_array_element(elem.clone(), &data_sort);
+                let coerced_elem = coerce_array_element(self, elem.clone(), &data_sort);
                 Expr::const_array(ptr_sort(), coerced_elem)
             } else {
                 // Part of #3447: element translation failed — data array unconstrained.
                 self.record_aggregate_gap("vec_from_elem_data_unconstrained");
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         use std::fmt::Write;
                         let mut n = String::with_capacity(24);
@@ -465,8 +627,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && dt.constructors.first().is_some_and(|c| c.has_field(vec_layout::FLD_CAP))
         {
             let dt_name = out_sort.datatype_name().expect("has datatype_sort");
-            let ptr = materialized_base.unwrap_or_else(|| {
-                declare_pending_var(
+            let ptr = materialized_base.or(unfilled_base).unwrap_or_else(|| {
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 7);
                         n.push_str(&out_name);
@@ -483,12 +647,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .unwrap_or_else(|| Sort::array(ptr_sort(), ptr_sort()));
             let data = if let Some(ref elem) = elem_expr {
                 // Part of #3496 Bug D: coerce element sort to match declared data sort.
-                let coerced_elem = coerce_array_element(elem.clone(), &data_sort);
+                let coerced_elem = coerce_array_element(self, elem.clone(), &data_sort);
                 Expr::const_array(ptr_sort(), coerced_elem)
             } else {
                 // Part of #3447: element translation failed — DT data array unconstrained.
                 self.record_aggregate_gap("vec_from_elem_dt_data_unconstrained");
-                declare_pending_var(
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 8);
                         n.push_str(&out_name);

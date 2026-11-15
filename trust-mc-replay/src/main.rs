@@ -22,7 +22,7 @@
 //!     -> solve typed CHC/PDR requests
 //!     -> mint and re-check live, non-serializable exact-module authority
 //!
-//! Because it is a leaf binary, `cargo build -p trust-mc-replay` finishes in
+//! Because it is a leaf binary, `targo --unverified build -p trust-mc-replay` finishes in
 //! seconds, so you can edit ay-chc / trust-mc and re-check a real obligation
 //! immediately.
 //! The resulting authority covers the exact dumped TrustIr module. As in the
@@ -35,17 +35,18 @@
 //!          <stage2>/targo-trust trust check path/to/proof.rs
 //!      -> writes /tmp/bundles/native_bundle_<fn>.json
 //!   2. ITERATE (seconds each):
-//!        cargo build -p trust-mc-replay
+//!        targo --unverified build -p trust-mc-replay
 //!        trust-mc-replay /tmp/bundles/native_bundle_<fn>.json
 
 use std::path::Path;
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use trust_mc_core::ChcPdrSolveOptions;
 use trust_mc_driver::NativeTrustIrChcPdrRunner;
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let mut args = std::env::args().skip(1);
     let path =
         args.next().context("usage: trust-mc-replay <native_bundle_*.json> [timeout_secs]")?;
@@ -92,44 +93,49 @@ fn main() -> Result<()> {
     let refuted = evidence.refuted.len();
     println!("replayed {} obligation(s) in {elapsed:?}\n", proved + not_proved + refuted);
 
-    for (i, solved) in evidence.obligations.iter().enumerate() {
-        // Recompute the private mutation-bound seal at the point where this
-        // harness labels the row proved. The serialized transport beside it is
-        // diagnostic only and cannot recreate this borrowed capability.
-        let authority = solved.verification.authorized_native_proof().map_err(|e| {
-            anyhow!(
-                "bundle runner returned row {} without live exact-module authority: {e}",
-                solved.translated.obligation.obligation_id
-            )
-        })?;
-        let obligation = &solved.translated.obligation;
-        println!(
-            "[{i}] {} :: {}\n     route={:?}  verdict=PROVED [exact-module authority: {:?}]",
-            obligation.function_name,
-            obligation.obligation_id,
-            solved.verification.route,
-            authority.candidate().proof_kind,
-        );
-    }
-
-    for (offset, unresolved) in evidence.not_proved.iter().enumerate() {
-        let i = proved + offset;
-        let obligation = &unresolved.translated.obligation;
-        println!(
-            "[{i}] {} :: {}\n     verdict=NOT-PROVED [{}]",
-            obligation.function_name, obligation.obligation_id, unresolved.reason
-        );
-    }
-
-    for (offset, row) in evidence.refuted.iter().enumerate() {
-        let i = proved + not_proved + offset;
-        let obligation = &row.translated.obligation;
-        // A witnessed refutation is dev-loop diagnostics here; the compiler's
-        // consumer independently revalidates the witness before any verdict.
-        println!(
-            "[{i}] {} :: {}\n     verdict=REFUTED (witnessed; consumer revalidation required)",
-            obligation.function_name, obligation.obligation_id
-        );
+    // One running index over the three channels, in display order: proved,
+    // then not-proved, then refuted. `enumerate` numbers the rows, so no
+    // offset arithmetic can overflow here.
+    for (i, row) in numbered_rows(&evidence.obligations, &evidence.not_proved, &evidence.refuted) {
+        match row {
+            Row::Proved(solved) => {
+                // Recompute the private mutation-bound seal at the point where
+                // this harness labels the row proved. The serialized transport
+                // beside it is diagnostic only and cannot recreate this
+                // borrowed capability.
+                let authority = solved.verification.authorized_native_proof().map_err(|e| {
+                    anyhow!(
+                        "bundle runner returned row {} without live exact-module authority: {e}",
+                        solved.translated.obligation.obligation_id
+                    )
+                })?;
+                let obligation = &solved.translated.obligation;
+                println!(
+                    "[{i}] {} :: {}\n     route={:?}  verdict=PROVED [exact-module authority: {:?}]",
+                    obligation.function_name,
+                    obligation.obligation_id,
+                    solved.verification.route,
+                    authority.candidate().proof_kind,
+                );
+            }
+            Row::NotProved(unresolved) => {
+                let obligation = &unresolved.translated.obligation;
+                println!(
+                    "[{i}] {} :: {}\n     verdict=NOT-PROVED [{}]",
+                    obligation.function_name, obligation.obligation_id, unresolved.reason
+                );
+            }
+            Row::Refuted(row) => {
+                let obligation = &row.translated.obligation;
+                // A witnessed refutation is dev-loop diagnostics here; the
+                // compiler's consumer independently revalidates the witness
+                // before any verdict.
+                println!(
+                    "[{i}] {} :: {}\n     verdict=REFUTED (witnessed; consumer revalidation required)",
+                    obligation.function_name, obligation.obligation_id
+                );
+            }
+        }
     }
 
     println!(
@@ -137,14 +143,73 @@ fn main() -> Result<()> {
         proved + not_proved + refuted
     );
 
-    // Non-zero exit if nothing received live exact-module authority, so scripts
-    // cannot accidentally gate on generic public candidate bytes.
-    if proved == 0 {
-        std::process::exit(2);
-    }
-    Ok(())
+    Ok(exit_code(proved))
+}
+
+/// Non-zero exit (2) if nothing received live exact-module authority, so
+/// scripts cannot accidentally gate on generic public candidate bytes. Returned
+/// from `main` rather than calling `std::process::exit`, so destructors and
+/// stdout flushing run on every path.
+fn exit_code(proved: usize) -> ExitCode {
+    if proved == 0 { ExitCode::from(2) } else { ExitCode::SUCCESS }
+}
+
+/// One evidence row, borrowed from the channel it was reported on.
+#[derive(Debug, PartialEq)]
+enum Row<P, N, R> {
+    Proved(P),
+    NotProved(N),
+    Refuted(R),
+}
+
+/// Number the rows of the three evidence channels in display order (proved,
+/// then not-proved, then refuted) with a single running index.
+fn numbered_rows<'a, P, N, R>(
+    proved: &'a [P],
+    not_proved: &'a [N],
+    refuted: &'a [R],
+) -> impl Iterator<Item = (usize, Row<&'a P, &'a N, &'a R>)> {
+    proved
+        .iter()
+        .map(Row::Proved)
+        .chain(not_proved.iter().map(Row::NotProved))
+        .chain(refuted.iter().map(Row::Refuted))
+        .enumerate()
 }
 
 fn short_name(path: &str) -> &str {
     Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_share_one_index_in_display_order() {
+        let rows: Vec<_> = numbered_rows(&[10, 11], &['n'], &["r0", "r1"]).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (0, Row::Proved(&10)),
+                (1, Row::Proved(&11)),
+                (2, Row::NotProved(&'n')),
+                (3, Row::Refuted(&"r0")),
+                (4, Row::Refuted(&"r1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_skip_empty_channels_without_gaps() {
+        let rows: Vec<_> = numbered_rows::<u8, u8, &str>(&[], &[], &["only"]).collect();
+        assert_eq!(rows, vec![(0, Row::Refuted(&"only"))]);
+    }
+
+    #[test]
+    fn exit_code_is_two_only_when_nothing_proved() {
+        assert_eq!(exit_code(0), ExitCode::from(2));
+        assert_eq!(exit_code(1), ExitCode::SUCCESS);
+        assert_eq!(exit_code(usize::MAX), ExitCode::SUCCESS);
+    }
 }

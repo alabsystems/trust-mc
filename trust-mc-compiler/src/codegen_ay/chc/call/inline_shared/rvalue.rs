@@ -4,11 +4,13 @@
 //
 //! Rvalue translation for inline body translators, extracted from `inline_shared/mod.rs`.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_abi::VariantIdx as InternalVariantIdx;
-use rustc_public::mir::{
-    AggregateKind, BinOp, LocalDecl, NullOp, Operand, RuntimeChecks, Rvalue, UnOp,
-};
+use rustc_public::mir::{AggregateKind, BinOp, LocalDecl, Operand, ProjectionElem, Rvalue, UnOp};
+#[cfg(not(trust_toolchain))]
+use rustc_public::mir::{NullOp, RuntimeChecks};
 use rustc_public::rustc_internal;
 use rustc_public::ty::{AdtKind, RigidTy, TyKind, UintTy};
 use std::collections::HashMap;
@@ -22,6 +24,7 @@ use super::super::quantifier_encoding::QuantifierEncoding;
 use super::place::{inline_operand_to_expr, resolve_place};
 use super::rvalue_cast::inline_cast_to_expr;
 use super::{PlaceResolver, discriminant};
+use crate::codegen_ay::chc::heap::stack_address::is_relational_ptr_op;
 
 use crate::codegen_ay::chc::stmt::codegen_stmt_aggregate_adt::sign_extend_discr_val;
 use crate::codegen_ay::shared::ty_signedness_shallow;
@@ -44,6 +47,22 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
 ) -> Option<Expr> {
     match rvalue {
         Rvalue::BinaryOp(op, lhs, rhs) => {
+            if matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::Cmp
+                    | BinOp::Offset
+            ) && [lhs, rhs].iter().any(|operand| {
+                operand.ty(locals).ok().is_some_and(|ty| ctx.readonly_scalar_pointee(ty).is_some())
+                    && !ctx.inline_walk_operand_is_address(operand)
+            }) {
+                ctx.record_sound_fallback_reason("inline_reference_address_observation_unmodeled");
+            }
             let l = inline_operand_to_expr(ctx, lhs, local_exprs, resolver, locals)?;
             let r = inline_operand_to_expr(ctx, rhs, local_exprs, resolver, locals)?;
             let lhs_ty = lhs.ty(locals).ok()?;
@@ -76,6 +95,22 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
             // Part of #3839: route float BinOps through FP theory instead of BV arithmetic.
             if is_float && l.sort().is_bitvec() {
                 return inline_float_binop(*op, l, r, int_bv_width);
+            }
+            // Relational comparison of raw pointers: unordered across
+            // allocations (heap/stack_address.rs).
+            let (l, r) = if is_relational_ptr_op(*op)
+                && matches!(lhs_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..)))
+            {
+                ctx.ptr_order_operands(l, r)
+            } else {
+                (l, r)
+            };
+            // `==` / `!=` of raw pointers: the fail-closed far pointer
+            // observation (heap/stack_address.rs `note_ptr_equality`).
+            if matches!(op, BinOp::Eq | BinOp::Ne)
+                && matches!(lhs_ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..)))
+            {
+                ctx.note_raw_pointer_equality(&l, &r, None);
             }
             if let Some(result) = try_translate_inline_wide_pointer_binop(*op, &l, &r) {
                 return Some(result);
@@ -119,43 +154,63 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
             }
         }
         Rvalue::UnaryOp(UnOp::Neg, operand) => {
+            let operand_ty = ctx.resolve_body_ty(operand.ty(locals).ok()?);
+            if matches!(operand_ty.kind(), TyKind::RigidTy(RigidTy::Float(_))) {
+                let result = inline_operand_to_expr(ctx, operand, local_exprs, resolver, locals)
+                    .and_then(|inner| {
+                        let width = ty_to_bv_width(operand_ty)?;
+                        crate::codegen_ay::float_arithmetic::bv_float_neg(inner, width)
+                    });
+                if result.is_none() {
+                    ctx.record_sound_fallback_reason("inline_float_operation_unmodeled");
+                }
+                return result;
+            }
             let inner = inline_operand_to_expr(ctx, operand, local_exprs, resolver, locals)?;
             if inner.sort().is_int() {
                 Some(inner.int_neg())
             } else if inner.sort().is_bitvec() {
-                // Part of #3839: float negation is sign-bit flip, not two's
-                // complement. Mirrors codegen_stmt_rvalue.rs Part of #3693.
-                let is_float = matches!(
-                    operand.ty(locals).ok().map(|t| t.kind()),
-                    Some(TyKind::RigidTy(RigidTy::Float(_)))
-                );
                 let w = inner.sort().bitvec_width()?;
-                if is_float {
-                    let sign_mask = match w {
-                        32 => Expr::bitvec_const(0x8000_0000_i128, 32),
-                        64 => Expr::bitvec_const(0x8000_0000_0000_0000_u64 as i128, 64),
-                        _ => return Some(Expr::bitvec_const(0u64, w).bvsub(inner)),
-                    };
-                    Some(inner.bvxor(sign_mask))
-                } else {
-                    Some(Expr::bitvec_const(0u64, w).bvsub(inner))
-                }
+                Some(Expr::bitvec_const(0u64, w).bvsub(inner))
             } else {
                 None
             }
         }
-        Rvalue::Use(operand) => {
+        Rvalue::Use(operand, ..) => {
             preserve_inline_subslice_metadata_from_operand(ctx, dest_local, operand);
             inline_operand_to_expr(ctx, operand, local_exprs, resolver, locals)
         }
         // Preserve address identity for ref-like rvalues rooted at an existing pointer local.
         Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+            if place.ty(locals).ok().is_some_and(|ty| ctx.readonly_scalar_pointee(ty).is_some()) {
+                ctx.record_sound_fallback_reason("readonly_ref_carrier_address_unmodeled");
+                return None;
+            }
             preserve_inline_subslice_metadata_from_place(ctx, dest_local, place.local);
             // The inline walker's expression map is still untyped, so the
             // Address / Transparent distinction is dropped here rather than
-            // resolved — see `InlineRefExpr`.
-            super::place::inline_ref_place_to_expr(ctx, local_exprs, place, resolver, locals)
-                .map(super::place::InlineRefExpr::into_expr)
+            // resolved — see `InlineRefExpr`. The walker's statement executor
+            // reads the lane back to tag the destination as address-bound
+            // (F2, `inline_walk_guard.rs`).
+            let resolved =
+                super::place::inline_ref_place_to_expr(ctx, local_exprs, place, resolver, locals);
+            if matches!(rvalue, Rvalue::AddressOf(..))
+                && matches!(&resolved, Some(super::place::InlineRefExpr::Transparent(_)))
+                && !(matches!(place.projection.as_slice(), [ProjectionElem::Deref])
+                    && (ctx.inline_walk_local_is_address(place.local)
+                        || locals.get(place.local).is_some_and(|decl| {
+                            matches!(
+                                ctx.resolve_body_ty(decl.ty).kind(),
+                                TyKind::RigidTy(RigidTy::RawPtr(..))
+                            )
+                        })))
+            {
+                ctx.record_sound_fallback_reason("inline_reference_raw_address_unmodeled");
+                return None;
+            }
+            ctx.last_inline_ref_was_address =
+                matches!(resolved, Some(super::place::InlineRefExpr::Address(_)));
+            resolved.map(super::place::InlineRefExpr::into_expr)
         }
         Rvalue::CopyForDeref(place) => resolve_place(ctx, local_exprs, place, resolver, locals),
         Rvalue::Discriminant(place) => {
@@ -235,7 +290,15 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
                     dest_local,
                 )
             })
-            .or_else(|| inline_operand_to_expr(ctx, &operands[0], local_exprs, resolver, locals))
+            .or_else(|| {
+                // Tuple translation owns its representation/address checks.
+                // Its refusal must not become an untyped operand pass-through.
+                if matches!(kind, AggregateKind::Tuple) {
+                    None
+                } else {
+                    inline_operand_to_expr(ctx, &operands[0], local_exprs, resolver, locals)
+                }
+            })
         }
         // Part of #4050/#4163: keep the data pointer expression but preserve raw-pointer len
         // metadata in `subslice_len`.
@@ -244,6 +307,13 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
             let data_expr =
                 inline_operand_to_expr(ctx, &operands[0], local_exprs, resolver, locals)?;
             let data_ptr = inline_coerce_to_ptr(data_expr);
+            // A data "pointer" that is not a bitvector (an array value a walked
+            // body built as a store chain, reached through `slice::from_raw_parts`
+            // in std's `contains`) has no address to pack: the walk declines the
+            // aggregate. It used to reach `concat` below and panic ("concat
+            // requires BitVec sorts"), taking the compilation with it (walker
+            // fail-closed review 6 round 2, found by the finding 6 unit test).
+            data_ptr.sort().bitvec_width()?;
             // When metadata is usize (fat pointer), construct BV128 = len.concat(data_ptr)
             // so metadata survives array store/load round-trips and pointer casts.
             if operands.len() > 1 {
@@ -297,11 +367,22 @@ pub(in crate::codegen_ay) fn inline_rvalue_to_expr<'tcx, 'body>(
             Some(Expr::const_array(crate::codegen_ay::types::ptr_sort(), elem))
         }
         // Part of #3188: NullaryOp runtime-check constants (ub_checks, etc.).
+        #[cfg(not(trust_toolchain))]
         Rvalue::NullaryOp(null_op) => match null_op {
-            NullOp::RuntimeChecks(RuntimeChecks::UbChecks) => Some(Expr::bool_const(true)),
+            NullOp::RuntimeChecks(RuntimeChecks::UbChecks) => Some(Expr::bool_const(
+                crate::rustc_compat::runtime_checks_value(&RuntimeChecks::UbChecks),
+            )),
             NullOp::RuntimeChecks(RuntimeChecks::ContractChecks) => Some(Expr::bool_const(true)),
             NullOp::RuntimeChecks(RuntimeChecks::OverflowChecks) => Some(Expr::bool_const(false)),
         },
+        // Trust: user-ADT reborrowing has no CHC encoding (see
+        // `trust_reborrow`). Unlike the silent `_` arm below, record the
+        // fail-close reason before bailing.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(..) => {
+            ctx.record_reborrow_unsupported("inline_rvalue_to_expr");
+            None
+        }
         _ => {
             // external enum: Rvalue
             debug!("inline: unsupported rvalue {:?}", rvalue);
@@ -415,44 +496,51 @@ fn inline_adt_variant_aggregate_to_expr<'tcx, 'body>(
 
     let mut field_values = Vec::with_capacity(operands.len());
     for (i, expr) in operand_exprs.into_iter().enumerate() {
-        let field_sort = &cons.fields[i].sort;
-        let coerced = if *expr.sort() == *field_sort {
-            expr
-        } else if expr.sort().is_bool() && field_sort.is_bitvec() {
-            let width = field_sort.bitvec_width()?;
-            Expr::ite(expr, Expr::bitvec_const(1u64, width), Expr::bitvec_const(0u64, width))
-        } else if expr.sort().is_bitvec() && field_sort.is_bool() {
-            let width = expr.sort().bitvec_width()?;
-            expr.ne(Expr::bitvec_const(0u64, width))
-        } else if expr.sort().is_bitvec() && field_sort.is_bitvec() {
-            if let (Some(src_w), Some(dst_w)) =
-                (expr.sort().bitvec_width(), field_sort.bitvec_width())
-            {
-                if src_w != dst_w {
-                    coerce_bitvec_width(expr, dst_w, SignExtension::ZeroExtend)
-                } else {
-                    expr
-                }
-            } else {
-                expr
-            }
-        } else if expr.sort().is_bool() && field_sort.is_datatype() {
-            // Part of #4090: Bool→Datatype coercion for ZST struct fields.
-            crate::codegen_ay::types::coerce_bool_to_unit_datatype(&expr, field_sort)
-                .unwrap_or(expr)
-        } else if expr.sort().is_bitvec() && field_sort.is_datatype() {
-            // Part of #3984: BV→DT reconstruction for inline aggregate fields.
-            crate::codegen_ay::types::unflatten_bitvec_to_datatype(&expr, field_sort)
-                .unwrap_or(expr)
-        } else {
-            expr
+        // A datatype-involved sort mismatch declines instead of emitting an
+        // ill-sorted constructor that AY's parser rejects (see `ctor_field`).
+        let Some(coerced) = super::ctor_field::coerce_inline_ctor_field(expr, &cons.fields[i].sort)
+        else {
+            ctx.record_aggregate_gap("inline_ctor_field_sort_mismatch");
+            return None;
         };
         field_values.push(coerced);
     }
 
     // Part of #3984: Declare callee-body DT sorts not in caller's state variables.
     ctx.declare_datatype_sort_if_needed(&sort);
-    Some(Expr::datatype_constructor(&dt.name, &cons.name, field_values, sort.clone()))
+    // Declines a field-sort mismatch instead of panicking (see the helper).
+    checked_inline_variant_constructor(&dt.name, &cons.name, field_values, sort.clone())
+}
+
+/// The constructor application when every field's sort matches the declaration.
+///
+/// ay ad07c5cc63 checks each argument sort against the datatype declaration, and
+/// `datatype_constructor` panics on a mismatch. A field none of the coercions
+/// could bring to its declared sort is not a value of this constructor, so the
+/// aggregate declines, as it does for an untranslatable operand. The panic took
+/// down the whole harness into the `chc_codegen_error` fallback, whose forced
+/// counterexample was certified Genuine: expected/derive-bounded-arbitrary/enum.rs
+/// (the `BoundedArbitrary` payload of `Enum::B(Vec<T>, usize)` built inside
+/// `bounded_any`) FAILED on a program Kani verifies.
+pub(in crate::codegen_ay::chc) fn checked_inline_variant_constructor(
+    dt_name: &str,
+    cons_name: &str,
+    field_values: Vec<Expr>,
+    sort: ay_bindings::Sort,
+) -> Option<Expr> {
+    match Expr::try_datatype_constructor(dt_name, cons_name, field_values.clone(), sort) {
+        Ok(expr) => Some(expr),
+        Err(error) => {
+            debug!(
+                dt_name,
+                cons_name,
+                field_sorts = ?field_values.iter().map(|f| f.sort().to_string()).collect::<Vec<_>>(),
+                ?error,
+                "inline ADT aggregate: field sorts do not match the constructor; declining"
+            );
+            None
+        }
+    }
 }
 
 // Pointer, fat-pointer, float, and sort-coercion helpers extracted to rvalue_ptr.rs.
@@ -462,3 +550,45 @@ use super::rvalue_ptr::{
     seed_inline_raw_ptr_metadata, translate_inline_ptr_metadata,
     try_translate_inline_wide_pointer_binop,
 };
+
+#[cfg(test)]
+mod constructor_decline_tests {
+    use super::checked_inline_variant_constructor;
+    use ay_bindings::{Expr, Sort};
+
+    fn guard_like_sort() -> Sort {
+        // `core::array::Guard { array_mut: &mut [MaybeUninit<T>], initialized: usize }`
+        // as translate_ty declares it: a BV128 fat pointer and a usize.
+        Sort::struct_type(
+            "Guard_probe",
+            [("array_mut", Sort::bitvec(128)), ("initialized", Sort::bitvec(64))],
+        )
+    }
+
+    #[test]
+    fn matching_field_sorts_build_the_aggregate() {
+        let sort = guard_like_sort();
+        let fields = vec![Expr::bitvec_const(0u64, 128), Expr::bitvec_const(0u64, 64)];
+        let built = checked_inline_variant_constructor(
+            "Guard_probe",
+            "Guard_probe_mk",
+            fields,
+            sort.clone(),
+        );
+        assert!(built.is_some_and(|e| *e.sort() == sort));
+    }
+
+    /// The walker hands a reference over as its REFERENT; a memory array where
+    /// the constructor declares a fat pointer must decline, not panic in ay.
+    #[test]
+    fn referent_array_for_fat_pointer_field_declines() {
+        let sort = guard_like_sort();
+        let referent =
+            Expr::var("guard_probe_referent", Sort::array(Sort::bitvec(64), Sort::bitvec(16)));
+        let fields = vec![referent, Expr::bitvec_const(0u64, 64)];
+        assert!(
+            checked_inline_variant_constructor("Guard_probe", "Guard_probe_mk", fields, sort)
+                .is_none()
+        );
+    }
+}

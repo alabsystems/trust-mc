@@ -73,8 +73,10 @@ fn find_nested_flattened_enum_payload_read(
 ) -> Option<rustc_public::mir::Place> {
     body.blocks.iter().find_map(|block| {
         block.statements.iter().find_map(|stmt| {
-            let StatementKind::Assign(_, Rvalue::Use(Operand::Copy(place) | Operand::Move(place))) =
-                &stmt.kind
+            let StatementKind::Assign(
+                _,
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
+            ) = &stmt.kind
             else {
                 return None;
             };
@@ -104,8 +106,10 @@ fn find_nested_enum_i32_head_read(
 ) -> Option<rustc_public::mir::Place> {
     body.blocks.iter().find_map(|block| {
         block.statements.iter().find_map(|stmt| {
-            let StatementKind::Assign(_, Rvalue::Use(Operand::Copy(place) | Operand::Move(place))) =
-                &stmt.kind
+            let StatementKind::Assign(
+                _,
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
+            ) = &stmt.kind
             else {
                 return None;
             };
@@ -268,7 +272,7 @@ fn test_projected_coroutine_call_destination_rebuilds_wrapper_root() {
                 "projected coroutine call should constrain the wrapper root output var {root_out_name}; smt={smt}"
             );
             assert!(
-                smt.contains("Yielded_CoroutineState_i32_i32"),
+                spells_variant_ctor(&smt, "Yielded", COROUTINE_STATE, "_i32_i32"),
                 "projected coroutine call should still expose the Yielded branch; smt={smt}"
             );
             assert!(
@@ -347,16 +351,17 @@ fn test_repeated_resume_coroutine_dispatch_sequences_receiver_state() {
 
             let receiver_out_name =
                 chc_ctx.state_var_mgr.output_state_vars[receiver_state_idx].0.clone();
-            let before_fallback = chc_ctx.sound_fallback_count();
+            let before = bookings(&chc_ctx);
             let before_rules = chc_ctx.vc.rules.len();
             assert!(
                 chc_ctx.try_dispatch_call_coroutine(&dcx),
                 "repeated-resume coroutine call should be handled by coroutine dispatch"
             );
-            assert_eq!(
-                chc_ctx.sound_fallback_count(),
-                before_fallback,
-                "sequenced repeated-resume coroutine should stay on the precise path"
+            // The resume is not walked: its payloads are booked havocs (Rule E).
+            assert_precise_up_to_attributed_havocs(
+                &chc_ctx,
+                &before,
+                "sequenced repeated-resume coroutine should stay on the precise path",
             );
             assert_eq!(
                 chc_ctx.vc.rules.len(),
@@ -370,7 +375,7 @@ fn test_repeated_resume_coroutine_dispatch_sequences_receiver_state() {
                 "sequenced re-entry coroutine should constrain the receiver output var {receiver_out_name}; smt={smt}"
             );
             assert!(
-                smt.contains("Complete_CoroutineState"),
+                spells_variant_ctor(&smt, "Complete", COROUTINE_STATE, ""),
                 "sequenced re-entry coroutine should expose the Complete branch for the second resume; smt={smt}"
             );
             found = true;
@@ -677,7 +682,7 @@ fn test_for_loop_vec_next_tuple_head_with_coroutine_payload_translates() {
             .filter_map(|stmt| {
                 let StatementKind::Assign(
                     _,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                 else {
                     return None;

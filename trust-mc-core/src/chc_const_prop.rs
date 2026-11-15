@@ -233,13 +233,21 @@ fn apply_constant_propagation(
         // Propagate through equality chains in constraints.
         propagate_through_equalities(&rule.body.constraints, &mut known);
 
-        // Propagate constants to unconstrained `__out` head variables.
-        // The codegen creates identity pass-throughs as universally quantified
-        // `__out` variables without explicit `(= X__out X)` constraints.
-        // This is valid CHC but prevents const prop from cascading. For each
-        // head arg `Var(Y)` where Y = X + "__out" and X is known-constant,
-        // if Y is not already bound by any constraint, propagate the constant.
-        propagate_to_unconstrained_out_vars(&rule.head.args, &rule.body.constraints, &mut known);
+        // A head argument `X__out` that no constraint binds is NOT read as
+        // `X__out = X`. A variable of a clause is universally quantified over
+        // that clause, so an unbound head argument is a HAVOC: the head holds
+        // for every value of it. The encoder states an unchanged slot by
+        // putting the INPUT variable `X` in the head (`build_block_output_args`,
+        // `build_output_args`) or by an explicit `(= X__out X)`, both of which
+        // the equality propagation above already follows. It leaves `X__out`
+        // unbound on purpose to havoc the slot: the constraint-or-unchanged
+        // fix-up (#3138), every fail-closed havoc (`havoc_local_fail_closed`
+        // registers `true` per slot) and every audited `SoundHavoc` site.
+        // Copying a known constant from `X` onto such an `X__out` (the removed
+        // `propagate_to_unconstrained_out_vars`) re-bound the havocked slot to
+        // its stale value before the solver saw it: a SoundHavoc proof then
+        // rested on that value unqualified, and a fail-closed one survived only
+        // through the demotion. See `chc_const_prop_havoc_tests.rs`.
 
         // Substitute known constants into constraint expressions.
         // This transforms `(= _20 #x0)` into `(= #x4 #x0)` when `_20 → #x4`,
@@ -262,15 +270,21 @@ fn apply_constant_propagation(
         //    (from_app), so without re-adding the constraint the variable
         //    becomes unconstrained — causing unsound over-approximation.
         //    Part of #3426.
-        let body_rel_var_names: HashSet<&str> = body_rel
-            .args
-            .iter()
-            .filter_map(|arg| {
-                if let ExprValue::Var { name } = arg.value() { Some(name.as_str()) } else { None }
-            })
-            .collect();
-        for (name, constant) in &known {
-            if body_rel_var_names.contains(name.as_str()) {
+        //
+        // In the order the variables first appear among the body relation's
+        // arguments: `known` is a `HashMap`, and iterating it here put these
+        // equalities in a per-process random order, so one harness got
+        // differently ordered rule bodies from run to run (measured 2026-10-01:
+        // the most common CHC-lane text difference over the soundness duals).
+        let mut readded: HashSet<&str> = HashSet::new();
+        for arg in body_rel.args.iter() {
+            let ExprValue::Var { name } = arg.value() else {
+                continue;
+            };
+            let Some(constant) = known.get(name) else {
+                continue;
+            };
+            if readded.insert(name.as_str()) {
                 let var_expr = Expr::var(name.clone(), constant.sort().clone());
                 substituted.push(var_expr.eq(constant.clone()));
             }
@@ -426,10 +440,7 @@ mod subst;
 #[path = "chc_const_prop_array.rs"]
 mod array;
 
-use eval::{
-    flatten_conjunctions, has_false_conjunct, propagate_to_unconstrained_out_vars,
-    strip_trivially_true_constraints,
-};
+use eval::{flatten_conjunctions, has_false_conjunct, strip_trivially_true_constraints};
 use subst::substitute_vars;
 
 /// Eliminates rules whose body constraints contain `false`.
@@ -455,7 +466,45 @@ pub(crate) fn rule_body_is_literal_false(rule: &crate::chc::Rule) -> bool {
 
 fn eliminate_trivially_false_rules(vc: &mut ChcVc) -> usize {
     let before = vc.rules.len();
+    // A per-property error rule deleted because its body FOLDS to false is a
+    // PROOF that the check cannot fire — but deleting it silently leaves the
+    // property ruleless, which the driver cannot tell from a check the encoder
+    // DROPPED, so it fails closed with `[AY:UNKNOWN_REASON:LostErrorRules]`.
+    // Measured 2026-09-17: that reason was 32 of 32 unparked CHC `unknown` rows.
+    //
+    // Record the discharge before dropping the rule. Note the rule is still
+    // DELETED, deliberately: retaining a complex-bodied infeasible error rule
+    // sends the solver into re-deriving the infeasibility (the regression the
+    // comment below records). The fact belongs out of band, not in the system.
+    let discharged: Vec<String> = vc
+        .rules
+        .iter()
+        .filter(|rule| {
+            let head: &str = rule.head.name.as_ref();
+            head.starts_with("error_p")
+                && !rule_body_is_literal_false(rule)
+                && has_false_conjunct(&rule.body.constraints)
+        })
+        .map(|rule| rule.head.name.as_str().to_string())
+        .collect();
+    let keep_error_obligations = vc.keep_error_obligations;
+    if keep_error_obligations {
+        for rule in vc.rules.iter_mut() {
+            if crate::chc::rule_is_error_obligation(rule)
+                && !rule_body_is_literal_false(rule)
+                && has_false_conjunct(&rule.body.constraints)
+            {
+                crate::chc::pin_false_error_obligation(rule);
+            }
+        }
+    }
     vc.rules.retain(|rule| {
+        // Lost-checks recovery (`ChcVc::keep_error_obligations`): a check
+        // whose guard folded to `false` stays an obligation for the discharge
+        // and the solver to settle, pinned to a literal-`false` body above.
+        if keep_error_obligations && crate::chc::rule_is_error_obligation(rule) {
+            return true;
+        }
         let head: &str = rule.head.name.as_ref();
         if (head == "error" || head.starts_with("error_p")) && rule_body_is_literal_false(rule) {
             // Retain ONLY the certified discharge shape (a LITERAL `false`
@@ -469,6 +518,11 @@ fn eliminate_trivially_false_rules(vc: &mut ChcVc) -> usize {
         }
         !has_false_conjunct(&rule.body.constraints)
     });
+    for relation in discharged {
+        if let Some(id) = relation.strip_prefix("error_p").and_then(|n| n.parse::<u32>().ok()) {
+            vc.mark_property_discharged_at_encode(id, "violation_folds_to_false");
+        }
+    }
     before - vc.rules.len()
 }
 
@@ -496,3 +550,7 @@ mod heap_liveness_tests;
 #[cfg(test)]
 #[path = "chc_const_prop_overlap_shuffle_tests.rs"]
 mod overlap_shuffle_tests;
+
+#[cfg(test)]
+#[path = "chc_const_prop_havoc_tests.rs"]
+mod havoc_tests;

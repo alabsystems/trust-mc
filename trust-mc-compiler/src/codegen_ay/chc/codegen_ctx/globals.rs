@@ -112,7 +112,10 @@ pub(in crate::codegen_ay::chc) fn push_pending_datatype_sort(sort: Sort) {
 ///
 /// Part of #2267: accepts `impl Into<Arc<str>>` to avoid String allocation
 /// when called with `Arc<str>` from state_vars.
-pub(in crate::codegen_ay::chc) fn push_pending_var_decl(name: impl Into<Arc<str>>, sort: Sort) {
+pub(in crate::codegen_ay::chc::codegen_ctx) fn push_pending_var_decl(
+    name: impl Into<Arc<str>>,
+    sort: Sort,
+) {
     PENDING_FRESH_VAR_DECLS.with(|decls| {
         decls.borrow_mut().push(VarDecl::new(name, sort));
     });
@@ -123,8 +126,14 @@ pub(in crate::codegen_ay::chc) fn push_pending_var_decl(name: impl Into<Arc<str>
 /// Combines `push_pending_var_decl` + `Expr::var` with a single name
 /// allocation instead of two. The name is moved into the Expr and a
 /// borrow is used for the VarDecl registration.
+///
+/// Private to `codegen_ctx` (Rule E): a site outside it mints a fresh value
+/// through a `fresh_vars` constructor that states why the value is fresh.
 #[must_use]
-pub(in crate::codegen_ay::chc) fn declare_pending_var(name: String, sort: Sort) -> Expr {
+pub(in crate::codegen_ay::chc::codegen_ctx) fn declare_pending_var(
+    name: String,
+    sort: Sort,
+) -> Expr {
     let expr = Expr::var(&*name, sort.clone());
     push_pending_var_decl(name, sort);
     expr
@@ -208,9 +217,34 @@ pub(in crate::codegen_ay::chc) fn record_offset_provenance_unresolved_for_fn(
     GLOBAL_COUNTERS.record_offset_provenance_unresolved_for_fn(fn_name, count);
 }
 
+/// BMC-lane entry to the offset-provenance-unresolved recorder
+/// (`AYCtx::bmc_offset_provenance_unresolved`). Bumps BOTH the crate total —
+/// the driver's fallback when a harness has no per-harness entry — and the
+/// per-function map, which `absorb_fn_keyed_for_harness` re-keys onto the
+/// harness at its codegen boundary. The CHC lane reaches the same two
+/// counters through its per-context diagnostics; this is the direct route for
+/// a lane that has no `ChcCtx`.
+pub(in crate::codegen_ay) fn record_bmc_offset_provenance_unresolved_for_fn(
+    fn_name: &str,
+    count: usize,
+) {
+    GLOBAL_COUNTERS.offset_provenance_unresolved.fetch_add(count, Ordering::Relaxed);
+    GLOBAL_COUNTERS.record_offset_provenance_unresolved_for_fn(fn_name, count);
+}
+
 /// Take (drain) the per-function offset-provenance-unresolved map.
 pub(in crate::codegen_ay) fn take_offset_provenance_unresolved_by_fn() -> BTreeMap<String, usize> {
     GLOBAL_COUNTERS.take_offset_provenance_unresolved_by_fn()
+}
+
+/// Record a per-function untranslatable-assertion count.
+pub(in crate::codegen_ay::chc) fn record_assert_untranslatable_for_fn(fn_name: &str, count: usize) {
+    GLOBAL_COUNTERS.record_assert_untranslatable_for_fn(fn_name, count);
+}
+
+/// Take (drain) the per-function untranslatable-assertion map.
+pub(in crate::codegen_ay) fn take_assert_untranslatable_by_fn() -> BTreeMap<String, usize> {
+    GLOBAL_COUNTERS.take_assert_untranslatable_by_fn()
 }
 
 /// Reset the kani::mem over-approximation counter, returning the previous value (#3165).
@@ -337,6 +371,14 @@ pub(in crate::codegen_ay) fn take_translation_drop_by_fn() -> BTreeMap<String, u
 /// Record per-function recognized-clean SoundHavoc-drop delta after CHC
 /// translation (Part of #unsound-havoc-split).
 pub(in crate::codegen_ay::chc) fn record_sound_havoc_drop_for_fn(fn_name: &str, count: usize) {
+    GLOBAL_COUNTERS.record_sound_havoc_drop_for_fn(fn_name, count);
+}
+
+/// Record a BMC-lane SAT-only taint in the same per-function SoundHavoc-drop
+/// map (`AYCtx::bmc_sound_havoc`). A separate entry point because the CHC
+/// recorder is scoped to `codegen_ay::chc` and `GLOBAL_COUNTERS` is re-exported
+/// outside `chc` only under `cfg(test)`.
+pub(in crate::codegen_ay) fn record_bmc_sound_havoc_for_fn(fn_name: &str, count: usize) {
     GLOBAL_COUNTERS.record_sound_havoc_drop_for_fn(fn_name, count);
 }
 

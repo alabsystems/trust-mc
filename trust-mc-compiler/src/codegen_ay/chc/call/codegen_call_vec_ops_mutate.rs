@@ -23,6 +23,7 @@
 //!
 //! Part of #4135: Vec residual extend/sort/append leaf handlers.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
@@ -33,9 +34,9 @@ use rustc_public::mir::Operand;
 use tracing::debug;
 
 use super::ChcCtx;
+use super::chc_fresh_name;
 use super::codegen_call_vec::ChcVecFields;
 use super::codegen_ctx::types::CollectionProjectionKind;
-use super::{chc_fresh_name, declare_pending_var};
 use crate::codegen_ay::stubs::StubKind;
 
 /// Maximum number of moved source elements unrolled into `store` constraints by
@@ -184,7 +185,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         collection_local: Option<usize>,
         modified_locals: &HashSet<usize>,
         acc: &mut CallAccumulator<'_>,
-        build_data: fn(&Expr, &Expr, &mut Vec<Expr>) -> Option<Expr>,
+        build_data: fn(&mut Self, &Expr, &Expr, &mut Vec<Expr>) -> Option<Expr>,
     ) -> bool {
         let Some(recv_local) = collection_local else {
             return false;
@@ -208,7 +209,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let (Some(ptr), Some(len), Some(cap), Some(data)) = (ptr, len, cap, data) else {
                 return false;
             };
-            let Some(new_data) = build_data(&data, &len, acc.constraints) else {
+            let Some(new_data) = build_data(self, &data, &len, acc.constraints) else {
                 return false;
             };
             let emitted = self.constrain_flattened_fields_for_call(
@@ -245,7 +246,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return false;
         };
         let ChcVecFields { vec_sort, ptr, len, cap, data } = fields;
-        let Some(new_data) = build_data(&data, &len, acc.constraints) else {
+        let Some(new_data) = build_data(self, &data, &len, acc.constraints) else {
             return false;
         };
         let Some((out_name, out_sort)) = self.state_var_mgr.output_state_vars.get(vec_idx).cloned()
@@ -343,6 +344,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Returns `None` when `old_data` is not an Array sort or its index width
     /// cannot be determined — the caller then keeps its own fallback.
     fn build_reversed_data(
+        ctx: &mut Self,
         old_data: &Expr,
         len: &Expr,
         constraints: &mut Vec<Expr>,
@@ -360,7 +362,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             len.clone().extract(idx_width - 1, 0)
         };
 
-        let new_data = declare_pending_var(chc_fresh_name("vec_reverse"), data_sort);
+        // Exact up to the unroll bound; past it the reversal is not computed,
+        // so the array is a booked havoc (Rule E).
+        let new_data = Havoc::mint(
+            ctx,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
+            chc_fresh_name("vec_reverse"),
+            data_sort,
+        );
 
         // Case-split on the concrete lengths the unroll covers so that every
         // element equality uses CONSTANT indices on both sides; a symbolic
@@ -420,6 +429,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Returns `None` when `old_data` is not an Array sort or its index width
     /// cannot be determined — the caller then fails closed.
     fn build_permuted_data(
+        ctx: &mut Self,
         old_data: &Expr,
         len: &Expr,
         constraints: &mut Vec<Expr>,
@@ -436,7 +446,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             len.clone().extract(idx_width - 1, 0)
         };
 
-        let fresh = declare_pending_var(chc_fresh_name("vec_permute"), data_sort);
+        // Some permutation of the old elements up to the unroll bound, nothing
+        // past it: a booked havoc (Rule E).
+        let fresh = Havoc::mint(
+            ctx,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
+            chc_fresh_name("vec_permute"),
+            data_sort,
+        );
 
         for k in 2..=MAX_PERMUTE_UNROLL {
             let slots: Vec<Expr> = (0..k).map(|i| Expr::bitvec_const(i, idx_width)).collect();
@@ -530,11 +547,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             acc.constraints.push(new_self_len.clone().bvuge(self_old_len.clone()));
             self.collection_len_set(&self_len_var, new_self_len.clone(), acc);
 
-            // Capacity growth: cap = max(cap, new_len).
+            // Capacity growth: `append_elements` reserves the count, RawVec's
+            // amortized growth.
             if let Some(cap_var) = self.collections.len_state.get_cap_var(self_local).cloned() {
                 let old_cap = self.collection_current_cap(&cap_var);
-                let grow_needed = old_cap.clone().bvult(new_self_len.clone());
-                let new_cap = Expr::ite(grow_needed, new_self_len.clone(), old_cap);
+                let new_cap = self.vec_reserved_cap(
+                    Some(self.body.locals()[self_local].ty),
+                    &old_cap,
+                    &new_self_len,
+                    crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                    acc.constraints,
+                );
                 self.collection_cap_set(&cap_var, new_cap.clone(), acc);
                 Self::emit_cap_ge_len(new_cap, new_self_len, acc.constraints);
             }
@@ -653,11 +676,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let new_len = old_len.clone().bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
         self.collection_len_set(&len_var, new_len.clone(), acc);
 
-        // Capacity growth: cap = max(cap, new_len).
+        // Capacity growth: `grow_one` when full, RawVec's amortized growth.
         if let Some(cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let old_cap = self.collection_current_cap(&cap_var);
-            let grow_needed = old_cap.clone().bvult(new_len.clone());
-            let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap);
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &old_cap,
+                &new_len,
+                crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, new_len, acc.constraints);
         }
@@ -733,7 +761,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let old_len = self.collection_current_len(&len_var);
 
         // new_len is fresh symbolic, constrained to [0, old_len]
-        let fresh_len = super::declare_pending_var(
+        let fresh_len = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
             super::chc_fresh_name("__vec_filter_len"),
             ay_bindings::Sort::bitvec(POINTER_WIDTH),
         );
@@ -786,17 +816,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Splice can grow or shrink — new_len is fully unconstrained.
         // The only sound constraint is new_len >= 0 (unsigned).
-        let fresh_len = super::declare_pending_var(
+        let fresh_len = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
             super::chc_fresh_name("__vec_splice_len"),
             ay_bindings::Sort::bitvec(POINTER_WIDTH),
         );
         self.collection_len_set(&len_var, fresh_len.clone(), acc);
 
-        // Cap must be >= len
+        // Cap must be >= len; a growth is one or two amortized steps
+        // (`Splice::drop`'s `move_tail`), left a fresh value.
         if let Some(cap_var) = self.collections.len_state.get_cap_var(coll_local).cloned() {
             let old_cap = self.collection_current_cap(&cap_var);
-            let grow_needed = old_cap.clone().bvult(fresh_len.clone());
-            let new_cap = Expr::ite(grow_needed, fresh_len.clone(), old_cap);
+            let new_cap = self.vec_fresh_grown_cap(&old_cap, &fresh_len, acc.constraints);
             self.collection_cap_set(&cap_var, new_cap.clone(), acc);
             Self::emit_cap_ge_len(new_cap, fresh_len, acc.constraints);
         }
@@ -810,9 +842,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// VecSplitOff: `self.split_off(at) -> Vec<T>`.
     ///
-    /// Returns a new Vec containing elements from `at` to end.
-    /// `self.len = at`, new vec `len = old_len - at`.
-    /// Sound over-approximation: dest is unconstrained, self.len bounded.
+    /// `split_off` panics when `at > self.len()`; otherwise `self` keeps its
+    /// first `at` elements and its capacity, and the returned Vec is
+    /// `Vec::with_capacity_in(len - at)` holding the rest: its length and its
+    /// capacity are both `len - at` (`alloc/src/vec/mod.rs`). Returns the
+    /// no-panic condition, `at <= len` over the call's entry state, for the
+    /// caller to state as Kani's panic check; the transition assumes it.
+    ///
+    /// The model assumed `at <= len` and checked nothing, so `split_off(3)` on
+    /// a two-element Vec verified clean where Kani fails; it set only the
+    /// length side-state, so the returned Vec's capacity was whatever its
+    /// slot held (`w.capacity() == 2`, which Kani proves, failed certified
+    /// Genuine), and its elements were havocked with no record (walker
+    /// fail-closed review, round 3 of the repair after the merge with main,
+    /// `vec_capacity_elem_layout_dual.rs`). Both Vecs' fields are now written:
+    /// `self`'s length, and the returned Vec's length, capacity, a fresh
+    /// pointer and fresh elements (`vec_split_off_elements_unmodelled`, an
+    /// identified sound havoc, so a counterexample that reads them is not
+    /// certified).
     pub(in crate::codegen_ay::chc) fn vec_op_split_off(
         &mut self,
         args: &[Operand],
@@ -820,47 +867,95 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         collection_local: Option<usize>,
         dest_local: usize,
         acc: &mut CallAccumulator<'_>,
-    ) {
+    ) -> Option<Expr> {
         let Some(coll_local) = collection_local else {
             self.record_sound_fallback_reason("vec_split_off_no_local");
             acc.dests.push(dest_local);
-            return;
+            return None;
         };
-        let Some(len_var) = self.collections.len_state.get_len_var(coll_local).cloned() else {
+        let at = args.get(1).and_then(|a| self.translate_operand_with_modified(a, modified_locals));
+        let Some(at) = at else {
+            self.record_sound_fallback_reason("vec_split_off_no_at");
+            acc.dests.push(dest_local);
+            return None;
+        };
+        // The length: the side-state when tracked, else the Vec's own field.
+        let old_len = match self.collections.len_state.get_len_var(coll_local).cloned() {
+            Some(len_var) => {
+                let old_len = self.collection_current_len(&len_var);
+                self.collection_len_set(&len_var, at.clone(), acc);
+                Some(old_len)
+            }
+            None => self.read_vec_fields(coll_local, modified_locals).map(|(_, len, _, _)| len),
+        };
+        let Some(old_len) = old_len else {
             self.record_sound_fallback_reason("vec_split_off_no_len");
             acc.dests.push(dest_local);
-            return;
+            return None;
         };
+        let no_panic = at.clone().bvule(old_len.clone());
+        acc.constraints.push(no_panic.clone());
+        let other_len = old_len.bvsub(at.clone());
 
-        let at_arg =
-            args.get(1).and_then(|a| self.translate_operand_with_modified(a, modified_locals));
-
-        if let Some(at) = at_arg {
-            let old_len = self.collection_current_len(&len_var);
-            // self.len = at (elements 0..at remain in self)
-            // Ensure at <= old_len (Rust panics otherwise, but we model soundly)
-            acc.constraints.push(at.clone().bvule(old_len.clone()));
-            self.collection_len_set(&len_var, at.clone(), acc);
-
-            // New Vec's length = old_len - at
-            if let Some(dest_len_var) = self.collections.len_state.get_len_var(dest_local).cloned()
-            {
-                let new_vec_len = old_len.bvsub(at);
-                self.collection_len_set(&dest_len_var, new_vec_len, acc);
-            }
-        } else {
-            self.record_sound_fallback_reason("vec_split_off_no_at");
+        // `self`: its length field is `at`; pointer, capacity and elements stay.
+        if !self.write_vec_fields(
+            coll_local,
+            modified_locals,
+            |ptr, _len, cap, data| (ptr, at.clone(), cap, data),
+            acc,
+        ) {
+            self.record_sound_fallback_reason("vec_split_off_fields_unwritten");
         }
 
-        // Dest Vec data is unconstrained.
-        acc.dests.push(dest_local);
+        // The returned Vec: `len - at` elements in a buffer of exactly that
+        // capacity, at a fresh address, with elements the model does not copy.
+        if let Some(dest_len_var) = self.collections.len_state.get_len_var(dest_local).cloned() {
+            self.collection_len_set(&dest_len_var, other_len.clone(), acc);
+        }
+        if let Some(dest_cap_var) = self.collections.len_state.get_cap_var(dest_local).cloned() {
+            self.collection_cap_set(&dest_cap_var, other_len.clone(), acc);
+        }
+        // Rule E: the buffer's address is an untracked pointer value, and the
+        // elements a fresh array booked under its sound-havoc reason with the
+        // array as its identity (booked before the fields are written, since
+        // the array's sort is the field's).
+        let ptr = crate::codegen_ay::chc::codegen_ctx::Havoc::mint(
+            self,
+            crate::codegen_ay::chc::codegen_ctx::sound_havoc::UNTRACKED_POINTER_VALUE,
+            chc_fresh_name("vec_split_off_ptr"),
+            crate::codegen_ay::types::ptr_sort(),
+        );
+        let data_name = chc_fresh_name("vec_split_off_data");
+        let elements_booked = self.record_sound_fallback_reason_identified(
+            crate::codegen_ay::chc::codegen_ctx::sound_havoc::VEC_SPLIT_OFF_ELEMENTS_UNMODELLED
+                .as_str(),
+            Some(&data_name),
+        );
+        let written = self.write_vec_fields(
+            dest_local,
+            modified_locals,
+            |_ptr, _len, _cap, data| {
+                let fresh = crate::codegen_ay::chc::codegen_ctx::Havoc::booked(
+                    elements_booked,
+                    data_name.clone(),
+                    data.sort().clone(),
+                );
+                (ptr, other_len.clone(), other_len.clone(), fresh)
+            },
+            acc,
+        );
+        if !written {
+            self.record_sound_fallback_reason("vec_split_off_fields_unwritten");
+            acc.dests.push(dest_local);
+        }
 
         debug!(
             fn_name = %self.fn_name,
             coll_local,
             dest_local,
-            "VecSplitOff: self.len = at, new vec unconstrained"
+            "VecSplitOff: self.len = at, returned Vec len = cap = len - at, elements fresh"
         );
+        Some(no_panic)
     }
 
     /// VecLast: `self.last() -> Option<&T>`.

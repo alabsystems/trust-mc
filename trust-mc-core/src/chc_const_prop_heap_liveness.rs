@@ -41,11 +41,169 @@ pub fn has_scalarized_obj_valid_liveness(vc: &ChcVc) -> bool {
 /// (e.g. `expected/realloc/shrink`). Leave these VCs unreduced so the bounds
 /// obligation survives to the solver. This mirrors the `obj_valid` mitigation
 /// (ay#9227) for the `obj_size` bounds lane.
+///
+/// The hazard is an OUT-OF-BOUNDS cell. When every scalarized constant-address
+/// cell (heap or region lane) provably lies inside its object — the object has
+/// exactly one size in the VC, a constant, and the cell's bytes end at or before
+/// it — there is no such cell and the guard stays off
+/// (`scalarized_cells_provably_in_bounds`). Without that exemption the guard
+/// fired on any VC whose memory happened to scalarize before constant
+/// propagation, whatever the cells were: a `Box` payload written at constant
+/// addresses and then coerced to `Box<dyn T>` (fix/chc-lost-writes) kept its
+/// drop's nineteen memory-safety obligations over symbolic pointers, where
+/// const-prop collapses them to two, and the per-property solve overran its
+/// deadline into the driver watchdog. `realloc/shrink` still fires: its cells
+/// run past the shrunk object's size, and that size is not a constant.
 pub fn has_scalarized_obj_size_bounds(vc: &ChcVc) -> bool {
     if !vc_mentions_heap_metadata(vc) {
         return false;
     }
-    vc.vars().iter().any(|var| is_scalarized_const_address_cell(&var.name, var.sort.is_array()))
+    if !vc.vars().iter().any(|var| is_scalarized_const_address_cell(&var.name, var.sort.is_array()))
+    {
+        return false;
+    }
+    !scalarized_cells_provably_in_bounds(vc)
+}
+
+/// A scalarized constant-address memory or region lane: the object id and byte
+/// offset its name encodes (`..._at_0x<obj:32><offset:32>_bv64`) and its width
+/// in bytes. `None` for a name or sort this does not read with certainty.
+fn const_address_cell(name: &str, sort: &ay_bindings::Sort) -> Option<(u64, u64, u64)> {
+    if sort.is_array() || !(name.contains("_mem_") || name.contains("_region_")) {
+        return None;
+    }
+    let name = name.strip_suffix("__out").unwrap_or(name);
+    let (_, rest) = name.rsplit_once("_at_0x")?;
+    let hex = rest.strip_suffix("_bv64")?;
+    let addr = u64::from_str_radix(hex, 16).ok()?;
+    let width_bytes = if sort.is_bool() { 1 } else { u64::from(sort.bitvec_width()?).div_ceil(8) };
+    Some((addr >> 32, addr & 0xffff_ffff, width_bytes))
+}
+
+/// The unsigned value of a constant expression (after constant folding).
+fn const_u64(expr: &Expr) -> Option<u64> {
+    let folded = crate::chc_const_prop::eval::try_eval_to_const(expr)?;
+    let ExprValue::BitVecConst { value, .. } = folded.value() else { return None };
+    let (sign, digits) = value.to_u64_digits();
+    if sign == num_bigint::Sign::Minus {
+        return None;
+    }
+    match digits.as_slice() {
+        [] => Some(0),
+        [d] => Some(*d),
+        _ => None,
+    }
+}
+
+/// Every size the VC gives an object, keyed by object id; `None` for an object
+/// given a size that is not a constant. `Err(())` when an `obj_size` store has a
+/// symbolic index, which may resize any object.
+///
+/// A size comes from a store into the `obj_size` array (at any depth of a store
+/// chain), from the definition of a scalarized size lane
+/// (`obj_size_at_0x<obj>_bv32__out = v`, identity copies aside), or from a
+/// top-level fact of an entry rule (`(select obj_size c) = v`, `lane = v`).
+fn object_sizes(vc: &ChcVc) -> Result<HashMap<u64, Option<HashSet<u64>>>, ()> {
+    fn note(sizes: &mut HashMap<u64, Option<HashSet<u64>>>, obj: u64, size: Option<u64>) {
+        let entry = sizes.entry(obj).or_insert_with(|| Some(HashSet::new()));
+        match (entry.as_mut(), size) {
+            (Some(set), Some(size)) => {
+                set.insert(size);
+            }
+            _ => *entry = None,
+        }
+    }
+    fn is_obj_size_array(expr: &Expr) -> bool {
+        matches!(expr.value(), ExprValue::Var { name } if name.starts_with("obj_size"))
+            && expr.sort().is_array()
+    }
+    fn store_chain_base(mut expr: &Expr) -> &Expr {
+        while let ExprValue::Store { array, .. } = expr.value() {
+            expr = array;
+        }
+        expr
+    }
+    /// The object id of a size lane (`obj_size_at_0x<obj>_bv32`, or its `__out`).
+    fn lane_obj(name: &str) -> Option<u64> {
+        let rest = name.strip_prefix("obj_size_at_0x")?;
+        let rest = rest.strip_suffix("__out").unwrap_or(rest);
+        u64::from_str_radix(rest.strip_suffix("_bv32")?, 16).ok()
+    }
+    fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match expr.value() {
+            ExprValue::And(children) => children.iter().for_each(|c| conjuncts(c, out)),
+            _ => out.push(expr),
+        }
+    }
+
+    let mut sizes: HashMap<u64, Option<HashSet<u64>>> = HashMap::new();
+    for rule in &vc.rules {
+        if rule.body.relation.is_none() {
+            let mut facts = Vec::new();
+            rule.body.constraints.iter().for_each(|c| conjuncts(c, &mut facts));
+            for fact in facts {
+                let ExprValue::Eq(lhs, rhs) = fact.value() else { continue };
+                let obj = match lhs.value() {
+                    ExprValue::Select { array, index } if is_obj_size_array(array) => {
+                        const_u64(index)
+                    }
+                    ExprValue::Var { name } if !name.ends_with("__out") => lane_obj(name),
+                    _ => None,
+                };
+                if let Some(obj) = obj {
+                    note(&mut sizes, obj, const_u64(rhs));
+                }
+            }
+        }
+        let mut stack: Vec<&Expr> = rule.body.constraints.iter().collect();
+        while let Some(expr) = stack.pop() {
+            match expr.value() {
+                ExprValue::Store { index, value, .. } if is_obj_size_array(store_chain_base(expr)) => {
+                    let Some(obj) = const_u64(index) else { return Err(()) };
+                    note(&mut sizes, obj, const_u64(value));
+                }
+                ExprValue::Eq(lhs, rhs) => {
+                    if let ExprValue::Var { name } = lhs.value()
+                        && name.ends_with("__out")
+                        && let Some(obj) = lane_obj(name)
+                    {
+                        let identity = matches!(rhs.value(), ExprValue::Var { name: r }
+                            if !r.ends_with("__out") && lane_obj(r) == Some(obj));
+                        if !identity {
+                            note(&mut sizes, obj, const_u64(rhs));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            stack.extend(expr.value().children());
+        }
+    }
+    Ok(sizes)
+}
+
+/// Whether every scalarized constant-address cell of the VC lies inside its
+/// object: the object has exactly one size, a constant, and the cell's bytes
+/// end at or before it. Any cell this cannot read, and any object with no
+/// size, a symbolic size or two sizes (a resize), answers `false`.
+fn scalarized_cells_provably_in_bounds(vc: &ChcVc) -> bool {
+    let Ok(sizes) = object_sizes(vc) else { return false };
+    for var in vc.vars() {
+        let name: &str = &var.name;
+        let memory_lane = name.contains("_mem_") || name.contains("_region_");
+        if var.sort.is_array() || !memory_lane || !name.contains("_at_0x") {
+            continue;
+        }
+        let Some((obj, offset, width)) = const_address_cell(name, &var.sort) else {
+            return false;
+        };
+        let Some(Some(obj_sizes)) = sizes.get(&obj) else { return false };
+        let [size] = obj_sizes.iter().copied().collect::<Vec<_>>()[..] else { return false };
+        if offset.checked_add(width).is_none_or(|end| end > size) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Returns whether the VC carries an error-reachable edge guarded by the

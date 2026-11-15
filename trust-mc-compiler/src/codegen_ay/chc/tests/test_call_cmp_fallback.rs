@@ -353,7 +353,7 @@ fn test_cmp_clamp_emits_error_rule_for_invalid_bounds() {
             Operand::Copy(Place { local: 3usize, projection: vec![] }),
         ];
         let before_rules = chc_ctx.vc.rules.len();
-        let before_error_rules = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before_error_rules = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(chc_ctx.sound_fallback_count(), 0, "precondition: start at zero");
         let target_opt = Some(target);
         let dcx =
@@ -362,11 +362,12 @@ fn test_cmp_clamp_emits_error_rule_for_invalid_bounds() {
 
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before_rules + 2,
-            "clamp should emit one error rule and one guarded successor rule"
+            // BSEM-18: the error rule's `error_p{id}` head also adds its bridge rule.
+            before_rules + 3,
+            "clamp should emit one error rule, its error_p bridge, and one guarded successor rule"
         );
         assert_eq!(
-            chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count(),
+            chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count(),
             before_error_rules + 1,
             "clamp must emit an error rule for min > max"
         );
@@ -379,7 +380,7 @@ fn test_cmp_clamp_emits_error_rule_for_invalid_bounds() {
         let emitted_rules = &chc_ctx.vc.rules[before_rules..];
         let error_rule = emitted_rules
             .iter()
-            .find(|r| r.head.name == "error")
+            .find(|r| is_error_check_rule(r))
             .expect("expected emitted clamp error rule");
         let error_constraints =
             error_rule.body.constraints.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -392,7 +393,7 @@ fn test_cmp_clamp_emits_error_rule_for_invalid_bounds() {
 
         let guarded_goto = emitted_rules
             .iter()
-            .find(|r| r.head.name != "error")
+            .find(|r| !is_error_head(r.head.name.as_str()))
             .expect("expected emitted clamp successor rule");
         let guarded_constraints =
             guarded_goto.body.constraints.iter().map(ToString::to_string).collect::<Vec<_>>();

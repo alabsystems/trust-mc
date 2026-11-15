@@ -42,6 +42,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // result = lhs * 2^rhs (SMT-LIB has no int pow; model with constraints)
         let result_name = self.ctx.fresh_name(result_prefix);
         let result = self.ctx.declare_var(&result_name, int_sort());
+        self.ctx.bmc_sound_havoc("bigint_shift_result");
         // Constraint: if rhs == 0 then result == lhs
         let zero_shift = rhs.clone().eq(Expr::int_const(0));
         self.ctx.assert(Expr::ite(
@@ -85,6 +86,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Right shift: result = floor(lhs / 2^rhs) — approximation with constraints
         let result_name = self.ctx.fresh_name(result_prefix);
         let result = self.ctx.declare_var(&result_name, int_sort());
+        self.ctx.bmc_sound_havoc("bigint_shift_result");
         // Constraint: if rhs == 0 then result == lhs
         let zero_shift = rhs.clone().eq(Expr::int_const(0));
         self.ctx.assert(Expr::ite(
@@ -222,6 +224,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // Create unconstrained symbolic value
                 let result_name = self.ctx.fresh_name_with_suffix("bigint", op_name);
                 let result = self.ctx.declare_var(&result_name, int_sort());
+                self.ctx.bmc_sound_havoc("bigint_bitwise_result");
                 // #933: BigUint bitwise result must be non-negative
                 Self::assert_nonneg_if_biguint(self.ctx, &result, is_biguint);
                 self.assign_value_to_place(destination, result);

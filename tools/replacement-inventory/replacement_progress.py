@@ -51,6 +51,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+import replacement_harness_dispositions as dispositions
+
 TOOL = "replacement_progress"
 BRAND = "ay / trust-mc"
 
@@ -87,6 +92,8 @@ class Observed:
     execution_state: str | None = None
     report_match: bool | None = None
     proof_quality: bool | None = None
+    cover_properties: Any = None
+    cover_error: Any = None
 
     def classify(self) -> str:
         """Map an observed harness result onto the inventory vocabulary.
@@ -137,6 +144,7 @@ class RowResult:
     proven: bool  # PROOF row, SUCCESS, zero fallback
     closed: bool  # non-PROOF row whose outcome is justified (== expected)
     fallback: int
+    cover_mismatch: str | None = None
 
 
 @dataclass
@@ -239,6 +247,8 @@ def _observed_from_proof_summary(entry: dict[str, Any]) -> Observed:
         undetermined=_as_int(counts.get("undetermined")),
         unknown=_as_int(counts.get("unknown")),
         validation_status=entry.get("validation_status"),
+        cover_properties=entry.get("cover_properties"),
+        cover_error=entry.get("cover_error"),
     )
 
 
@@ -306,6 +316,8 @@ def _observed_from_ay_compiletest(entry: dict[str, Any]) -> Observed:
         execution_state=(str(execution_state) if execution_state is not None else None),
         report_match=report_match,
         proof_quality=proof_quality,
+        cover_properties=entry.get("cover_properties"),
+        cover_error=entry.get("cover_error"),
     )
 
 
@@ -396,6 +408,7 @@ def compute_progress(inventory: dict[str, Any], observed: list[Observed]) -> Pro
         expected = str(row.get("expected", "")).upper()
         is_proof = expected == "PROOF"
         obs = _lookup(index, row)
+        cover_error = None
 
         if obs is None:
             actual = "MISSING"
@@ -406,6 +419,8 @@ def compute_progress(inventory: dict[str, Any], observed: list[Observed]) -> Pro
             actual = obs.classify()
             fallback = obs.sound_fallback
             matched = actual == expected
+            cover_error = dispositions.cover_mismatch(row, obs.cover_properties, obs.cover_error)
+            matched = matched and cover_error is None
             prog.rows_measured += 1
             if is_proof:
                 proven = (
@@ -414,6 +429,7 @@ def compute_progress(inventory: dict[str, Any], observed: list[Observed]) -> Pro
                     and fallback == 0
                     and obs.report_match is not False
                     and obs.proof_quality is not False
+                    and cover_error is None
                 )
                 closed = False
             else:
@@ -432,6 +448,7 @@ def compute_progress(inventory: dict[str, Any], observed: list[Observed]) -> Pro
             proven=proven,
             closed=closed,
             fallback=fallback,
+            cover_mismatch=cover_error,
         )
         prog.rows.append(rr)
 
@@ -548,6 +565,7 @@ def render_json(prog: Progress) -> str:
                 "proven": r.proven,
                 "closed": r.closed,
                 "fallback": r.fallback,
+                "cover_mismatch": r.cover_mismatch,
             }
             for r in prog.rows
         ],

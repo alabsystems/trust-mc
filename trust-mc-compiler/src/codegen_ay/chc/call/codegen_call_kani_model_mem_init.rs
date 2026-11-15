@@ -21,6 +21,7 @@
 //! byte (`shmem_val__out = true`). That can only hide bugs, never introduce
 //! false failures on currently-passing harnesses.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
@@ -37,7 +38,7 @@ use super::super::shadow_mem_state::{
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use super::{ChcCtx, KaniModel, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, KaniModel, chc_fresh_name};
 
 /// Raw-alloc route: whether `path` names the REFERENCE-FORMING
 /// `slice::from_raw_parts{,_mut}` itself (which reads all `len` elements via
@@ -561,7 +562,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else {
             elem_bytes.clone()
         };
-        let should_reset = declare_pending_var(chc_fresh_name("shmem_copy_reset"), bool_sort());
+        let should_reset = ExactVar::nondet(chc_fresh_name("shmem_copy_reset"), bool_sort());
         Some(self.shadow_state_in().copy_exprs(
             &from.obj,
             &from.off,
@@ -612,7 +613,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let sel = self.translate_operand_with_modified(dcx.args.get(1)?, dcx.modified_locals)?;
         let sel = coerce_bitvec_width_safe(sel, 32, SignExtension::ZeroExtend);
         sel.sort().bitvec_width()?;
-        let should_store = declare_pending_var(chc_fresh_name("shmem_ab_store"), bool_sort());
+        let should_store = ExactVar::nondet(chc_fresh_name("shmem_ab_store"), bool_sort());
         Some([
             shadow_out(SHMEM_AB_SOME).eq(Expr::ite(
                 should_store.clone(),
@@ -661,7 +662,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let hit = shadow_in(SHMEM_AB_SOME).and(shadow_in(SHMEM_AB_SEL).eq(sel));
         let elem_bytes = Expr::bitvec_const(layout_size.max(1), 32);
         let (from_obj, from_off) = self.split_pointer(&shadow_in(SHMEM_AB_ADDR))?;
-        let should_reset = declare_pending_var(chc_fresh_name("shmem_load_reset"), bool_sort());
+        let should_reset = ExactVar::nondet(chc_fresh_name("shmem_load_reset"), bool_sort());
         let state = self.shadow_state_in();
         let copied = state.copy_exprs(
             &from_obj,

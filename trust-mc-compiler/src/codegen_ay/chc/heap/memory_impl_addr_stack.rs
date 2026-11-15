@@ -19,10 +19,46 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Self::try_extract_constant_addr(addr).map(|(obj_id, _)| obj_id)
     }
 
+    /// Extract an allocation base, never an interior pointer's object alone.
+    ///
+    /// `known_alloc_ids` and whole-owner ref targets imply offset zero when
+    /// read back as an address. Region/bounds queries must keep using
+    /// `try_extract_obj_id`, which intentionally accepts interior addresses.
+    pub(in crate::codegen_ay::chc) fn try_extract_base_obj_id(addr: &Expr) -> Option<u32> {
+        Self::try_extract_constant_addr(addr)
+            .filter(|(_, offset)| *offset == 0)
+            .map(|(obj_id, _)| obj_id)
+    }
+
+    /// The concrete stack address recorded for `local_idx`, when that record
+    /// holds on every path.
+    ///
+    /// The table is keyed by local, not by path. A local that more than one
+    /// statement or call assigns (`let r = if b { &m } else { &n };`) keeps
+    /// whichever producer was translated LAST, and that address is wrong on
+    /// every path through another producer. Read through it, `*r` was `n` on
+    /// the path where `r = &m`, and `--ay-chc` proved `assert!(*r == 2)` there
+    /// (tools/soundness-duals/negative/joined_pointer_last_producer.rs). Such a
+    /// local answers `None`, so its readers fall back to the local's own
+    /// path-sensitive state.
     pub(in crate::codegen_ay::chc) fn known_stack_addr_expr(
         &self,
         local_idx: usize,
     ) -> Option<Expr> {
+        // `known_stack_addr_exprs` is keyed by local and written in block encoding
+        // order. For a local with more than one whole-local producer it names the
+        // producer encoded LAST, not the address on the current path: after
+        // `let p = if c { &mut b } else { &mut a }` the store `*p = 1` went to one
+        // arm's constant object on both paths, and the modifies-frame check compared
+        // that one address (negative/modifies_frame_residual.rs::merge_*). Refuse it;
+        // every caller then takes its path-precise state-variable lane.
+        if self.local_has_multiple_whole_definitions(local_idx) {
+            debug!(
+                local_idx,
+                "CHC: stack address provenance ignored: the local has several producers"
+            );
+            return None;
+        }
         self.known_stack_addr_exprs.get(&local_idx).cloned()
     }
 

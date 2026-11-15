@@ -57,7 +57,15 @@ pub(in crate::codegen_ay::chc) fn compute_single_assign_locals(ctx: &mut ChcCtx<
     // single-assign when it actually has multiple values across blocks.
     let ref_target_referents: HashSet<usize> =
         ctx.ref_resolution.ref_targets.values().map(|rt| rt.local).collect();
-    let shared_const_referents = shared_borrowed_const_referents(ctx.body);
+    // A shared borrow does not freeze an interior-mutable referent: `Cell::set`,
+    // `RefCell::replace` and atomic stores all write through `&T`. Such a local
+    // keeps the #3937 exclusion even when it is assigned once from a constant
+    // (`let c = CONST_CELL;`), or its first value would be cached across blocks
+    // over every later interior write.
+    let shared_const_referents: HashSet<usize> = shared_borrowed_const_referents(ctx.body)
+        .into_iter()
+        .filter(|&local| !ctx.ty_has_interior_mut(ctx.body.locals()[local].ty))
+        .collect();
     // Raw "written exactly once" set, WITHOUT the ref-target exclusion below.
     // Consumed only by the field-0 Box/pointer-wrapper provenance forward,
     // which pairs it with `deref_store_target_locals` for soundness.
@@ -120,7 +128,7 @@ fn shared_borrowed_const_referents(body: &Body) -> HashSet<usize> {
             };
 
             if lhs.projection.is_empty()
-                && matches!(rvalue, Rvalue::Use(Operand::Constant(_)))
+                && matches!(rvalue, Rvalue::Use(Operand::Constant(_), ..))
                 && body
                     .locals()
                     .get(lhs.local)

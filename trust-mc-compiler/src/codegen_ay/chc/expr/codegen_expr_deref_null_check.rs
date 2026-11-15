@@ -42,7 +42,7 @@ use ay_bindings::Expr;
 use rustc_public::mir::{
     AggregateKind, Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
 };
-use rustc_public::ty::{ConstantKind, IntTy, RigidTy, TyKind, UintTy};
+use rustc_public::ty::{IntTy, RigidTy, TyKind, UintTy};
 use tracing::debug;
 
 use super::ChcCtx;
@@ -259,7 +259,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 let dst = lhs.local;
                 let addr_op = match rvalue {
-                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => op,
+                    Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) => op,
                     Rvalue::Aggregate(AggregateKind::RawPtr(..), operands) => {
                         let Some(op) = operands.first() else {
                             continue;
@@ -328,13 +328,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         {
             return true;
         }
+        // A null pointer constant: no relocation, and every byte initialized
+        // data zero (`const_pointer`'s slot clause).
         matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..)))
-            && matches!(
-                c.const_.kind(),
-                ConstantKind::Allocated(alloc)
-                    if alloc.provenance.ptrs.is_empty()
-                        && !alloc.bytes.is_empty()
-                        && alloc.bytes.iter().all(|b| *b == Some(0))
-            )
+            && crate::codegen_ay::shared::const_pointer::const_bytes(&c.const_).is_some_and(|b| {
+                use crate::codegen_ay::shared::const_pointer::ConstRead;
+                b.len() > 0
+                    && b.is_plain_data()
+                    && b.read_data_bytes(0, b.len()).is_some_and(|v| v.iter().all(|&x| x == 0))
+            })
     }
 }

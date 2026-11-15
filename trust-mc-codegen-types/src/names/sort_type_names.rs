@@ -129,4 +129,142 @@ pub fn hashmap_into_iter_sort_name(key_suffix: &str, val_suffix: &str) -> String
     s
 }
 
+// ---------------------------------------------------------------------------
+// Recognizers. Every test of a sort's NAME lives in `names`, beside the code
+// that builds the name (design trust-mc-reds-final §7.2, T3-1), so a change of
+// naming scheme changes its readers in the same module. The engine lint
+// `test_sort_name_single_rule` refuses a string predicate on a sort name
+// anywhere else under `codegen_ay`.
+// ---------------------------------------------------------------------------
+
+/// A [`vec_sort_name`] sort.
+pub fn is_vec_sort_name(name: &str) -> bool {
+    name.starts_with("Vec_")
+}
+
+/// A sort of the Vec model family: [`vec_sort_name`], `VecIter_*`,
+/// [`vec_into_iter_sort_name`].
+pub fn is_vec_family_sort_name(name: &str) -> bool {
+    name.starts_with("Vec")
+}
+
+/// An Option sort: a model [`option_sort_name`] sort (or the bare fixture
+/// name `Option`), or the sort of the `Option` ADT itself ([`super::adt_sort_is`]).
+pub fn is_option_sort_name(name: &str) -> bool {
+    name == "Option"
+        || name.starts_with("Option_")
+        || super::adt_sort_is(name, super::known_adt::OPTION)
+}
+
+/// A [`slice_sort_name`] sort.
+pub fn is_slice_sort_name(name: &str) -> bool {
+    name.starts_with("Slice_")
+}
+
+/// A sort whose name mentions the slice model anywhere (`Slice_*`,
+/// `SliceIter_*`, `VecIter_Slice_*`): a value carrying a slice's `fld_ptr`.
+pub fn sort_name_mentions_slice(name: &str) -> bool {
+    name.contains("Slice")
+}
+
+/// A [`dyn_sort_name`] sort.
+pub fn is_dyn_sort_name(name: &str) -> bool {
+    name.starts_with("Dyn_")
+}
+
+/// A [`closure_sort_name`] sort.
+pub fn is_closure_sort_name(name: &str) -> bool {
+    name.starts_with("Closure_")
+}
+
+/// A [`vec_into_iter_sort_name`] sort.
+pub fn is_vec_into_iter_sort_name(name: &str) -> bool {
+    name.starts_with("VecIntoIter")
+}
+
+/// A [`hashmap_into_iter_sort_name`] sort.
+pub fn is_hashmap_into_iter_sort_name(name: &str) -> bool {
+    name.starts_with("HashMapIntoIter")
+}
+
+/// A [`hashset_into_iter_sort_name`] sort.
+pub fn is_hashset_into_iter_sort_name(name: &str) -> bool {
+    name.starts_with("HashSetIntoIter")
+}
+
+/// A `SliceIter_*` model sort.
+pub fn is_slice_iter_sort_name(name: &str) -> bool {
+    name.starts_with("SliceIter_")
+}
+
+/// Which collection an `IntoIter` model sort iterates, read from the name its
+/// builder gave it: a HashMap or HashSet model, an array's ([`into_iter_sort_name`]
+/// over a [`polymorphic_iter_sort_name`], or the bare `IntoIter`), else a Vec's.
+pub fn into_iter_sort_source(name: &str) -> IntoIterSource {
+    if name.contains("HashMap") {
+        IntoIterSource::HashMap
+    } else if name.contains("HashSet") {
+        IntoIterSource::HashSet
+    } else if name == "IntoIter" || name.contains("PolymorphicIter") {
+        IntoIterSource::Array
+    } else {
+        IntoIterSource::Vec
+    }
+}
+
+/// See [`into_iter_sort_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntoIterSource {
+    HashMap,
+    HashSet,
+    Array,
+    Vec,
+}
+
+/// A synthetic iterator model sort with no MIR type to classify it by
+/// (`*IntoIter*`, `*Iter_*`, `*Iter`).
+pub fn is_iterator_model_sort_name(name: &str) -> bool {
+    name.contains("IntoIter") || name.contains("Iter_") || name.ends_with("Iter")
+}
+
+/// The BMC lane's `RawVec` model sort.
+pub const RAWVEC_MODEL_SORT: &str = "RawVec";
+
+/// The BMC lane's `Layout` model sort.
+pub const LAYOUT_MODEL_SORT: &str = "Layout";
+
+/// A sort whose name mentions `RawVec` (the model sort, or an ADT over it).
+pub fn sort_name_mentions_rawvec(name: &str) -> bool {
+    name.contains("RawVec")
+}
+
+/// A `Copied<I>` or `Cloned<I>` sort: the ADT's own sort, or the bare fixture
+/// names.
+pub fn is_copied_or_cloned_sort_name(name: &str) -> bool {
+    name == "Copied"
+        || name == "Cloned"
+        || super::adt_sort_is(name, super::known_adt::COPIED)
+        || super::adt_sort_is(name, super::known_adt::CLONED)
+}
+
+/// A `TypeId` sort: the ADT's own sort, or the bare name a stub gives it.
+pub fn is_type_id_sort_name(name: &str) -> bool {
+    name == "TypeId" || super::adt_sort_is(name, super::known_adt::TYPE_ID)
+}
+
+/// A `str::Chars` sort, or a model sort over one.
+pub fn sort_name_mentions_chars(name: &str) -> bool {
+    name.contains("Chars")
+}
+
+/// An allocation `Result<_, AllocError>` sort (#2618).
+pub fn is_alloc_result_sort_name(name: &str) -> bool {
+    name.contains("Result") && name.contains("AllocError")
+}
+
+/// A BigInt / BigUint / Ratio model sort (value semantics).
+pub fn is_bignum_sort_name(name: &str) -> bool {
+    name.contains("BigInt") || name.contains("BigUint") || name.contains("Ratio")
+}
+
 // Tests live in trust_mc-compiler (standalone test binaries cannot link rustc sysroot dylibs).

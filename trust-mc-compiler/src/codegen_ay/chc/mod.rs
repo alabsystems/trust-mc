@@ -92,6 +92,7 @@ pub(in crate::codegen_ay) mod expr;
 use expr::codegen_expr_array_eq;
 use expr::codegen_expr_constant;
 use expr::codegen_expr_env;
+use expr::codegen_expr_flat_struct_path;
 use expr::codegen_expr_signedness;
 mod rules;
 use rules::codegen_rules;
@@ -112,21 +113,26 @@ use stmt::stmt_accumulator;
 // pub(crate) for external consumers (statement/*.rs, call/virtual_inline/)
 pub(crate) use stmt::codegen_stmt_aggregate_adt;
 mod decl;
+pub(in crate::codegen_ay) use call::codegen_call::codegen_call_sysconf::is_modeled_sysconf_path;
+pub(in crate::codegen_ay) use call::codegen_call_atomic::{AtomicKind, detect_atomic_intrinsic};
 use decl::codegen_decl_flatten;
 use decl::codegen_decl_panic_filter;
 use decl::codegen_types;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 use decl::codegen_types_adt;
 use decl::codegen_types_adt_sort;
-pub(in crate::codegen_ay) use call::codegen_call_atomic::{AtomicKind, detect_atomic_intrinsic};
-pub(in crate::codegen_ay) use call::codegen_call::codegen_call_sysconf::is_modeled_sysconf_path;
 pub(in crate::codegen_ay) use decl::{frame_narrowing_enabled, frame_narrowing_flattened_enabled};
+// The panic-only block analysis, shared with the BMC lane's constant materialization.
+pub(in crate::codegen_ay) use decl::codegen_decl_panic_filter::compute_may_continue_blocks;
 pub(in crate::codegen_ay::chc) use decl::{
     reset_dropped_frame_columns, take_dropped_frame_columns,
 };
+mod admission_prune;
 pub(in crate::codegen_ay) mod call_uf_table;
 mod dyn_coercion;
 mod dyn_coercion_resolve;
+mod dyn_dispatch_scope;
+mod dyn_to_dyn;
 mod error_property;
 mod fieldless_constructor_cmp;
 mod float_assertion_patterns;
@@ -137,8 +143,10 @@ mod float_roundtrip_patterns;
 mod fragment;
 mod loop_modifies_frame;
 mod modifies_frame;
+mod modifies_frame_net;
 mod pointer_step;
 pub(in crate::codegen_ay) mod quantifier_encoding;
+mod rc_strong_count;
 mod shadow_mem_state;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 mod tests;
@@ -206,9 +214,12 @@ use codegen_ctx::chc_debug_enabled;
 use codegen_ctx::chc_fresh_name;
 #[cfg(test)]
 pub(in crate::codegen_ay) use codegen_ctx::clear_chc_fallback_counts;
-use codegen_ctx::declare_pending_var;
 #[cfg(test)]
 pub(in crate::codegen_ay) use codegen_ctx::diagnostics::GLOBAL_COUNTERS;
+#[cfg(test)]
+pub(in crate::codegen_ay) use codegen_ctx::diagnostics::{
+    compilation_counters, enter_compilation_counters,
+};
 pub(in crate::codegen_ay) use codegen_ctx::get_aggregate_encoding_gap_count;
 #[cfg(test)]
 use codegen_ctx::get_chc_fallback_counts;
@@ -230,7 +241,8 @@ pub(in crate::codegen_ay) use codegen_ctx::globals::take_rounding_assertion_bypa
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_stub_approximation_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::globals::take_stub_approximation_count;
 use codegen_ctx::push_pending_datatype_sort;
-use codegen_ctx::push_pending_var_decl;
+pub(in crate::codegen_ay) use codegen_ctx::record_bmc_offset_provenance_unresolved_for_fn;
+pub(in crate::codegen_ay) use codegen_ctx::record_bmc_sound_havoc_for_fn;
 use codegen_ctx::record_type_sort_fallback;
 #[cfg(test)]
 pub(in crate::codegen_ay) use codegen_ctx::set_chc_fallback_count_for_test;
@@ -238,6 +250,7 @@ pub(in crate::codegen_ay) use codegen_ctx::set_chc_fallback_count_for_test;
 pub(in crate::codegen_ay) use codegen_ctx::set_chc_unhandled_call_count_for_test;
 #[cfg(test)]
 pub(in crate::codegen_ay) use codegen_ctx::set_type_sort_fallback_count_for_test;
+pub(in crate::codegen_ay) use codegen_ctx::take_assert_untranslatable_by_fn;
 pub(in crate::codegen_ay) use codegen_ctx::take_chc_diverging_call_drop_count;
 pub(in crate::codegen_ay) use codegen_ctx::take_chc_fallback_counts;
 pub(in crate::codegen_ay) use codegen_ctx::take_chc_offset_provenance_unresolved_count;
@@ -280,6 +293,9 @@ use std::collections::HashMap;
 use trust_mc_core::chc::{ChcQuery, ChcVc, VarDecl};
 use trust_mc_core::chc::{RelationApp, Rule, RuleBody};
 mod codegen_ctx_dead_locals;
+mod codegen_ctx_stack_lifetime;
+pub(in crate::codegen_ay) use codegen_ctx_stack_lifetime::reused_address_taken_locals;
+pub(in crate::codegen_ay) use codegen_ctx_stack_lifetime::stack_storage_liveness_at_entry;
 pub(in crate::codegen_ay) use codegen_expr_assert::get_chc_assert_untranslatable_count;
 pub(in crate::codegen_ay) use codegen_expr_assert::get_chc_assume_dropped_transition_count;
 pub(in crate::codegen_ay) use codegen_expr_heap::get_chc_heap_check_unknown_layout_count;
@@ -294,6 +310,9 @@ pub(in crate::codegen_ay) use stmt::codegen_stmt_output::mir_to_chc;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 pub(in crate::codegen_ay) use stmt::codegen_stmt_output::mir_to_chc_skip_tic;
 pub(in crate::codegen_ay) use stmt::codegen_stmt_output::mir_to_chc_with_instance;
+pub(in crate::codegen_ay) use stmt::codegen_stmt_output::{
+    lost_obligation_recovery_disabled, recover_lost_error_obligations,
+};
 // Stub interception and translation — proper module boundary (Part of #3254)
 mod stub_codegen;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
@@ -322,15 +341,14 @@ use stubs_option_helpers::option_value_sort;
 // Post-codegen unused type array pruning (Part of #3184)
 mod prune_arrays;
 mod prune_relation_args;
+pub(in crate::codegen_ay) use admission_prune::prune_unconstrained_relation_args_for_admission;
 pub(in crate::codegen_ay) use prune_relation_args::prune_dead_array_relation_args;
 // Post-pruning constant-index array scalarization (Part of #4050)
 mod scalarize_arrays;
 pub(in crate::codegen_ay) use scalarize_arrays::scalarize_vc;
-mod straightline_proof;
-#[cfg(test)]
-pub(in crate::codegen_ay) use straightline_proof::set_straightline_discharge_disabled;
+pub(in crate::codegen_ay) mod straightline_proof;
 pub(in crate::codegen_ay) use straightline_proof::{
-    discharge_straightline_safety, straightline_discharge_disabled,
+    discharge_straightline_safety, straightline_discharge_env_disabled,
 };
 
 // Note: All diagnostic counters are consolidated in GLOBAL_COUNTERS
@@ -359,6 +377,9 @@ pub(in crate::codegen_ay) fn take_inferable_summary_names_by_fn()
 
 // translate.rs — MIR-to-CHC entry point: translate(), MemPromoteAction, reset_chc_session_counters
 mod translate;
+// Trust toolchain: `Rvalue::Reborrow` fails closed.
+#[cfg(trust_toolchain)]
+mod trust_reborrow;
 pub(super) use translate::MemPromoteAction;
 pub(in crate::codegen_ay) use translate::block_relation_apps_consistent;
 pub(in crate::codegen_ay) use translate::block_relation_slot_names_consistent;
@@ -367,3 +388,5 @@ pub(in crate::codegen_ay) use translate::constraint_vars_outside_relation_frames
 pub(in crate::codegen_ay) use translate::fixup_relation_app_arities;
 pub(in crate::codegen_ay) use translate::report_slot_layout;
 pub(in crate::codegen_ay) use translate::reset_chc_session_counters;
+#[cfg(trust_toolchain)]
+pub(in crate::codegen_ay) use trust_reborrow::body_has_reborrow;

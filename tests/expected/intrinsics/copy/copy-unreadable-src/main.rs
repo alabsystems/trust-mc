@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 // Checks that `copy` fails when `src` is not valid for reads.
+#![feature(core_intrinsics)]
+
 #[kani::proof]
 fn test_copy_invalid() {
     let arr: [i32; 3] = [0, 1, 0];

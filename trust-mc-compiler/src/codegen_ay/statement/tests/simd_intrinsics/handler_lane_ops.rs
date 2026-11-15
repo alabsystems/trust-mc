@@ -19,6 +19,8 @@ fn test_codegen_simd_shuffle_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.codegen_simd_shuffle(
             &[local_operand(1), local_operand(2), local_operand(3)],
             &dest,
@@ -28,8 +30,8 @@ fn test_codegen_simd_shuffle_returns_target() {
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_shuffle should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("ite"),
             "simd_shuffle should emit ITE lane selection, got {emitted}"
@@ -48,13 +50,15 @@ fn test_codegen_simd_cast_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.codegen_simd_cast(&[local_operand(1)], &dest, Some(8));
         assert_eq!(result, Some(8));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_cast should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U16x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U16x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("zero_extend"),
             "unsigned simd_cast widen should emit zero_extend, got {emitted}"
@@ -99,6 +103,8 @@ fn test_codegen_simd_insert_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.codegen_simd_insert(
             &[local_operand(1), local_operand(2), local_operand(3)],
             &dest,
@@ -108,8 +114,8 @@ fn test_codegen_simd_insert_returns_target() {
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_insert should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("ite"), "simd_insert should emit ITE per-lane, got {emitted}");
     });
 }
@@ -193,13 +199,15 @@ fn test_codegen_simd_cast_narrow_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.codegen_simd_cast(&[local_operand(1)], &dest, Some(49));
         assert_eq!(result, Some(49));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_cast narrow should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U8x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U8x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("extract"),
             "simd_cast narrowing should emit extract, got {emitted}"
@@ -218,13 +226,15 @@ fn test_codegen_simd_cast_signed_widen_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result = codegen.codegen_simd_cast(&[local_operand(1)], &dest, Some(50));
         assert_eq!(result, Some(50));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_cast signed widen should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("I16x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("I16x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(
             emitted.contains("sign_extend"),
             "simd_cast signed widening should emit sign_extend, got {emitted}"

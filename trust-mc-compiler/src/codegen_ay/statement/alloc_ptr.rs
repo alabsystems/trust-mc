@@ -7,9 +7,12 @@
 //! Extracted from alloc.rs per #2231 — NonNull::new, slice_from_raw_parts,
 //! as_non_null_ptr, Option::ok_or, Try::branch, ptr::add/read/write.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
-use rustc_public::mir::{BasicBlockIdx, Operand, Place};
+use rustc_public::mir::{BasicBlockIdx, Operand, Place, ProjectionElem, Rvalue};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
@@ -281,11 +284,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return target;
         }
 
-        let self_val = self.codegen_operand(&args[0]).unwrap_or_else(|| {
-            warn!("codegen_try_branch: codegen_operand failed, using fallback");
-            Expr::bitvec_const(FALLBACK_PTR, POINTER_WIDTH)
-        });
-
         // For allocation paths, we have Result<NonNull<T>, AllocError>
         // Assuming allocation succeeds, this is Ok(ptr).
         // Try::branch returns ControlFlow::Continue(ptr)
@@ -293,10 +291,61 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // We simplify by assigning the inner value directly to destination.
         // The destination type is ControlFlow<Residual, Output>, but since
         // we only take the Continue path, we can model it as just the output.
-        let value = self.coerce_to_ptr_width(self_val);
+        //
+        // Two parts of that are approximations and are recorded as such:
+        // - Continue is ASSUMED. That holds for an allocator result under Kani's
+        //   default (allocation does not fail); for any other `Try` type it
+        //   drops the Break path, so a proof resting on it is demoted.
+        // - The success value is the operand itself only when it already is a
+        //   pointer-width bitvector (the flattened `Ok` payload). Otherwise the
+        //   old code substituted the constant FALLBACK_PTR — a stand-in no
+        //   certificate check can see. It is a fresh pointer now, recorded as a
+        //   sound approximation.
+        if !self.try_branch_self_is_allocator_result(&args[0]) {
+            self.ctx.unsupported_with_fallback(
+                "try_branch_continue_assumed",
+                "Try::branch on a non-allocator value assumes Continue",
+            );
+        }
+        let value = match self.codegen_operand(&args[0]) {
+            Some(v) if v.sort().bitvec_width() == Some(POINTER_WIDTH) => v,
+            _ => {
+                warn!("codegen_try_branch: no pointer-width success value; fresh pointer");
+                let name = self.ctx.fresh_name("ay_try_branch_output");
+                let fresh = self.ctx.declare_var(&name, crate::codegen_ay::types::ptr_sort());
+                self.ctx.bmc_sound_havoc("try_branch_output");
+                fresh
+            }
+        };
         self.assign_value_to_place(destination, value);
         debug!("codegen_try_branch: returned Continue with success value");
         target
+    }
+
+    /// Is `operand` an allocator result, `Result<NonNull<_>, AllocError>`, whose
+    /// `?` may assume success under Kani's default allocation model?
+    fn try_branch_self_is_allocator_result(&self, operand: &Operand) -> bool {
+        let Some(ty) = operand.ty(self.body.locals()).into_option() else {
+            return false;
+        };
+        let TyKind::RigidTy(RigidTy::Adt(def, generic_args)) = ty.kind() else {
+            return false;
+        };
+        if def.trimmed_name() != "Result" {
+            return false;
+        }
+        let mut types = generic_args.0.iter().filter_map(|arg| match arg {
+            rustc_public::ty::GenericArgKind::Type(t) => Some(*t),
+            _ => None,
+        });
+        let (Some(ok_ty), Some(err_ty)) = (types.next(), types.next()) else {
+            return false;
+        };
+        let is_named = |t: rustc_public::ty::Ty, name: &str| match t.kind() {
+            TyKind::RigidTy(RigidTy::Adt(d, _)) => d.trimmed_name() == name,
+            _ => false,
+        };
+        is_named(ok_ty, "NonNull") && is_named(err_ty, "AllocError")
     }
 
     /// Exact encoding of `<Option<T> as Try>::branch(self) -> ControlFlow<Option<Infallible>, T>`.
@@ -399,11 +448,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // whose sole inhabitant is None — encode that constructor exactly when
         // the residual type supports it; otherwise leave the key unset (reads
         // fall back to the existing honest unsupported path).
-        let break_field_ty = cf_variants[1]
-            .fields()
-            .first()
-            .map(|f| f.ty())
-            .and_then(|ty| Self::resolve_generic_ty(ty, &cf_args));
+        let break_field_ty =
+            cf_variants[1].fields().first().and_then(|f| mono_ty::field_ty(f, &cf_args));
         if let Some(break_ty) = break_field_ty
             && let Some(residual_val) = Self::try_singleton_enum_value(break_ty)
         {
@@ -572,11 +618,44 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
-        // Evaluate operands for side effects, but don't model the store.
-        // The heap model tracks validity/size but not content.
-        let _ptr = self.codegen_operand(&args[0]);
-        let _value = self.codegen_operand(&args[1]);
-        debug!("codegen_ptr_write: store operation (content not modeled)");
+        // `ptr::write(p, v)` is the store `*p = v` without dropping the old
+        // value. It used to evaluate both operands and store nothing, so every
+        // read of the pointee kept its old value: after
+        // `unsafe { ptr::write(&mut o, None) }` the BMC lane proved
+        // `assert!(!(o == None))`, and a write through a pointer joined from two
+        // borrows left both locals untouched
+        // (tools/soundness-duals/negative/review_r18_mutate_then_compare.rs).
+        // Encode it as that store, through the same assignment lanes as MIR's
+        // own `(*p) = move v`.
+        let ptr_local = match &args[0] {
+            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                Some(place.local)
+            }
+            _ => None,
+        };
+        let Some(ptr_local) = ptr_local else {
+            let _ptr = self.codegen_operand(&args[0]);
+            let _value = self.codegen_operand(&args[1]);
+            self.ctx.unsupported_with_fallback(
+                "ptr_write_unresolved_pointer",
+                "pointer operand is not a plain local",
+            );
+            return target;
+        };
+        let deref_place = Place { local: ptr_local, projection: vec![ProjectionElem::Deref] };
+        let store = rvalue_use!(Rvalue::Use(args[1].clone()));
+        let ref_base = crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), ptr_local);
+        let tracked = self.ref_pointees.contains_key(ref_base.as_str());
+        self.codegen_assign(&deref_place, &store);
+        if !tracked {
+            // The byte-level store stands, but no stack pointee is known to
+            // receive the write: reads through other names may be stale.
+            self.ctx.unsupported_with_fallback(
+                "ptr_write_untracked_pointee",
+                "pointer has no tracked pointee",
+            );
+        }
+        debug!(ptr_local, tracked, "codegen_ptr_write: encoded as a deref store");
         target
     }
 }

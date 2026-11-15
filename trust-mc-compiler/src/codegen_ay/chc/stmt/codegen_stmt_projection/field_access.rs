@@ -10,8 +10,8 @@ use ay_bindings::{Expr, ExprValue, SortInner};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, trace};
 
+use crate::codegen_ay::chc::ChcCtx;
 use crate::codegen_ay::chc::stubs_util::extract_payload_from_option_reconstruction_ite;
-use crate::codegen_ay::chc::{ChcCtx, chc_fresh_name, declare_pending_var};
 use crate::codegen_ay::provenance::{Val, is_transparent_pointer_wrapper_repr};
 use crate::codegen_ay::shared::IntoOption;
 
@@ -188,16 +188,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return None;
         };
-        let fresh_field_value =
-            || declare_pending_var(chc_fresh_name("field_select"), field.sort.clone());
+        // A branch the term-level select cannot reduce is selected by the
+        // datatype's own selector: the branch has the container's sort, so on
+        // the path that takes it, `sel(branch)` IS the field. It used to be a
+        // fresh value, which no booking named (Rule E): a counterexample
+        // through it could be certified Genuine.
+        let selector_of = |branch: &Expr| {
+            branch.clone().field_select(&*dt.name, &*field.name, field.sort.clone())
+        };
 
         if let ExprValue::Ite { cond, then_expr, else_expr } = container.value() {
             let then_selected = Self::datatype_field_select_term(then_expr, field_idx, cons_idx)
                 .and_then(|selected| coerce_selected_field_value(selected, &field.sort))
-                .unwrap_or_else(&fresh_field_value);
+                .unwrap_or_else(|| selector_of(then_expr));
             let else_selected = Self::datatype_field_select_term(else_expr, field_idx, cons_idx)
                 .and_then(|selected| coerce_selected_field_value(selected, &field.sort))
-                .unwrap_or_else(&fresh_field_value);
+                .unwrap_or_else(|| selector_of(else_expr));
             return Some(Expr::ite(cond.clone(), then_selected, else_selected));
         }
 
@@ -213,10 +219,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if *ctor_name == cons.name {
                 if let Some(arg) = args.get(actual_field_idx) {
                     return coerce_selected_field_value(arg.clone(), &field.sort)
-                        .or_else(|| Some(fresh_field_value()));
+                        .or_else(|| Some(selector_of(container)));
                 }
             }
-            return Some(fresh_field_value());
+            // Another variant's constructor: the field is read only on a path
+            // its own variant's check excludes; the selector is exact there.
+            return Some(selector_of(container));
         }
 
         Some(container.clone().field_select(&*dt.name, &*field.name, field.sort.clone()))

@@ -124,7 +124,8 @@ fn test_overflow_check_signed_rem_int_min_guard() {
 
         assert!(result.is_some(), "signed Rem should produce INT_MIN/-1 overflow guard");
         let (_, label) = result.unwrap();
-        assert_eq!(label, "overflow_check_div");
+        // `%` has its own label for Kani message parity (b2d2dca93).
+        assert_eq!(label, "overflow_check_rem");
     });
 }
 
@@ -576,7 +577,7 @@ fn test_emit_neg_overflow_check_records_violation() {
 }
 
 // =============================================================================
-// Unchecked operation variants — same overflow checks as checked
+// Unchecked operation variants — same predicate as the safe operator, own label
 // =============================================================================
 
 /// AddUnchecked uses the same overflow check as Add.
@@ -595,9 +596,17 @@ fn test_overflow_check_add_unchecked_same_as_add() {
         let add_result = codegen.overflow_check(BinOp::Add, &lhs, &rhs, false);
         let unchecked_result = codegen.overflow_check(BinOp::AddUnchecked, &lhs, &rhs, false);
 
-        assert!(add_result.is_some());
-        assert!(unchecked_result.is_some());
-        assert_eq!(add_result.unwrap().1, unchecked_result.unwrap().1);
+        // Same predicate, distinct labels: the safe operator's overflow is a
+        // Rust panic (`overflow_check_add`, driver class `overflow`), the
+        // unchecked one UB of an unsafe intrinsic (`unchecked_add_overflow`,
+        // Kani's `arithmetic_overflow`, never gated). One shared label let a
+        // `#[kani::should_panic]` harness bank the UB as its panic.
+        let (add_expr, add_label) = add_result.expect("Add is overflow-checkable");
+        let (unchecked_expr, unchecked_label) =
+            unchecked_result.expect("AddUnchecked is overflow-checkable");
+        assert_eq!(add_expr, unchecked_expr);
+        assert_eq!(add_label, "overflow_check_add");
+        assert_eq!(unchecked_label, "unchecked_add_overflow");
     });
 }
 
@@ -617,9 +626,12 @@ fn test_overflow_check_sub_unchecked_same_as_sub() {
         let sub_result = codegen.overflow_check(BinOp::Sub, &lhs, &rhs, true);
         let unchecked_result = codegen.overflow_check(BinOp::SubUnchecked, &lhs, &rhs, true);
 
-        assert!(sub_result.is_some());
-        assert!(unchecked_result.is_some());
-        assert_eq!(sub_result.unwrap().1, unchecked_result.unwrap().1);
+        let (sub_expr, sub_label) = sub_result.expect("Sub is overflow-checkable");
+        let (unchecked_expr, unchecked_label) =
+            unchecked_result.expect("SubUnchecked is overflow-checkable");
+        assert_eq!(sub_expr, unchecked_expr);
+        assert_eq!(sub_label, "overflow_check_sub");
+        assert_eq!(unchecked_label, "unchecked_sub_overflow");
     });
 }
 
@@ -639,8 +651,172 @@ fn test_overflow_check_mul_unchecked_same_as_mul() {
         let mul_result = codegen.overflow_check(BinOp::Mul, &lhs, &rhs, false);
         let unchecked_result = codegen.overflow_check(BinOp::MulUnchecked, &lhs, &rhs, false);
 
-        assert!(mul_result.is_some());
-        assert!(unchecked_result.is_some());
-        assert_eq!(mul_result.unwrap().1, unchecked_result.unwrap().1);
+        let (mul_expr, mul_label) = mul_result.expect("Mul is overflow-checkable");
+        let (unchecked_expr, unchecked_label) =
+            unchecked_result.expect("MulUnchecked is overflow-checkable");
+        assert_eq!(mul_expr, unchecked_expr);
+        assert_eq!(mul_label, "overflow_check_mul");
+        assert_eq!(unchecked_label, "unchecked_mul_overflow");
+    });
+}
+
+/// The intercepted `<int>::unchecked_{add,sub,mul}` methods reach
+/// `codegen_unchecked_arith` as the plain `BinOp::Add`/`Sub`/`Mul`
+/// (`dispatch_arithmetic`). Their overflow is UB: it records the unchecked
+/// label under the ungated UB kind, and `--no-overflow-checks` keeps it (the
+/// check has no assume half, so gating dropped the only check of the UB).
+#[test]
+fn test_codegen_unchecked_arith_records_unchecked_label_ungated() {
+    with_test_ay_ctx_for_source(ARITH_PROBE_SOURCE, |mut ctx| {
+        ctx.config.overflow_checks = false;
+        let instance = find_instance_by_suffix(&ctx, "probe");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        for (op, label) in [
+            (BinOp::Add, "unchecked_add_overflow"),
+            (BinOp::Sub, "unchecked_sub_overflow"),
+            (BinOp::Mul, "unchecked_mul_overflow"),
+        ] {
+            let before = codegen.ctx.bmc_vc.violations.len();
+            let result = codegen.codegen_unchecked_arith(
+                &[local_operand(1), local_operand(2)],
+                &local_place(0),
+                Some(1),
+                op,
+            );
+            assert_eq!(result, Some(1), "{label}");
+            assert_eq!(
+                codegen.ctx.bmc_vc.violations.len(),
+                before + 1,
+                "{label} must survive --no-overflow-checks"
+            );
+            let violation = codegen.ctx.bmc_vc.violations.last().expect("unchecked overflow check");
+            assert_eq!(violation.kind, trust_mc_core::PropertyKind::UndefinedBehavior, "{label}");
+            let prefix = format!("ay_violation_{label}_");
+            assert!(
+                violation.smt_var.as_deref().is_some_and(|name| name.starts_with(&prefix)),
+                "{label}: got {:?}",
+                violation.smt_var
+            );
+        }
+    });
+}
+
+/// The smt names of the violations recorded since `before`.
+fn violation_vars_since(codegen: &StatementCodegen<'_, '_, '_>, before: usize) -> Vec<String> {
+    codegen.ctx.bmc_vc.violations[before..]
+        .iter()
+        .map(|v| v.smt_var.clone().unwrap_or_default())
+        .collect()
+}
+
+/// An `unchecked_shl`/`unchecked_shr` past the width (or by a negative signed
+/// distance) is UB of an unsafe intrinsic: its checks carry the unchecked
+/// labels and the ungated UB kind, so `--no-overflow-checks` keeps them. On the
+/// shared `shift_distance_check` labels the flag dropped the only check of the
+/// UB.
+#[test]
+fn test_emit_shift_distance_check_records_unchecked_labels_ungated() {
+    with_test_ay_ctx_for_source(ARITH_PROBE_SOURCE, |mut ctx| {
+        ctx.config.overflow_checks = false;
+        let instance = find_instance_by_suffix(&ctx, "probe");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+        let before = codegen.ctx.bmc_vc.violations.len();
+        let value = Expr::var("v", Sort::bitvec(64));
+        let distance = Expr::var("d", Sort::bitvec(32));
+        codegen.emit_shift_distance_check(&value, &distance, Some(true));
+
+        let vars = violation_vars_since(&codegen, before);
+        assert_eq!(vars.len(), 2, "both sub-checks survive --no-overflow-checks: {vars:?}");
+        assert!(vars[0].starts_with("ay_violation_unchecked_shift_distance_check_"), "{vars:?}");
+        assert!(
+            vars[1].starts_with("ay_violation_unchecked_shift_distance_check_negative_"),
+            "{vars:?}"
+        );
+        for v in &codegen.ctx.bmc_vc.violations[before..] {
+            assert_eq!(v.kind, trust_mc_core::PropertyKind::UndefinedBehavior);
+        }
+    });
+}
+
+/// The SIMD lane shift checks (Kani's compiler writes them) and the MIR
+/// `Assert(Overflow(Shl|Shr))` checks (enabled at the terminator) keep the
+/// `shift_distance_check` labels and record under `CheckGate::Always`: the
+/// label's gated kind does not drop them under `--no-overflow-checks`.
+#[test]
+fn test_simd_and_mir_assert_shift_checks_survive_no_overflow_checks() {
+    with_test_ay_ctx_for_source(ARITH_PROBE_SOURCE, |mut ctx| {
+        ctx.config.overflow_checks = false;
+        let instance = find_instance_by_suffix(&ctx, "probe");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+        let value = Expr::var("v", Sort::bitvec(32));
+        let distance = Expr::var("d", Sort::bitvec(32));
+        let before = codegen.ctx.bmc_vc.violations.len();
+        codegen.emit_shift_distance_check_named(&value, &distance, Some(true), Some("simd_shl"));
+        let vars = violation_vars_since(&codegen, before);
+        assert_eq!(vars.len(), 2, "SIMD shift checks survive the flag: {vars:?}");
+        assert!(vars[0].starts_with("ay_violation_shift_distance_check_"), "{vars:?}");
+        assert!(vars[1].starts_with("ay_violation_shift_distance_check_negative_"), "{vars:?}");
+
+        let before = codegen.ctx.bmc_vc.violations.len();
+        codegen.emit_mir_assert_shift_distance_check(
+            &value,
+            &distance,
+            Some(false),
+            "attempt to shift left with overflow",
+        );
+        let vars = violation_vars_since(&codegen, before);
+        assert_eq!(vars.len(), 1, "the enabled MIR Assert's check is recorded: {vars:?}");
+        assert!(vars[0].starts_with("ay_violation_shift_distance_check_"), "{vars:?}");
+    });
+}
+
+const SIGNED_ARITH_PROBE_SOURCE: &str = r#"
+pub fn probe_signed(x: i32, y: i32) -> i32 { x.wrapping_add(y) }
+"#;
+
+/// An intercepted `unchecked_div`/`unchecked_rem` reaches
+/// `codegen_unchecked_arith` as `BinOp::Div`/`Rem`. Its signed `MIN / -1` is
+/// UB: the operator-level `binop_*` labels (ungated UB kind), never the MIR
+/// `Assert`'s gated panic label `overflow_check_div`/`_rem`.
+#[test]
+fn test_codegen_unchecked_div_rem_records_binop_overflow_label() {
+    with_test_ay_ctx_for_source(SIGNED_ARITH_PROBE_SOURCE, |mut ctx| {
+        ctx.config.overflow_checks = false;
+        let instance = find_instance_by_suffix(&ctx, "probe_signed");
+        let body = instance.body().expect("body");
+        ctx.set_current_fn(instance);
+        let tuple_usage = TupleUsageAnalysis::run(&body);
+        let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+        for (op, zero, overflow) in [
+            (BinOp::Div, "unchecked_div_by_zero", "binop_div_overflow"),
+            (BinOp::Rem, "unchecked_div_by_zero", "binop_rem_overflow"),
+        ] {
+            let before = codegen.ctx.bmc_vc.violations.len();
+            let result = codegen.codegen_unchecked_arith(
+                &[local_operand(1), local_operand(2)],
+                &local_place(0),
+                Some(1),
+                op,
+            );
+            assert_eq!(result, Some(1), "{op:?}");
+            let vars = violation_vars_since(&codegen, before);
+            assert_eq!(vars.len(), 2, "{op:?}: divisor and MIN / -1, got {vars:?}");
+            assert!(vars[0].starts_with(&format!("ay_violation_{zero}_")), "{op:?}: {vars:?}");
+            assert!(vars[1].starts_with(&format!("ay_violation_{overflow}_")), "{op:?}: {vars:?}");
+            for v in &codegen.ctx.bmc_vc.violations[before..] {
+                assert_eq!(v.kind, trust_mc_core::PropertyKind::UndefinedBehavior, "{op:?}");
+            }
+        }
     });
 }

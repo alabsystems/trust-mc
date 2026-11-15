@@ -10,9 +10,12 @@
 //! `base_addr + field_offset`, each with a primitive sort that passes
 //! the Datatype guard.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort, SortInner};
 use tracing::{debug, warn};
 
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 use super::super::ChcCtx;
@@ -59,26 +62,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         // Get field types from rustc type system (needed by build_memory_store).
-        // Part of #3675: Resolve field types using the ADT's generic args, not
-        // the body instance args. Generic field types like `[T; LANES]` from
-        // `repr(simd)` structs have params from the ADT's impl, not from the
-        // harness. Using resolve_body_ty_with_args with the ADT's args correctly
-        // substitutes T→u8, LANES→10. resolve_body_ty (instance-based) would
-        // fail because the harness instance has no binding for T/LANES.
+        // Part of #3675 and Rule A (`shared::mono_ty::field_ty`): a field's type
+        // is instantiated at the ADT's OWN arguments (`[T; LANES]` of a
+        // `repr(simd)` struct is `[u8; 10]`), never the body instance's.
         let field_tys: Vec<rustc_public::ty::Ty> = match store_ty.kind() {
             TyKind::RigidTy(RigidTy::Adt(def, ref args)) => {
                 let variants = def.variants();
                 if variants.is_empty() {
                     return false;
                 }
-                let tys: Vec<_> = variants[0]
+                let Some(tys) = variants[0]
                     .fields()
                     .iter()
-                    .map(|f| resolve_adt_field_ty(f.ty(), args))
-                    .collect();
-                // If any field type still has unresolved params after ADT-arg
-                // substitution, bail out to prevent panics in build_memory_store.
-                if tys.iter().any(|ty| ty_has_params(*ty)) {
+                    .map(|f| mono_ty::field_ty(f, args))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                // A field type that still names a parameter would panic in
+                // build_memory_store's layout queries: bail out.
+                if tys.iter().any(|ty| mono_ty::has_unresolved_params(*ty)) {
                     return false;
                 }
                 tys
@@ -227,116 +230,5 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
         0
-    }
-}
-
-/// Resolve generic parameters in an ADT field type using the ADT's generic args.
-///
-/// Field types from `f.ty()` may contain unresolved Param types (e.g.,
-/// `[T; LANES]` for a `repr(simd)` struct `CustomSimd<T, LANES>`). When
-/// the ADT is monomorphized (e.g., `CustomSimd<u8, 10>`), the args contain
-/// the concrete bindings. This function substitutes them recursively.
-/// Part of #3675.
-fn resolve_adt_field_ty(
-    ty: rustc_public::ty::Ty,
-    args: &rustc_public::ty::GenericArgs,
-) -> rustc_public::ty::Ty {
-    use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyConstKind, TyKind};
-
-    match ty.kind() {
-        TyKind::Param(param_ty) => {
-            let idx = param_ty.index as usize;
-            args.0
-                .get(idx)
-                .and_then(|arg| match arg {
-                    GenericArgKind::Type(resolved) => Some(*resolved),
-                    _ => None,
-                })
-                .unwrap_or(ty)
-        }
-        TyKind::RigidTy(RigidTy::Array(elem_ty, len)) => {
-            let resolved_elem = resolve_adt_field_ty(elem_ty, args);
-            // Resolve const-generic length (e.g., LANES → 10).
-            let resolved_len = match len.kind() {
-                TyConstKind::Param(param_const) => args
-                    .0
-                    .get(param_const.index as usize)
-                    .and_then(|arg| match arg {
-                        GenericArgKind::Const(resolved_const) => Some(resolved_const.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| len.clone()),
-                _ => len.clone(),
-            };
-            if resolved_elem == elem_ty && resolved_len == len {
-                ty
-            } else {
-                Ty::from_rigid_kind(RigidTy::Array(resolved_elem, resolved_len))
-            }
-        }
-        // Part of #3942: Recurse into ADT generic args to resolve nested params.
-        // Without this, `MaybeUninit<[u8; BYTES]>` from PointerGenerator<BYTES>
-        // passes through unresolved because the outer type is Adt, not Param.
-        TyKind::RigidTy(RigidTy::Adt(def, adt_args)) => {
-            let resolved_adt_args: Vec<_> = adt_args
-                .0
-                .iter()
-                .map(|arg| match arg {
-                    GenericArgKind::Type(arg_ty) => {
-                        GenericArgKind::Type(resolve_adt_field_ty(*arg_ty, args))
-                    }
-                    GenericArgKind::Const(c) => {
-                        let resolved = match c.kind() {
-                            TyConstKind::Param(param_const) => args
-                                .0
-                                .get(param_const.index as usize)
-                                .and_then(|a| match a {
-                                    GenericArgKind::Const(rc) => Some(rc.clone()),
-                                    _ => None,
-                                })
-                                .unwrap_or_else(|| c.clone()),
-                            _ => c.clone(),
-                        };
-                        GenericArgKind::Const(resolved)
-                    }
-                    other => other.clone(),
-                })
-                .collect();
-            if resolved_adt_args == adt_args.0 {
-                ty
-            } else {
-                Ty::from_rigid_kind(RigidTy::Adt(
-                    def,
-                    rustc_public::ty::GenericArgs(resolved_adt_args),
-                ))
-            }
-        }
-        _ => ty,
-    }
-}
-
-/// Check if a type contains unresolved generic parameters.
-///
-/// Used to bail out of decompose_struct_store before passing unresolved
-/// types to build_memory_store. Part of #3675, #3942.
-fn ty_has_params(ty: rustc_public::ty::Ty) -> bool {
-    use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
-
-    match ty.kind() {
-        TyKind::Param(_) => true,
-        TyKind::RigidTy(RigidTy::Array(elem_ty, len)) => {
-            ty_has_params(elem_ty) || matches!(len.kind(), TyConstKind::Param(_))
-        }
-        TyKind::RigidTy(RigidTy::Slice(elem_ty)) => ty_has_params(elem_ty),
-        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => ty_has_params(pointee),
-        TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => ty_has_params(pointee),
-        // Part of #3942: Check ADT generic args for unresolved type/const params.
-        // Without this, `MaybeUninit<[u8; BYTES]>` is not detected as having params.
-        TyKind::RigidTy(RigidTy::Adt(_, ref args)) => args.0.iter().any(|arg| match arg {
-            GenericArgKind::Type(arg_ty) => ty_has_params(*arg_ty),
-            GenericArgKind::Const(c) => matches!(c.kind(), TyConstKind::Param(_)),
-            _ => false,
-        }),
-        _ => false,
     }
 }

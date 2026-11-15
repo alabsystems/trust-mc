@@ -483,17 +483,20 @@ fn test_packed_row_same_arg_call_identity_solver_produces_unsat() {
     assert_probe_unsat("probe_packed_row_same_arg_call_identity");
 }
 
-/// Known false proof: same-arg call inlining creates independent symbolic copies.
-/// Demoted to assert_probe_unsat per W3:4311 precedent (#4028 Group E).
+/// Was a known false proof, pinned here as `unsat` (W3:4311, #4028 Group E):
+/// the walked assertion compares a term with itself, its discriminant folds
+/// onto the panic arm, and the walker bailed, dropping the certain failure.
+/// Since fix/chc-walker-fail-closed (Mechanism D commit) a fold onto a
+/// diverging arm records the failure.
 #[test]
 fn test_packed_row_same_arg_call_false_assert_is_not_vacuously_unsat() {
-    assert_probe_unsat("probe_packed_row_same_arg_call_false_assert");
+    assert_probe_not_unsat("probe_packed_row_same_arg_call_false_assert");
 }
 
-/// Known false proof: same pattern for bits-only comparison.
+/// The same for the bits-only comparison.
 #[test]
 fn test_packed_row_same_arg_call_bits_false_assert_is_not_vacuously_unsat() {
-    assert_probe_unsat("probe_packed_row_same_arg_call_bits_false_assert");
+    assert_probe_not_unsat("probe_packed_row_same_arg_call_bits_false_assert");
 }
 
 #[test]

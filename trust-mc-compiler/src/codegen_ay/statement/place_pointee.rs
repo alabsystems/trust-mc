@@ -172,6 +172,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ///
     /// Part of #468: Enable iterator support by fixing deref chain resolution.
     pub(super) fn ensure_derived_pointee_in_env(&mut self, pointee_base: &str) -> Option<Expr> {
+        let mut resolving = Vec::new();
+        self.ensure_derived_pointee_in_env_guarded(pointee_base, &mut resolving)
+    }
+
+    /// Deepest `_deref` chain [`Self::ensure_derived_pointee_in_env`] follows.
+    ///
+    /// Real chains are a handful of hops (a reference to a field of a
+    /// reference). Past this the name is not a derivation the encoder built.
+    const MAX_DERIVED_POINTEE_DEPTH: usize = 32;
+
+    /// [`Self::ensure_derived_pointee_in_env`] with the chain of `ref_pointees`
+    /// targets currently being resolved.
+    ///
+    /// A `ref_pointees` entry can name a pointee DERIVED FROM ITSELF: under
+    /// `-Z loop-contracts`, `while let [first, rest @ ..] = bytes { bytes = rest }`
+    /// re-points the slice reference at a sub-slice of its own pointee, so
+    /// `ref_pointees[bytes]` names `bytes_deref_...`, whose `_deref` step asks
+    /// for `ref_pointees[bytes]` again. The recursion had no bound and the
+    /// compiler died with a stack overflow (SIGABRT, no verdict at all —
+    /// tests/expected/loop-contract/while_let_loop_for_slice.rs). A target that
+    /// is already being resolved, or a chain deeper than
+    /// [`Self::MAX_DERIVED_POINTEE_DEPTH`], has no value this function can
+    /// build: it returns `None`, the same answer as any other unresolvable
+    /// name, and every caller already takes its recorded unsupported /
+    /// synthesis path on `None`.
+    fn ensure_derived_pointee_in_env_guarded(
+        &mut self,
+        pointee_base: &str,
+        resolving: &mut Vec<Arc<str>>,
+    ) -> Option<Expr> {
         // Already in env? Return it.
         if let Some(expr) = self.env_lookup(pointee_base) {
             return Some(expr.clone());
@@ -326,7 +356,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         "ensure_derived_pointee_in_env: {} -> ref_pointees[{}] = {}",
                         pointee_base, current_base_name, ref_pointee
                     );
-                    let base_expr = self.ensure_derived_pointee_in_env(&ref_pointee)?;
+                    if resolving.len() >= Self::MAX_DERIVED_POINTEE_DEPTH
+                        || resolving.iter().any(|r| **r == *ref_pointee)
+                    {
+                        debug!(
+                            "ensure_derived_pointee_in_env: {} -> {} is a cyclic or \
+                             too-deep deref chain (depth {}); unresolvable",
+                            current_base_name,
+                            ref_pointee,
+                            resolving.len()
+                        );
+                        return None;
+                    }
+                    resolving.push(Arc::clone(&ref_pointee));
+                    let base_expr =
+                        self.ensure_derived_pointee_in_env_guarded(&ref_pointee, resolving);
+                    resolving.pop();
+                    let base_expr = base_expr?;
                     current_base_name.clear();
                     current_base_name.push_str(ref_pointee.as_ref());
                     current_expr = Some(base_expr);

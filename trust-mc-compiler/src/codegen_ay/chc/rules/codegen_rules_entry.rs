@@ -73,6 +73,12 @@ impl<'tcx, 'body> CodegenRulesEntry<'tcx, 'body> for ChcCtx<'tcx, 'body> {
 
         self.collect_entry_heap_and_static_constraints(&mut entry_constraints);
 
+        // Base addresses of tracked stack locals (heap/stack_address.rs), after
+        // allocation so every tracked local has its object id.
+        if self.track_level >= ChcTrackLevel::Ptr {
+            entry_constraints.extend(self.stack_base_entry_constraints());
+        }
+
         // Part of #4050: Initialize ArraySolver shadow state at function entry.
         // Only emitted when shadow aux vars were declared (body_needs_array_solver_shadow
         // gate prevents adding Array-sorted vars to harnesses that don't need them).
@@ -259,7 +265,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Appends entry constraints for static initial values (#428).
     fn collect_static_initial_constraints(&self, constraints: &mut Vec<Expr>) {
-        for (vec_idx, init_expr) in &self.ref_resolution.static_initial_values {
+        // In state-variable order: `static_initial_values` is a `HashMap`, and
+        // iterating it put these entry conjuncts in a per-run random order
+        // (measured 2026-10-01, `bmc_static_address_identity_dual.rs::
+        // bug_two_statics_claimed_aliased`).
+        let mut initial: Vec<(&usize, &Expr)> =
+            self.ref_resolution.static_initial_values.iter().collect();
+        initial.sort_unstable_by_key(|(vec_idx, _)| **vec_idx);
+        for (vec_idx, init_expr) in initial {
             if let Some((name, sort)) = self.state_var_mgr.state_vars.get(*vec_idx) {
                 let var = Expr::var(&**name, sort.clone());
                 debug!(
@@ -346,7 +359,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.int_lifted_vars.is_empty() {
             return;
         }
-        for (&vec_idx, &(orig_width, is_signed)) in &self.int_lifted_vars {
+        // In state-variable order (a `HashMap` would emit these per-run randomly).
+        let mut lifted: Vec<(usize, (u32, bool))> =
+            self.int_lifted_vars.iter().map(|(&idx, &lift)| (idx, lift)).collect();
+        lifted.sort_unstable_by_key(|(idx, _)| *idx);
+        for (vec_idx, (orig_width, is_signed)) in lifted {
             let Some((name, sort)) = self.state_var_mgr.state_vars.get(vec_idx) else {
                 continue;
             };

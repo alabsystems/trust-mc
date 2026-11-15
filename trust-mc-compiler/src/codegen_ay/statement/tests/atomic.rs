@@ -132,9 +132,13 @@ fn test_atomic_load_returns_target() {
     });
 }
 
-/// Test atomic load with empty args returns None (guard path).
+/// Atomic load with no arguments fails CLOSED and continues (7856c9559: a
+/// `None` here was routed to Diverge, which deleted the post-call path and made
+/// every later assertion hold vacuously). It returns the target, leaves the
+/// result unconstrained, and records `atomic_load_arity` as an unsupported
+/// construct with fallback, which demotes the verdict.
 #[test]
-fn test_atomic_load_empty_args_returns_none() {
+fn test_atomic_load_empty_args_fails_closed_and_continues() {
     with_test_ay_ctx_for_source(ATOMIC_PROBE_SOURCE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "simple_atomic_probe");
         let body = instance.body().expect("function body");
@@ -144,7 +148,11 @@ fn test_atomic_load_empty_args_returns_none() {
 
         let dest = Place { local: 0, projection: vec![] };
         let result = codegen.codegen_atomic_load(&[], &dest, Some(5));
-        assert_eq!(result, None, "atomic_load with empty args should return None");
+        assert_eq!(result, Some(5), "the post-call path must survive (no Diverge)");
+        assert!(
+            codegen.ctx.unsupported_constructs.contains_key("atomic_load_arity"),
+            "the arity gap must be recorded, so the verdict is demoted"
+        );
     });
 }
 
@@ -204,9 +212,12 @@ fn test_atomic_store_returns_target() {
     });
 }
 
-/// Test atomic store with insufficient args returns target (no-op fallback).
+/// Atomic store with fewer than two arguments fails CLOSED and continues
+/// (7856c9559): it returns the target and records `atomic_store_arity`, which
+/// demotes the verdict, instead of returning `None`, which was routed to
+/// Diverge and deleted the rest of the harness.
 #[test]
-fn test_atomic_store_insufficient_args_returns_target() {
+fn test_atomic_store_insufficient_args_fails_closed_and_continues() {
     with_test_ay_ctx_for_source(ATOMIC_PROBE_SOURCE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "atomic_load_probe");
         let body = instance.body().expect("function body");
@@ -214,9 +225,12 @@ fn test_atomic_store_insufficient_args_returns_target() {
         let tuple_usage = TupleUsageAnalysis::run(&body);
         let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
 
-        // Only one arg when two needed — fail-closed
         let result = codegen.codegen_atomic_store(&[], Some(9));
-        assert_eq!(result, None, "atomic_store with <2 args must fail-closed (#2497)");
+        assert_eq!(result, Some(9), "the post-call path must survive (no Diverge)");
+        assert!(
+            codegen.ctx.unsupported_constructs.contains_key("atomic_store_arity"),
+            "the arity gap must be recorded, so the verdict is demoted"
+        );
     });
 }
 

@@ -10,10 +10,12 @@
 
 use crate::args::common::{MessageFormat, Verbosity};
 use crate::args::playback_args::{CargoPlaybackArgs, KaniPlaybackArgs};
-use crate::call_cargo::cargo_config_args;
+use crate::call_cargo::{cargo_config_args, trustc_cargo_config_args};
 use crate::call_single_file::{LibConfig, base_rustc_flags};
 use crate::session::{
-    InstallType, lib_playback_folder, run_terminal_with_default_timeout, setup_cargo_command,
+    InstallType, PlaybackRoute, apply_playback_route_env, playback_compiler,
+    playback_compiler_and_identity, route_posture_rustc_args, run_terminal_with_default_timeout,
+    setup_cargo_command_inner, trustc_route,
 };
 use crate::util;
 use crate::util::args::{CargoArg, CommandWrapper, PassTo, RustcArg};
@@ -81,7 +83,8 @@ fn build_test(install: &InstallType, args: &KaniPlaybackArgs) -> Result<PathBuf>
         util::info_operation("Building", args.input.to_string_lossy().deref());
     }
 
-    let mut rustc_args = base_rustc_flags(LibConfig::new(lib_playback_folder()?)?);
+    let route = PlaybackRoute::resolve(&args.playback.compiler_route)?;
+    let mut rustc_args = base_rustc_flags(LibConfig::new(route.library_folder("playback/lib")?)?);
     rustc_args.push("--test".into());
     rustc_args.push(RustcArg::from(&args.input));
     rustc_args.push(format!("--crate-name={TEST_BIN_NAME}").into());
@@ -94,8 +97,11 @@ fn build_test(install: &InstallType, args: &KaniPlaybackArgs) -> Result<PathBuf>
         rustc_args.push("--error-format=json".into());
     }
 
-    let mut cmd = Command::new(install.kani_compiler()?);
+    rustc_args.extend(route_posture_rustc_args(&route));
+
+    let mut cmd = Command::new(playback_compiler(install, &route)?);
     cmd.pass_rustc_args(&rustc_args, PassTo::OnlyLocalCrate);
+    apply_playback_route_env(&route, &mut cmd);
 
     // Ensure compiler has enough stack for complex MIR patterns (#1572).
     util::apply_rust_min_stack(&mut cmd);
@@ -109,9 +115,29 @@ fn build_test(install: &InstallType, args: &KaniPlaybackArgs) -> Result<PathBuf>
 /// Invokes cargo test using Kani compiler and the provided arguments.
 fn cargo_test(args: CargoPlaybackArgs) -> Result<()> {
     let install = InstallType::new()?;
-    let mut cmd = setup_cargo_command()?;
 
-    let rustc_args = base_rustc_flags(LibConfig::new(lib_playback_folder()?)?);
+    let route = PlaybackRoute::resolve(&args.playback.compiler_route)?;
+    if matches!(route, PlaybackRoute::Trustc { .. }) {
+        // Before the preflight probes anything, as on the verification route.
+        trustc_route::refuse_rustc_wrappers(std::env::vars_os())?;
+    }
+    let (compiler, identity) = playback_compiler_and_identity(&install, &route)?;
+    let mut cmd = match &identity {
+        // The seal's own cargo, with RUSTC=trustc and every rustc wrapper disabled.
+        Some(identity) => {
+            let mut cmd = trustc_route::trustc_cargo_command(
+                identity,
+                std::env::vars_os(),
+                trustc_route::CargoInvocation::Build,
+            )?;
+            util::apply_rust_min_stack(&mut cmd);
+            cmd
+        }
+        None => setup_cargo_command_inner(None)?,
+    };
+
+    let mut rustc_args = base_rustc_flags(LibConfig::new(route.library_folder("playback/lib")?)?);
+    rustc_args.extend(route_posture_rustc_args(&route));
 
     let mut cargo_args: Vec<CargoArg> = vec!["test".into()];
 
@@ -130,7 +156,10 @@ fn cargo_test(args: CargoPlaybackArgs) -> Result<()> {
     }
 
     cargo_args.append(&mut args.cargo.to_cargo_args());
-    cargo_args.append(&mut cargo_config_args());
+    cargo_args.append(&mut match identity {
+        Some(_) => trustc_cargo_config_args(),
+        None => cargo_config_args(),
+    });
 
     // These have to be the last arguments to cargo test.
     if !args.playback.test_args.is_empty() {
@@ -140,9 +169,10 @@ fn cargo_test(args: CargoPlaybackArgs) -> Result<()> {
 
     // Arguments that will only be passed to the target package.
     cmd.pass_cargo_args(&cargo_args)
-        .env("RUSTC", &install.kani_compiler()?)
+        .env("RUSTC", compiler)
         .pass_rustc_args(&rustc_args, PassTo::AllCrates)
         .env("CARGO_TERM_PROGRESS_WHEN", "never");
+    apply_playback_route_env(&route, &mut cmd);
 
     // Use timeout protection (#995)
     run_terminal_with_default_timeout(&args.playback.common_opts, cmd)?;

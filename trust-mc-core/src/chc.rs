@@ -34,6 +34,33 @@ use crate::ident::SourceLocation;
 use crate::violation::PropertyKind;
 use ay_bindings::{AYProgram, Expr, ExprValue, Sort};
 
+/// Reserved name prefix of every TRANSLATION HAVOC variable: a fresh, unconstrained
+/// value a translator introduces where it does not model a value exactly (an opaque
+/// call's result, a value with no binding in the block, a read of lanes it does not
+/// carry). Declared only through [`ChcVc::declare_havoc_var`].
+///
+/// A havoc is a sound over-approximation for a PROOF, never a value of the program:
+/// a constraint that mentions it — even an equality `(= h 263)` that looks like a
+/// definition — is a restriction the solver satisfies by CHOOSING `h`, so a model
+/// that assigns it need not correspond to any execution. A refutation gate reads
+/// this prefix to tell such a variable from one the program defines
+/// (`trust_mc_driver`'s bounded-unroll grounding gate and the consumer's
+/// independent replay). The name carries the identity because the variable's name
+/// is what survives into the lowered CHC problem and into its normalized-input
+/// digest, so the producer's gate and the consumer's replay classify the same
+/// digest-bound problem the same way.
+///
+/// Every other variable the native translator declares is a block-relation
+/// argument (`bb{N}_…`), so a relation argument never carries this prefix; a name
+/// that carries it wrongly can only make a refutation gate decline (fail closed).
+pub const TRANSLATION_HAVOC_VAR_PREFIX: &str = "havoc__";
+
+/// Whether `name` names a translation havoc (see [`TRANSLATION_HAVOC_VAR_PREFIX`]).
+#[must_use]
+pub fn is_translation_havoc_var(name: &str) -> bool {
+    name.starts_with(TRANSLATION_HAVOC_VAR_PREFIX)
+}
+
 /// Per-property metadata for a single CHC check site (BSEM-18).
 ///
 /// The CHC encoder emits one `error_p{id}` relation per distinct check site
@@ -72,6 +99,19 @@ pub struct ChcProperty {
     /// (subject to [`ChcVc::approximation_identity_complete`]). `None` means the
     /// analysis was not run — the driver treats it as dependent (fail-closed).
     pub approximation_dependent: Option<bool>,
+
+    /// Set when the ENCODER proved this check cannot fire and therefore emitted
+    /// no `error_p{id}` rule — the reason, for the record.
+    ///
+    /// A registered property with no rule is ambiguous to the driver: it cannot
+    /// tell "discharged at encode time" from "the encoder dropped the check",
+    /// so it fails closed with `[AY:UNKNOWN_REASON:LostErrorRules]`. Measured
+    /// 2026-09-17: that reason was 32 of 32 unparked CHC `unknown` rows.
+    /// This field removes the ambiguity at the only place that knows the
+    /// answer. It is NOT a verdict on its own — see
+    /// `ChcVc::all_properties_discharged_at_encode`, which is what licenses the
+    /// canonical discharge, and only when EVERY property is accounted for.
+    pub discharged_at_encode: Option<&'static str>,
 }
 
 /// A Constrained Horn Clause verification condition.
@@ -131,6 +171,21 @@ pub struct ChcVc {
     /// distinguishes "proved then cleared" from "silently discarded".
     pub trivially_safe_discharged: bool,
 
+    /// KEEP-ERROR-OBLIGATIONS mode for the rule-pruning passes.
+    ///
+    /// Set only by the lost-checks recovery (`passes_lost_every_error_obligation`):
+    /// a pass sequence turned a VC with error obligations and registered
+    /// properties into one with no error obligation left. Nothing was proved
+    /// there: the driver cannot tell that shape from checks the encoding lost,
+    /// and a real missed bug (a loop body the encoding never reaches) hid behind
+    /// it. With the flag set, `prune_orphan_block_rules` keeps error obligations
+    /// whose body relation nothing derives, and the false-rule pruning passes
+    /// keep error obligations whose body folded to `false` (as a literal-`false`
+    /// body over the same body relation). The obligations then reach the
+    /// straight-line discharge and the solver, whose Safe / vacuous / refuted
+    /// answers decide the harness instead of the collapse.
+    pub keep_error_obligations: bool,
+
     /// Set when a trivially-safe discharge proved the obligations UNREACHABLE
     /// rather than SAFE — i.e. no check site was reachable at all, because
     /// every path into it was pruned as infeasible (`kani::assume(false)`, two
@@ -187,6 +242,56 @@ pub fn normalize_approx_var(name: &str) -> &str {
     name.strip_suffix("__out").unwrap_or(name)
 }
 
+/// Separator the constant-index array scalarization puts between an array
+/// state variable and one of its cells: `A` becomes `A_at_0x<index>_bv<w>`
+/// (`trust-mc-compiler`'s `scalarize_const_index_arrays`).
+const SCALARIZED_CELL_SEPARATOR: &str = "_at_0x";
+
+/// The array a constant-index scalarized cell was split from, if `name` (either
+/// state spelling) is one: `float_binop_tbl_f32_at_0x3f8000003f800000_bv72`
+/// belongs to `float_binop_tbl_f32`.
+///
+/// A freed array's cells are the SAME freed value read at a constant index, so
+/// whoever decides "does this read a freed value" must see through the split.
+/// Measured 2026-09-24 on tests/expected/test6/main.rs: `add2(1, 1) == 2.0`
+/// became a select of the float-binop table at the constant key `1.0 + 1.0`,
+/// scalarization renamed it to such a cell, and the taint closure (which only
+/// knew the table's own name) marked the check independent of the table.
+#[must_use]
+pub fn scalarized_cell_parent(name: &str) -> Option<&str> {
+    let name = normalize_approx_var(name);
+    name.find(SCALARIZED_CELL_SEPARATOR).map(|pos| normalize_approx_var(&name[..pos]))
+}
+
+/// Whether `name` names a value in the freed set `tainted` (normalized names):
+/// the variable itself, either state spelling, or a scalarized cell of a freed
+/// array.
+fn is_tainted_name(name: &str, tainted: &HashSet<String>) -> bool {
+    tainted.contains(normalize_approx_var(name))
+        || scalarized_cell_parent(name).is_some_and(|parent| tainted.contains(parent))
+}
+
+/// SMT name of the congruent f32 float-binop table.
+///
+/// The CHC encoder translates a symbolic float `a op b` to
+/// `select(<table>, op ++ a ++ b)` over a read-only array no rule constrains
+/// (`trust-mc-compiler`'s `float_binop_table.rs`), threads the table through
+/// every relation unchanged, and records each select as an IDENTIFIED sound
+/// approximation freeing this variable. Shared here because the driver's
+/// counterexample recertification treats these variables specially: a
+/// counterexample the dependence analysis certifies independent of a table is
+/// also REPLAYED on a system with every table read removed before it may be
+/// reported `Genuine` (`trust_mc_driver::replay_error_derivation_free_of`).
+pub const FLOAT_BINOP_TABLE_F32: &str = "float_binop_tbl_f32";
+/// SMT name of the congruent f64 float-binop table ([`FLOAT_BINOP_TABLE_F32`]).
+pub const FLOAT_BINOP_TABLE_F64: &str = "float_binop_tbl_f64";
+
+/// Whether `name` (either state spelling) is a congruent float-binop table.
+#[must_use]
+pub fn is_float_binop_table_var(name: &str) -> bool {
+    matches!(normalize_approx_var(name), FLOAT_BINOP_TABLE_F32 | FLOAT_BINOP_TABLE_F64)
+}
+
 /// A variable declaration for CHC rules.
 ///
 /// Variables declared with declare-var can be used in rules without
@@ -222,6 +327,7 @@ impl ChcVc {
             cover_assertions: Vec::new(),
             properties: Vec::new(),
             trivially_safe_discharged: false,
+            keep_error_obligations: false,
             vacuous_all_checks_unreachable: false,
             approximated_vars: Vec::new(),
             accounted_approximations: 0,
@@ -274,6 +380,15 @@ impl ChcVc {
         Expr::var(&*name, sort)
     }
 
+    /// Declares a TRANSLATION HAVOC — a fresh unconstrained value, not a value the
+    /// program defines — named `stem` behind [`TRANSLATION_HAVOC_VAR_PREFIX`], and
+    /// returns an Expr referencing it. A translator declares every such value
+    /// through this method, so a refutation gate can recognize it by name
+    /// ([`is_translation_havoc_var`]).
+    pub fn declare_havoc_var(&mut self, stem: &str, sort: Sort) -> Expr {
+        self.declare_var(format!("{TRANSLATION_HAVOC_VAR_PREFIX}{stem}"), sort)
+    }
+
     /// Adds a declaration.
     pub fn add_decl(&mut self, decl: Decl) {
         self.decls.push(decl);
@@ -311,6 +426,65 @@ impl ChcVc {
     #[must_use]
     pub fn property_count(&self) -> usize {
         self.properties.len()
+    }
+
+    /// Record that the encoder discharged property `id` at encode time.
+    pub fn mark_property_discharged_at_encode(&mut self, id: u32, reason: &'static str) {
+        if let Some(p) = self.properties.iter_mut().find(|p| p.id == id) {
+            p.discharged_at_encode = Some(reason);
+        }
+    }
+
+    /// Is this VC's ENTIRE obligation discharged at encode time?
+    ///
+    /// True only when there is at least one property, EVERY property carries a
+    /// `discharged_at_encode` reason, and no `error_p{id}`-headed rule exists.
+    /// That last clause is what keeps this honest: a property whose rule was
+    /// emitted and later deleted — by `eliminate_trivially_false_rules`, or by
+    /// `prune_orphan_block_rules` taking a rule whose block relation became an
+    /// orphan — was never marked, so the conjunction fails and the caller must
+    /// leave the VC alone. The driver then keeps failing closed with
+    /// `LostErrorRules`, which is the correct answer for a check nobody can
+    /// account for.
+    ///
+    /// Bridges (`error_p{id} -> error`) have head `error`, not `error_p…`, so
+    /// they do not defeat the test.
+    #[must_use]
+    pub fn all_properties_discharged_at_encode(&self) -> bool {
+        if self.trivially_safe_discharged || self.properties.is_empty() {
+            return false;
+        }
+        if !self.properties.iter().all(|prop| prop.discharged_at_encode.is_some()) {
+            return false;
+        }
+        // No surviving per-property rule...
+        if self.rules.iter().any(|rule| rule.head.name.as_str().starts_with("error_p")) {
+            return false;
+        }
+        // ...AND nothing derives the AGGREGATE `error` directly either.
+        //
+        // This clause is not redundant, and omitting it was a missed bug.
+        // `error_only_region_head` gives an `Unreachable` target the aggregate
+        // `error` head and registers NO property
+        // (rules/codegen_rules/unreachable_error.rs:45), so a live
+        // `from_app /\ guard -> error` rule is invisible to a property-only
+        // test. Since the canonical discharge CLEARS every rule, firing on such
+        // a VC deletes a real error path: measured 2026-09-18,
+        // `unreachable_discharge_dual.rs::bug_reachable_unreachable` and
+        // `obligation_free_walk_dual.rs::bug_unreachable_unchecked_one_deep`
+        // — both genuinely reachable `unreachable_unchecked` — were reported
+        // SUCCESSFUL.
+        //
+        // Bridges are exempt: their body relation IS an `error_p{id}`, and those
+        // are already accounted for above.
+        !self.rules.iter().any(|rule| {
+            rule.head.name.as_str() == "error"
+                && !rule
+                    .body
+                    .relation
+                    .as_ref()
+                    .is_some_and(|app| app.name.as_str().starts_with("error_p"))
+        })
     }
 
     /// Task #78: record that a sound-approximation event freed a value, and its
@@ -374,7 +548,9 @@ impl ChcVc {
                 for rule in &self.rules {
                     for constraint in rule.body.constraints.iter() {
                         if let Some((lhs, rhs_vars)) = definition_lhs_and_rhs_vars(constraint) {
-                            if rhs_vars.iter().any(|v| tainted.contains(v)) && tainted.insert(lhs) {
+                            if rhs_vars.iter().any(|v| is_tainted_name(v, &tainted))
+                                && tainted.insert(lhs)
+                            {
                                 changed = true;
                             }
                         }
@@ -508,7 +684,15 @@ impl ChcVc {
                 self.rules.iter().map(|rule| rule.head.name.clone()).collect();
 
             let before = self.rules.len();
+            let keep_error_obligations = self.keep_error_obligations;
             self.rules.retain(|rule| {
+                // Lost-checks recovery: an error obligation over an orphan
+                // block is still an obligation. An underivable body relation
+                // is EMPTY in CHC semantics, so keeping the rule changes no
+                // answer; it only lets the discharge and the solver say so.
+                if keep_error_obligations && rule_is_error_obligation(rule) {
+                    return true;
+                }
                 if let Some(ref body_rel) = rule.body.relation {
                     targeted.contains(&body_rel.name)
                 } else {
@@ -581,7 +765,7 @@ fn expr_reads_tainted(expr: &Expr, tainted: &HashSet<String>) -> bool {
     let mut stack = vec![expr];
     while let Some(node) = stack.pop() {
         if let ExprValue::Var { name } = node.value()
-            && tainted.contains(normalize_approx_var(name))
+            && is_tainted_name(name, tainted)
         {
             return true;
         }
@@ -657,6 +841,44 @@ fn build_relation_app(app: &RelationApp) -> Expr {
     } else {
         Expr::func_app(&*app.name, (*app.args).clone())
     }
+}
+
+/// Whether `rule` is an ERROR OBLIGATION: a rule headed by `error` or by a
+/// per-property `error_p{id}` relation.
+pub fn rule_is_error_obligation(rule: &Rule) -> bool {
+    let head: &str = rule.head.name.as_ref();
+    head == "error" || head.starts_with("error_p")
+}
+
+/// Whether a rule/column pass sequence turned `before`, a VC that carries error
+/// obligations, into `after`, a VC that registered properties and carries NO
+/// error obligation: the shape the compiler calls lost checks, not proved checks
+/// (`discharge_straightline_safety`, SOUNDNESS #67) and the driver reports
+/// INCONCLUSIVE (`LostErrorRules`).
+///
+/// Exempt: a certified discharge (`trivially_safe_discharged`), a VC already
+/// re-run in keep mode, a VC with no registered property, and — the case that
+/// belongs to somebody else's mechanism — a VC whose EVERY property was recorded
+/// `discharged_at_encode`. That last one is not a lost check: emission turns it
+/// into the canonical `false => error` obligation
+/// (`ChcVc::all_properties_discharged_at_encode`), which the driver reads as a
+/// clean proof with no solver run. Re-encoding it in keep mode would pin live
+/// `error_p{id}` rules, defeat that gate, and hand the solver an infeasibility to
+/// re-derive — the 1.8x slowdown the in-band marker cost before it was reverted.
+pub fn passes_lost_every_error_obligation(before: &ChcVc, after: &ChcVc) -> bool {
+    !after.trivially_safe_discharged
+        && !after.keep_error_obligations
+        && !after.properties.is_empty()
+        && !after.properties.iter().all(|prop| prop.discharged_at_encode.is_some())
+        && !after.rules.iter().any(rule_is_error_obligation)
+        && before.rules.iter().any(rule_is_error_obligation)
+}
+
+/// Keep mode's replacement for deleting an error obligation whose body folded
+/// to `false`: the same head and body relation over a literal-`false`
+/// constraint, which no solver has to re-derive.
+pub(crate) fn pin_false_error_obligation(rule: &mut Rule) {
+    rule.body.constraints = Constraints::Owned(vec![Expr::bool_const(false)]);
 }
 
 impl Default for ChcVc {
@@ -960,6 +1182,7 @@ mod tests {
             message: None,
             location: None,
             approximation_dependent: None,
+            discharged_at_encode: None,
         });
         vc.query = ChcQuery::new().with_target("error");
         vc
@@ -994,6 +1217,107 @@ mod tests {
             Some(false),
             "guard reads only raw input → independent → MAY certify Genuine"
         );
+    }
+
+    /// A float-binop table identity: `bb2` carries the input `_1` and the table;
+    /// the transition `bb2 -> bb3` defines `_3 = select(tbl, _1)`; `error_p3`
+    /// guards on `guard` from `bb2` (when `from_bb3` is false) or on `_3` from
+    /// `bb3`.
+    fn table_shape_vc(guard: Expr, from_bb3: bool) -> ChcVc {
+        let bv = Sort::bitvec(32);
+        let tbl_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(32));
+        let input = Expr::var("_1", bv.clone());
+        let out3 = Expr::var("_3", bv.clone());
+        let tbl = Expr::var(FLOAT_BINOP_TABLE_F32, tbl_sort.clone());
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::new("bb2", vec![bv.clone(), tbl_sort.clone()]));
+        vc.add_relation(RelationDecl::new("bb3", vec![bv.clone(), bv.clone(), tbl_sort]));
+        vc.add_relation(RelationDecl::nullary("error_p3"));
+        vc.add_relation(RelationDecl::nullary("error"));
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb2", vec![input.clone(), tbl.clone()])),
+                vec![Expr::var("_3__out", bv).eq(tbl.clone().select(input.clone()))],
+            ),
+            RelationApp::new(
+                "bb3",
+                vec![input.clone(), Expr::var("_3__out", Sort::bitvec(32)), tbl.clone()],
+            ),
+        ));
+        vc.add_rule(Rule::new(
+            RuleBody::new(Some(RelationApp::nullary("error_p3")), vec![]),
+            RelationApp::nullary("error"),
+        ));
+        let from = if from_bb3 {
+            RelationApp::new("bb3", vec![input, out3, tbl])
+        } else {
+            RelationApp::new("bb2", vec![input, tbl])
+        };
+        vc.add_rule(Rule::new(
+            RuleBody::new(Some(from), vec![guard]),
+            RelationApp::nullary("error_p3"),
+        ));
+        vc.add_property(ChcProperty {
+            id: 3,
+            kind: PropertyKind::MemorySafety,
+            bb: 2,
+            relation: "error_p3".to_owned(),
+            message: None,
+            location: None,
+            approximation_dependent: None,
+            discharged_at_encode: None,
+        });
+        vc.query = ChcQuery::new().with_target("error");
+        vc.record_approximation_identity(Some(FLOAT_BINOP_TABLE_F32));
+        vc.finalize_approximation_identity(1);
+        vc
+    }
+
+    #[test]
+    fn float_table_identity_leaves_an_operand_check_independent() {
+        let vc = table_shape_vc(
+            Expr::var("_1", Sort::bitvec(32)).eq(Expr::bitvec_const(0x7f80_0000u64, 32)),
+            false,
+        );
+        assert!(vc.approximation_identity_complete);
+        assert_eq!(vc.approximated_vars, vec![FLOAT_BINOP_TABLE_F32.to_string()]);
+        assert_eq!(vc.properties[0].approximation_dependent, Some(false));
+    }
+
+    #[test]
+    fn a_select_on_the_float_table_is_a_read_of_it() {
+        let tbl = Expr::var(FLOAT_BINOP_TABLE_F32, Sort::array(Sort::bitvec(32), Sort::bitvec(32)));
+        let direct = table_shape_vc(
+            tbl.select(Expr::var("_1", Sort::bitvec(32))).eq(Expr::bitvec_const(0u64, 32)),
+            false,
+        );
+        assert_eq!(direct.properties[0].approximation_dependent, Some(true), "guard selects");
+        let through_a_definition = table_shape_vc(
+            Expr::var("_3", Sort::bitvec(32)).eq(Expr::bitvec_const(0u64, 32)),
+            true,
+        );
+        assert_eq!(
+            through_a_definition.properties[0].approximation_dependent,
+            Some(true),
+            "guard reads a slot a table select defined"
+        );
+        assert!(is_float_binop_table_var("float_binop_tbl_f64__out"));
+        assert!(!is_float_binop_table_var("float_binop_tbl_f16"));
+    }
+
+    /// tests/expected/test6/main.rs: the table select at a constant key was
+    /// scalarized into a cell before finalization; the check reads the cell.
+    #[test]
+    fn a_scalarized_cell_of_the_float_table_is_a_read_of_it() {
+        let cell = format!("{FLOAT_BINOP_TABLE_F32}_at_0x3f8000003f800000_bv72");
+        assert_eq!(scalarized_cell_parent(&cell), Some(FLOAT_BINOP_TABLE_F32));
+        assert_eq!(scalarized_cell_parent(&format!("{cell}__out")), Some(FLOAT_BINOP_TABLE_F32));
+        assert_eq!(scalarized_cell_parent("_main_5"), None);
+        let direct = table_shape_vc(
+            Expr::var(cell.as_str(), Sort::bitvec(32)).eq(Expr::bitvec_const(0x4000_0000u64, 32)),
+            false,
+        );
+        assert_eq!(direct.properties[0].approximation_dependent, Some(true), "guard reads a cell");
     }
 
     #[test]
@@ -1185,4 +1509,27 @@ mod tests {
         let names: HashSet<&str> = vc.relations.iter().map(|rel| rel.name.as_str()).collect();
         assert_eq!(names, HashSet::from(["live", "constraint_rel", "error"]));
     }
+
+    /// A havoc declared through `declare_havoc_var` carries the reserved prefix the
+    /// refutation gates read; an ordinary declaration does not, and the prefix is the
+    /// whole test (a havoc stem that looks like a relation argument stays a havoc).
+    #[test]
+    fn declare_havoc_var_marks_the_name_a_refutation_gate_reads() {
+        let mut vc = ChcVc::new();
+        let havoc = vc.declare_havoc_var("bb3_v7", Sort::bitvec(32));
+        let ExprValue::Var { name } = havoc.value() else {
+            panic!("a declared havoc is a variable: {havoc:?}");
+        };
+        assert_eq!(name, &format!("{TRANSLATION_HAVOC_VAR_PREFIX}bb3_v7"));
+        assert!(is_translation_havoc_var(name));
+        let relation_arg = vc.declare_var("bb3_v7", Sort::bitvec(32));
+        let ExprValue::Var { name } = relation_arg.value() else {
+            panic!("a declared variable is a variable: {relation_arg:?}");
+        };
+        assert!(!is_translation_havoc_var(name));
+    }
 }
+
+#[cfg(test)]
+#[path = "chc_keep_error_obligations_tests.rs"]
+mod keep_error_obligations_tests;

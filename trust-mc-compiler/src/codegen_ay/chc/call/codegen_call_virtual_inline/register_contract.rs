@@ -231,7 +231,7 @@ fn find_nested_closure_capture_source_local(
                 Rvalue::Ref(_, _, src) | Rvalue::AddressOf(_, src) if src.projection.is_empty() => {
                     return Some(src.local);
                 }
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                 | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                     if src.projection.is_empty() =>
                 {

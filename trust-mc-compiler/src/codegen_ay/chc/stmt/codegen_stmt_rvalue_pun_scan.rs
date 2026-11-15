@@ -44,6 +44,8 @@ fn operand_uses_local(op: &Operand, local: usize) -> bool {
     match op {
         Operand::Copy(place) | Operand::Move(place) => place.local == local,
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 
@@ -64,6 +66,8 @@ fn operand_is_bare_deref_of_local(op: &Operand, local: usize) -> bool {
                 && matches!(place.projection[0], ProjectionElem::Deref)
         }
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 
@@ -75,6 +79,8 @@ fn operand_is_bare_local(op: &Operand, local: usize) -> bool {
             place.local == local && place.projection.is_empty()
         }
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 
@@ -141,7 +147,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 match rvalue {
                     // Pointer-identity flows: follow the value into the
                     // destination local and vet its uses too.
-                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => {
+                    Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) => {
                         if operand_is_bare_local(op, local) {
                             if !place.projection.is_empty() {
                                 return false;
@@ -188,6 +194,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Rvalue::CopyForDeref(place_r)
                     | Rvalue::Discriminant(place_r)
                     | Rvalue::Len(place_r) => !place_uses_local(place_r, local),
+                    // Trust: `Reborrow` bitwise-copies `place_r` into a new
+                    // value; if that copies the punned pointer, the flow is
+                    // untracked, so it blocks exactly like the reads above.
+                    #[cfg(trust_toolchain)]
+                    Rvalue::Reborrow(_, _, place_r) => !place_uses_local(place_r, local),
                     // Raw-alloc route: a pointer-VALUE COMPARISON (`p == null`,
                     // `p < q`, ...) yields a bool, not a derived pointer — the
                     // ub_checks / is_null machinery emits these. Pure reads of
@@ -201,13 +212,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                         !operand_uses_local(a, local) && !operand_uses_local(b, local)
                     }
-                    Rvalue::UnaryOp(_, op)
-                    | Rvalue::Repeat(op, _)
-                    | Rvalue::ShallowInitBox(op, _) => !operand_uses_local(op, local),
+                    Rvalue::UnaryOp(_, op) | Rvalue::Repeat(op, _) => {
+                        !operand_uses_local(op, local)
+                    }
+                    #[cfg(not(trust_toolchain))]
+                    Rvalue::ShallowInitBox(op, _) => !operand_uses_local(op, local),
                     Rvalue::Aggregate(_, ops) => {
                         !ops.iter().any(|op| operand_uses_local(op, local))
                     }
-                    Rvalue::ThreadLocalRef(_) | Rvalue::NullaryOp(..) => true,
+                    Rvalue::ThreadLocalRef(_) => true,
+                    #[cfg(not(trust_toolchain))]
+                    Rvalue::NullaryOp(..) => true,
                 }
             }
             // The copy-intrinsic statement form: bare pointer-value operands
@@ -232,6 +247,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Discriminant writes / retags touching the punned pointer:
             // conservative bail.
             StatementKind::SetDiscriminant { place, .. } => !place_uses_local(place, local),
+            #[cfg(not(trust_toolchain))]
             StatementKind::Retag(_, place) => !place_uses_local(place, local),
         }
     }

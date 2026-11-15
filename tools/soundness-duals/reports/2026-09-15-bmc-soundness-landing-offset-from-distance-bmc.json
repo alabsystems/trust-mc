@@ -1,0 +1,283 @@
+{
+  "provenance": {
+    "ay": {
+      "build_commit": "10bc4b1856675396fe7b111fc79e81750f0cc9a8",
+      "cargo_toml_pin": "10bc4b1856675396fe7b111fc79e81750f0cc9a8",
+      "path": "~/.cache/trust-mc-ay-cli-10bc4b185/release/ay",
+      "pin_match": true,
+      "version": "ay 0.26.0+build.9791.10bc4b1856675396fe7b111fc79e81750f0cc9a8@2026-09-15T15:49:56Z"
+    },
+    "bundle": {
+      "checkout_at_run": null,
+      "compiler_sha256": "0e710d7104a1df7f697a8ea421327b875c6c2af3f448ca8f7ba21920b56b8ed0",
+      "dir": "/tmp/claude-1000/-home-ayates-trust-mc/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/landing/bundle-a",
+      "driver_mtime_utc": "2026-09-15T16:04:28+00:00",
+      "driver_sha256": "7a853584f51a18338a5f632b43a703e201407101f1949f521bb0732a21f1e4c5",
+      "driver_version": "trust-mc 0.6.0"
+    },
+    "config": {
+      "env": {
+        "PATH_first": "~/.cache/trust-mc-ay-cli-10bc4b185/release",
+        "RUSTFLAGS": "-Awarnings",
+        "TRUST_MC_SYSROOT": "/tmp/claude-1000/-home-ayates-trust-mc/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/landing/bundle-a"
+      },
+      "harness_timeout_s": 30,
+      "inherited_env": {
+        "RUSTUP_TOOLCHAIN": "nightly-2025-12-03"
+      },
+      "jobs": 3,
+      "kinds": [],
+      "lanes": [
+        "bmc"
+      ],
+      "only": [
+        "offset_from_distance_dual"
+      ],
+      "strict": false,
+      "wall_timeout_rule": "180 + harnesses * (2 * 30 + 30) seconds per file"
+    },
+    "finished_at_utc": "2026-09-15T16:41:34+00:00",
+    "host": {
+      "cpu_count": 20,
+      "load_average_end": [
+        25.06,
+        28.02,
+        27.13
+      ],
+      "load_average_start": [
+        25.06,
+        28.02,
+        27.13
+      ],
+      "platform": "Linux-6.17.0-1026-nvidia-aarch64-with-glibc2.39",
+      "python": "3.12.3"
+    },
+    "manifest": {
+      "changed_during_run": false,
+      "path": "tools/soundness-duals/manifest.toml",
+      "sha256": "b9ec9c2107eee6ddbf1ece699d04e68f37a8d0c033717642e23bc6c1f5b37a19"
+    },
+    "runtime_seconds": 3.2,
+    "started_at_utc": "2026-09-15T16:41:30+00:00",
+    "trust_mc": {
+      "dirty": true,
+      "dirty_tracked_paths": 1,
+      "head": "55d60cd3a3edb5fff7bf61909492c05c35ae50cc",
+      "path": "~/tmc-fix/sync/trust-mc",
+      "untracked_paths": 1
+    },
+    "trust_mc_changed_during_run": false
+  },
+  "rows": [
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "safety_check",
+          "Expected the distance between the pointers, in bytes, to be a multiple of the size of `T`"
+        ]
+      ],
+      "harness": "bug_offset_from_odd_byte_distance",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "offset_from_distance_dual.rs",
+      "property": "assertion",
+      "property_ok": false,
+      "property_seen": [
+        "memory-safety",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 8,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": null,
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "safety_check",
+          "Expected the distance between the pointers, in bytes, to be a multiple of the size of `T`"
+        ]
+      ],
+      "harness": "bug_offset_from_symbolic_odd_distance",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "offset_from_distance_dual.rs",
+      "property": "assertion",
+      "property_ok": false,
+      "property_seen": [
+        "memory-safety",
+        "panic"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 7,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "fixed by the fix/bmc-soundness merge (exact same-allocation offset checks, 26b2122a8 and follow-ups): bmc now match (SUCCESSFUL, no failed checks) on the land/integration bundle at ay 10bc4b185, gate run 2026-09-15 (report reports/2026-09-15-bmc-soundness-landing-offset-from-distance-bmc.json), where the origin/main 5aec7f89b bundle on the same run still scored false-certificate (FAILED, Genuine, pointer arithmetic overflow); was: soundness/bmc-safe-offset-from-false-certificate; measured 2026-09-14 on the frozen dev-cli lane, on the pre-rebase engine AND on the rebased one, before AND after the S12 CHC fix: the BMC lane reports `Failed Checks: pointer arithmetic overflow` and `Failed Checks: Offset result and original pointer should point to the same allocation` on a `&buf[0]`-derived `*const u8` that never leaves its 8-byte object, and CERTIFIES it `[AY:CTREX_CAT:Genuine]` \u2014 a false CERTIFICATE, not a demoted false failure. Reproduces identically on the trustc route, so it is the engine's and not a route's. Pre-existing and untouched by the S12 fix, which changes only the CHC lane; chc is green on all three",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_from_aligned_distance",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "offset_from_distance_dual_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "fixed by the fix/bmc-soundness merge (exact same-allocation offset checks, 26b2122a8 and follow-ups): bmc now match (SUCCESSFUL, no failed checks) on the land/integration bundle at ay 10bc4b185, gate run 2026-09-15 (report reports/2026-09-15-bmc-soundness-landing-offset-from-distance-bmc.json), where the origin/main 5aec7f89b bundle on the same run still scored false-certificate (FAILED, Genuine, pointer arithmetic overflow); was: soundness/bmc-safe-offset-from-false-certificate; measured 2026-09-14 on the frozen dev-cli lane, on the pre-rebase engine AND on the rebased one, before AND after the S12 CHC fix: the BMC lane reports `Failed Checks: pointer arithmetic overflow` and `Failed Checks: Offset result and original pointer should point to the same allocation` on a `&buf[0]`-derived `*const u8` that never leaves its 8-byte object, and CERTIFIES it `[AY:CTREX_CAT:Genuine]` \u2014 a false CERTIFICATE, not a demoted false failure. Reproduces identically on the trustc route, so it is the engine's and not a route's. Pre-existing and untouched by the S12 fix, which changes only the CHC lane; chc is green on all three",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_from_branch_aligned_distance",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "offset_from_distance_dual_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 6,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "fixed by the fix/bmc-soundness merge (exact same-allocation offset checks, 26b2122a8 and follow-ups): bmc now match (SUCCESSFUL, no failed checks) on the land/integration bundle at ay 10bc4b185, gate run 2026-09-15 (report reports/2026-09-15-bmc-soundness-landing-offset-from-distance-bmc.json), where the origin/main 5aec7f89b bundle on the same run still scored false-certificate (FAILED, Genuine, pointer arithmetic overflow); was: soundness/bmc-safe-offset-from-false-certificate; measured 2026-09-14 on the frozen dev-cli lane, on the pre-rebase engine AND on the rebased one, before AND after the S12 CHC fix: the BMC lane reports `Failed Checks: pointer arithmetic overflow` and `Failed Checks: Offset result and original pointer should point to the same allocation` on a `&buf[0]`-derived `*const u8` that never leaves its 8-byte object, and CERTIFIES it `[AY:CTREX_CAT:Genuine]` \u2014 a false CERTIFICATE, not a demoted false failure. Reproduces identically on the trustc route, so it is the engine's and not a route's. Pre-existing and untouched by the S12 fix, which changes only the CHC lane; chc is green on all three",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_from_byte_pointee_any_distance",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "bmc",
+      "markers": [
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "offset_from_distance_dual_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    }
+  ],
+  "runs": [
+    {
+      "command": [
+        "trust-mc-driver",
+        "offset_from_distance_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 1,
+      "lane": "bmc",
+      "path": "offset_from_distance_dual.rs",
+      "seconds": 2.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "offset_from_distance_dual_safe.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s"
+      ],
+      "exit_code": 0,
+      "lane": "bmc",
+      "path": "offset_from_distance_dual_safe.rs",
+      "seconds": 2.8,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 450
+    }
+  ],
+  "schema": "trust-mc.soundness-dual-gate-report/v2",
+  "summary": {
+    "decided_rows": 5,
+    "false_certificate_rows": [],
+    "gate": "pass",
+    "gate_reasons": [],
+    "gating_rows": [],
+    "known_red_class_changed": [],
+    "known_red_now_green": [],
+    "needs_review": [],
+    "per_lane": {
+      "bmc": {
+        "error": 0,
+        "false-certificate": 0,
+        "false-failure": 0,
+        "match": 5,
+        "missed-bug": 0,
+        "property_mismatch": 2,
+        "total": 5,
+        "unclassified": 0,
+        "unknown": 0
+      }
+    },
+    "soundness_rows": []
+  }
+}

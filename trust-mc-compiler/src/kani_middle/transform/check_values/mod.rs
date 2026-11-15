@@ -34,8 +34,9 @@ use crate::kani_middle::transform::body::{
 };
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
+use crate::rustc_compat::ValueAbi;
 use rustc_middle::ty::{Const, TyCtxt};
-use rustc_public::abi::{FieldsShape, Scalar, ValueAbi, WrappingRange};
+use rustc_public::abi::{FieldsShape, Scalar, WrappingRange};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::visit::{Location, PlaceContext, PlaceRef};
 use rustc_public::mir::{
@@ -55,6 +56,79 @@ use tracing::{debug, trace};
 pub(crate) struct ValidValuePass {
     pub(crate) safety_check_type: CheckType,
     pub(crate) unsupported_check_type: CheckType,
+}
+
+#[cfg(all(test, trust_toolchain, version("1.101")))]
+mod modern_box_cast_tests {
+    use super::*;
+    use rustc_public::{CompilerError, CrateDef, run_with_tcx};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn actual_box_cast_has_unsupported_source_validity_even_for_raw_pointer_target() {
+        let temp = tempfile::TempDir::new().expect("create native probe directory");
+        let src = temp.path().join("lib.rs");
+        std::fs::write(&src, "pub fn probe_box(b: Box<u32>) -> u32 { *b }").expect("write probe");
+        let args = vec![
+            "rustc".to_owned(),
+            src.to_string_lossy().into_owned(),
+            "--crate-type=lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            temp.path().to_string_lossy().into_owned(),
+        ];
+        let observed = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::clone(&observed);
+        let result = run_with_tcx!(&args, |tcx| {
+            let probes: Vec<_> = rustc_public::all_local_items()
+                .into_iter()
+                .filter(|item| {
+                    let def_id = rustc_internal::internal(tcx, item.def_id());
+                    tcx.def_kind(def_id) == rustc_hir::def::DefKind::Fn
+                        && tcx.parent(def_id) == rustc_hir::def_id::CRATE_DEF_ID.to_def_id()
+                        && tcx
+                            .opt_item_name(def_id)
+                            .is_some_and(|name| name.as_str() == "probe_box")
+                })
+                .collect();
+            assert_eq!(probes.len(), 1, "unique compiler-owned root probe function");
+            let instance = Instance::try_from(probes.into_iter().next().expect("probe function"))
+                .expect("probe instance");
+            let body = instance.body().expect("box dereference body");
+            for (bb, block) in body.blocks.iter().enumerate() {
+                for (idx, stmt) in block.statements.iter().enumerate() {
+                    if let StatementKind::Assign(
+                        _,
+                        rvalue @ Rvalue::Cast(CastKind::BoxDerefTransmute, _, target),
+                    ) = &stmt.kind
+                    {
+                        assert!(matches!(target.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))));
+                        let mut visitor = CheckValueVisitor {
+                            tcx,
+                            locals: body.locals(),
+                            skip_next: false,
+                            current: SourceInstruction::Statement { idx, bb },
+                            target: None,
+                            bb,
+                            machine: MachineInfo::target(),
+                        };
+                        visitor.visit_rvalue(
+                            rvalue,
+                            rustc_public::mir::visit::statement_location(&body, &bb, idx),
+                        );
+                        assert!(visitor.target.expect("unsupported validity check").operations.iter().any(
+                            |op| matches!(op, SourceOp::UnsupportedCheck { check: "box dereference transmute", ty } if ty == target),
+                        ));
+                        checked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            std::ops::ControlFlow::<(), ()>::Continue(())
+        });
+        assert!(result.is_ok() || matches!(result, Err(CompilerError::Skipped)), "{result:?}");
+        assert!(observed.load(Ordering::Relaxed) > 0, "the real cast callback must execute");
+    }
 }
 
 impl TransformPass for ValidValuePass {
@@ -113,7 +187,7 @@ impl ValidValuePass {
                     // that the CHC type-indexed memory model mistracks.
                     if let Some(src_op) = transmute_scalar_source(body.locals(), &rvalue) {
                         let value = body.insert_assignment(
-                            Rvalue::Use(src_op),
+                            rvalue_use!(Rvalue::Use(src_op)),
                             &mut source,
                             InsertPosition::Before,
                         );
@@ -252,7 +326,7 @@ impl ValidValuePass {
                     // Build count_is_zero = (count == 0)
                     let zero_const = body.new_uint_operand(0, UintTy::Usize, span);
                     let count_local = body.insert_assignment(
-                        Rvalue::Use(count),
+                        rvalue_use!(Rvalue::Use(count)),
                         &mut source,
                         InsertPosition::Before,
                     );
@@ -349,6 +423,8 @@ fn transmute_scalar_source(locals: &[LocalDecl], rvalue: &Rvalue) -> Option<Oper
         // consumes the place afterwards).
         Operand::Move(place) | Operand::Copy(place) => Operand::Copy(place.clone()),
         constant @ Operand::Constant(_) => constant.clone(),
+        #[cfg(trust_toolchain)]
+        checks @ Operand::RuntimeChecks(_) => checks.clone(),
     })
 }
 
@@ -373,7 +449,7 @@ struct ArraySource {
 /// anything that could shift the pointer off the array base or that this pass
 /// cannot prove addresses the whole array.
 fn array_source(body: &MutableBody, rvalue: &Rvalue) -> Option<ArraySource> {
-    let Rvalue::Use(Operand::Copy(ptr_place) | Operand::Move(ptr_place)) = rvalue else {
+    let Rvalue::Use(Operand::Copy(ptr_place) | Operand::Move(ptr_place), ..) = rvalue else {
         return None;
     };
     if !ptr_place.projection.is_empty() {
@@ -384,7 +460,7 @@ fn array_source(body: &MutableBody, rvalue: &Rvalue) -> Option<ArraySource> {
     for _ in 0..16 {
         let rhs = unique_assignment_rhs(body, current)?;
         match rhs {
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.projection.is_empty() => {
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) if p.projection.is_empty() => {
                 current = p.local;
             }
             Rvalue::Cast(kind, Operand::Copy(p) | Operand::Move(p), _)
@@ -578,9 +654,9 @@ impl ValidValueReq {
             })
         } else {
             let shape = ty.layout().expect("type layout for valid value req").shape();
-            match shape.abi {
+            match layout_value_abi!(shape) {
                 ValueAbi::Scalar(Scalar::Initialized { value, valid_range })
-                | ValueAbi::ScalarPair(Scalar::Initialized { value, valid_range }, _) => {
+                | scalar_pair_abi!(Scalar::Initialized { value, valid_range }, _) => {
                     Some(ValidValueReq {
                         offset: 0,
                         size: value.size(machine_info),
@@ -588,9 +664,11 @@ impl ValidValueReq {
                     })
                 }
                 ValueAbi::Scalar(_)
-                | ValueAbi::ScalarPair(_, _)
+                | scalar_pair_abi!(_, _)
                 | ValueAbi::Vector { .. }
                 | ValueAbi::Aggregate { .. } => None,
+                #[cfg(trust_toolchain)]
+                ValueAbi::ScalableVector { .. } => None,
             }
         }
     }
@@ -837,7 +915,9 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                                             Some(ranges) if !ranges.is_empty() => {
                                                 self.push_target(SourceOp::DerefValidity {
                                                     pointee_ty,
-                                                    rvalue: Rvalue::Use(copy.src.clone()),
+                                                    rvalue: rvalue_use!(Rvalue::Use(
+                                                        copy.src.clone()
+                                                    )),
                                                     ranges,
                                                 });
                                             }
@@ -860,7 +940,7 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                                         // - Checks first element when count > 0 (conservative)
                                         self.push_target(SourceOp::GuardedDerefValidity {
                                             pointee_ty,
-                                            rvalue: Rvalue::Use(copy.src.clone()),
+                                            rvalue: rvalue_use!(Rvalue::Use(copy.src.clone())),
                                             ranges: base_ranges,
                                             count: copy.count.clone(),
                                         });
@@ -903,13 +983,14 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                 | StatementKind::SetDiscriminant { .. }
                 | StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
-                | StatementKind::Retag(_, _)
                 | StatementKind::PlaceMention(_)
                 | StatementKind::AscribeUserType { .. }
                 | StatementKind::Coverage(_)
                 | StatementKind::ConstEvalCounter
                 | StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))
                 | StatementKind::Nop => self.super_statement(stmt, location),
+                #[cfg(not(trust_toolchain))]
+                StatementKind::Retag(_, _) => self.super_statement(stmt, location),
             }
         }
 
@@ -1005,13 +1086,13 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                             Ok(ranges) if !ranges.is_empty() => {
                                 self.push_target(SourceOp::DerefValidity {
                                     pointee_ty: target_ty,
-                                    rvalue: Rvalue::Use(
+                                    rvalue: rvalue_use!(Rvalue::Use(
                                         Operand::Copy(Place {
                                             local: place_ref.local,
                                             projection: place_ref.projection.to_vec(),
                                         })
                                         .clone(),
-                                    ),
+                                    )),
                                     ranges,
                                 });
                             }
@@ -1032,10 +1113,10 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                             Ok(ranges) if !ranges.is_empty() => {
                                 self.push_target(SourceOp::BytesValidity {
                                     target_ty: *target_ty,
-                                    rvalue: Rvalue::Use(Operand::Copy(Place {
+                                    rvalue: rvalue_use!(Rvalue::Use(Operand::Copy(Place {
                                         local: place_ref.local,
                                         projection: place_ref.projection.to_vec(),
-                                    })),
+                                    }))),
                                     ranges,
                                 });
                             }
@@ -1118,6 +1199,15 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                         });
                     }
                 }
+                #[cfg(all(trust_toolchain, version("1.101")))]
+                CastKind::BoxDerefTransmute => {
+                    // Destination byte validity does not establish the extra
+                    // source-Box validity required by this cast.
+                    self.push_target(SourceOp::UnsupportedCheck {
+                        check: "box dereference transmute",
+                        ty: *dest_ty,
+                    });
+                }
                 CastKind::Transmute | CastKind::Subtype => {
                     debug!(?dest_ty, "transmute");
                     // For transmute, we care about the destination type only.
@@ -1148,6 +1238,7 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                 | CastKind::IntToFloat
                 | CastKind::FnPtrToPtr => {}
             },
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(_, _) => {
                 // The contents of the box is considered uninitialized.
                 // This should already be covered by the Assign detection.
@@ -1177,7 +1268,7 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
                             ) {
                                 self.push_target(SourceOp::BytesValidity {
                                     target_ty: dest_ty,
-                                    rvalue: Rvalue::Use(first_op),
+                                    rvalue: rvalue_use!(Rvalue::Use(first_op)),
                                     ranges: vec![req],
                                 });
                             }
@@ -1201,9 +1292,42 @@ impl MirVisitor for CheckValueVisitor<'_, '_> {
             | Rvalue::Ref(_, _, _)
             | Rvalue::Repeat(_, _)
             | Rvalue::ThreadLocalRef(_)
-            | Rvalue::NullaryOp(_)
             | Rvalue::UnaryOp(_, _)
-            | Rvalue::Use(_) => {}
+            | Rvalue::Use(_, ..) => {}
+            #[cfg(not(trust_toolchain))]
+            Rvalue::NullaryOp(_) => {}
+            // A reborrow is a bitwise copy of `place` (codegen lowers it to `Operand::Copy`).
+            // `Mut` keeps the type, so copying a valid value is valid, exactly as for `Use`.
+            // `Not` copies into the `CoerceShared` target type. That copy is only as valid as
+            // its source when both types carry identical validity requirements; otherwise the
+            // target could be stricter, like a transmute, so fail closed.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(target_ty, mutability, place) => {
+                if *mutability == Mutability::Not {
+                    // A source place that does not type is malformed MIR. It fails closed through
+                    // the same `UnsupportedCheck` as unequal validity instead of panicking the pass.
+                    let same_validity = place.ty(self.locals).is_ok_and(|src_ty| {
+                        matches!(
+                            (
+                                ty_validity_per_offset(&self.machine, src_ty, 0),
+                                ty_validity_per_offset(&self.machine, *target_ty, 0),
+                            ),
+                            (Ok(src_validity), Ok(dest_validity)) if src_validity == dest_validity
+                        )
+                    });
+                    if !same_validity {
+                        self.push_target(SourceOp::UnsupportedCheck {
+                            check: "shared reborrow",
+                            ty: *target_ty,
+                        });
+                    }
+                }
+                // Visit the source as the copy it lowers to. `super_rvalue` would pass a mutating
+                // place context for a `Mut` reborrow, which skips the union-read validity check.
+                self.visit_ty(target_ty, location);
+                self.visit_operand(&Operand::Copy(place.clone()), location);
+                return;
+            }
         }
         self.super_rvalue(rvalue, location);
     }

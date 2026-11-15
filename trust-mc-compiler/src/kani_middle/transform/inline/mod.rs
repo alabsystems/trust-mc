@@ -99,11 +99,30 @@ pub(crate) struct InlineConfig {
     /// bound with a loud unwinding assertion (`Poll::Pending` on the last
     /// permitted poll FAILS; it is never silently pruned).
     pub preserve_block_on: bool,
+    /// Preserve authenticated core default array comparisons for the CHC
+    /// typed-value handlers before preprocessing erases their array/iterator
+    /// carriers (including authenticated str::chars construction).
+    /// BMC keeps its existing body-inlining path.
+    pub preserve_array_comparisons: bool,
+    /// BMC keeps authenticated native Box construction and trivial-pointee
+    /// destruction for its checked pointer/allocator models.
+    pub bmc_native_box_validity: bool,
+    /// Keep an authenticated Global Box's complete native Drop for CHC's
+    /// checked thin-empty or concrete dynamic destructor model.
+    /// User allocator effects are not elided.
+    pub chc_native_box_drop: bool,
 }
 
 impl Default for InlineConfig {
     fn default() -> Self {
-        InlineConfig { max_depth: 10, enabled: true, preserve_block_on: true }
+        InlineConfig {
+            max_depth: 10,
+            enabled: true,
+            preserve_block_on: true,
+            preserve_array_comparisons: true,
+            bmc_native_box_validity: false,
+            chc_native_box_drop: false,
+        }
     }
 }
 
@@ -281,10 +300,10 @@ impl FunctionInlinePass {
     }
 
     /// Find all Call terminators in a MutableBody that should be inlined.
-    fn find_calls_to_inline_mutable(&self, body: &MutableBody) -> Vec<usize> {
+    fn find_calls_to_inline_mutable(&self, tcx: TyCtxt<'_>, body: &MutableBody) -> Vec<usize> {
         let mut call_sites = Vec::new();
         for (idx, block) in body.blocks().iter().enumerate() {
-            if let TerminatorKind::Call { func, destination, .. } = &block.terminator.kind {
+            if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind {
                 // Note: Projected destinations (e.g., _3.0 = foo()) are now handled
                 // correctly via ret_tmp + post_return_bb. See #225 and Phase 4 M1.
                 if !destination.projection.is_empty() {
@@ -293,7 +312,7 @@ impl FunctionInlinePass {
                         idx
                     );
                 }
-                if self.should_inline_mutable(func, body) {
+                if self.should_inline_mutable(tcx, func, args, body) {
                     call_sites.push(idx);
                 }
             }
@@ -337,7 +356,15 @@ impl FunctionInlinePass {
     /// Check if a function call should be inlined (MutableBody variant).
     ///
     /// Handles both FnDef (regular functions) and Closure types (#1575).
-    fn should_inline_mutable(&self, func: &Operand, body: &MutableBody) -> bool {
+    fn should_inline_mutable(
+        &self,
+        tcx: TyCtxt<'_>,
+        func: &Operand,
+        call_args: &[Operand],
+        body: &MutableBody,
+    ) -> bool {
+        #[cfg(not(all(trust_toolchain, version("1.101"))))]
+        let _ = call_args;
         // Get the function type
         let func_ty: rustc_public::ty::Ty = match func.ty(body.locals()) {
             Ok(ty) => ty,
@@ -347,10 +374,14 @@ impl FunctionInlinePass {
         // Accept FnDef or Closure types (#1575)
         let (fn_name, fn_def_for_resolve, fn_args_for_resolve) = match func_ty.kind() {
             TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_args)) => {
+                if handler_boundaries::is_kani_mem_stub_boundary(tcx, fn_def) {
+                    debug!("Not inlining kani::mem predicate: {}", fn_def.0.name());
+                    return false;
+                }
                 // Don't inline kani functions that have marker attributes (hooks,
                 // intrinsics, models) — the AY codegen has special handlers for
-                // these. kani::mem:: predicates (can_dereference, can_read_unaligned,
-                // etc.) are also blocked — see has_special_codegen_handler.
+                // these. Registered kani::mem predicates are preserved above
+                // after checking their defining crate.
                 // Part of #1229, #3470.
                 //
                 // Part of #3207: Also inline AnyModel (kani::any<T>()) so that
@@ -467,13 +498,95 @@ impl FunctionInlinePass {
                 debug!("Not inlining block_on (CHC specializer boundary): {}", fn_name);
                 return false;
             }
-            debug!("Inlining block_on (BMC: poll loop unrolled under the unwind bound): {}", fn_name);
+            debug!(
+                "Inlining block_on (BMC: poll loop unrolled under the unwind bound): {}",
+                fn_name
+            );
         }
 
         // Don't inline functions with special codegen handlers (#274)
         // These are handled in try_codegen_std_intrinsic and need to
         // be visible as function calls, not inlined match arms.
-        if Self::has_special_codegen_handler(&fn_name) {
+        //
+        // The handlers model LIBRARY functions and match them by name
+        // (`contains("wrapping_")`, `contains("checked_")`, ...), which a
+        // function of the crate under verification matches just as well:
+        // `fn my_wrapping_add(..) { assert!(..); .. }`, or a `#[kani::stub]`
+        // replacement named after the function it stubs, stayed a call and
+        // the BMC lane modelled it as `wrapping_add`, dropping its body
+        // (tools/soundness-duals/user_fn_std_helper_name_dual.rs). A local
+        // function is inlined like any other.
+        let callee_is_local = fn_def_for_resolve.is_some_and(|def| def.krate().is_local);
+        // Unsafe initialization contracts must survive even when their payload
+        // is outside the model's supported capability or stubs are active.
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if self.config.chc_native_box_drop
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && (crate::codegen_ay::native_init_boundary(tcx, &instance).is_some()
+                || crate::codegen_ay::native_maybe_unsafe_accessor(tcx, &instance)
+                || crate::codegen_ay::native_maybe_uninit_write(tcx, &instance).is_some_and(
+                    |native| {
+                        call_args.first().is_some_and(|receiver| {
+                            crate::codegen_ay::native_maybe_write_box_receiver(
+                                tcx,
+                                body.blocks(),
+                                body.locals(),
+                                receiver,
+                                native.maybe,
+                            )
+                        })
+                    },
+                ))
+        {
+            return false;
+        }
+        if self.config.chc_native_box_drop
+            && !crate::codegen_ay::native_bmc_has_custom_global_allocator(tcx)
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && crate::codegen_ay::native_box_new_uninit(tcx, &instance).is_some()
+        {
+            return false;
+        }
+        if self.config.chc_native_box_drop
+            && !crate::codegen_ay::native_bmc_has_custom_global_allocator(tcx)
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && crate::codegen_ay::native_global_dyn_box_drop_value(tcx, &instance).is_some()
+        {
+            return false;
+        }
+        // The real native forwarding body is walked with an explicitly typed
+        // Box value view. Pre-inlining it erases that ownership/frame boundary.
+        if self.config.chc_native_box_drop
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && crate::codegen_ay::native_global_dyn_box_call(tcx, &instance)
+                .is_some_and(|(_, kind)| kind != crate::codegen_ay::NativeBoxCallKind::FnOnce)
+        {
+            return false;
+        }
+        if self.config.bmc_native_box_validity
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && (crate::codegen_ay::native_bmc_box_from_raw(tcx, &instance).is_some()
+                || crate::codegen_ay::native_bmc_box_into_raw(tcx, &instance).is_some()
+                || crate::codegen_ay::native_bmc_box_drop_value(tcx, &instance).is_some())
+        {
+            return false;
+        }
+        // Keep native ownership release visible to CHC. Its ManuallyDrop
+        // body obscures the typed Box birth before the checked pointer cast.
+        if self.config.chc_native_box_drop
+            && !crate::codegen_ay::native_bmc_has_custom_global_allocator(tcx)
+            && let (Some(def), Some(args)) = (fn_def_for_resolve, fn_args_for_resolve.as_ref())
+            && let Ok(instance) = Instance::resolve(def, args)
+            && crate::codegen_ay::native_box_into_raw_identity(tcx, &instance).is_some()
+        {
+            return false;
+        }
+        if !callee_is_local && Self::has_special_codegen_handler(&fn_name) {
             debug!("Not inlining function with special handler: {}", fn_name);
             return false;
         }
@@ -483,6 +596,24 @@ impl FunctionInlinePass {
         // Resolve the instance to get the impl-specific path and check if the
         // stub registry would handle it. (#3679)
         if let (Some(fn_def), Some(fn_args)) = (fn_def_for_resolve, fn_args_for_resolve) {
+            if self.config.preserve_array_comparisons
+                && let Ok(instance) = Instance::resolve(fn_def, &fn_args)
+                && crate::kani_middle::std_abstraction::preserve_core_iterator_boundary(
+                    tcx, &instance,
+                )
+            {
+                debug!("Preserving authenticated iterator value boundary: {}", instance.name());
+                return false;
+            }
+            if self.config.preserve_array_comparisons
+                && let Ok(instance) = Instance::resolve(fn_def, &fn_args)
+                && crate::kani_middle::std_abstraction::is_default_spec_array_comparison(
+                    tcx, &instance,
+                )
+            {
+                debug!("Preserving authenticated default array comparison: {}", instance.name());
+                return false;
+            }
             if Self::has_stubbed_trait_impl(&fn_name, fn_def, &fn_args) {
                 debug!("Not inlining trait method with stubbed impl: {}", fn_name);
                 return false;
@@ -567,6 +698,33 @@ impl FunctionInlinePass {
             {
                 return true;
             }
+        }
+
+        // `Result::expect_err` — preserve for the ResultUnwrapErr stub (BMC
+        // `codegen_result_unwrap_err`, CHC `translate_unwrap_expect_call`), which
+        // records the panic-on-Ok obligation and extracts the Err payload.
+        // Inlined, the body drags `unwrap_failed`'s Debug formatting of the Ok
+        // payload into the harness: measured `Err(3u8).expect_err("x") == 3` was
+        // demoted (`unconstrained_assignment=6`) and could never PROVE, while
+        // the stub route proves it and fails the `Ok(3).expect_err` variant.
+        // Scoped to `expect_err` only: `unwrap`/`expect`/`unwrap_err` keep their
+        // measured inlined behaviour (this is not the place to widen that).
+        if fn_name.contains("Result") && fn_name.ends_with("::expect_err") {
+            debug!("Not inlining Result::expect_err stub boundary: {}", fn_name);
+            return true;
+        }
+
+        // `hint::unreachable_unchecked` — preserve for the PanicError stub
+        // (exact-match registry entry): reaching it is UB and must surface as
+        // an obligation. Inlined, its `assert_unsafe_precondition!` expansion
+        // (`precondition_check` → `panic_nounwind_fmt` → `runtime::panic_impl`
+        // → `Location::caller`) exhausted the inline budget, left an
+        // unsupported `Call terminator`, and the solver returned UNDECIDED on
+        // `if x == 3 { unreachable_unchecked() }`. `Result::unwrap_unchecked`
+        // on `Err` lowers to exactly this call.
+        if fn_name.ends_with("hint::unreachable_unchecked") {
+            debug!("Not inlining unreachable_unchecked obligation boundary: {}", fn_name);
+            return true;
         }
 
         // Checked/wrapping/saturating/overflowing/unchecked arithmetic
@@ -907,31 +1065,6 @@ impl FunctionInlinePass {
             return true;
         }
 
-        // kani::mem predicates — preserve for CHC kani_mem stub dispatch (Part of #3470)
-        // can_dereference, can_read_unaligned, can_write, can_write_unaligned,
-        // is_inbounds, is_ptr_aligned, assert_is_initialized are all kani_mem stubs
-        // that CHC over-approximates as true. If inlined, the expanded MIR has
-        // short-circuit && control flow with Option pattern matching (from
-        // checked_size_of_raw inside is_inbounds) that CHC encoding handles
-        // incorrectly — inner calls evaluate to unconstrained, causing spurious CTREX.
-        // Blocking inlining lets stub detection recognize the whole predicate.
-        if fn_name.contains("kani") && fn_name.contains("::mem::") {
-            let method = fn_name.rsplit("::").next().unwrap_or_default();
-            if matches!(
-                method,
-                "can_dereference"
-                    | "can_read_unaligned"
-                    | "can_write"
-                    | "can_write_unaligned"
-                    | "is_inbounds"
-                    | "is_ptr_aligned"
-                    | "assert_is_initialized"
-            ) {
-                debug!("Not inlining kani::mem predicate: {}", fn_name);
-                return true;
-            }
-        }
-
         // Part of #4067: Rc::new / Arc::new — preserve for CHC codegen_rc_arc_new
         // dispatch (codegen_call_dispatch_dyn.rs). If MIR-inlined, the body expands
         // into Box::new + into_raw_with_allocator + Global field projections that
@@ -1267,12 +1400,17 @@ impl FunctionInlinePass {
                 &mut body_provider,
                 max_depth.saturating_sub(total_inline_count),
                 &mut total_inline_count,
+                self.config.bmc_native_box_validity
+                    || (self.config.chc_native_box_drop
+                        && !crate::codegen_ay::native_bmc_has_custom_global_allocator(tcx)),
+                self.config.chc_native_box_drop
+                    && !crate::codegen_ay::native_bmc_has_custom_global_allocator(tcx),
             ) {
                 iteration_changed = true;
             }
 
             // Phase 2: Find call sites in current body state
-            let call_sites = self.find_calls_to_inline_mutable(&mutable_body);
+            let call_sites = self.find_calls_to_inline_mutable(tcx, &mutable_body);
             if call_sites.is_empty() && !iteration_changed {
                 break;
             }
@@ -1402,7 +1540,7 @@ impl FunctionInlinePass {
                                 args.clone(),
                                 destination.clone(),
                                 *target,
-                                block.terminator.span,
+                                mir_span!(block.terminator),
                             )
                         })
                     } else {
@@ -1530,6 +1668,17 @@ impl FunctionInlinePass {
                 if callee_instance.def.def_id() == instance.def.def_id() {
                     debug!(
                         "FunctionInlinePass: SKIP (self-recursion) fn={}",
+                        callee_instance.name()
+                    );
+                    continue;
+                }
+
+                // A renamed float intrinsic stays a call so it reaches its model: on Trust its
+                // fallback body would otherwise replace the model (see
+                // `intrinsics::is_modelled_renamed_intrinsic`). On the nightly it has no body.
+                if crate::intrinsics::is_modelled_renamed_intrinsic(&callee_instance) {
+                    debug!(
+                        "FunctionInlinePass: SKIP (modelled intrinsic) fn={}",
                         callee_instance.name()
                     );
                     continue;

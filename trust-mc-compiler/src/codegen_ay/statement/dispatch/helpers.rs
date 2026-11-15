@@ -141,7 +141,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             instance_opt.as_ref().map_or_else(|| fn_def.def_id(), |instance| instance.def.def_id());
         let internal_def_id = rustc_internal::internal(self.ctx.tcx, def_id);
         let path = self.ctx.tcx.def_path_str(internal_def_id);
-        Some(path)
+        // A float intrinsic Trust core renamed reads as its nightly name, which the
+        // math dispatch matches on (`crate::intrinsics::nightly_float_intrinsic_name`).
+        Some(crate::intrinsics::callee_path_model_spelling(path, fn_def, &fn_args))
     }
 
     /// Check if the callee is a foreign (FFI) function.
@@ -230,12 +232,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
-        let arg = args.first()?;
-        let dest_ty = destination.ty(self.body.locals()).into_option()?;
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
+        let Some(arg) = args.first() else {
+            self.ctx.unsupported_with_fallback("transmute_intrinsic", "no argument");
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+        let Some(dest_ty) = destination.ty(self.body.locals()).into_option() else {
+            self.ctx
+                .unsupported_with_fallback("transmute_intrinsic", "destination type unavailable");
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+
         // Part of #3809: route through codegen_cast_with_kind so the
         // intrinsic path shares the same layout-sensitive transmute guard
         // as the MIR Rvalue::Cast(Transmute, ...) path.
-        let expr = self.codegen_cast_with_kind(&super::super::CastKind::Transmute, arg, dest_ty)?;
+        let Some(expr) =
+            self.codegen_cast_with_kind(&super::super::CastKind::Transmute, arg, dest_ty)
+        else {
+            self.ctx
+                .unsupported_with_fallback("transmute_intrinsic", "transmute did not translate");
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
         self.assign_value_to_place(destination, expr);
         target
     }

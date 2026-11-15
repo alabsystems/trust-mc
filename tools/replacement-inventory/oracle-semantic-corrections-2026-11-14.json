@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "reason": "Correct six mismatched semantic oracles using unchanged original programs, original expected outputs, and the exact selected contract mode. Test-level success is not a raw semantic verdict; a file-level outcome is not a per-harness oracle.",
+  "fork_commit": "c4d858036efec56e02caa743f8732582da973d5a",
+  "historical_total": 818,
+  "corrections": [
+    {
+      "file": "tests/expected/coroutines/main.rs",
+      "harness": "main",
+      "before": "CTREX",
+      "after": "PROOF",
+      "reason": "Both resumes preserve val: the first yields val, the second completes with !val. The original single-harness expected output is SUCCESSFUL.",
+      "fork_blob": "9b76e6e4302ed8e3654573d1007b9ebf74887836",
+      "fork_sha256": "c66819f002809f3e00f4d40f93b4ca40f3471855674ae8e2bbbe28862d178a56",
+      "current_source_sha256_at_audit": "c66819f002809f3e00f4d40f93b4ca40f3471855674ae8e2bbbe28862d178a56",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/coroutines/expected",
+      "expectation_blob": "c1be99367ed3c4cef340dab476a284e73ff218c8",
+      "expectation_sha256": "cfc8e9802dc68a509671a8c67953cac27b95a4517040237a93ef9a246ce78465"
+    },
+    {
+      "file": "tests/expected/coroutines/pin/main.rs",
+      "harness": "main",
+      "before": "CTREX",
+      "after": "PROOF",
+      "reason": "The first resume yields 1 and the second completes with true. The original single-harness expected output is SUCCESSFUL.",
+      "fork_blob": "fc97e57761e009e56618565efc8708a596fedbaf",
+      "fork_sha256": "1fc59442ef5a4877d1e67983b4689c143e00e33e2b3d84c0932721fe4f61e385",
+      "current_source_sha256_at_audit": "1fc59442ef5a4877d1e67983b4689c143e00e33e2b3d84c0932721fe4f61e385",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/coroutines/pin/expected",
+      "expectation_blob": "1c2dc54a2f62bebe082d0851ffcafadb97ead5a7",
+      "expectation_sha256": "28f0424699b6202ce0a22f1237cd7b6e5e6150133a99d2341882468a7230e032"
+    },
+    {
+      "file": "tests/expected/function-contract/mutable-references/mut_ref_ensures_and_modifies.rs",
+      "harness": "divide_by_harness",
+      "before": "CTREX",
+      "after": "PROOF",
+      "reason": "The precondition 0 < *b < a makes the division defined; a / *b <= a. Only b is modified and the returned reference is b. The original expected output is SUCCESSFUL.",
+      "fork_blob": "64f34c475824fbff883028833528debf12c722f6",
+      "fork_sha256": "0ff18b84e640348cc83c3b5dc688bfc5f02a43809a6ea64bf7ad56fdc2e625cf",
+      "current_source_sha256_at_audit": "0ff18b84e640348cc83c3b5dc688bfc5f02a43809a6ea64bf7ad56fdc2e625cf",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/function-contract/mutable-references/mut_ref_ensures_and_modifies.expected",
+      "expectation_blob": "54fa880047e50515f55307ed20fad5e5918a5b42",
+      "expectation_sha256": "3bf6a04868a06ef3f97aa539a9da62032328977b07fa6d8855a3f2f9eaee914d"
+    },
+    {
+      "file": "tests/expected/uninit/atomic/atomic.rs",
+      "harness": "local_atomic_uninit",
+      "before": "PROOF",
+      "after": "CTREX",
+      "reason": "Choosing the atomic_load or atomic_cxchg branch reads allocated but uninitialized u8 storage. The original single-harness expected output is FAILED. The atomic_store branch alone does not establish this bug.",
+      "fork_blob": "a5bb0cbe9561d8366cc3a4f2517fa3213bfdaabb",
+      "fork_sha256": "e92fbc1fc2c3f26483dbe20828dcf39228b0ae3ba311426dfa1788cb4a961355",
+      "current_source_sha256_at_audit": "e92fbc1fc2c3f26483dbe20828dcf39228b0ae3ba311426dfa1788cb4a961355",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/uninit/atomic/expected",
+      "expectation_blob": "c7d9593f22a77259a9b361089ee2197ac331c709",
+      "expectation_sha256": "deaa339d640afc23150186e4f4c1ff15bb3ddc4e6d7c9ce581c11239fdc7bd0b"
+    },
+    {
+      "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
+      "harness": "modify_harness",
+      "before": "PROOF",
+      "after": "CTREX",
+      "reason": "This selected proof_for_contract harness allows *ptr=0. modify returns 1, violating its result==100 postcondition. The separate ordinary harness sets *ptr=99 and is not the selected contract harness; its file-level SUCCESSFUL output cannot be used here.",
+      "fork_blob": "87129dad4c598439cd6f23be9f2dfa802b1477b4",
+      "fork_sha256": "19e1a59db937f0add186020a51b4620382b031e2766059c83ab22ac280365ecb",
+      "current_source_sha256_at_audit": "19e1a59db937f0add186020a51b4620382b031e2766059c83ab22ac280365ecb",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/function-contract/modifies/check_only_verification.expected",
+      "expectation_blob": "34c886c358cb05884f1c2f8d809390998e90a9e1",
+      "expectation_sha256": "a0b8de8486d4977be2ef2f306176f32c759a2c7c4f68d80d28faa9fd4c81d737"
+    },
+    {
+      "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
+      "harness": "check_modify",
+      "before": "PROOF",
+      "after": "CTREX",
+      "reason": "This selected proof_for_contract harness allows *ptr=0. modify leaves *ptr=1, violating its *ptr==100 postcondition. Both this contract check and the separate stub-use harness are negative; the original file-level output is FAILED.",
+      "fork_blob": "ce9b6bb86460d4c6bf5aee4777a0a14ee982b279",
+      "fork_sha256": "c1060ee9949cc2c025d0f13ba78e1d786652bbf42d3ac2395d9178e28c6675b8",
+      "current_source_sha256_at_audit": "c1060ee9949cc2c025d0f13ba78e1d786652bbf42d3ac2395d9178e28c6675b8",
+      "program_unchanged_except_full_line_comments": true,
+      "expectation_file": "tests/expected/function-contract/modifies/mistake_condition_return.expected",
+      "expectation_blob": "ad1cbf4f72d2c20293fa0c5c1c55465fc82e3f82",
+      "expectation_sha256": "580acc4be2d15f5c05b5a168e9fd4f21d4b0836e5a5ce0d57cb9be33a373de5c"
+    }
+  ],
+  "unchanged_partition": {
+    "proof": 477,
+    "negative": 341,
+    "active_proof": 445,
+    "active_negative": 341
+  },
+  "deferred": "Cover requirements need property-level accounting; all-undetermined covers must not gain credit from a safety marker. File-level contract failures do not change other independently valid contract harnesses."
+}

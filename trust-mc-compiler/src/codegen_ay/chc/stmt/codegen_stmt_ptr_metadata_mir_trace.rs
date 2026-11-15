@@ -36,11 +36,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &self,
         local_idx: usize,
     ) -> Option<u64> {
-        // Transitive trace with depth limit to prevent infinite loops.
+        // Trace only stable producers. A local with one direct assignment can
+        // still be replaced through an alias; its initial literal or array
+        // extent then says nothing about the current wide pointer's metadata.
+        // The caller falls through to that pointer's current state instead.
         let mut current = local_idx;
         let mut visited = HashSet::new();
         while visited.insert(current) {
-            if self.local_has_multiple_whole_definitions(current) {
+            if !self.path_insensitive_metadata_is_stable(current) {
                 return None;
             }
             let mut traced_local = None;
@@ -50,22 +53,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.local == current
                     {
                         match rvalue {
-                            Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
-                                // Check if the source type has an array tail we can extract.
-                                if let Ok(src_ty) = place.ty(self.body.locals()) {
-                                    let len = Self::extract_array_len_from_ref(src_ty);
-                                    if let Some(len) = len {
-                                        return Some(len);
-                                    }
+                            Rvalue::Cast(_, operand, _) => {
+                                // Check if the source type has an array tail we can extract
+                                // (covers both Copy/Move of `&[T; N]` and Constant `b"..."`).
+                                if let Ok(src_ty) = operand.ty(self.body.locals())
+                                    && let Some(len) = Self::extract_array_len_from_ref(
+                                        self.resolve_body_ty(src_ty),
+                                    )
+                                {
+                                    return Some(len);
                                 }
-                                // Trace through projected pointer casts like
-                                // `Copy(((_2.0).0))` used by Box<str> fat-pointer
-                                // lowering; the owning local still carries the
-                                // length-preserving call provenance.
-                                traced_local = Some(place.local);
+                                if let Operand::Copy(place) | Operand::Move(place) = operand {
+                                    // Trace through projected pointer casts like
+                                    // `Copy(((_2.0).0))` used by Box<str> fat-pointer
+                                    // lowering; the owning local still carries the
+                                    // length-preserving call provenance.
+                                    traced_local = Some(place.local);
+                                }
                             }
-                            Rvalue::Use(operand) => {
-                                // Part of #3497: &str constant → extract byte length.
+                            Rvalue::Use(operand, ..) => {
+                                // Part of #3497: &str / &[T] constant → extract length.
                                 if let Some(len) = Self::extract_str_len_from_const_operand(operand)
                                 {
                                     return Some(len);
@@ -76,6 +83,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 // Part of #3497, #3655: trace through field projections.
                                 if traced_local.is_none() {
                                     traced_local = self.trace_use_field_projection(operand);
+                                }
+                                // Trace through single-deref loads (`_x = copy (*_ref)`) when
+                                // `_ref` resolves via `ref_targets` to a local holding the fat ptr.
+                                if traced_local.is_none()
+                                    && let Operand::Copy(place) | Operand::Move(place) = operand
+                                    && place.projection.as_slice()
+                                        == [rustc_public::mir::ProjectionElem::Deref]
+                                {
+                                    traced_local = self
+                                        .ref_resolution
+                                        .ref_targets
+                                        .get(&place.local)
+                                        .filter(|rt| rt.projections.is_empty())
+                                        .map(|rt| rt.local);
                                 }
                             }
                             Rvalue::CopyForDeref(place) if place.projection.is_empty() => {
@@ -137,7 +158,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Single-local helper for resolve_metadata_from_str_producing_call.
     fn resolve_str_producing_call_single(&self, local_idx: usize) -> Option<u64> {
-        if self.local_has_multiple_whole_definitions(local_idx) {
+        if !self.path_insensitive_metadata_is_stable(local_idx) {
             return None;
         }
         for block in &self.body.blocks {
@@ -168,7 +189,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             let string_local = args.first().and_then(Self::operand_bare_local)?;
-            if self.local_has_multiple_whole_definitions(string_local) {
+            if !self.path_insensitive_metadata_is_stable(string_local) {
                 return None;
             }
             let string_local = self
@@ -176,7 +197,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .ref_targets
                 .get(&string_local)
                 .map_or(string_local, |rt| rt.local);
-            if self.local_has_multiple_whole_definitions(string_local) {
+            if !self.path_insensitive_metadata_is_stable(string_local) {
                 return None;
             }
             // Find the String::from call that produced this String local.
@@ -189,7 +210,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Find the const &str source length for a String local produced by String::from.
     fn resolve_string_from_source_len(&self, string_local: usize) -> Option<u64> {
-        if self.local_has_multiple_whole_definitions(string_local) {
+        if !self.path_insensitive_metadata_is_stable(string_local) {
             return None;
         }
         for block in &self.body.blocks {
@@ -235,7 +256,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut current = local_idx;
         let mut visited = HashSet::new();
         while visited.insert(current) {
-            if self.local_has_multiple_whole_definitions(current) {
+            if !self.path_insensitive_metadata_is_stable(current) {
                 return None;
             }
             let mut next_local = None;
@@ -244,7 +265,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if let StatementKind::Assign(lhs, rvalue) = &stmt.kind
                         && lhs.local == current
                     {
-                        if let Rvalue::Use(operand) = rvalue {
+                        if let Rvalue::Use(operand, ..) = rvalue {
                             if let Some(len) = Self::extract_str_len_from_const_operand(operand) {
                                 return Some(len);
                             }
@@ -275,7 +296,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
                 && destination.local == local_idx
                 && destination.projection.is_empty()
-                && !self.local_has_multiple_whole_definitions(local_idx)
+                && self.path_insensitive_metadata_is_stable(local_idx)
             {
                 let Some((_, _, index)) = self.authenticated_core_slice_index_args(func, args)
                 else {
@@ -304,13 +325,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
                 && destination.local == local_idx
                 && destination.projection.is_empty()
-                && !self.local_has_multiple_whole_definitions(local_idx)
+                && self.path_insensitive_metadata_is_stable(local_idx)
             {
                 let Some(source) = self.authenticated_core_range_full_source(func, args) else {
                     continue;
                 };
                 if let Some(arg_local) = Self::operand_bare_local(source)
-                    && !self.local_has_multiple_whole_definitions(arg_local)
+                    && self.path_insensitive_metadata_is_stable(arg_local)
                     && let Some(len) = self.resolve_slice_metadata_from_mir(arg_local)
                 {
                     debug!(

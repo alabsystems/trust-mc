@@ -6,6 +6,7 @@
 //!
 //! Extracted from `inline_known_calls.rs` — Part of #4206.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use ay_bindings::Expr;
 use rustc_public::mir::{LocalDecl, Operand};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -76,7 +77,7 @@ pub(super) fn inline_raw_pointer_cmp_expr(method: &str, translated_args: &[Expr]
             // Using an arbitrary pending var here leaves bad clamp bounds as
             // unconstrained data instead of a failing guard, which produces SAT
             // counterexamples in ptr-comparison helpers that rely on `Ord::clamp`.
-            let fallback = super::declare_pending_var(
+            let fallback = ExactVar::nondet(
                 super::chc_fresh_name("__assert_fail_inline_raw_ptr_clamp"),
                 lhs.sort().clone(),
             );

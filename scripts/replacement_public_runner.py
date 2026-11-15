@@ -136,7 +136,9 @@ def solver_attestation(solver: str, expected_pin: str) -> dict[str, str]:
         raise ReplacementRunError(
             f"replacement-public requires solver 'ay', got {solver!r}"
         )
-    solver_path = shutil.which(solver)
+    # The driver runs $TRUST_MC_AY_BIN in preference to PATH (and never falls
+    # back to PATH while it is set), so attest that binary when it is named.
+    solver_path = os.environ.get("TRUST_MC_AY_BIN") or shutil.which(solver)
     if solver_path is None:
         raise ReplacementRunError("ay solver binary not found in PATH")
     result = subprocess.run(
@@ -213,7 +215,10 @@ def build_invocation(
         row["driver_harness"],
         "--exact",
     ]
-    flags.extend(_authoritative_file_flags(source))
+    # A source may forward a trailing --cbmc-args section. The compatibility
+    # CLI intentionally consumes its whole tail, so put every driver operand
+    # before source flags or the input/target path becomes a discarded CBMC arg.
+    source_flags = _authoritative_file_flags(source)
 
     env = dict(os.environ)
     env["TRUST_MC_EMIT_EFFECTIVE_SUCCESS_MARKERS"] = "1"
@@ -232,10 +237,21 @@ def build_invocation(
             *flags,
             "--target-dir",
             str(config.target_dir / target_key),
+            *source_flags,
         ]
     elif row["executor"] == "single-file":
         cwd = REPO_ROOT
-        command = [str(config.driver), *flags, str(source)]
+        # Keep metadata and native witness outputs out of the source tree.
+        # Different harnesses in one file must also have independent outputs.
+        output_key = hashlib.sha256(
+            f"{row['file']}\0{row['harness']}".encode()
+        ).hexdigest()
+        command = [
+            str(config.driver), *flags,
+            "--target-dir", str(config.target_dir / "single" / output_key),
+            str(source),
+            *source_flags,
+        ]
     else:
         raise ReplacementRunError(
             f"{row['file']}::{row['harness']}: unsupported executor {row['executor']!r}"
@@ -336,6 +352,47 @@ def _retry_fields(output: str) -> dict[str, Any]:
     return fields
 
 
+def _cover_properties(output: str) -> tuple[list[dict[str, str]], str | None]:
+    """Read actual named cover checks; summaries and safety markers cannot replace them."""
+    properties = []
+    blocks = list(re.finditer(
+        r"^Check ([^:\n]+): ([^\n]+)\n(.*?)(?=^Check [^\n]*|^\s*SUMMARY:|\Z)",
+        output, re.MULTILINE | re.DOTALL,
+    ))
+    if len(blocks) != len(re.findall(r"^Check [^\n]*", output, re.MULTILINE)):
+        return properties, "malformed property header"
+    seen = set()
+    cover_names = set()
+    for block in blocks:
+        number, name, body = block.groups()
+        if not re.fullmatch(r"[1-9][0-9]*", number) or number in seen:
+            return properties, "invalid or repeated property check identity"
+        seen.add(number)
+        if not (name == "cover" or name.startswith("cover.") or ".cover." in name):
+            continue
+        if not re.fullmatch(r"(?:[^\s]+\.)?cover\.[0-9]+", name):
+            return properties, "invalid cover check identity"
+        if name in cover_names:
+            return properties, "repeated cover property identity"
+        cover_names.add(name)
+        # Count every field prefix before validating its spelling and value.
+        # Otherwise a second lowercase status or unquoted description is
+        # invisible to a regex that only counts valid fields.
+        fields: dict[str, list[str]] = {"status": [], "description": []}
+        for line in body.splitlines():
+            field = re.match(r"^[ \t]*(?:-[ \t]*)?(status|description)\b", line, re.IGNORECASE)
+            if field is not None:
+                fields[field[1].lower()].append(line)
+        if len(fields["status"]) != 1 or len(fields["description"]) != 1:
+            return properties, f"malformed cover check {number}"
+        status = re.fullmatch(r"[ \t]*- Status: ([A-Z]+)[ \t]*", fields["status"][0])
+        description = re.fullmatch(r'[ \t]*- Description: "([^\r\n]*)"[ \t]*', fields["description"][0])
+        if status is None or description is None:
+            return properties, f"malformed cover check {number}"
+        properties.append({"description": description[1], "status": status[1]})
+    return properties, None
+
+
 def parse_driver_result(
     row: dict[str, Any], result: ProcessResult
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -385,14 +442,27 @@ def parse_driver_result(
             execution_details = "no_final_marker"
         verdict = "ERROR"
 
-    if verdict == "CTREX" and effective_success == "should_panic_panics_only":
-        verdict = "PROOF"
-
+    # The corpus records semantic outcomes. A should_panic harness can succeed
+    # as a test while its checked semantic result remains a counterexample.
+    # Keep the driver's outcome independent of the expected label; converting
+    # that counterexample to PROOF rejects the corpus's negative expectation
+    # and can mistake an existential panic witness for a safety proof.
     expected = row["expected"]
     matched = execution_state == "complete" and verdict == expected
     if expected == "BMC_SAFE":
         matched = execution_state == "complete" and verdict in {"BMC", "PROOF"}
     if expected == "PROOF" and result.returncode != 0:
+        matched = False
+    # A bug oracle requires an actual validated refutation. A coarse CTREX
+    # marker from unsupported/over-approximate execution is not that evidence.
+    # Other negative expectations retain their own checked closure semantics.
+    ctrex = _last(MARKER_RES["ctrex"], output)
+    ctrex_category = _split_label_details(ctrex)[0] if ctrex else ""
+    if expected == "CTREX" and ctrex_category != "Genuine":
+        matched = False
+    covers, cover_error = _cover_properties(output)
+    cover_mismatch = dispositions.cover_mismatch(row, covers, cover_error)
+    if cover_mismatch is not None:
         matched = False
     status = "PASS" if matched else "FAIL"
 
@@ -411,6 +481,14 @@ def parse_driver_result(
     }
     if verdict == "PROOF" and status == "PASS":
         flat["trusted_proof"] = True
+    if effective_success:
+        flat["effective_success"] = effective_success
+    if covers or dispositions.cover_expectations(row) is not None:
+        flat["cover_properties"] = covers
+    if cover_error:
+        flat["cover_error"] = cover_error
+    if cover_mismatch:
+        flat["cover_mismatch"] = cover_mismatch
 
     ctrex = _last(MARKER_RES["ctrex"], output)
     if ctrex:
@@ -428,8 +506,6 @@ def parse_driver_result(
     if unknown_reason:
         flat["unknown_reason"] = unknown_reason
     qualifiers = _last(MARKER_RES["proof_qualifiers"], output)
-    if verdict == "PROOF" and effective_success == "should_panic_panics_only":
-        qualifiers = "should_panic"
     if qualifiers:
         flat["proof_qualifiers"] = qualifiers
     demotion = _last(MARKER_RES["demotion"], output)
@@ -451,6 +527,9 @@ def parse_driver_result(
             }
         },
     }
+    for field in ("cover_properties", "cover_error", "cover_mismatch"):
+        if field in flat:
+            runtime_record[field] = flat[field]
     return flat, runtime_record
 
 
@@ -669,6 +748,24 @@ def checked_disposition_report() -> dict[str, Any]:
     return report
 
 
+def locally_inactive_rows(disposition_report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the cfg-disabled rows that are still inside the replacement bar.
+
+    The BAR is what the INCUMBENT DOES. A row upstream Kani itself disabled
+    because CBMC could not run it is not something Kani does, so it cannot
+    block a REPLACEMENT claim; it stays in the historical denominator with zero
+    execution and zero proof credit. A row WE disabled stays inside the bar and
+    blocks — that asymmetry is the anti-cheat.
+    """
+
+    return [
+        row
+        for row in disposition_report["rows"]
+        if row["disposition"] == "inactive"
+        and row.get("inactive_origin") != "upstream"
+    ]
+
+
 def clean_measurement_fingerprint(stage: str) -> str:
     """Require a clean evidence tree and return its tracked-input digest."""
 
@@ -708,7 +805,7 @@ def run(args: argparse.Namespace) -> int:
     disposition_report = checked_disposition_report()
     if args.plan_only:
         print(json.dumps(disposition_report["summary"], indent=2, sort_keys=True))
-        return 1 if disposition_report["summary"]["proof"]["inactive_zero_credit"] else 0
+        return 1 if locally_inactive_rows(disposition_report) else 0
 
     initial_tree_fingerprint = clean_measurement_fingerprint("pre-run")
     driver = args.driver.resolve()
@@ -731,6 +828,24 @@ def run(args: argparse.Namespace) -> int:
         verbose=args.verbose,
     )
     rows, runtime_records, runs = execute_plan(disposition_report, config)
+    report_path = config.report_dir / DEFAULT_REPORT.name
+    tsv_path = config.report_dir / DEFAULT_TSV.name
+    manifest_path = config.report_dir / DEFAULT_RUN_MANIFEST.name
+    manifest = {
+        "schema_version": 1,
+        "artifact_kind": "trust-mc.replacement_public_run_manifest",
+        "report": str(report_path),
+        "source_commit": head,
+        "ay_pin": ay_pin,
+        "tree_fingerprint": initial_tree_fingerprint,
+        "driver_binary": driver_binary,
+        "finalized": False,
+        "runs": runs,
+    }
+    # Retain actual commands, exits and log paths even if final validation
+    # rejects a row or detects changed inputs. A failed run is still useful
+    # evidence; finalized=False never supplies replacement authority.
+    _write_json_atomic(manifest_path, manifest)
     runtime = validate_runtime(disposition_report, runtime_records)
     report = build_report(
         rows,
@@ -748,39 +863,44 @@ def run(args: argparse.Namespace) -> int:
         raise ReplacementRunError(
             "replacement-public report tree fingerprint is not the post-run tree"
         )
-    report_path = config.report_dir / DEFAULT_REPORT.name
-    tsv_path = config.report_dir / DEFAULT_TSV.name
-    manifest_path = config.report_dir / DEFAULT_RUN_MANIFEST.name
     _write_json_atomic(report_path, report)
     _write_tsv(tsv_path, rows)
-    _write_json_atomic(
-        manifest_path,
-        {
-            "schema_version": 1,
-            "artifact_kind": "trust-mc.replacement_public_run_manifest",
-            "report": str(report_path),
-            "driver_binary": driver_binary,
-            "runs": runs,
-        },
-    )
+    manifest["finalized"] = True
+    _write_json_atomic(manifest_path, manifest)
     print(f"replacement-public report: {report_path}")
     print(
         "replacement-public accounting: "
         f"historical={runtime['historical_total']} "
         f"active={runtime['active_executed']} "
-        f"inactive={runtime['inactive_accounted']}"
+        f"inactive={runtime['inactive_accounted']} "
+        f"bar={runtime['proof']['bar'] + runtime['non_proof']['bar']} "
+        f"proof_bar={runtime['proof']['bar']} "
+        f"upstream_inactive={runtime['proof']['upstream_inactive']}"
     )
     failures = sum(row["status"] == "FAIL" for row in rows)
-    inactive_proofs = runtime["proof"]["inactive_zero_credit"]
+    local_inactive = locally_inactive_rows(disposition_report)
+    counted = (
+        runtime["proof"]["local_inactive"] + runtime["non_proof"]["local_inactive"]
+    )
+    if len(local_inactive) != counted:
+        raise ReplacementRunError(
+            "locally-inactive accounting disagrees with the checked source plan"
+        )
     if failures:
         print(f"replacement-public: FAIL: {failures} active row(s) failed", file=sys.stderr)
-    if inactive_proofs:
+    if local_inactive:
+        for row in local_inactive:
+            print(
+                f"  locally disabled: {row['file']}::{row['harness']}",
+                file=sys.stderr,
+            )
         print(
-            "replacement-public: FAIL: strict replacement proof remains blocked by "
-            f"{inactive_proofs} cfg-disabled PROOF rows with zero credit",
+            "replacement-public: FAIL: the replacement bar is blocked by "
+            f"{len(local_inactive)} LOCALLY-disabled row(s) with zero credit; "
+            "upstream-disabled rows are outside the bar, ours are not",
             file=sys.stderr,
         )
-    return 1 if failures or inactive_proofs else 0
+    return 1 if failures or local_inactive else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

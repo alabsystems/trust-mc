@@ -7,6 +7,9 @@
 // cast propagation, and constant reference handling.
 
 use super::{IntoOption, StatementCodegen};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::{
@@ -91,13 +94,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         ) && let Operand::Copy(src) | Operand::Move(src) = operand
         {
             let src_base = self.ssa_base_name(src);
-            if let Some(pointee) = self.ref_pointees.get(src_base.as_str()).cloned() {
-                let dst_base: Arc<str> = self.ssa_base_name(lhs).into();
+            let dst_base: Arc<str> = self.ssa_base_name(lhs).into();
+            if let Some(pointee) =
+                self.ref_pointees.copy_entry(Arc::clone(&dst_base), src_base.as_str())
+            {
                 debug!(
                     "codegen_assign Cast: propagating ref {} -> {} (pointee={})",
                     src_base, dst_base, pointee
                 );
-                self.ref_pointees.insert(dst_base, pointee);
             }
         }
 
@@ -151,7 +155,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // never-allocated address.
                 let lhs_base_name = self.ssa_base_name(lhs);
                 if let Some(ptr_expr) = self.env_lookup(&lhs_base_name).cloned() {
+                    let ptr_expr = self.box_pointer_value(&ptr_expr).unwrap_or(ptr_expr);
                     self.ctx.heap_invalidate_no_provenance(ptr_expr);
+                    // FAIL-CLOSED, not exact: Rust gives this pointer the
+                    // provenance of any previously EXPOSED allocation, and the
+                    // model has no exposed set, so a legitimate
+                    // expose-then-reconstruct round trip reads as a use after
+                    // free. Such a failure is forced, never Genuine
+                    // (transmute_provenance_repro.rs::
+                    // provenance_roundtrip_CONTROL_failclosed). The invalidation
+                    // only adds violations, so a proof stays clean.
+                    self.ctx.bmc_sound_havoc("pointer_with_exposed_provenance");
                 }
             }
             self.ptr_source_map.insert(dst_base, src_root);
@@ -278,6 +292,364 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Some(Arc::from(base))
     }
 
+    /// Does more than one statement or call assign the whole of `local`?
+    ///
+    /// `ref_pointees` and the aggregate-field entries derived from it are keyed
+    /// by the ssa base name of a local, not by path. For a local that several
+    /// producers assign (`let r = if b { &m } else { &n };`, or an aggregate
+    /// built in both arms holding `&m` and `&n`), the map keeps whichever
+    /// producer the encoder translated last, and every read through the local
+    /// uses it on every path.
+    pub(in crate::codegen_ay::statement) fn bmc_local_has_multiple_whole_definitions(
+        &self,
+        local: usize,
+    ) -> bool {
+        use rustc_public::mir::{StatementKind, TerminatorKind};
+        let statements = self
+            .body
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter(|stmt| {
+                matches!(
+                    &stmt.kind,
+                    StatementKind::Assign(lhs, _) if lhs.local == local && lhs.projection.is_empty()
+                )
+            })
+            .take(2)
+            .count();
+        let calls = self
+            .body
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    &block.terminator.kind,
+                    TerminatorKind::Call { destination, .. }
+                        if destination.local == local && destination.projection.is_empty()
+                )
+            })
+            .take(2)
+            .count();
+        statements + calls > 1
+    }
+
+    /// Is every whole definition of `local` a borrow or address-of of one and
+    /// the same place, which has no `Deref` projection? A call that assigns the
+    /// local, any other rvalue, a second distinct place, or a place read through
+    /// a pointer answers `false`.
+    pub(in crate::codegen_ay::statement) fn bmc_local_whole_definitions_borrow_one_place(
+        &self,
+        local: usize,
+    ) -> bool {
+        use rustc_public::mir::{StatementKind, TerminatorKind};
+        let assigned_by_call = self.body.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator.kind,
+                TerminatorKind::Call { destination, .. } if destination.local == local
+            )
+        });
+        if assigned_by_call {
+            return false;
+        }
+        let mut borrowed: Option<&Place> = None;
+        for stmt in self.body.blocks.iter().flat_map(|block| &block.statements) {
+            let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+            if lhs.local != local {
+                continue;
+            }
+            if !lhs.projection.is_empty() {
+                return false;
+            }
+            let (Rvalue::Ref(_, _, source) | Rvalue::AddressOf(_, source)) = rhs else {
+                return false;
+            };
+            if source.projection.iter().any(|elem| matches!(elem, ProjectionElem::Deref)) {
+                return false;
+            }
+            match borrowed {
+                None => borrowed = Some(source),
+                Some(first) if first == source => {}
+                Some(_) => return false,
+            }
+        }
+        borrowed.is_some()
+    }
+
+    /// May the pointer held by `ptr_local` address a stack local?
+    ///
+    /// Walks backward over EVERY producer of each local on the way: a borrow of
+    /// a place that does not start with a deref answers `true`; copies, casts,
+    /// reborrows through `*p`, aggregates and call arguments are followed;
+    /// constants and arithmetic end a branch. Hitting the bound answers `true`.
+    pub(in crate::codegen_ay::statement) fn bmc_pointer_may_address_stack_local(
+        &self,
+        ptr_local: usize,
+    ) -> bool {
+        use rustc_public::mir::{Operand, StatementKind, TerminatorKind};
+        const MAX_VISITED: usize = 64;
+        let operand_local = |op: &Operand| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(p.local),
+            _ => None,
+        };
+        let mut stack = vec![ptr_local];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if seen.len() > MAX_VISITED {
+                return true;
+            }
+            for block in &self.body.blocks {
+                for stmt in &block.statements {
+                    let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                    if lhs.local != current || !lhs.projection.is_empty() {
+                        continue;
+                    }
+                    match rhs {
+                        Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                            if matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+                                stack.push(place.local);
+                            } else {
+                                return true;
+                            }
+                        }
+                        Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) => {
+                            stack.extend(operand_local(op));
+                        }
+                        Rvalue::CopyForDeref(place) => stack.push(place.local),
+                        Rvalue::Aggregate(_, operands) => {
+                            stack.extend(operands.iter().filter_map(operand_local));
+                        }
+                        _ => {}
+                    }
+                }
+                if let TerminatorKind::Call { destination, args, .. } = &block.terminator.kind
+                    && destination.local == current
+                {
+                    stack.extend(args.iter().filter_map(operand_local));
+                }
+            }
+        }
+        false
+    }
+
+    /// The stack locals a pointer held by `ptr_local` may address, and whether
+    /// the walk was complete (same walk as
+    /// [`Self::bmc_pointer_may_address_stack_local`]).
+    pub(in crate::codegen_ay::statement) fn bmc_stack_locals_pointer_may_address(
+        &self,
+        ptr_local: usize,
+    ) -> (Vec<usize>, bool) {
+        use rustc_public::mir::{Operand, StatementKind, TerminatorKind};
+        const MAX_VISITED: usize = 64;
+        let operand_local = |op: &Operand| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(p.local),
+            _ => None,
+        };
+        let mut candidates = Vec::new();
+        let mut stack = vec![ptr_local];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if seen.len() > MAX_VISITED {
+                return (candidates, false);
+            }
+            for block in &self.body.blocks {
+                for stmt in &block.statements {
+                    let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                    if lhs.local != current || !lhs.projection.is_empty() {
+                        continue;
+                    }
+                    match rhs {
+                        Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                            if matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+                                stack.push(place.local);
+                            } else if !candidates.contains(&place.local) {
+                                candidates.push(place.local);
+                            }
+                        }
+                        Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) => {
+                            stack.extend(operand_local(op));
+                        }
+                        Rvalue::CopyForDeref(place) => stack.push(place.local),
+                        Rvalue::Aggregate(_, operands) => {
+                            stack.extend(operands.iter().filter_map(operand_local));
+                        }
+                        _ => {}
+                    }
+                }
+                if let TerminatorKind::Call { destination, args, .. } = &block.terminator.kind
+                    && destination.local == current
+                {
+                    stack.extend(args.iter().filter_map(operand_local));
+                }
+            }
+        }
+        (candidates, true)
+    }
+
+    /// Does a value of `ty` own its bytes in place (no raw pointer, reference
+    /// or pointer wrapper anywhere in it)? A byte copy into such a local changes
+    /// the local itself; a copy through a pointer derived from a container that
+    /// holds a pointer (a `Vec`, a `Box`) lands in the heap buffer instead.
+    fn bmc_ty_owns_bytes_in_place(ty: Ty, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(
+                RigidTy::Bool
+                | RigidTy::Char
+                | RigidTy::Int(_)
+                | RigidTy::Uint(_)
+                | RigidTy::Float(_),
+            ) => true,
+            TyKind::RigidTy(RigidTy::Array(elem, _)) => {
+                Self::bmc_ty_owns_bytes_in_place(elem, depth - 1)
+            }
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                elems.iter().all(|elem| Self::bmc_ty_owns_bytes_in_place(*elem, depth - 1))
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => match def.kind() {
+                AdtKind::Union => false,
+                AdtKind::Enum | AdtKind::Struct => def.variants_iter().all(|variant| {
+                    variant.fields().iter().all(|field| {
+                        mono_ty::field_ty(field, &args)
+                            .is_some_and(|t| Self::bmc_ty_owns_bytes_in_place(t, depth - 1))
+                    })
+                }),
+            },
+            _ => false,
+        }
+    }
+
+    /// A byte-level copy (`copy_nonoverlapping`, `copy`, `write_bytes`) into
+    /// `dst` updates the memory image only; the ssa environment a read of a
+    /// stack local consults keeps the old value. When `dst` may address a
+    /// stack local that owns its bytes in place, the copy is kept and the
+    /// harness is marked: `a.swap(0, 1)` on `[Option<u8>; 2]` left `a[0]` at
+    /// its old value and the BMC lane proved `assert!(!(a[0] == None))`
+    /// (tools/soundness-duals/negative/review_r25_intrinsic_write_fallbacks.rs).
+    ///
+    /// `writes_nothing` is set for a constant count of zero or a zero-sized
+    /// element: the unroll then writes no byte, so the memory image and the
+    /// ssa environment still agree and there is nothing to mark
+    /// (dual_write_bytes_zero_count_noop.rs).
+    pub(in crate::codegen_ay::statement) fn mark_byte_copy_into_stack_local(
+        &mut self,
+        dst: &Operand,
+        writes_nothing: bool,
+        intrinsic: &'static str,
+    ) {
+        if writes_nothing {
+            return;
+        }
+        let (Operand::Copy(place) | Operand::Move(place)) = dst else {
+            return;
+        };
+        if !place.projection.is_empty() {
+            self.ctx.unsupported_with_fallback(intrinsic, "copy destination is a projected place");
+            return;
+        }
+        // A pointer with a tracked pointee (`ptr::swap`'s parameters, bound by the
+        // mini-inline to `&mut a[0]` and `&mut a[1]`) addresses storage the ssa
+        // environment holds; the body-local walk below cannot see where a
+        // parameter came from, and `a.swap(0, 1)` was not marked.
+        let ptr_name =
+            crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), place.local);
+        let tracked_pointee = self.ref_pointees.contains_key(ptr_name.as_str());
+        let (candidates, complete) = self.bmc_stack_locals_pointer_may_address(place.local);
+        let in_place = candidates.iter().any(|&local| {
+            self.body
+                .locals()
+                .get(local)
+                .is_some_and(|decl| Self::bmc_ty_owns_bytes_in_place(decl.ty, 8))
+        });
+        if in_place || !complete || tracked_pointee {
+            debug!(
+                dst_local = place.local,
+                ?candidates,
+                complete,
+                tracked_pointee,
+                intrinsic,
+                "byte copy may write a stack local (fail closed)"
+            );
+            self.ctx.unsupported_with_fallback(
+                intrinsic,
+                format!("copy through _{} may write a stack local in place", place.local),
+            );
+        }
+    }
+
+    /// A store through `*p` whose pointer has no tracked pointee writes a
+    /// syntactic slot (or memory) that no read of the stack local it addresses
+    /// consults, so that local keeps its old value. With the points-at facts
+    /// of joined pointers withdrawn (`forget_joined_ref_pointees`), a write
+    /// through `let r = if b { &mut m } else { &mut n };` is such a store:
+    /// it is kept, and the harness is marked so it cannot come back clean.
+    pub(in crate::codegen_ay::statement) fn mark_untracked_deref_store(&mut self, lhs: &Place) {
+        if !matches!(lhs.projection.first(), Some(ProjectionElem::Deref)) {
+            return;
+        }
+        let ref_base = crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), lhs.local);
+        if self.ref_pointees.contains_key(ref_base.as_str()) {
+            return;
+        }
+        if !self.bmc_pointer_may_address_stack_local(lhs.local) {
+            return;
+        }
+        debug!(
+            local = lhs.local,
+            "deref store through a pointer with no tracked pointee (fail closed)"
+        );
+        self.ctx.unsupported_with_fallback(
+            "deref_store_untracked_pointee",
+            format!("store through _{} may address a stack local", lhs.local),
+        );
+    }
+
+    /// After a whole-local write to `place`, drop the points-at entries rooted
+    /// at its local when that local has several producers.
+    ///
+    /// The value of such a local is joined path-sensitively by the ssa env; the
+    /// points-at map is not, so an entry would name one producer's referent on
+    /// every path. Without the entry a read through the local takes the deref
+    /// ladder over its own path-sensitive pointer value, or fails closed. The
+    /// BMC lane proved `assert!(*h.r == Some(2))` for
+    /// `let h = if b { H { r: &m } } else { H { r: &n } };` with `m = Some(1)`
+    /// (tools/soundness-duals/negative/review_r17_aggregate_field_join.rs).
+    pub(in crate::codegen_ay) fn forget_joined_ref_pointees(&mut self, place: &Place) {
+        if !place.projection.is_empty()
+            || !self.bmc_local_has_multiple_whole_definitions(place.local)
+        {
+            return;
+        }
+        // Several producers that all borrow the SAME deref-free place give the
+        // local one address, hence one referent, on every path: the entry is
+        // exact. Two `Pin::new(&mut coro).resume(())` calls reuse one temporary
+        // for `&mut coro`; dropping its entry left every store into the
+        // coroutine's fields untracked, and coroutine_dual_wrongfield.rs's safe
+        // harnesses failed closed.
+        if self.bmc_local_whole_definitions_borrow_one_place(place.local) {
+            return;
+        }
+        let base = crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), place.local);
+        // `RefPointees` has no `DerefMut`: withdrawal goes through the table's
+        // own method, which keeps a withdrawn key's poison (downgraded to
+        // unknown) so a join the table already refused cannot read clean.
+        let removed = self.ref_pointees.forget_rooted_at(base.as_str());
+        if removed != 0 {
+            debug!(
+                local = place.local,
+                removed, "ref_pointees: dropped entries of a local with several producers"
+            );
+        }
+    }
+
     /// Track reference pointees for Ref/AddressOf rvalues.
     ///
     /// When we see `_ref = &_pointee`, store the mapping. Also evaluates
@@ -338,6 +710,32 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             .ty(self.body.locals())
             .into_option()
             .is_some_and(|ty| Self::definitely_freeze(ty, 0));
+
+        // The referent's ADDRESS, derived from the object it sits in, recorded
+        // under the referent's own name.
+        //
+        // A REBORROW (`&raw const *r`, the shape `ptr::eq(&S3.a, &S3.b)` lowers
+        // to) reaches `codegen_address_of` with the place `(*r)`, whose base name
+        // is the referent `r` names — and `derived_place_address` could not place
+        // that name inside any object, so `get_or_create_address_symbol` minted
+        // an UNRELATED fresh symbol for it. Two fields of one `static` then
+        // compared EQUAL and two borrows of ONE field compared UNEQUAL, both
+        // `FAILED [AY:CTREX_CAT:Genuine]` on safe programs (fourth adversarial
+        // review of m3/soundness-fixes-2, 2026-09-14, defect D8). Recording the
+        // derived address here makes the reborrow find it. Never overwrites an
+        // address already minted for the name.
+        if !pointee_place.projection.is_empty()
+            && !self.addr_symbols.contains_key(pointee_base.as_ref())
+        {
+            let pointee_ty = pointee_place.ty(self.body.locals()).into_option();
+            if let Some(addr) = self.derived_place_address(pointee_place, pointee_ty) {
+                debug!(
+                    "codegen_assign Ref: recording the derived address of {} under its own name",
+                    pointee_base
+                );
+                self.addr_symbols.insert(Arc::clone(&pointee_base), addr);
+            }
+        }
 
         // If the pointee has complex projections, evaluate it and store in the env
         if !pointee_place.projection.is_empty() {
@@ -403,7 +801,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// is rejected transitively via its `UnsafeCell` field. Pointers/references
     /// are Freeze: interior mutability *behind* a pointer lives in a different
     /// allocation, not in this value's bytes, so we stop the walk there.
-    fn definitely_freeze(ty: Ty, depth: u32) -> bool {
+    pub(super) fn definitely_freeze(ty: Ty, depth: u32) -> bool {
         // Bound the walk (recursive types terminate at pointers, but guard anyway).
         if depth > 16 {
             return false;
@@ -443,7 +841,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 def.variants().into_iter().all(|v| {
                     v.fields()
                         .into_iter()
-                        .all(|f| Self::definitely_freeze(f.ty_with_args(&args), depth + 1))
+                        .all(|f| {
+                            mono_ty::field_ty(&f, &args)
+                                .is_some_and(|t| Self::definitely_freeze(t, depth + 1))
+                        })
                 })
             }
             // Foreign / Closure / Coroutine* / Dynamic / CoroutineWitness: opaque.
@@ -481,9 +882,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return false;
                 }
                 def.variants().into_iter().any(|v| {
-                    v.fields()
-                        .into_iter()
-                        .any(|f| Self::ty_contains_unsafe_cell(f.ty_with_args(&args), depth + 1))
+                    v.fields().into_iter().any(|f| {
+                        mono_ty::field_ty(&f, &args)
+                            .is_none_or(|t| Self::ty_contains_unsafe_cell(t, depth + 1))
+                    })
                 })
             }
             RigidTy::Array(elem, _) | RigidTy::Slice(elem) | RigidTy::Pat(elem, _) => {
@@ -541,7 +943,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
         let mut payload = None;
         for f in variant.fields() {
-            let field_ty = f.ty_with_args(&args);
+            let Some(field_ty) = mono_ty::field_ty(&f, &args) else {
+                return false;
+            };
             if Self::layout_is_zst(field_ty) {
                 continue;
             }
@@ -565,7 +969,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// such as `Pin<&mut T>` resume paths.
     pub(super) fn track_copy_move_ref_pointees(&mut self, lhs: &Place, rhs: &Rvalue) {
         let src = match rhs {
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) | Rvalue::CopyForDeref(src) => src,
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+            | Rvalue::CopyForDeref(src) => src,
             _ => return,
         };
         let src_base = self.ssa_base_name(src);
@@ -573,15 +978,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         self.propagate_nested_copy_move_ref_pointees(&dst_base, &src_base);
 
-        if !self.ref_pointees.contains_key(src_base.as_str()) {
+        if !self.ref_pointees.has_entry(src_base.as_str()) {
             self.ensure_ref_pointee_for_place(src);
         }
-        if let Some(pointee) = self.ref_pointees.get(src_base.as_str()).cloned() {
+        // A copy names the same storage on the same paths: carry the entry and
+        // its poison, and read no pointee (`RefPointees::copy_entry`).
+        if let Some(pointee) =
+            self.ref_pointees.copy_entry(Arc::clone(&dst_base), src_base.as_str())
+        {
             debug!(
                 "codegen_assign Copy/Move/CopyForDeref: propagating ref {} -> {} (pointee={})",
                 src_base, dst_base, pointee
             );
-            self.ref_pointees.insert(Arc::clone(&dst_base), pointee);
         }
         // Propagate entry_map_bases and entry_keys for BTreeMap Entry operations
         if let (Some(map_base), Some(key)) = (
@@ -609,24 +1017,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut prefix = String::with_capacity(src_base.len() + 1);
         prefix.push_str(src_base);
         prefix.push('_');
-        let range_start: Arc<str> = Arc::from(prefix.as_str());
-        let nested_refs: Vec<_> = self
-            .ref_pointees
-            .range(range_start..)
-            .take_while(|(key, _)| key.starts_with(prefix.as_str()))
-            .map(|(key, pointee)| (Arc::clone(key), Arc::clone(pointee)))
-            .collect();
-
-        for (nested_key, nested_pointee) in nested_refs {
+        for nested_key in self.ref_pointees.nested_keys(prefix.as_str()) {
             let suffix = &nested_key[src_base.len()..];
             let mut dst_nested_key = String::with_capacity(dst_base.len() + suffix.len());
             dst_nested_key.push_str(dst_base);
             dst_nested_key.push_str(suffix);
-            debug!(
-                "codegen_assign Copy/Move/CopyForDeref: propagating nested ref {} -> {} (pointee={})",
-                nested_key, dst_nested_key, nested_pointee
-            );
-            self.ref_pointees.insert(Arc::from(dst_nested_key), nested_pointee);
+            if let Some(nested_pointee) = self
+                .ref_pointees
+                .copy_entry(Arc::from(dst_nested_key.as_str()), nested_key.as_ref())
+            {
+                debug!(
+                    "codegen_assign Copy/Move/CopyForDeref: propagating nested ref {} -> {} (pointee={})",
+                    nested_key, dst_nested_key, nested_pointee
+                );
+            }
         }
     }
 
@@ -673,7 +1077,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Track constant references (#366): `_ref = const &0` needs synthetic pointee.
     pub(super) fn track_const_ref_pointees(&mut self, lhs: &Place, rhs: &Rvalue) {
-        let Rvalue::Use(Operand::Constant(c)) = rhs else {
+        let Rvalue::Use(Operand::Constant(c), ..) = rhs else {
             return;
         };
         let const_ty = c.const_.ty();
@@ -682,6 +1086,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return;
         };
         debug!("codegen_assign: detected constant reference, pointee_ty = {:?}", pointee_ty.kind());
+        self.premint_const_ref_targets(&c.const_);
         let Some(pointee_expr) = self.try_codegen_const_ref_pointee(&c.const_, pointee_ty) else {
             debug!("codegen_assign: pointee_expr = None",);
             return;
@@ -712,8 +1117,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.assert_ssa_def(pointee_var.clone(), pointee_expr, &pointee_base);
         self.env_update(Arc::clone(&pointee_base), pointee_var);
 
+        // The ADDRESS of a constant allocation is keyed on the ALLOCATION, not
+        // on this borrow: two borrows of one static share it, two statics do
+        // not. `derived_place_address` reads this to place `&S[i]` inside a
+        // registered, disjoint object.
+        if let Some(object) = Self::const_allocation_target(&c.const_) {
+            self.const_pointee_objects.insert(Arc::clone(&pointee_base), object);
+        }
+
         let ref_base = self.ssa_base_name(lhs);
         self.ref_pointees.insert(Arc::from(ref_base), pointee_base);
+    }
+
+    /// The pointer a reference constant holds: the relocation AT its byte 0
+    /// (its target) and the byte offset its bytes carry, or `None` when no
+    /// relocation starts there or the pointer bytes are not all initialized.
+    ///
+    /// The offset matters: `const R: &u32 = &S.1` points 4 bytes into `S`, and
+    /// keying on the allocation alone placed `*R` at `S`'s base.
+    fn const_allocation_target(
+        mir_const: &rustc_public::ty::MirConst,
+    ) -> Option<crate::codegen_ay::shared::const_pointer::ConstPtr> {
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+        const_pointer::const_bytes(mir_const)?.stored_pointer(0)
     }
 }
 

@@ -306,7 +306,7 @@ fn assert_solver_probe_produces_proof(source: &str, fn_name: &str) {
     with_test_ay_ctx_for_source(source, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, fn_name);
         let body = instance.body().expect("function body");
-        let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
+        let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig { straightline_discharge: true, ..ChcConfig::default() });
 
         assert!(!vc.rules.is_empty(), "{fn_name} should produce rules");
         assert!(has_any_constraints(&vc), "{fn_name} should constrain the VC");
@@ -663,7 +663,7 @@ fn replay_simple_inline_assignments(
         }
 
         let src_local = match rvalue {
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
             | Rvalue::Ref(_, _, src)
             | Rvalue::CopyForDeref(src)
                 if src.projection.is_empty() =>
@@ -874,7 +874,7 @@ fn test_double_box_dyn_semantic_solver_produces_proof() {
         let fn_name = "probe_double_box_dyn_semantic";
         let instance = find_instance_by_suffix(ctx.tcx, fn_name);
         let body = instance.body().expect("function body");
-        let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig::default());
+        let vc = mir_to_chc(ctx.tcx, &body, fn_name, ChcConfig { straightline_discharge: true, ..ChcConfig::default() });
 
         assert!(!vc.rules.is_empty(), "{fn_name} should produce rules");
         assert!(has_any_constraints(&vc), "{fn_name} should constrain the VC");
@@ -967,7 +967,7 @@ fn test_slice_boxed_dyn_solver_produces_proof() {
     with_test_ay_ctx_for_source(SLICE_BOXED_DYN_PROBE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_slice_boxed_dyn");
         let body = instance.body().expect("function body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_slice_boxed_dyn", ChcConfig::default());
+        let vc = mir_to_chc(ctx.tcx, &body, "probe_slice_boxed_dyn", ChcConfig { straightline_discharge: true, ..ChcConfig::default() });
 
         assert!(!vc.rules.is_empty(), "should produce rules");
         assert!(has_any_constraints(&vc), "should constrain the VC");

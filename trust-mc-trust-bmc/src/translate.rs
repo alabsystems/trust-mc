@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use ay_bindings::{Expr, Sort};
-use trust_ir::inst::{BinOp, Inst, OverflowOp};
+use ay_bindings::{Expr, ExprValue, Sort};
+use trust_ir::inst::{BinOp, Inst, OverflowOp, UnOp};
 use trust_ir::node::InstrNode;
 use trust_ir::proof::ProofAnnotation;
 use trust_ir::ty::Ty;
@@ -22,6 +22,9 @@ use trust_mc_core::bmc::{BmcQuery, BmcVc};
 use trust_mc_core::decl::Decl;
 use trust_mc_core::ident::{PropertyId, SourceLocation};
 use trust_mc_core::violation::{PropertyKind, Violation};
+
+use crate::bulk_count::{ByteCount, Truth};
+use crate::signature_abi::first_typed_signature_abi;
 
 /// Trust: host target thin-pointer width in bits. trust-ir `Ty::bit_width()`
 /// returns `None` for pointer-like types as of trust-ir 6ed4bf0 (pointer width
@@ -46,19 +49,6 @@ pub struct TranslateOptions {
     pub logic: Option<String>,
     /// Timeout in milliseconds for each query.
     pub timeout_ms: Option<u64>,
-    /// Target block of the SINGLE obligation this translation serves, when the
-    /// caller knows it. `None` (the default everywhere today) keeps the exact
-    /// whole-function behavior: every unsupported-construct error rule is
-    /// included unconditionally.
-    ///
-    /// When set, an unsupported construct's unconditional error rule is included
-    /// ONLY if the construct's block can appear on an entry->target path
-    /// (entry ->* site ->* target). A construct on no such path cannot influence
-    /// the states reaching the target assertion, so excluding its rule cannot
-    /// mask a real violation of THIS obligation. Reachability is computed over
-    /// the CFG successors; ANY uncertainty (unknown terminator, missing block)
-    /// includes the rule — over-approximate, never under.
-    pub narrow_to_target_block: Option<trust_ir::BlockId>,
     /// Collect the direct-call-summary census into
     /// `ChcTranslationOutput::call_summary_census` (default: false).
     ///
@@ -79,7 +69,6 @@ impl Default for TranslateOptions {
             check_memory_bounds: true,
             logic: Some("QF_BV".to_owned()),
             timeout_ms: None,
-            narrow_to_target_block: None,
             collect_call_summary_census: false,
         }
     }
@@ -87,22 +76,29 @@ impl Default for TranslateOptions {
 
 /// Translate a `trust_ir::Module` into a set of BMC verification conditions.
 ///
-/// Returns one `BmcVc` per function in the module. Each VC contains violations
-/// for potentially-failing operations, including operations carrying bare proof
-/// annotations.
+/// Valid modules yield one `BmcVc` per actual function. Invalid modules yield
+/// one unconditional module-input `Other` refusal, even with no functions; it
+/// has no fabricated function owner or source symbols. No instruction-level
+/// assumption can hide input invalidity. A valid empty library has no function
+/// obligations; an empty batch is never program-proof authority. Potentially
+/// failing operations retain their checks despite bare proof annotations.
 pub fn trust_ir_to_bmc_vc(module: &Module, options: &TranslateOptions) -> Vec<BmcVc> {
-    module.functions.iter().map(|func| translate_function(func, module, options)).collect()
+    crate::input::ModuleInput::new(module).all(options)
 }
 
 /// Translate one function from a `trust_ir::Module` into a BMC verification condition.
 ///
-/// Returns `None` when `function` does not exist in `module`.
+/// The complete module is canonically validated before translation. An
+/// existing selection in an invalid module yields an unconditional module-input
+/// `Other` refusal. `None` denotes an actually absent function: a refusal to
+/// translate that selection, never a successful verification or evidence that
+/// the module was valid.
 pub fn trust_ir_function_to_bmc_vc(
     module: &Module,
     function: FuncId,
     options: &TranslateOptions,
 ) -> Option<BmcVc> {
-    module.function_by_id(function).map(|func| translate_function(func, module, options))
+    crate::input::ModuleInput::new(module).function(function, options)
 }
 
 /// A symbolic memory region created by an `Alloca` instruction.
@@ -123,6 +119,60 @@ struct MemoryRegion {
     count: Option<u64>,
     /// The base pointer expression associated with this region.
     base_ptr: Expr,
+    /// The `Alloca`'s declared type: the type of every element, whose byte size
+    /// a bulk `MemCopy`/`MemSet` compares its count with.
+    ty: Ty,
+}
+
+/// What a bulk instruction writes: a copy of `src`, or a fill with `byte`.
+#[derive(Debug, Clone, Copy)]
+enum BulkWrite {
+    Copy { src: ValueId, overlap: bool },
+    Fill { byte: ValueId },
+}
+
+/// Does `ty` take the 64-bit compound placeholder sort in [`ty_to_sort`] — one
+/// element standing for a value whose bytes the array model does not split?
+fn ty_is_compound_placeholder(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Struct(_)
+            | Ty::Array(_, _)
+            | Ty::Tuple(_)
+            | Ty::Enum(_)
+            | Ty::Set(_, _)
+            | Ty::Sequence(_)
+            | Ty::Record(_)
+            | Ty::Closure(_)
+            | Ty::Refine(_, _)
+            | Ty::Dialect(_)
+    )
+}
+
+/// What a whole-cell bulk write leaves in the destination region.
+enum WholeCellWrite {
+    /// A copy from a cell of the same type: the source region's whole array.
+    Region(Expr),
+    /// A fill of an integer cell: its one element.
+    Element(Expr),
+}
+
+/// The element of an INTEGER `ty` (`size` bytes) whose every byte is `byte`, or
+/// `None` for any other type: a `bool`, `char`, float or pointer has invalid or
+/// unmodeled byte images, and a compound type is one placeholder in this model.
+fn repeated_byte_element(ty: &Ty, size: u64, byte: &Expr) -> Option<Expr> {
+    if !ty.is_integer() || byte.sort().bitvec_width() != Some(8) {
+        return None;
+    }
+    let width = ty_to_sort(ty).bitvec_width()?;
+    if width == 0 || u64::from(width) != size.checked_mul(8)? {
+        return None;
+    }
+    let mut repeated = byte.clone();
+    for _ in 1..width / 8 {
+        repeated = repeated.try_concat(byte.clone()).ok()?;
+    }
+    Some(repeated)
 }
 
 /// A CFG edge into a block, recorded while translating the predecessor's
@@ -135,6 +185,15 @@ struct IncomingEdge {
     /// Block-parameter argument expressions, evaluated in the predecessor's
     /// context and normalized to the target's parameter types.
     args: Vec<Expr>,
+}
+
+/// Which compare-exchange a `CmpXchg` node is (trust-ir v48 `weak` flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmpXchgStrength {
+    /// Succeeds exactly when the current value equals the expected one.
+    Strong,
+    /// May also fail spuriously when the values are equal.
+    Weak,
 }
 
 /// Per-function translation state.
@@ -160,12 +219,9 @@ struct FuncTranslator<'a> {
     gep_results: BTreeMap<ValueId, (ValueId, Expr)>,
     /// Pointer lane facts for values built by PtrFromParts.
     ptr_parts: BTreeMap<ValueId, (Expr, Expr)>,
-    /// Reachability guard for the block currently being translated.
-    ///
-    /// Literally `true` for the entry block and for the legacy linear
-    /// translation; otherwise the exact path condition under which the
-    /// block executes. Violations, assumptions, and memory updates emitted
-    /// while translating a block are scoped to this guard.
+    /// Reachability at the current instruction: the block-entry guard AND
+    /// every assumption already encountered in that block. A later assumption
+    /// must not constrain an earlier violation or another block's prefix.
     current_guard: Expr,
 }
 
@@ -204,12 +260,14 @@ impl<'a> FuncTranslator<'a> {
         expr
     }
 
-    /// Resolve a ValueId to its symbolic Expr, creating a fresh symbolic if not found.
+    /// Resolve an already-validated SSA value to its symbolic expression.
     fn resolve(&mut self, val: ValueId, ty: &Ty) -> Expr {
         if let Some(expr) = self.values.get(&val) {
             return expr.clone();
         }
-        // Value not yet defined — create a fresh symbolic (happens for function params).
+        // Complete module validity precedes this walk; entry and block parameters
+        // are bound explicitly. This existing conservative diagnostic fallback
+        // is not permission to invent an undefined/non-dominating source value.
         let expr = self.fresh_symbolic(&format!("v{}", val.0), ty);
         self.values.insert(val, expr.clone());
         expr
@@ -222,9 +280,8 @@ impl<'a> FuncTranslator<'a> {
 
     /// Add a violation (potential property failure).
     ///
-    /// The recorded condition is conjoined with the current block guard, so
-    /// the violation is satisfiable exactly on the feasible paths that reach
-    /// the instruction.
+    /// Capture the current instruction-prefix guard. Later assumptions must
+    /// not alter the feasible paths on which this instruction can fail.
     fn add_violation(&mut self, kind: PropertyKind, condition: Expr, msg: &str, node: &InstrNode) {
         let prop_id = self.alloc_property_id(msg);
         let condition = and_guard(&self.current_guard, condition);
@@ -240,9 +297,8 @@ impl<'a> FuncTranslator<'a> {
 
     /// Add an always-failing VC for trust_ir semantics this translator cannot model exactly.
     ///
-    /// In a guarded CFG region the VC fires whenever the enclosing block is
-    /// reachable (the condition is the block guard); for straight-line code
-    /// the guard is literally `true` and the VC is unconditional as before.
+    /// The refusal fires on the prefix reaching this instruction, including
+    /// preceding assumptions but never assumptions appearing later.
     fn add_unsupported_semantics(&mut self, reason: impl Into<String>, node: &InstrNode) {
         let reason = reason.into();
         self.add_violation(
@@ -268,7 +324,7 @@ impl<'a> FuncTranslator<'a> {
     ///
     /// In a guarded CFG region a store in an untaken branch must not be
     /// observable elsewhere, so the update is wrapped in
-    /// `ite(guard, updated, original)`. Straight-line code (guard = true)
+    /// `ite(guard, updated, original)`. An unconditional prefix (guard = true)
     /// keeps the plain update.
     fn guard_array_update(&self, updated: Expr, original: Expr) -> Expr {
         if expr_is_true(&self.current_guard) {
@@ -305,6 +361,14 @@ impl<'a> FuncTranslator<'a> {
 
     /// Translate the entire function.
     fn translate(mut self) -> BmcVc {
+        // trust-ir wire v60: a typed signature ABI anywhere in the module is
+        // transport this lowering does not model (`crate::signature_abi`).
+        if let Some(func_ty) = first_typed_signature_abi(self.module) {
+            self.add_guarded_unsupported_violation(
+                format!("typed signature ABI transport (function type #{func_ty})"),
+                Expr::true_(),
+            );
+        }
         // Create symbolic variables for block parameters of the entry block.
         if let Some(entry_block) = self.func.blocks.iter().find(|b| b.id == self.func.entry) {
             for (val, ty) in &entry_block.params {
@@ -315,28 +379,33 @@ impl<'a> FuncTranslator<'a> {
 
         match self.acyclic_topo_order() {
             // Acyclic, structurally well-formed CFG: exact guarded-path
-            // encoding (single-block functions take this path with a
-            // constant-true guard, producing the same VCs as before).
+            // encoding. Single-block functions start with a constant-true
+            // entry guard and use the same instruction-prefix semantics.
             Some(order) => self.translate_guarded_blocks(&order),
-            // Loops (back-edges) or malformed block structure: legacy linear
-            // walk, which fails closed on every branch instruction.
+            // No execution order is modeled for a cyclic or malformed CFG.
+            // Refuse the structure independently of any instruction-local
+            // assumption; a linear walk could hide this refusal or conflate
+            // values and memory from unrelated blocks.
+            //
+            // A `Constant::TensorBlob` switch case (`crate::tensor_region`) is
+            // one such structure: it is named rather than lumped in with the
+            // generic refusal.
             None => {
-                for block in &self.func.blocks {
-                    for node in &block.body {
-                        self.translate_node(node);
-                    }
-                }
+                let blob_case = self.func.blocks.iter().flat_map(|block| &block.body).any(|node| {
+                    matches!(node.inst, Inst::Switch { .. })
+                        && crate::tensor_region::inst_carries_tensor_blob(&node.inst)
+                });
+                let reason = if blob_case {
+                    tensor_region_semantics(crate::TensorConstruct::TensorBlobConstant)
+                } else {
+                    "path-sensitive control flow (cyclic or structurally unsupported CFG)"
+                        .to_owned()
+                };
+                self.add_guarded_unsupported_violation(reason, Expr::true_());
             }
         }
 
-        let mut query = BmcQuery::new();
-        if let Some(logic) = &self.options.logic {
-            query = query.with_logic(logic.clone());
-        }
-        if let Some(timeout) = self.options.timeout_ms {
-            query = query.with_timeout(timeout);
-        }
-        query = query.with_model();
+        let query = query_for_options(self.options);
 
         BmcVc {
             decls: self.decls,
@@ -457,10 +526,10 @@ impl<'a> FuncTranslator<'a> {
     /// - `guard(b)` = OR over incoming edges of
     ///   `guard(pred) AND edge condition`.
     ///
-    /// Violations and assumptions inside a block are conditioned on its
-    /// guard, memory updates become no-ops when the guard is false, and
-    /// block parameters are fresh symbolics constrained per incoming edge —
-    /// so exactly the feasible paths are satisfiable.
+    /// Each instruction sees that entry guard conjoined with the assumptions
+    /// preceding it. Violations retain that prefix, memory updates are guarded,
+    /// and outgoing edges carry the final prefix. Block parameters remain
+    /// fresh symbolics constrained only by their feasible incoming edges.
     fn translate_guarded_blocks(&mut self, order: &[usize]) {
         let func = self.func;
         let mut incoming: BTreeMap<BlockId, Vec<IncomingEdge>> = BTreeMap::new();
@@ -496,7 +565,8 @@ impl<'a> FuncTranslator<'a> {
             }
             match &terminator.inst {
                 Inst::Br { .. } | Inst::CondBr { .. } | Inst::Switch { .. } => {
-                    self.record_outgoing_edges(terminator, &guard, &mut incoming);
+                    let outgoing_guard = self.current_guard.clone();
+                    self.record_outgoing_edges(terminator, &outgoing_guard, &mut incoming);
                 }
                 // Return / Unreachable: translated normally; their VCs are
                 // scoped to the block guard via add_violation.
@@ -750,26 +820,26 @@ impl<'a> FuncTranslator<'a> {
                 if let Some(result_id) = node.results.first() {
                     self.bind(*result_id, result);
                 }
-                // Boolean And/Or/Xor are modeled PRECISELY by `eval_binop` as
-                // logical connectives (mirroring translate_chc). Every other
+                // Boolean connectives, including canonical BAnd/BOr/BXor,
+                // are modeled PRECISELY by `eval_binop`. Every other
                 // non-integer binop result is a havoc: fail closed so the
                 // unconstrained value can never silently decide an obligation
                 // — floating-point arithmetic in particular has no bitvector
                 // encoding here (rounding, NaN/∞ propagation, -0.0).
-                let modeled_precisely =
-                    matches!(ty, Ty::Bool) && matches!(op, BinOp::And | BinOp::Or | BinOp::Xor);
+                let modeled_precisely = matches!(ty, Ty::Bool)
+                    && lhs_expr.sort().is_bool()
+                    && rhs_expr.sort().is_bool()
+                    && matches!(
+                        op,
+                        BinOp::And
+                            | BinOp::Or
+                            | BinOp::Xor
+                            | BinOp::BAnd
+                            | BinOp::BOr
+                            | BinOp::BXor
+                    );
                 if !modeled_precisely {
-                    let reason = if ty.is_float()
-                        || matches!(
-                            op,
-                            BinOp::FAdd
-                                | BinOp::FSub
-                                | BinOp::FMul
-                                | BinOp::FDiv
-                                | BinOp::FRem
-                                | BinOp::FMin
-                                | BinOp::FMax
-                        ) {
+                    let reason = if ty.is_float() || binop_is_floating_point(*op) {
                         format!("floating-point binary operation {op:?}")
                     } else {
                         format!("non-integer binary operation {op:?} on {ty:?}")
@@ -779,6 +849,17 @@ impl<'a> FuncTranslator<'a> {
             }
 
             // --- Constants ---
+            // trust-ir v67-v70 tensor region (`crate::tensor_region`): a
+            // `TensorBlob`, or any constant of a tensor type, has no bits and
+            // no sort here, so it fails closed by name before the arm below
+            // could havoc it at a sort this lane does not have. Its result
+            // stays unbound, as for the tensor instructions.
+            Inst::Const { ty, value }
+                if let Some(construct) =
+                    crate::tensor_region::const_tensor_construct(ty, value) =>
+            {
+                self.add_tensor_region_violation(construct, node);
+            }
             Inst::Const { ty, value } => {
                 let expr = if matches!(value, trust_ir::constant::Constant::SymbolAddr { .. }) {
                     let expr = self.fresh_symbolic("symbol_addr", ty);
@@ -845,11 +926,35 @@ impl<'a> FuncTranslator<'a> {
 
             // --- Store (array-based memory model) ---
             Inst::Store { ty, ptr, value, .. } => {
-                self.translate_store(ty, *ptr, *value, node);
+                // R129: a store carrying `ProofAnnotation::RegionHavocStore`
+                // is a BULK write whose target set the producer could not
+                // bound (e.g. `copy_nonoverlapping` with a symbolic element
+                // count). This array-based memory model would translate it as
+                // constraining a SINGLE (symbolic) index, leaving every OTHER
+                // index at its pre-write value — a later read of an element
+                // the real copy overwrote would return a STALE value, the
+                // false-proof shape the annotation's consumer contract names.
+                // Per that contract this backend has no sound reading and
+                // MUST fail closed; the CHC lane owns the audited
+                // whole-tracked-cell invalidation reading.
+                if node.proofs.contains(&ProofAnnotation::RegionHavocStore) {
+                    self.add_unsupported_semantics(
+                        "region-havoc store: the array memory model would \
+                         under-approximate the write set (stale-read hazard); \
+                         whole-region invalidation is required",
+                        node,
+                    );
+                } else {
+                    self.translate_store(ty, *ptr, *value, node);
+                }
             }
 
             // --- Assert → direct VC ---
-            Inst::Assert { cond } => {
+            // trust-ir v52 `kind` and v54 `site` name WHICH panic a failed check
+            // is and the entry it would call; neither changes when the check
+            // fails (iff `cond` is false), and a failed assert is a terminal
+            // panic outcome whatever its site, so the violation is the same.
+            Inst::Assert { cond, kind: _, site: _ } => {
                 let cond_expr = self.resolve(*cond, &Ty::Bool);
                 if cond_expr.sort().is_bool() {
                     // Violation condition is !cond — if cond is false, the assert fails.
@@ -867,14 +972,13 @@ impl<'a> FuncTranslator<'a> {
                 }
             }
 
-            // --- Assume → path constraint ---
+            // --- Assume → remaining execution guard ---
             Inst::Assume { cond } => {
                 let cond_expr = self.resolve(*cond, &Ty::Bool);
                 if cond_expr.sort().is_bool() {
-                    // An assumption only constrains executions that actually
-                    // reach this block: guard => cond.
-                    let guard = self.current_guard.clone();
-                    self.constraints.push(implied_under_guard(&guard, cond_expr));
+                    // Restrict only the remaining execution. A global
+                    // constraint would retroactively erase earlier failures.
+                    self.current_guard = and_guard(&self.current_guard, cond_expr);
                 } else {
                     // Non-boolean assumption operand (malformed trust_ir):
                     // fail closed instead of emitting an ill-sorted constraint.
@@ -1018,6 +1122,9 @@ impl<'a> FuncTranslator<'a> {
             // `acyclic_topo_order` rejected the function (loops/back-edges
             // or a structurally malformed CFG). Acyclic CFGs are handled
             // exactly by `translate_guarded_blocks` and never get here.
+            Inst::Switch { .. } if crate::tensor_region::inst_carries_tensor_blob(&node.inst) => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorBlobConstant, node);
+            }
             Inst::Br { .. } | Inst::CondBr { .. } | Inst::Switch { .. } => {
                 self.add_unsupported_semantics(
                     "path-sensitive control flow (cyclic or structurally unsupported CFG)",
@@ -1046,14 +1153,69 @@ impl<'a> FuncTranslator<'a> {
                 self.add_unsupported_semantics("atomic fence ordering", node);
             }
 
-            // --- UnOp (fail closed until exact unary semantics land) ---
-            Inst::UnOp { op: _, ty, operand } => {
-                let _operand_expr = self.resolve(*operand, ty);
-                let result = self.fresh_symbolic("unop_result", ty);
+            // --- Unary operations: exact integer Not/Neg, otherwise fail closed by name ---
+            Inst::UnOp { op, ty, operand } => {
+                let operand_expr = normalize_expr_to_ty(&self.resolve(*operand, ty), ty);
+                let result = match op {
+                    UnOp::Not if ty.is_integer() && *operand_expr.sort() == ty_to_sort(ty) => {
+                        operand_expr.bvnot()
+                    }
+                    UnOp::Neg if ty.is_integer() && *operand_expr.sort() == ty_to_sort(ty) => {
+                        // Match the CHC lane's overflow policy. Raw IR negation
+                        // is modular; the selected policy adds an obligation.
+                        // The value is always bvneg; only that obligation is
+                        // suppressed by Wrapping or the selected overflow policy.
+                        if !node.proofs.contains(&ProofAnnotation::Wrapping) {
+                            let no_overflow = if ty.is_signed() {
+                                self.options
+                                    .check_signed_overflow
+                                    .then(|| operand_expr.clone().bvneg_no_overflow())
+                            } else {
+                                self.options.check_unsigned_overflow.then(|| {
+                                    operand_expr.clone().eq(Expr::bitvec_const(
+                                        0u64,
+                                        ty.bit_width_with(HOST_POINTER_BITS)
+                                            .expect("integer type has a bit width"),
+                                    ))
+                                })
+                            };
+                            if let Some(no_overflow) = no_overflow {
+                                let signedness = if ty.is_signed() { "signed" } else { "unsigned" };
+                                self.add_violation(
+                                    PropertyKind::ArithmeticOverflow,
+                                    no_overflow.not(),
+                                    &format!("{signedness} neg overflow in {}", self.func.name),
+                                    node,
+                                );
+                            }
+                        }
+                        operand_expr.bvneg()
+                    }
+                    // Exhaustive so a new trust-ir operation must be deliberately
+                    // modeled or refused. Type/sort mismatches also stay refused.
+                    UnOp::Not
+                    | UnOp::Neg
+                    | UnOp::FNeg
+                    | UnOp::FAbs
+                    | UnOp::FSqrt
+                    | UnOp::FFloor
+                    | UnOp::FCeil
+                    | UnOp::FTrunc
+                    | UnOp::CtPop
+                    | UnOp::CtLz
+                    | UnOp::CtTz
+                    | UnOp::BSwap
+                    | UnOp::BitReverse => {
+                        self.add_unsupported_semantics(
+                            format!("unary operation {}", unop_name(*op)),
+                            node,
+                        );
+                        self.fresh_symbolic("unop_result", ty)
+                    }
+                };
                 if let Some(result_id) = node.results.first() {
                     self.bind(*result_id, result);
                 }
-                self.add_unsupported_semantics("unary operation", node);
             }
 
             // --- Overflow check instruction (CheckedBinaryOp) ---
@@ -1092,7 +1254,48 @@ impl<'a> FuncTranslator<'a> {
                 }
             }
 
-            // --- Aggregate operations (fail closed until field/element semantics land) ---
+            // MakeAggregate has no BMC construction model yet. A symbolic result
+            // must retain an unsupported VC even when the result is unused.
+            Inst::MakeAggregate { ty, .. } => {
+                let result = self.fresh_symbolic("make_aggregate_result", ty);
+                if let Some(result_id) = node.results.first() {
+                    self.bind(*result_id, result);
+                }
+                self.add_unsupported_semantics("MakeAggregate construction", node);
+            }
+
+            // A closure carries a function target as well as ordered captures.
+            // This lane has no closure value/application model. Refuse even an
+            // unused constructor: construction consumes captures, so merely
+            // havocing the result could hide poison or handle misuse.
+            Inst::MakeClosure { ty, .. } => {
+                let result = self.fresh_symbolic("make_closure_result", &Ty::Closure(*ty));
+                if let Some(result_id) = node.results.first() {
+                    self.bind(*result_id, result);
+                }
+                self.add_unsupported_semantics("MakeClosure construction", node);
+            }
+
+            // trust-ir v50 `ArraySplat` (`[value; n]`, `ty = Array(e, n)`): pure
+            // and total — no memory effect, no run-time obligation. This lane
+            // has no aggregate VALUE model: an array is the opaque carrier sort
+            // `ty_to_sort` gives every compound type, the same one a constant
+            // array literal gets from `const_to_expr`. So the result is ONE
+            // fresh value whatever `n` is (constant size; nothing walks the
+            // lanes), and it needs no unsupported VC: an unconstrained array
+            // over-approximates `[value; n]` (every real value is a model), and
+            // every consumer that could inspect a lane — `ExtractElement`,
+            // `InsertElement`, `ExtractField`, `InsertField`, and the eq/order
+            // type gates of `ICmp` — independently fails closed, exactly as for
+            // an `Undef` or a constant array. An operand-free fresh value also
+            // reads nothing of `value`, so no fact about it is imported.
+            Inst::ArraySplat { ty, value: _ } => {
+                let result = self.fresh_symbolic("array_splat", ty);
+                if let Some(result_id) = node.results.first() {
+                    self.bind(*result_id, result);
+                }
+            }
+
             Inst::ExtractField { ty, aggregate: _, field: _ }
             | Inst::ExtractElement { ty, array: _, index: _ } => {
                 let result = self.fresh_symbolic("extract_result", ty);
@@ -1128,8 +1331,9 @@ impl<'a> FuncTranslator<'a> {
             }
 
             // --- CmpXchg (conditional exchange with VC) ---
-            Inst::CmpXchg { ty, ptr, expected, desired, .. } => {
-                self.translate_cmpxchg(ty, *ptr, *expected, *desired, node);
+            Inst::CmpXchg { ty, ptr, expected, desired, weak, .. } => {
+                let strength = if *weak { CmpXchgStrength::Weak } else { CmpXchgStrength::Strong };
+                self.translate_cmpxchg(ty, *ptr, *expected, *desired, strength, node);
             }
 
             // --- FCmp (fail closed: havoc result + unsupported VC) ---
@@ -1183,6 +1387,16 @@ impl<'a> FuncTranslator<'a> {
                 self.add_unsupported_semantics("heap deallocation semantics", node);
             }
 
+            // trust-ir v47 `Drop { ty, ptr }` runs `ty`'s drop glue on the place
+            // at `ptr`: a destructor call whose body (user `Drop` impls, nested
+            // field drops, deallocation) is not part of this node, so it may read
+            // or write anything reachable from `ptr` and may panic. No sound
+            // transfer function exists here without that body, so it fails
+            // closed by name.
+            Inst::Drop { .. } => {
+                self.add_unsupported_semantics("drop-glue semantics", node);
+            }
+
             Inst::OpenFrame { .. } | Inst::BindSlot { .. } => {
                 let result = self.fresh_symbolic("binding_frame", &Ty::Ptr);
                 if let Some(result_id) = node.results.first() {
@@ -1225,6 +1439,47 @@ impl<'a> FuncTranslator<'a> {
                 self.add_unsupported_semantics("exception resume/re-raise semantics", node);
             }
 
+            // trust-ir v53 no-unwind call boundaries: a normal return means what
+            // `Call` / `CallIndirect` means, and an unwind out of the callee must
+            // be stopped at the site (the target enforces it or refuses). This
+            // lane models neither the boundary nor, for the indirect form, the
+            // dispatch, so both fail closed by name.
+            Inst::CallCannotUnwind { .. } => {
+                self.add_unsupported_semantics("direct call with a no-unwind boundary", node);
+            }
+
+            Inst::CallIndirectCannotUnwind { .. } => {
+                self.add_unsupported_semantics(
+                    "indirect call dispatch with a no-unwind boundary",
+                    node,
+                );
+            }
+
+            // The trust-ir unwinding twins (v54 `AssertInvoke`, v55 `DropInvoke`,
+            // v56 `InvokeIndirect`) are terminators with `Invoke`'s successor
+            // discipline. Like `Invoke`, none has an edge in this lane
+            // (`record_outgoing_edges`), and each fails closed by name.
+            Inst::AssertInvoke { .. } => {
+                self.add_unsupported_semantics(
+                    "sited check with an exception-handling unwind edge",
+                    node,
+                );
+            }
+
+            Inst::DropInvoke { .. } => {
+                self.add_unsupported_semantics(
+                    "drop-glue semantics with an exception-handling unwind edge",
+                    node,
+                );
+            }
+
+            Inst::InvokeIndirect { .. } => {
+                self.add_unsupported_semantics(
+                    "indirect invoke call with exception-handling semantics",
+                    node,
+                );
+            }
+
             // Structural element-wise sequence maps: whole-sequence semantics
             // (map `+k` / `Bool.not` over every element) have no precise BMC
             // encoding yet, so bind the result symbolically and fail closed.
@@ -1236,9 +1491,301 @@ impl<'a> FuncTranslator<'a> {
                 self.add_unsupported_semantics("structural sequence-map semantics", node);
             }
 
+            // --- Bulk memory (trust-ir WS3.20): `memcpy`/`memmove`/`memset` ---
+            // `bytes` bytes at `dst`. Exact where `dst` (and a copy's `src`) is a
+            // single-cell `Alloca` named whole: in-bounds, overlap and the write
+            // are compared with the cell's byte size, once, whatever `bytes` is.
+            // Anything else keeps the previous model: the region the write lands
+            // in is havocked and the instruction fails closed by name. See
+            // `translate_bulk_memory`.
+            Inst::MemCopy { dst, src, bytes, overlap } => {
+                self.translate_bulk_memory(
+                    *dst,
+                    BulkWrite::Copy { src: *src, overlap: *overlap },
+                    *bytes,
+                    node,
+                );
+            }
+            Inst::MemSet { dst, byte, bytes } => {
+                self.translate_bulk_memory(*dst, BulkWrite::Fill { byte: *byte }, *bytes, node);
+            }
+
             Inst::DialectOp(_) => {
                 self.add_unsupported_semantics("dialect operation", node);
             }
+
+            // trust-ir v67-v69 tensor region (`crate::tensor_region`): no tensor
+            // value has a sort in this lane (`UnsupportedSort::Tensor`), and the
+            // module input refuses every module that stores one before any
+            // function is translated. If a caller bypasses it, each instruction
+            // still fails closed by name, with an always-failing violation. Its
+            // results are deliberately left unbound and its operands unread:
+            // binding a result would need a tensor sort this lane does not have.
+            Inst::TensorContract { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorContract, node);
+            }
+            Inst::TensorMap { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorMap, node);
+            }
+            Inst::TensorReduce { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorReduce, node);
+            }
+            Inst::TensorView { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorView, node);
+            }
+            Inst::TensorGather { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorGather, node);
+            }
+            Inst::TensorScatter { .. } => {
+                self.add_tensor_region_violation(crate::TensorConstruct::TensorScatter, node);
+            }
+        }
+    }
+
+    /// The always-failing violation that names a tensor-region instruction or
+    /// constant (`crate::tensor_region`).
+    fn add_tensor_region_violation(&mut self, construct: crate::TensorConstruct, node: &InstrNode) {
+        self.add_unsupported_semantics(tensor_region_semantics(construct), node);
+    }
+
+    /// `MemCopy` / `MemSet` in the typed array memory model.
+    ///
+    /// The model has one SMT array per `Alloca`, indexed by ELEMENT, so a byte
+    /// range has an exact reading only when it is a whole element. That is the
+    /// case decided here, in an encoding whose size does not depend on `bytes`:
+    /// `dst` (and a copy's `src`) is a single-cell `Alloca` pointer, which names
+    /// its whole cell at offset 0, so
+    ///
+    /// * `bytes == 0` is a no-op (even through a dangling pointer);
+    /// * `bytes >u size_of(cell)` on either side is out of bounds;
+    /// * a `memcpy` from a cell to itself overlaps whenever `bytes != 0`;
+    /// * `bytes == size_of(cell)` copies the source cell when both cells have the
+    ///   SAME type (its whole region array, so a lane read of a compound cell
+    ///   reads the source's lane too), or fills an INTEGER cell with the byte
+    ///   repeated to its width.
+    ///
+    /// A defined, non-empty range that is none of these (a strict prefix of the
+    /// cell, a copy between cells of different types, a fill of a non-integer
+    /// cell) havocs the destination and fails closed by name where it happens;
+    /// an operand that is not a single-cell `Alloca` pointer keeps the previous
+    /// model (havoc the region, fail closed wherever `bytes != 0`).
+    fn translate_bulk_memory(
+        &mut self,
+        dst: ValueId,
+        write: BulkWrite,
+        bytes: ValueId,
+        node: &InstrNode,
+    ) {
+        let _dst = self.resolve(dst, &Ty::Ptr);
+        let spelling = match write {
+            BulkWrite::Copy { overlap: true, .. } => "memmove",
+            BulkWrite::Copy { overlap: false, .. } => "memcpy",
+            BulkWrite::Fill { .. } => "memset",
+        };
+        let (src_cell, byte) = match write {
+            BulkWrite::Copy { src, .. } => {
+                let _src = self.resolve(src, &Ty::Ptr);
+                (Some(self.bulk_cell(src)), None)
+            }
+            BulkWrite::Fill { byte } => (None, Some(self.resolve(byte, &Ty::U8))),
+        };
+        let count = ByteCount::new(self.resolve(bytes, &Ty::Usize));
+        let zero = count.as_ref().map_or(Truth::Known(false), |count| count.equals(0));
+        if zero.is_true() {
+            return;
+        }
+        let dst_cell = self.bulk_cell(dst);
+        let exact = match (count, dst_cell, src_cell) {
+            (Some(count), Some(dst_cell), None) => Some((count, dst_cell, None)),
+            (Some(count), Some(dst_cell), Some(Some(src_cell))) => {
+                Some((count, dst_cell, Some(src_cell)))
+            }
+            _ => None,
+        };
+        let Some((count, (dst_key, dst_ty, dst_size), src_cell)) = exact else {
+            // No exact cell: the previous model, now silent where `bytes == 0`.
+            let nonzero = zero.negate();
+            self.havoc_bulk_write_destination(dst, &nonzero);
+            self.add_violation(
+                PropertyKind::Other,
+                nonzero.expr(),
+                &format!(
+                    "unsupported trust_ir semantics in {}: bulk memory {} with a dynamic \
+                     byte count: the typed array memory model has no byte-granular write or \
+                     range-bounds model",
+                    self.func.name,
+                    if spelling == "memset" {
+                        "fill (memset)".to_owned()
+                    } else {
+                        format!("copy ({spelling})")
+                    },
+                ),
+                node,
+            );
+            return;
+        };
+
+        // Undefined behaviour, decided exactly.
+        let mut out_of_bounds = count.exceeds(dst_size);
+        let mut overlapping = Truth::Known(false);
+        if let Some((src_key, _, src_size)) = &src_cell {
+            out_of_bounds = out_of_bounds.or(count.exceeds(*src_size));
+            if matches!(write, BulkWrite::Copy { overlap: false, .. }) && *src_key == dst_key {
+                overlapping = zero.clone().negate();
+            }
+        }
+        if self.options.check_memory_bounds {
+            if !out_of_bounds.is_false() {
+                self.add_violation(
+                    PropertyKind::OutOfBounds,
+                    out_of_bounds.expr(),
+                    &format!("bulk memory {spelling} out of bounds in {}", self.func.name),
+                    node,
+                );
+            }
+            if !overlapping.is_false() {
+                self.add_violation(
+                    PropertyKind::UndefinedBehavior,
+                    overlapping.expr(),
+                    &format!("{spelling} source and destination overlap in {}", self.func.name),
+                    node,
+                );
+            }
+        }
+        let undefined = out_of_bounds.or(overlapping);
+
+        // What a whole-cell write leaves in the region, if this write has one.
+        //
+        // A copy between two cells of one type takes the source's WHOLE array,
+        // not its element 0. A cell of a compound type is one 64-bit placeholder
+        // element here, but a lane `GEP` into it (memory checks off) reads array
+        // index `k`: storing only element 0 would leave every such index holding
+        // its pre-copy value, a stale read the source's bytes overwrote. The
+        // whole array is the source cell index for index, so every read of the
+        // destination after the copy is the same read of the source before it.
+        // A fill writes only an INTEGER cell, which is its element 0 alone.
+        let whole_write = match (&src_cell, &byte) {
+            (Some((src_key, src_ty, src_size)), None)
+                if *src_ty == dst_ty && *src_size == dst_size =>
+            {
+                self.memory_regions
+                    .get(src_key)
+                    .map(|region| WholeCellWrite::Region(region.array.clone()))
+            }
+            (None, Some(byte)) => {
+                repeated_byte_element(&dst_ty, dst_size, byte).map(WholeCellWrite::Element)
+            }
+            _ => None,
+        };
+        let whole = match &whole_write {
+            Some(_) => count.equals(dst_size),
+            None => Truth::Known(false),
+        };
+        let unplaced =
+            zero.clone().negate().and(whole.clone().negate()).and(undefined.clone().negate());
+        if !unplaced.is_false() {
+            self.add_violation(
+                PropertyKind::Other,
+                unplaced.expr(),
+                &format!(
+                    "unsupported trust_ir semantics in {}: bulk memory {spelling} of a range \
+                     that is not one whole element of a stack cell: the typed array memory \
+                     model has no partial-element or reinterpreting write",
+                    self.func.name
+                ),
+                node,
+            );
+        }
+
+        let Some(original) = self.memory_regions.get(&dst_key).map(|region| region.array.clone())
+        else {
+            return;
+        };
+        let stored = whole_write.map(|write| match write {
+            WholeCellWrite::Region(source) => source,
+            WholeCellWrite::Element(element) => {
+                original.clone().store(Expr::bitvec_const(0u64, 64), element)
+            }
+        });
+        // A fresh array where the cell's content is unknown afterwards: a range
+        // nothing places, and (whatever the checks) an undefined execution.
+        let havoc = if unplaced.is_false() && undefined.is_false() {
+            None
+        } else {
+            let sort = original.sort().clone();
+            let name = format!("mem_bulk_write_{}", self.next_sym_id);
+            self.next_sym_id += 1;
+            self.decls.push(Decl::constant(&name, sort.clone()));
+            Some(Expr::var(&name, sort))
+        };
+        let otherwise = match (&havoc, unplaced.is_false()) {
+            (Some(havoc), false) => zero.select(original.clone(), havoc.clone()),
+            _ => Some(original.clone()),
+        };
+        let updated = match (stored, otherwise) {
+            (Some(stored), Some(otherwise)) => whole.select(stored, otherwise),
+            (None, otherwise) => otherwise,
+            (Some(_), None) => None,
+        };
+        let updated = match (updated, &havoc) {
+            (Some(updated), Some(havoc)) if !undefined.is_false() => {
+                undefined.select(havoc.clone(), updated)
+            }
+            (updated, _) => updated,
+        };
+        match updated {
+            Some(updated) => {
+                let new_array = self.guard_array_update(updated, original);
+                if let Some(region) = self.memory_regions.get_mut(&dst_key) {
+                    region.array = new_array;
+                }
+            }
+            // An ill-sorted case never stands in for the write: forget the cell.
+            None => self.havoc_bulk_write_destination(dst_key, &Truth::Known(true)),
+        }
+    }
+
+    /// The single-cell region a bulk operand names WHOLE: an `Alloca` result
+    /// (offset 0) whose region holds one element of a type with a byte size.
+    /// `(region key, cell type, size in bytes)`.
+    fn bulk_cell(&self, ptr: ValueId) -> Option<(ValueId, Ty, u64)> {
+        let region = self.memory_regions.get(&ptr)?;
+        if region.count != Some(1) {
+            return None;
+        }
+        let bits = self.module.ty_layout_shape(&region.ty).ok()?.size_bits;
+        (bits % 8 == 0).then(|| (ptr, region.ty.clone(), bits / 8))
+    }
+
+    /// Reset the tracked region a bulk write through `dst` lands in to a fresh,
+    /// unconstrained array where `when` holds (and the current block executes).
+    ///
+    /// Defense in depth under the failing VC the caller also emits: the write set
+    /// of such a bulk write is not representable in this element-indexed model,
+    /// so the only sound update is to forget the whole region rather than leave
+    /// any element holding its pre-write value.
+    fn havoc_bulk_write_destination(&mut self, dst: ValueId, when: &Truth) {
+        if when.is_false() {
+            return;
+        }
+        let Some(key) = self.find_region_key_for_ptr(dst) else {
+            return;
+        };
+        let Some(region) = self.memory_regions.get(&key) else {
+            return;
+        };
+        let original = region.array.clone();
+        let array_sort = original.sort().clone();
+        let array_name = format!("mem_bulk_write_{}", self.next_sym_id);
+        self.next_sym_id += 1;
+        let fresh = Expr::var(&array_name, array_sort.clone());
+        self.decls.push(Decl::constant(&array_name, array_sort));
+        let Some(written) = when.select(fresh, original.clone()) else {
+            return;
+        };
+        let new_array = self.guard_array_update(written, original);
+        if let Some(region) = self.memory_regions.get_mut(&key) {
+            region.array = new_array;
         }
     }
 
@@ -1287,18 +1834,18 @@ impl<'a> FuncTranslator<'a> {
         // A float op on an INTEGER type is ill-typed IR; eval_binop havocs the
         // result ("float_on_int"), so fail closed rather than let the
         // unconstrained value silently feed an obligation.
-        if matches!(
-            op,
-            BinOp::FAdd
-                | BinOp::FSub
-                | BinOp::FMul
-                | BinOp::FDiv
-                | BinOp::FRem
-                | BinOp::FMin
-                | BinOp::FMax
-        ) {
+        if binop_is_floating_point(op) {
             self.add_unsupported_semantics(
                 format!("floating-point operation {op:?} on integer type {ty:?}"),
+                node,
+            );
+        }
+        // A rotate whose operands are not same-width bit-vectors has no exact
+        // encoding; eval_binop havocs it ("rotate_unencodable"), so fail closed
+        // exactly as for float-on-int.
+        if integer_rotate_is_unencodable(op, ty, &lhs_expr, &rhs_expr) {
+            self.add_unsupported_semantics(
+                format!("rotate {op:?} without a same-width bit-vector encoding on {ty:?}"),
                 node,
             );
         }
@@ -1339,7 +1886,13 @@ impl<'a> FuncTranslator<'a> {
 
         self.memory_regions.insert(
             result_id,
-            MemoryRegion { array: array_expr, element_sort, count: elem_count, base_ptr: ptr_expr },
+            MemoryRegion {
+                array: array_expr,
+                element_sort,
+                count: elem_count,
+                base_ptr: ptr_expr,
+                ty: ty.clone(),
+            },
         );
     }
 
@@ -1501,10 +2054,31 @@ impl<'a> FuncTranslator<'a> {
 
             // Array store: memory[offset] = value (a no-op on paths that do
             // not execute the current block).
-            let region =
-                self.memory_regions.get(&key).expect("resolved memory region key must exist");
-            let stored_array = region.array.clone().store(offset, val_expr);
-            let new_array = self.guard_array_update(stored_array, region.array.clone());
+            //
+            // A value of a COMPOUND type is one 64-bit placeholder element in
+            // this model, but its bytes span more than one index: a lane `GEP`
+            // into a compound cell (memory checks off) reads index `k >= 1`.
+            // Writing only `offset` would leave those indices holding what the
+            // store overwrote, a stale read and a false proof, so a compound
+            // store lands on a FRESH array: the written element is exact and
+            // every other index is unknown afterwards.
+            let original = self
+                .memory_regions
+                .get(&key)
+                .expect("resolved memory region key must exist")
+                .array
+                .clone();
+            let base = if ty_is_compound_placeholder(ty) {
+                let sort = original.sort().clone();
+                let name = format!("mem_store_spans_{}", self.next_sym_id);
+                self.next_sym_id += 1;
+                self.decls.push(Decl::constant(&name, sort.clone()));
+                Expr::var(&name, sort)
+            } else {
+                original.clone()
+            };
+            let stored_array = base.store(offset, val_expr);
+            let new_array = self.guard_array_update(stored_array, original);
             self.memory_regions
                 .get_mut(&key)
                 .expect("resolved memory region key must be mutable")
@@ -1736,6 +2310,7 @@ impl<'a> FuncTranslator<'a> {
         ptr: ValueId,
         expected: ValueId,
         desired: ValueId,
+        strength: CmpXchgStrength,
         node: &InstrNode,
     ) {
         let expected_expr = self.resolve(expected, ty);
@@ -1767,6 +2342,20 @@ impl<'a> FuncTranslator<'a> {
                 node,
             );
             self.fresh_symbolic("cmpxchg_success", &Ty::Bool)
+        };
+        // A WEAK compare-exchange (trust-ir v48, `CmpXchg { weak: true }`,
+        // Rust's `compare_exchange_weak`) may fail SPURIOUSLY: when the
+        // comparison holds it may still leave memory untouched and report
+        // failure, and it never succeeds when the comparison fails. That is
+        // exactly `equal AND an unconstrained choice`, so the choice is a fresh
+        // Bool the solver quantifies over. Modeling it as the strong instruction
+        // would prove a program that relies on a weak exchange succeeding.
+        let success_cond = match strength {
+            CmpXchgStrength::Strong => success_cond,
+            CmpXchgStrength::Weak => {
+                let may_succeed = self.fresh_symbolic("cmpxchg_weak_may_succeed", &Ty::Bool);
+                success_cond.and(may_succeed)
+            }
         };
 
         // Result value: if success then expected (== current) else current.
@@ -1828,7 +2417,8 @@ impl<'a> FuncTranslator<'a> {
             match op {
                 BinOp::Add => lhs.clone().bvadd(rhs.clone()),
                 BinOp::Sub => lhs.clone().bvsub(rhs.clone()),
-                BinOp::Mul => lhs.clone().bvmul(rhs.clone()),
+                BinOp::Mul => mul_by_power_of_two_as_shift(lhs, rhs)
+                    .unwrap_or_else(|| lhs.clone().bvmul(rhs.clone())),
                 BinOp::UDiv => lhs.clone().bvudiv(rhs.clone()),
                 BinOp::SDiv => lhs.clone().bvsdiv(rhs.clone()),
                 BinOp::URem => lhs.clone().bvurem(rhs.clone()),
@@ -1839,6 +2429,12 @@ impl<'a> FuncTranslator<'a> {
                 BinOp::Shl => lhs.clone().bvshl(rhs.clone()),
                 BinOp::LShr => lhs.clone().bvlshr(rhs.clone()),
                 BinOp::AShr => lhs.clone().bvashr(rhs.clone()),
+                // trust-ir WS3.20 rotates: TOTAL, amount reduced modulo the
+                // width — encoded EXACTLY (see `bv_rotate`). Unencodable
+                // operands havoc, and translate_integer_binop fails closed on
+                // exactly that case (`integer_rotate_is_unencodable`).
+                BinOp::RotL | BinOp::RotR => bv_rotate(lhs, rhs, matches!(op, BinOp::RotL))
+                    .unwrap_or_else(|| self.fresh_symbolic("rotate_unencodable", ty)),
                 // Float ops on integer type — ill-typed IR, return fresh symbolic
                 // (the callers flag this fail-closed; see translate_integer_binop).
                 BinOp::FAdd
@@ -1847,7 +2443,8 @@ impl<'a> FuncTranslator<'a> {
                 | BinOp::FDiv
                 | BinOp::FRem
                 | BinOp::FMin
-                | BinOp::FMax => self.fresh_symbolic("float_on_int", ty),
+                | BinOp::FMax
+                | BinOp::FCopySign => self.fresh_symbolic("float_on_int", ty),
                 // Trust: the BOOLEAN connectives (trust-ir 4b06918) on an INTEGER
                 // type are ill-typed IR -- trust-ir's own validator admits
                 // BAnd/BOr/BXor on Bool (or bool-vector) only. Treated exactly as
@@ -1897,7 +2494,30 @@ impl<'a> FuncTranslator<'a> {
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
-                _ => self.fresh_symbolic("binop_result", ty),
+                // Every other op on `Bool` is ill-typed: havoc, and the caller
+                // (translate_node's BinOp arm) fails closed because only
+                // the boolean connectives count as `modeled_precisely`. Listed, not `_`, so a
+                // new `BinOp` must be placed here before this compiles.
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::UDiv
+                | BinOp::SDiv
+                | BinOp::URem
+                | BinOp::SRem
+                | BinOp::FAdd
+                | BinOp::FSub
+                | BinOp::FMul
+                | BinOp::FDiv
+                | BinOp::FRem
+                | BinOp::FMin
+                | BinOp::FMax
+                | BinOp::FCopySign
+                | BinOp::Shl
+                | BinOp::LShr
+                | BinOp::AShr
+                | BinOp::RotL
+                | BinOp::RotR => self.fresh_symbolic("binop_result", ty),
             }
         } else {
             // Float or other types: return a fresh symbolic. Callers fail
@@ -1965,9 +2585,25 @@ impl<'a> FuncTranslator<'a> {
 }
 
 /// Translate a single function to a BmcVc.
-fn translate_function(func: &Function, module: &Module, options: &TranslateOptions) -> BmcVc {
+pub(super) fn translate_valid_function(
+    func: &Function,
+    module: &Module,
+    options: &TranslateOptions,
+) -> BmcVc {
     let translator = FuncTranslator::new(func, module, options);
     translator.translate()
+}
+
+/// Shared query configuration for ordinary VCs and module-input refusals.
+pub(super) fn query_for_options(options: &TranslateOptions) -> BmcQuery {
+    let mut query = BmcQuery::new();
+    if let Some(logic) = &options.logic {
+        query = query.with_logic(logic.clone());
+    }
+    if let Some(timeout) = options.timeout_ms {
+        query = query.with_timeout(timeout);
+    }
+    query.with_model()
 }
 
 /// Returns `true` when `expr` is the literal boolean constant `true`.
@@ -1996,6 +2632,12 @@ fn implied_under_guard(guard: &Expr, body: Expr) -> Expr {
 /// Encode a switch case constant as an expression matching the selector's
 /// sort. Returns `None` when the constant has no exact encoding against the
 /// selector (shared by the BMC and CHC lowerings).
+/// The unsupported-semantics reason that names a tensor-region construct
+/// (`crate::tensor_region`).
+fn tensor_region_semantics(construct: crate::TensorConstruct) -> String {
+    format!("{construct} (the trust-ir tensor region has no SMT value model)")
+}
+
 pub(crate) fn switch_case_expr(
     case: &trust_ir::constant::Constant,
     selector: &Expr,
@@ -2045,8 +2687,32 @@ pub(crate) fn normalize_expr_to_ty(expr: &Expr, ty: &Ty) -> Expr {
     }
 }
 
-pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
-    match ty {
+/// A type with no SMT value carrier: geometry-only storage, or a tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsupportedSort {
+    AddressableStorage,
+    /// trust-ir v67 `Ty::Tensor(elem, rank)`: extents and a row-major element
+    /// sequence that no bit-vector, Boolean or uninterpreted sort denotes
+    /// (`crate::tensor_region`).
+    Tensor,
+}
+
+impl UnsupportedSort {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::AddressableStorage => {
+                "addressable storage is allocation geometry, not a modeled SMT value"
+            }
+            Self::Tensor => "Ty::Tensor (the trust-ir tensor region) has no modeled SMT value",
+        }
+    }
+}
+
+/// Public translators reject unsupported module types before allocating any
+/// symbols. Keep the checked mapping available to classify the refusal without
+/// inventing a numeric or uninterpreted carrier for uninitialized storage.
+pub(crate) fn checked_ty_to_sort(ty: &Ty) -> Result<Sort, UnsupportedSort> {
+    Ok(match ty {
         Ty::Bool => Sort::bool(),
         Ty::I8 => Sort::bitvec(8),
         Ty::I16 => Sort::bitvec(16),
@@ -2060,6 +2726,13 @@ pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
         Ty::Isize | Ty::Usize => Sort::bitvec(64),
         Ty::Char => Sort::bitvec(32),
         Ty::Error => unreachable!("Ty::Error is rejected by validate_module"),
+        Ty::Storage(_) => return Err(UnsupportedSort::AddressableStorage),
+        // trust-ir v67 `Ty::Tensor`: no placeholder sort is invented for it. A
+        // 64-bit carrier would let a contraction, map, view, gather or scatter
+        // result flow as an unconstrained word with no extent or bounds
+        // obligation, so the module input refuses every tensor occurrence
+        // before translation, as it refuses Storage (`crate::tensor_region`).
+        Ty::Tensor(..) => return Err(UnsupportedSort::Tensor),
         Ty::F16 => Sort::bitvec(16), // Model floats as bitvectors for now.
         Ty::F32 => Sort::bitvec(32),
         Ty::F64 => Sort::bitvec(64),
@@ -2097,11 +2770,99 @@ pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
         // get harder, never falsely easier), and obligations that need refined
         // semantics fail closed downstream as unsupported. Adopted fail-closed
         // per the v30 plan-of-record (same posture as trust-cg dbb3d7db).
-        | Ty::Refine(_, _) => {
+        | Ty::Refine(_, _)
+        // trust-ir d1f4a2f nominal dialect types: no implicit scalar or pointer
+        // representation, and a Core consumer must require explicit checked
+        // legalization before it may interpret one. They take the SAME 64-bit
+        // placeholder sort as the other compound placeholders above -- this is
+        // a carrier, not a claim about layout. What keeps it sound is not the
+        // sort but the fences around it: trust-ir's validate_nominal_instruction_types
+        // refuses Const/Cast/Alloca/memory ops over a nominal type, every bmc
+        // arithmetic/compare path is allow-listed on scalar types, and
+        // const_to_expr below returns None for a Dialect-typed constant so
+        // this lane fails closed even when handed an unvalidated module.
+        | Ty::Dialect(_) => {
             // Compound types: use uninterpreted sort as placeholder.
             Sort::bitvec(64)
         }
-    }
+        // trust-ir amendment S: a level-R type (`NoExt`) has no extension.
+        Ty::Ext(e) => e.unreachable(),
+        // trust-ir v43 `Ty::Handle`: an OPAQUE runtime handle, one pointer word
+        // wide, whose identity is the exact `(name, runtime)` pair. It gets a
+        // TRUE uninterpreted sort keyed on that pair -- deliberately NOT the
+        // 64-bit placeholder the nominal dialect types above take. Two reasons,
+        // both about what the solver is allowed to do with it:
+        //
+        //  1. IDENTITY. `Handle(A)` is never equal to `Handle(B)` of a
+        //     different runtime, and never equal to `Ptr`; width is the only
+        //     thing a handle shares with a pointer. Under a shared
+        //     `bitvec(64)` all of them collapse into ONE sort, so every
+        //     sort-equality fence in this crate -- `normalize_expr_to_ty`'s
+        //     caller checks, translate_chc's `*coerced.sort() ==
+        //     ty_to_sort(src_ty)`, its block-parameter binding and its
+        //     call-argument `expected` check -- would silently ACCEPT a
+        //     cross-runtime or handle/pointer substitution. Those checks are
+        //     what matters here precisely because this module never calls
+        //     `validate_module` itself (same reasoning as `const_to_expr`
+        //     below). Keying the sort on `(name, runtime)` makes the fences
+        //     that already exist do the discrimination, at no new cost.
+        //  2. NO INVENTED VALUES. A `bitvec(64)` variable ranges over 2^64
+        //     CONCRETE literals and admits arithmetic, comparison and
+        //     concat/extract, so a solver could fabricate a handle -- and then
+        //     relate it to an equal-width pointer -- when the format says the
+        //     ONLY origin of a handle value is a call to a bodyless `External`
+        //     declaration pinned in `trust_ir_build::validate::
+        //     TRUSTED_HANDLE_RUNTIMES`. An uninterpreted sort has no literals
+        //     and no constructors: a handle term can only be related to other
+        //     handle terms already in the formula, which IS the
+        //     "produced only by a pinned entry point" semantics.
+        //
+        // No theory is attached, on purpose: `trust_bignum::Nat`'s arithmetic
+        // is a trusted-base row the consumer links against, not something to
+        // model here, so an obligation that needs handle VALUES fails closed
+        // downstream as unsupported rather than being proved against a wrong
+        // model. What keeps the carrier sound is the upstream fence:
+        // trust-ir's `validate_nominal_instruction_types` decides handles
+        // FIRST and admits exact-typed TRANSPORT only (copy, select,
+        // exact-signature call/invoke/return/branch edge) -- a strict subset
+        // of the dialect rule, with no `DialectOp` and no pointer-like
+        // indirect callee -- and refuses varargs, so a handle can reach this
+        // translation only through bit-preserving plumbing. Since trust-ir
+        // bf7ee706 (WS3.7) that plumbing includes a SEALED stack slot: an
+        // `Alloca` at a handle type (or a struct/tuple of handle lanes) whose
+        // pointer and borrows are used only by exact-typed `Store`s and
+        // `Load`s, every load dominated by a store. It adds no constructor:
+        // here a handle-typed slot is an array over this same sort, so a load
+        // returns the term a store wrote or an unconstrained one of the sort,
+        // never a literal; the CHC lane keeps no cell for it (a handle is not
+        // a precise stack scalar), so its loads are fresh; the `Borrow` /
+        // `EndBorrow` of the MIR spill shape fail closed in both lanes; and
+        // the driver's proof-grade gate refuses the `Alloca` by name
+        // (`single_cell_alloca_rejection`: not a scalar or aggregate cell).
+        //
+        // `Sort::uninterpreted` is the same mapping this workspace already
+        // gives trust-vc's opaque sorts (`SortMeta::Opaque` in
+        // trust-mc-trust-vc-ingest/src/sort_map.rs). The name mirrors `Ty`'s
+        // own Display spelling so a counterexample stays readable; it is
+        // injective because neither `name` nor `runtime` may contain `<`,
+        // `>`, `,` or a space (`HandleTy::validate`).
+        Ty::Handle(handle) => Sort::uninterpreted(handle_sort_name(handle)),
+    })
+}
+
+pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
+    checked_ty_to_sort(ty)
+        .expect("ModuleInput rejects addressable storage and tensors before SMT translation")
+}
+
+/// The uninterpreted-sort symbol for a v43 opaque runtime handle.
+///
+/// Injective in `(name, runtime)`: `HandleTy::validate` restricts `name` to
+/// `[A-Za-z0-9_]+` and `runtime` to `::`-separated segments of the same
+/// charset, so none of the punctuation used here can occur inside either
+/// field. Two runtimes therefore can never share a sort.
+pub(crate) fn handle_sort_name(handle: &trust_ir::ty::HandleTy) -> String {
+    format!("handle<{}, {}>", handle.name, handle.runtime)
 }
 
 /// Convert a trust_ir constant to a ay Expr.
@@ -2114,7 +2875,7 @@ pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
 /// obligation that depends on its value (false proofs AND false refutations),
 /// whereas a havoc + fail-closed VC is loud and sound.
 ///
-/// Aggregate-family constants (`Aggregate`/`Array`/…/`PhantomData`) keep the
+/// Aggregate-family constants (`Aggregate`/`Array`/`Splat`/…/`PhantomData`) keep the
 /// historical opaque placeholder: their *bits* are never value-inspected —
 /// every consumer that could turn them into a verdict (`ExtractField`/
 /// `ExtractElement`, `ICmp` via the eq/order type gates, `CmpXchg` via its
@@ -2123,6 +2884,43 @@ pub(crate) fn ty_to_sort(ty: &Ty) -> Sort {
 /// (store/load, select, block-parameter binding).
 pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Option<Expr> {
     use trust_ir::constant::Constant;
+    // Storage never denotes an initialized constant, including inline
+    // compounds. Public module admission additionally resolves table types.
+    let mut storage = false;
+    ty.visit_types(|child| storage |= matches!(child, Ty::Storage(_)));
+    if storage {
+        return None;
+    }
+    // Trust: a nominal dialect type has no bit pattern the schema grants, so no
+    // constant of that type has an exact encoding. trust-ir's validator refuses
+    // such constants upstream (validate_nominal_instruction_types), but this
+    // module never calls validate_module itself, so fail closed here as well:
+    // callers MUST havoc the result and emit an unsupported-semantics
+    // obligation on None.
+    if matches!(ty, Ty::Dialect(_)) {
+        return None;
+    }
+    // Trust (trust-ir v43): NO constant constructs an opaque runtime handle.
+    // Without this guard the `Constant::Int` / `Constant::U128` arms below
+    // would take `Ty::Handle`'s `bit_width_with` -- one pointer word, the only
+    // property it shares with `Ptr` -- and hand back a 64-bit literal, i.e.
+    // FABRICATE the one thing the format reserves to a pinned external entry
+    // point, in the wrong sort to boot. trust-ir's validator refuses such a
+    // constant upstream (`validate_nominal_instruction_types` admits no
+    // `Const` at handle type), but this module never calls `validate_module`
+    // itself, so fail closed here too: callers MUST havoc the result and emit
+    // an unsupported-semantics obligation on `None`.
+    if matches!(ty, Ty::Handle(_)) {
+        return None;
+    }
+    // trust-ir v67-v70 tensor region: a tensor has no bit pattern in this
+    // lowering (`UnsupportedSort::Tensor`), so no constant of a type that
+    // holds one has an exact encoding. The module input refuses every tensor
+    // occurrence first; fail closed here too, so a caller that bypassed it
+    // havocs the result and emits an unsupported-semantics obligation.
+    if crate::tensor_region::ty_holds_tensor(ty) {
+        return None;
+    }
     match value {
         Constant::Int(v) => {
             let width = ty.bit_width_with(HOST_POINTER_BITS).unwrap_or(64);
@@ -2131,6 +2929,15 @@ pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Op
         // Trust (trust-ir v25): a byte-array constant has no scalar SMT
         // model — same exact-bits-or-nothing rule as floats (fail closed).
         Constant::Bytes { .. } => None,
+        // trust-ir v49 `Uninit` is an UNWRITTEN aggregate lane, not a value:
+        // nothing may read it, and trust-ir-build's validator admits it only
+        // as a direct element of a struct/tuple `Aggregate`. As a whole
+        // constant it has no bits at all, so there is nothing exact to encode
+        // (fail closed). Inside an `Aggregate` it rides the opaque placeholder
+        // below, whose bits are never inspected; the proof-grade admission gate
+        // in trust-mc-driver refuses a `Const` that carries one, because a read
+        // of the lane is undefined behaviour this lowering cannot see.
+        Constant::Uninit => None,
         // Trust (trust-ir v24): the 128-bit-faithful unsigned carrier —
         // canonical iff value > i128::MAX. At width 128 the two's-complement
         // reinterpretation carries the EXACT bit pattern (same float lesson:
@@ -2157,6 +2964,14 @@ pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Op
         Constant::Vector(elems) => vector_const_to_expr(ty, elems),
         Constant::Aggregate(_)
         | Constant::Array(_)
+        // trust-ir v50 `Splat { elem, len }` is the ONE canonical spelling of a
+        // uniform array literal `[elem; len]` (SPEC_RATIFICATIONS §3.1): the
+        // same value a `Constant::Array` of `len` equal elements denotes, so it
+        // takes the same opaque placeholder — a spelling must not change what
+        // this lowering does. Nothing here reads `elem` or walks `len`, so it
+        // costs O(1) whatever the length. (translate_chc's `Const` arm models a
+        // trackable splat's lanes exactly before it ever reaches this.)
+        | Constant::Splat { .. }
         | Constant::Sequence(_)
         | Constant::Set(_)
         | Constant::Record(_)
@@ -2171,6 +2986,13 @@ pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Op
             // this cannot decide an obligation).
             Some(Expr::bitvec_const(0u64, 64))
         }
+        // trust-ir v70 `TensorBlob { digest, dims }`: a tensor whose elements
+        // are bytes of the module's blob table, outside every function body.
+        // It has no bits here whatever type it is spelled at (validation admits
+        // it only at an integer `Ty::Tensor`, refused above), so fail closed.
+        Constant::TensorBlob { .. } => None,
+        // trust-ir amendment S: a level-R constant (`NoExt`) has no extension.
+        Constant::Ext(e) => e.unreachable(),
     }
 }
 
@@ -2282,7 +3104,116 @@ pub(crate) fn op_name(op: BinOp) -> &'static str {
         BinOp::BAnd => "band",
         BinOp::BOr => "bor",
         BinOp::BXor => "bxor",
+        BinOp::RotL => "rotl",
+        BinOp::RotR => "rotr",
+        BinOp::FCopySign => "fcopysign",
     }
+}
+
+/// Text mnemonic of a unary operation, as trust-ir spells it.
+///
+/// EXHAUSTIVE on purpose — no wildcard — so a new `UnOp` is a compile error
+/// here until someone decides how the BMC lane models it or refuses it by
+/// this name.
+pub(crate) fn unop_name(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "neg",
+        UnOp::Not => "not",
+        UnOp::CtPop => "ctpop",
+        UnOp::CtLz => "ctlz",
+        UnOp::CtTz => "cttz",
+        UnOp::BSwap => "bswap",
+        UnOp::BitReverse => "bitreverse",
+        UnOp::FNeg => "fneg",
+        UnOp::FAbs => "fabs",
+        UnOp::FSqrt => "fsqrt",
+        UnOp::FFloor => "ffloor",
+        UnOp::FCeil => "fceil",
+        UnOp::FTrunc => "ftrunc",
+    }
+}
+
+/// Is `op` a floating-point operation?
+///
+/// EXHAUSTIVE on purpose — no wildcard — so a new `BinOp` cannot compile until it
+/// is classified here. Both lanes' float fail-closed checks (float-typed binops,
+/// and the ill-typed float-op-on-an-integer `float_on_int` havoc) read this one
+/// table instead of each carrying its own list that a new float op could miss.
+pub(crate) fn binop_is_floating_point(op: BinOp) -> bool {
+    match op {
+        BinOp::FAdd
+        | BinOp::FSub
+        | BinOp::FMul
+        | BinOp::FDiv
+        | BinOp::FRem
+        | BinOp::FMin
+        | BinOp::FMax
+        | BinOp::FCopySign => true,
+        BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::UDiv
+        | BinOp::SDiv
+        | BinOp::URem
+        | BinOp::SRem
+        | BinOp::And
+        | BinOp::Or
+        | BinOp::Xor
+        | BinOp::Shl
+        | BinOp::LShr
+        | BinOp::AShr
+        | BinOp::BAnd
+        | BinOp::BOr
+        | BinOp::BXor
+        | BinOp::RotL
+        | BinOp::RotR => false,
+    }
+}
+
+/// EXACT bit-vector encoding of trust-ir's TOTAL integer rotates
+/// (`BinOp::RotL` / `BinOp::RotR`, WS3.20).
+///
+/// trust-ir defines `rotl(x, n) = (x << k | x >> (w - k)) mod 2^w` with
+/// `k = n mod w`, `n` read as the UNSIGNED bits of the amount (the reference
+/// interpreter's `rotate_at_width`, Lean `semIntBinOp .RotL`); `rotr` is the
+/// mirror. There is no out-of-range case and therefore no obligation. The
+/// encoding is the same function over bit-vectors:
+///
+/// * `k` is `n & (w - 1)` when `w` is a power of two (every TrustIR integer
+///   width is) and `n urem w` otherwise — both equal `n mod w` over the
+///   unsigned reading;
+/// * `k == 0` is the identity, selected by an explicit `ite` so the encoding
+///   never depends on a backend's reading of a shift by the full width;
+/// * otherwise both shift amounts `k` and `w - k` lie in `1..w`.
+///
+/// `lhs`/`rhs` must already be normalized to the operation type. Returns `None`
+/// (the caller havocs AND fails closed) unless both are bit-vectors of one width.
+pub(crate) fn bv_rotate(lhs: &Expr, rhs: &Expr, left: bool) -> Option<Expr> {
+    let width = lhs.sort().bitvec_width()?;
+    if width == 0 || rhs.sort().bitvec_width()? != width {
+        return None;
+    }
+    let amount = if width.is_power_of_two() {
+        rhs.clone().bvand(Expr::bitvec_const(i128::from(width - 1), width))
+    } else {
+        rhs.clone().bvurem(Expr::bitvec_const(i128::from(width), width))
+    };
+    let complement = Expr::bitvec_const(i128::from(width), width).bvsub(amount.clone());
+    let (toward, around) = if left {
+        (lhs.clone().bvshl(amount.clone()), lhs.clone().bvlshr(complement))
+    } else {
+        (lhs.clone().bvlshr(amount.clone()), lhs.clone().bvshl(complement))
+    };
+    let is_identity = amount.eq(Expr::bitvec_const(0u64, width));
+    Some(Expr::ite(is_identity, lhs.clone(), toward.bvor(around)))
+}
+
+/// `true` exactly when `op` is a rotate that `bv_rotate` cannot encode for these
+/// operands, i.e. when `eval_binop` havocked its result. The integer-binop arms
+/// of both lanes fail closed on it, as they do on `float_on_int`.
+pub(crate) fn integer_rotate_is_unencodable(op: BinOp, ty: &Ty, lhs: &Expr, rhs: &Expr) -> bool {
+    matches!(op, BinOp::RotL | BinOp::RotR)
+        && bv_rotate(&normalize_expr_to_ty(lhs, ty), &normalize_expr_to_ty(rhs, ty), true).is_none()
 }
 
 /// Map a checked-arithmetic `OverflowOp` to its underlying integer `BinOp`.
@@ -2295,6 +3226,31 @@ pub(crate) fn overflow_op_to_binop(op: OverflowOp) -> BinOp {
         OverflowOp::SubOverflow => BinOp::Sub,
         OverflowOp::MulOverflow => BinOp::Mul,
     }
+}
+
+/// Lower `a * K` as `a << log2(K)` when `K` is a compile-time power-of-two
+/// bit-vector constant. `a * 2^k == a << k` (mod `2^w`) for every `k`, so this
+/// is EXACT — but the bit-blaster treats a constant shift as a bit relabeling
+/// instead of building a full multiplier circuit, which makes the strict UNSAT
+/// certificate for constant-scaled byte assembly (`trust-endian`/`trust-radix64`,
+/// whose every factor is `256^i` / `64^i` = a power of two) small enough to seal.
+/// `None` for a non-constant or non-power-of-two factor (caller falls back to
+/// `bvmul`). Both factor orders are handled; the shift amount is a same-width
+/// constant. Limited to the value fitting `u128` (widths up to 64 here).
+fn mul_by_power_of_two_as_shift(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    for (var, konst) in [(lhs, rhs), (rhs, lhs)] {
+        let ExprValue::BitVecConst { value, width } = konst.value() else {
+            continue;
+        };
+        let Ok(v) = value.to_string().parse::<u128>() else {
+            continue;
+        };
+        if v.is_power_of_two() {
+            let k = i128::from(v.trailing_zeros());
+            return Some(var.clone().bvshl(Expr::bitvec_const(k, *width)));
+        }
+    }
+    None
 }
 
 pub(crate) fn integer_binop_no_overflow_condition(
@@ -2314,6 +3270,46 @@ pub(crate) fn integer_binop_no_overflow_condition(
     let rhs_orig = rhs;
     let lhs = &normalize_expr_to_ty(lhs, ty);
     let rhs = &normalize_expr_to_ty(rhs, ty);
+
+    // EXHAUSTIVE on purpose (no wildcard): every `BinOp` states here whether it
+    // can carry an overflow / shift-range obligation at all, so a new op must be
+    // decided before this compiles instead of silently reaching the `_ => None`
+    // of the per-signedness table below.
+    match op {
+        BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::SDiv
+        | BinOp::SRem
+        | BinOp::Shl
+        | BinOp::LShr
+        | BinOp::AShr => {}
+        // TOTAL on integers: unsigned division/remainder (their div-by-zero is
+        // `integer_binop_div_by_zero_condition`), the bitwise ops, and the
+        // WS3.20 rotates, whose amount is reduced MODULO the width — unlike the
+        // shifts there is no out-of-range amount, hence no obligation.
+        BinOp::UDiv
+        | BinOp::URem
+        | BinOp::And
+        | BinOp::Or
+        | BinOp::Xor
+        | BinOp::RotL
+        | BinOp::RotR => return None,
+        // Ill-typed on an integer type: `eval_binop` havocs these and the
+        // integer-binop arms fail closed (`binop_is_floating_point`, and the
+        // boolean connectives are rejected by trust-ir's validator).
+        BinOp::FAdd
+        | BinOp::FSub
+        | BinOp::FMul
+        | BinOp::FDiv
+        | BinOp::FRem
+        | BinOp::FMin
+        | BinOp::FMax
+        | BinOp::FCopySign
+        | BinOp::BAnd
+        | BinOp::BOr
+        | BinOp::BXor => return None,
+    }
 
     match (op, ty.is_signed()) {
         (BinOp::Add, true) if options.check_signed_overflow => {
@@ -2456,11 +3452,13 @@ pub(crate) fn is_ordered_scalar_ty(ty: &Ty) -> bool {
             | Ty::I32
             | Ty::I64
             | Ty::I128
+            | Ty::Isize
             | Ty::U8
             | Ty::U16
             | Ty::U32
             | Ty::U64
             | Ty::U128
+            | Ty::Usize
             | Ty::Ptr
             | Ty::PtrConst(_)
             | Ty::PtrMut(_)

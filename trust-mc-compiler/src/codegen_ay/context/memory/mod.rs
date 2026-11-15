@@ -24,7 +24,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         if self.memory.is_none() {
             // Dual-write: add to both program and bmc_vc
             self.bmc_vc.add_decl(Decl::constant("memory", Sort::memory()));
-            self.memory = Some(self.program.declare_const("memory", Sort::memory()));
+            let memory = self.program.declare_const("memory", Sort::memory());
+            self.initial_memory = Some(memory.clone());
+            self.memory = Some(memory);
         }
     }
 
@@ -132,6 +134,31 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         self.symbolic_memory_stores.get(&addr).cloned()
     }
 
+    /// Record a non-bitvector value stored at `addr` for whole-value readers
+    /// (`load_symbolic_memory_value`); byte memory is not touched.
+    pub(in crate::codegen_ay) fn track_symbolic_store(&mut self, addr: Expr, value: Expr) {
+        let addr = Self::coerce_memory_addr(addr);
+        let name = self.fresh_name("mem_symbolic");
+        let var = self.declare_var(&name, value.sort().clone());
+        self.assert(var.clone().eq(value));
+        self.symbolic_memory_stores.insert(addr, var);
+    }
+
+    /// Replace the `len` bytes at `addr` with fresh values; every other byte of
+    /// memory keeps its value. Records nothing: the caller decides whether the
+    /// fresh bytes stand in for program values.
+    pub(in crate::codegen_ay) fn havoc_memory_range(&mut self, addr: Expr, len: u64) {
+        let addr = Self::coerce_memory_addr(addr);
+        let fresh_name = self.fresh_name("memory_object_havoc");
+        let fresh = self.declare_var(&fresh_name, Sort::memory());
+        let mut mem = self.memory.take().expect("Memory not initialized");
+        for i in 0..len {
+            let off = Expr::bitvec_const(i as u128, POINTER_WIDTH);
+            mem = mem.store(addr.clone().bvadd(off.clone()), fresh.clone().select(off));
+        }
+        self.memory = Some(mem);
+    }
+
     /// Store a multi-byte value to memory (little-endian).
     ///
     /// Writes the value as consecutive bytes starting at `addr`, with the
@@ -148,6 +175,45 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// - Panics if memory has not been initialized via `init_memory` (for
     ///   bitvector and Bool values that are written to byte-addressed memory).
     #[allow(clippy::panic)] // Defensive panic for internal consistency - unsupported sort is a codegen bug
+    /// `store_memory_bytes` for a value with no byte image (Int, Array,
+    /// Datatype), written only where `on_path` holds.
+    ///
+    /// The address's symbolic value becomes `ite(on_path, value, previous)`.
+    /// Without an earlier symbolic value of that sort at the address, `previous`
+    /// is unconstrained, and a counterexample through it is not certified.
+    pub(in crate::codegen_ay) fn store_memory_symbolic_on_path(
+        &mut self,
+        addr: Expr,
+        value: Expr,
+        on_path: Expr,
+    ) {
+        let addr = Self::coerce_memory_addr(addr);
+        let sort = value.sort().clone();
+        let previous = match self.symbolic_memory_stores.get(&addr) {
+            Some(previous) if *previous.sort() == sort => previous.clone(),
+            _ => {
+                self.bmc_sound_havoc("conditional_symbolic_store_prior");
+                let name = self.fresh_name("mem_symbolic_prior");
+                self.declare_var(&name, sort.clone())
+            }
+        };
+        let name = self.fresh_name("mem_symbolic");
+        let var = self.declare_var(&name, sort);
+        self.assert(var.clone().eq(Expr::ite(on_path.clone(), value, previous)));
+        self.symbolic_memory_stores.insert(addr, var);
+        // As in `store_memory_bytes`: the value's bytes were not written, so a
+        // byte read of this object on the store's path would see a stale image
+        // (a static's pinned initializer, a stack local's materialized bytes).
+        // On that path byte memory becomes a fresh array; off it, unchanged.
+        let fresh_name = self.fresh_name("memory_after_symbolic_store");
+        let fresh = self.declare_var(&fresh_name, Sort::memory());
+        self.memory = Some(match self.memory.take() {
+            Some(mem) => Expr::ite(on_path, fresh, mem),
+            None => fresh,
+        });
+        self.bmc_sound_havoc("symbolic_store_havocs_byte_memory");
+    }
+
     pub(in crate::codegen_ay) fn store_memory_bytes(&mut self, addr: Expr, value: Expr) {
         let addr = Self::coerce_memory_addr(addr);
         // Handle non-bitvector sorts (Int, Array, Datatype) - cannot use byte-addressed
@@ -165,16 +231,24 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         if sort.is_int() || sort.is_array() || sort.is_datatype() {
             // Non-bitvector values are tracked symbolically; `addr` is recorded for
             // fail-closed load detection.
-            let name = self.fresh_name("mem_symbolic");
             tracing::debug!(
-                "store_memory_bytes: {:?} sort value stored symbolically as {} at addr {:?}",
+                "store_memory_bytes: {:?} sort value stored symbolically at addr {:?}",
                 sort,
-                name,
                 addr
             );
-            let var = self.declare_var(&name, sort.clone());
-            self.assert(var.clone().eq(value));
-            self.symbolic_memory_stores.insert(addr, var);
+            self.track_symbolic_store(addr, value);
+            // The value's BYTES were not written, so bytes read from this object
+            // afterwards (a field read at an offset, a copy through another
+            // pointer) would see whatever was there before: a stack local's
+            // materialized bytes or a static's initializer — stale values that
+            // can prove a false assertion. Replace byte memory with a fresh
+            // array: every byte read after this store is unconstrained, which
+            // only adds behaviours, and the record keeps a counterexample that
+            // reads one uncertified.
+            let fresh_name = self.fresh_name("memory_after_symbolic_store");
+            let fresh = self.declare_var(&fresh_name, Sort::memory());
+            self.memory = Some(fresh);
+            self.bmc_sound_havoc("symbolic_store_havocs_byte_memory");
             return;
         }
 
@@ -207,6 +281,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         }
     }
 }
+
+mod exact_read;
 
 #[cfg(test)]
 mod tests;

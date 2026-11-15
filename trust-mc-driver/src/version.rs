@@ -37,9 +37,9 @@ const REQUIRED_AY_WORKSPACE_DEPENDENCIES: [(&str, &str); 8] = [
     ("ay-sys", "ay-sys"),
     ("ay-encode", "ay-encode"),
 ];
-/// Workspace root, i.e. the directory `[patch]` paths are resolved against.
-/// `CARGO_MANIFEST_DIR` is `<root>/trust-mc-driver`, so its parent is the root.
-const WORKSPACE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+/// Development package directory; its parent resolves the `[patch]` paths.
+/// Empty in release bundles, which must link the exact declared AY identity.
+const WORKSPACE_ROOT: &str = env!("MC_DRIVER_BUILD_WORKSPACE_ROOT");
 
 /// AY solver version, fetched from the ay facade crate metadata.
 /// Only available when ay-direct feature is enabled.
@@ -155,7 +155,7 @@ fn ay_package_version() -> Option<&'static str> {
     parse_ay_package_field(CARGO_LOCK, "version").filter(|version| !version.is_empty())
 }
 
-fn ay_pinned_commit() -> Result<String> {
+pub(crate) fn ay_pinned_commit() -> Result<String> {
     parse_uniform_ay_manifest_pin(ROOT_MANIFEST)
 }
 
@@ -296,9 +296,11 @@ enum AyResolution {
     /// accepted. The linked commit is then whatever that checkout's HEAD was at
     /// AY build time, which trust-mc does not own and cannot hold still — a
     /// second agent working in `../ay` moves it. Equality is therefore not an
-    /// enforceable property, but *ancestry* is: the linked build must CONTAIN
-    /// the declared pin, so this workspace can never link an AY older than, or
-    /// off the history of, the revision it claims.
+    /// enforceable property for co-development, but *ancestry* is: the linked
+    /// build must CONTAIN the declared pin. Exact clean equality establishes
+    /// that without a checkout. A different development revision requires
+    /// the real Git ancestry check; a release bundle requires exact equality
+    /// and carries no development checkout path.
     PathPatched {
         /// AY checkout path as written in `[patch]`, relative to the workspace root.
         path: String,
@@ -328,7 +330,9 @@ struct AyAuthority {
 /// linked revision, a patch Cargo silently declined, a path-resolved AY with no
 /// patch behind it, a lock source that names a different revision, a missing or
 /// non-canonical patch entry, and (path lane) a linked AY that does not contain
-/// the declared pin or cannot be examined at all.
+/// the declared pin. Exact clean equality needs no checkout; a different
+/// development revision must be examinable in Git, and release linkage must
+/// be exact.
 fn resolve_ay_authority() -> Result<AyAuthority> {
     let pin = ay_pinned_commit()?;
     let resolution = parse_ay_resolution(CARGO_LOCK, ROOT_MANIFEST, &pin)?;
@@ -340,6 +344,15 @@ fn validate_linked_ay_revision<'a>(
     resolution: &AyResolution,
     declared_pin: &str,
     linked_revision: &'a str,
+) -> Result<LinkedAyRevision<'a>> {
+    validate_linked_ay_revision_with_root(resolution, declared_pin, linked_revision, WORKSPACE_ROOT)
+}
+
+fn validate_linked_ay_revision_with_root<'a>(
+    resolution: &AyResolution,
+    declared_pin: &str,
+    linked_revision: &'a str,
+    workspace_root: &str,
 ) -> Result<LinkedAyRevision<'a>> {
     validate_full_lowercase_nonzero_sha(declared_pin).context("invalid declared AY pin")?;
     let linked = parse_linked_ay_revision(linked_revision)?;
@@ -356,15 +369,30 @@ fn validate_linked_ay_revision<'a>(
             }
         }
         AyResolution::PathPatched { path } => {
-            require_linked_contains_pin(&ay_checkout_directory(path), declared_pin, linked.sha)?;
+            // Full clean identity equality establishes reflexive ancestry.
+            // No Git checkout is needed to prove a commit contains itself.
+            if linked.sha != declared_pin {
+                if workspace_root.is_empty() {
+                    bail!(
+                        "packaged linked AY build revision {} must exactly match declared pin \
+                         {declared_pin}; development ancestry is unavailable in a release bundle",
+                        linked.sha
+                    );
+                }
+                require_linked_contains_pin(
+                    &ay_checkout_directory(workspace_root, path),
+                    declared_pin,
+                    linked.sha,
+                )?;
+            }
         }
     }
     Ok(linked)
 }
 
 /// Resolve a `[patch]` path against the workspace root.
-fn ay_checkout_directory(patch_path: &str) -> PathBuf {
-    Path::new(WORKSPACE_ROOT).parent().unwrap_or_else(|| Path::new(WORKSPACE_ROOT)).join(patch_path)
+fn ay_checkout_directory(workspace_root: &str, patch_path: &str) -> PathBuf {
+    Path::new(workspace_root).parent().unwrap_or_else(|| Path::new(workspace_root)).join(patch_path)
 }
 
 /// Assert that the AY commit actually linked into this binary contains the
@@ -583,6 +611,42 @@ version = "0.10.0"
         assert!(validate_linked_ay_revision(&pinned, PIN, OTHER_PIN).is_err());
     }
 
+    #[test]
+    fn exact_clean_path_pin_needs_no_workspace_or_git_checkout() {
+        let patched = AyResolution::PathPatched { path: "../absent-ay/crates/ay".into() };
+        for root in ["", "/absent-trust-mc-build-root/trust-mc-driver"] {
+            assert_eq!(
+                validate_linked_ay_revision_with_root(&patched, PIN, PIN, root).unwrap(),
+                LinkedAyRevision { sha: PIN, dirty: false }
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_path_authority_refuses_unbound_dirty_and_divergent_linkage() {
+        let patched = AyResolution::PathPatched { path: "../ay/crates/ay".into() };
+        for linked in ["", "unknown", OTHER_PIN, &format!("{PIN}-dirty")] {
+            assert!(validate_linked_ay_revision_with_root(&patched, PIN, linked, "").is_err());
+        }
+        for declared in ["", "unknown", "main", &format!("{PIN}-dirty")] {
+            assert!(validate_linked_ay_revision_with_root(&patched, declared, PIN, "").is_err());
+        }
+    }
+
+    #[test]
+    fn divergent_development_linkage_still_requires_its_checkout() {
+        let patched = AyResolution::PathPatched { path: "../absent-ay/crates/ay".into() };
+        assert!(
+            validate_linked_ay_revision_with_root(
+                &patched,
+                PIN,
+                OTHER_PIN,
+                "/absent-trust-mc-build-root/trust-mc-driver"
+            )
+            .is_err()
+        );
+    }
+
     const LOCK_PATH_RESOLVED: &str = r#"
 [[package]]
 name = "ay"
@@ -715,6 +779,19 @@ ay-encode = { git = "https://github.com/alabsystems/ay.git", rev = "fa63e3afed08
         require_linked_contains_pin(repo, &pin, &descendant)
             .expect("a descendant contains the pin");
         require_linked_contains_pin(repo, &pin, &pin).expect("a commit contains itself");
+        let patched = AyResolution::PathPatched { path: repo.to_string_lossy().into_owned() };
+        validate_linked_ay_revision_with_root(&patched, &pin, &descendant, "/development/driver")
+            .expect("development linkage retains its checked descendant lane");
+        assert!(validate_linked_ay_revision_with_root(&patched, &pin, &descendant, "").is_err());
+        assert!(
+            validate_linked_ay_revision_with_root(
+                &patched,
+                &pin,
+                &unrelated,
+                "/development/driver"
+            )
+            .is_err()
+        );
 
         // Linking an AY that predates the pin.
         let older = require_linked_contains_pin(repo, &descendant, &pin)

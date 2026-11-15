@@ -9,6 +9,7 @@
 
 mod assume_refinement;
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -37,7 +38,7 @@ fn fresh_inline_any_expr(ctx: &ChcCtx<'_, '_>, locals: &[LocalDecl], dest_local:
     let sort = ChcCtx::translate_ty(ctx.resolve_body_ty(dest_ty))
         .or_else(|| ty_to_bv_width(dest_ty).map(Sort::bitvec))
         .unwrap_or_else(|| Sort::bitvec(POINTER_WIDTH));
-    super::super::declare_pending_var(super::super::chc_fresh_name("__kani_any_inline"), sort)
+    ExactVar::nondet(super::super::chc_fresh_name("__kani_any_inline"), sort)
 }
 
 pub(super) fn inline_bool_condition(cond_expr: Expr) -> Option<Expr> {
@@ -102,42 +103,116 @@ fn handle_inline_kani_assert_call(
     deferred_checks: &mut Vec<DeferredInlineCheck>,
     reason: &str,
 ) -> Option<Expr> {
-    if let Some(cond_expr) = args
+    // Message extraction is restricted to `Operand::Constant`: `args` are
+    // CALLEE-body operands, and the Copy/Move lanes of
+    // `try_extract_const_str_bytes` trace HOST-body locals (wrong index
+    // space here). Const `&str` messages are the overwhelmingly common
+    // shape (`kani::assert(cond, "msg")`, contract-ensures expansion).
+    let message = args.get(1).and_then(|arg| match arg {
+        Operand::Constant(_) => {
+            let (bytes, _) = ctx.try_extract_const_str_bytes(arg)?;
+            String::from_utf8(bytes).ok()
+        }
+        _ => None,
+    });
+    let path_guard = current_inline_assume_guard(assume_guards);
+    let Some(cond_expr) = args
         .first()
         .and_then(|arg| inline_operand_to_expr(ctx, arg, local_exprs, resolver, locals))
         .and_then(inline_bool_condition)
-    {
-        let guarded_cond = if let Some(path_guard) = current_inline_assume_guard(assume_guards) {
-            path_guard.not().or(cond_expr)
-        } else {
-            cond_expr
+    else {
+        // Mechanism E through a CALL. trust-mc's `library/std` lowers
+        // `assert!`, `assert_eq!`/`assert_ne!` and `kani::assert` to this
+        // hook, not to a MIR `Assert` terminator, and a condition that reads a
+        // local the walk skipped (an array element at a symbolic index) used
+        // to drop the assertion here without a trace: the harness proved
+        // (`walker_kani_assert_call_dual.rs`). The assertion is real and its
+        // condition unknown, so it fails wherever it is reached, never
+        // certified, exactly as the `Assert` terminator's untranslatable arm
+        // (`terminator_exec.rs` `execute_inline_assert`, `uncertified_check.rs`).
+        // Side channel only: the value channel stays the walked value.
+        let reached = super::uncertified_check::uncertified_reach_check(
+            ctx,
+            super::uncertified_check::WALKER_UNTRANSLATABLE_ASSERT,
+        );
+        let check = match path_guard {
+            Some(path_guard) => path_guard.not().or(reached),
+            None => reached,
         };
-        // Assert-guard SIDE-CHANNEL: record the check with its property
-        // description so the HOST call site emits a real per-property error
-        // rule even when the return-value ITE below is later discarded (unit
-        // destinations, sort coercions, constructor wrapping).
-        //
-        // Message extraction is restricted to `Operand::Constant`: `args` are
-        // CALLEE-body operands, and the Copy/Move lanes of
-        // `try_extract_const_str_bytes` trace HOST-body locals (wrong index
-        // space here). Const `&str` messages are the overwhelmingly common
-        // shape (`kani::assert(cond, "msg")`, contract-ensures expansion).
-        let message = args.get(1).and_then(|arg| match arg {
-            Operand::Constant(_) => {
-                let (bytes, _) = ctx.try_extract_const_str_bytes(arg)?;
-                String::from_utf8(bytes).ok()
-            }
-            _ => None,
-        });
         deferred_checks.push(DeferredInlineCheck {
-            check: guarded_cond.clone(),
+            check,
             kind: PropertyKind::Assertion,
             message,
+            write_mark: ctx.heap_state.write_mark(),
+            merge_key: None,
         });
-        assert_guards.push(guarded_cond);
-        debug!(reason, "inline kani assert/check -> fail-closed guard added");
-    }
+        debug!(
+            reason,
+            "inline kani assert/check: condition untranslatable — uncertified reach check"
+        );
+        return Some(Expr::bitvec_const(0u64, POINTER_WIDTH));
+    };
+    let guarded_cond =
+        if let Some(path_guard) = path_guard { path_guard.not().or(cond_expr) } else { cond_expr };
+    // Assert-guard SIDE-CHANNEL: record the check with its property
+    // description so the HOST call site emits a real per-property error
+    // rule even when the return-value ITE below is later discarded (unit
+    // destinations, sort coercions, constructor wrapping).
+    deferred_checks.push(DeferredInlineCheck {
+        check: guarded_cond.clone(),
+        kind: PropertyKind::Assertion,
+        message,
+        write_mark: ctx.heap_state.write_mark(),
+        merge_key: None,
+    });
+    assert_guards.push(guarded_cond);
+    debug!(reason, "inline kani assert/check -> fail-closed guard added");
     Some(Expr::bitvec_const(0u64, POINTER_WIDTH))
+}
+
+/// The walker's half of `ChcCtx::kani_any_unwinding_check`: a `kani::any()`
+/// the walk replaces with a fresh value skips the loop Kani's `any_array`
+/// runs for it (`shared::kani_any_loops`), so under a declared unwind bound it
+/// does not outrun, the check fails wherever this path reaches the call.
+fn inline_kani_any_unwinding_check(
+    ctx: &ChcCtx<'_, '_>,
+    locals: &[LocalDecl],
+    dest_local: usize,
+    assume_guards: &[Expr],
+    deferred_checks: &mut Vec<DeferredInlineCheck>,
+) {
+    let Some(decl) = locals.get(dest_local) else {
+        return;
+    };
+    let passes = crate::codegen_ay::shared::kani_any_loops::kani_any_loop_passes(decl.ty);
+    push_inline_any_loop_unwinding_check(ctx, passes, assume_guards, deferred_checks);
+}
+
+/// The walker's check for a loop of `passes` passes a modelled `kani::any`
+/// (or a vector generator built on it) does not run.
+pub(super) fn push_inline_any_loop_unwinding_check(
+    ctx: &ChcCtx<'_, '_>,
+    passes: u64,
+    assume_guards: &[Expr],
+    deferred_checks: &mut Vec<DeferredInlineCheck>,
+) {
+    if ctx.recursive_unwind_depth == 0 || !ctx.unwinding_assertions {
+        return;
+    }
+    if passes < u64::from(ctx.recursive_unwind_depth) {
+        return;
+    }
+    let check = match current_inline_assume_guard(assume_guards) {
+        Some(path_guard) => path_guard.not(),
+        None => Expr::bool_const(false),
+    };
+    deferred_checks.push(DeferredInlineCheck {
+        check,
+        kind: PropertyKind::Other,
+        message: Some(crate::codegen_ay::shared::kani_any_loops::kani_any_unwind_message(passes)),
+        write_mark: ctx.heap_state.write_mark(),
+        merge_key: None,
+    });
 }
 
 /// Handle kani::any() and kani::assume() inside an inlined function body.
@@ -204,16 +279,23 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
         None
     };
 
-    if let Some(kani_fn) = fn_marker
-        .as_ref()
-        .and_then(|m| try_get_kani_function(m))
-        .or(raw_layout_fn)
+    if let Some(kani_fn) =
+        fn_marker.as_ref().and_then(|m| try_get_kani_function(m)).or(raw_layout_fn)
     {
         match kani_fn {
             KaniFunction::Model(KaniModel::Any)
             | KaniFunction::Hook(KaniHook::AnyRaw)
             | KaniFunction::Intrinsic(KaniIntrinsic::AnyModifies) => {
                 debug!(dest_local, ?kani_fn, "inline kani nondet call → fresh unconstrained var");
+                if matches!(kani_fn, KaniFunction::Model(KaniModel::Any)) {
+                    inline_kani_any_unwinding_check(
+                        ctx,
+                        locals,
+                        dest_local,
+                        assume_guards,
+                        deferred_checks,
+                    );
+                }
                 return Some(fresh_inline_any_expr(ctx, locals, dest_local));
             }
             KaniFunction::Hook(KaniHook::Assume) => {
@@ -280,6 +362,18 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
                     super::super::codegen_call_kani_model_dst::extract_pointee_from_ptr_arg(
                         arg_ty,
                     )?;
+                // An unsized pointee's size/align is read from the pointer's metadata,
+                // and `compute_size_or_align_value` resolves that operand against the
+                // HOST body. `args` are CALLEE-body operands (another index space, as
+                // the assert hook above notes), so only a layout constant is valid here.
+                if pointee.layout().ok().is_some_and(|layout| layout.shape().is_unsized()) {
+                    debug!(
+                        is_size,
+                        "inline kani::size_of_val/align_of_val: unsized pointee needs callee \
+                         metadata the host-body resolver cannot read; declining"
+                    );
+                    return None;
+                }
                 let empty_modified = std::collections::HashSet::new();
                 let value = super::super::codegen_call_kani_model_dst::compute_size_or_align_value(
                     ctx,
@@ -335,6 +429,15 @@ pub(in crate::codegen_ay::chc) fn try_handle_kani_call_inline<'tcx, 'body>(
         )
     {
         debug!(dest_local, %callee_path, "inline unmarked kani any path → fresh var");
+        if tail == Some("any") {
+            inline_kani_any_unwinding_check(
+                ctx,
+                locals,
+                dest_local,
+                assume_guards,
+                deferred_checks,
+            );
+        }
         return Some(fresh_inline_any_expr(ctx, locals, dest_local));
     }
     if callee_path.contains("kani::") && matches!(tail, Some("assume")) {

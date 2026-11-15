@@ -568,7 +568,8 @@ fn test_codegen_ctpop_returns_target() {
         // ctpop sums extracted bits via BvAdd chain
         let rhs = latest_assignment_rhs(&codegen);
         assert!(
-            matches!(rhs.value(), ExprValue::BvAdd(_, _)),
+            // c2baabafe sums bits in an 8-bit tree and zero-extends the count.
+            matches!(rhs.value(), ExprValue::BvAdd(_, _) | ExprValue::BvZeroExtend { .. }),
             "ctpop should produce BvAdd expression (bit sum), got {:?}",
             rhs.value()
         );
@@ -1068,7 +1069,8 @@ fn test_codegen_ctpop_symbolic_input() {
         // ctpop sums all bits: bvadd(bvadd(..., zext(extract(x,i,i))), ...)
         let rhs = latest_assignment_rhs(&codegen);
         assert!(
-            matches!(rhs.value(), ExprValue::BvAdd(_, _)),
+            // c2baabafe sums bits in an 8-bit tree and zero-extends the count.
+            matches!(rhs.value(), ExprValue::BvAdd(_, _) | ExprValue::BvZeroExtend { .. }),
             "ctpop symbolic should produce BvAdd expression (bit sum), got {:?}",
             rhs.value()
         );

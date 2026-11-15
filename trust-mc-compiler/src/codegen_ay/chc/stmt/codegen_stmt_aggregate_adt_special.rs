@@ -16,6 +16,10 @@
 //! - Alloc-infra enum wrappers (Result<Layout, LayoutError>)
 //! - Unit enums (discriminant as bitvec)
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
@@ -31,8 +35,9 @@ use tracing::{debug, warn};
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort};
 
 use super::codegen_stmt_aggregate_adt::sign_extend_discr_val;
+use super::codegen_types::CodegenTypes;
 use super::codegen_types_adt_sort::CodegenTypesAdtSort;
-use super::{ChcCtx, UNDEF_COUNTER, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, UNDEF_COUNTER, chc_fresh_name};
 use crate::codegen_ay::chc::decl::codegen_decl_flatten::byte_size_to_bv_width;
 use crate::codegen_ay::chc::decl::codegen_types_adt::CodegenTypesAdt;
 
@@ -55,6 +60,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let variant_index = variant_idx.to_index();
         let base_name = def.trimmed_name();
 
+        if let Some((index, pointer_ty)) =
+            crate::codegen_ay::shared::native_box_raw::native_box_raw_pointer_field(
+                self.tcx, def, args,
+            )
+        {
+            if variant_index != 0 || operands.len() != 2 {
+                return Some(None);
+            }
+            let pointer_sort = Self::translate_ty(pointer_ty)?;
+            return Some(
+                self.translate_operand_with_modified(&operands[index], modified_locals)
+                    .filter(|pointer| pointer.sort() == &pointer_sort),
+            );
+        }
+
         // Part of #3792: Single-field array wrapper aggregate -> passthrough to inner
         // array operand. Matches the structural check in translate_adt_sort (codegen_types_adt.rs)
         // which delegates these types to the inner array sort. Previously gated on
@@ -62,7 +82,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // (case-sensitive mismatch) and `i64x2` (no "simd" substring at all).
         // The structural check (1 variant, 1 field of type [T; N], 1 operand) is sufficient.
         if variants.len() == 1 && variants[0].fields().len() == 1 && operands.len() == 1 {
-            let field_ty = variants[0].fields()[0].ty_with_args(args);
+            let field_ty = mono_ty::field_ty(&variants[0].fields()[0], args)?;
             if matches!(field_ty.kind(), TyKind::RigidTy(RigidTy::Array(..))) {
                 debug!(
                     adt_name = %adt_name,
@@ -99,8 +119,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // Part of #4160: opaque iterator adapters.
-        if matches!(base_name.as_str(), "FlatMap" | "FlattenCompat" | "Chain" | "Fuse") {
+        // Part of #4160: opaque iterator adapters. Only std's: the sort rule
+        // (`translate_adt_sort`) makes these opaque only under an `iter` /
+        // `slice` path, and a user `struct Chain<T>` matched the bare name, so
+        // its aggregate became a fresh value that only an unread gap counter
+        // recorded: `Chain { v: 5, n: 1 }.next() == Some(5)` was certified a
+        // Genuine failure and a second `next()` returning `None` verified as
+        // `Some` (walker fail-closed repair round 5,
+        // `user_type_named_like_std_dual.rs`).
+        let full_name = def.0.name();
+        if matches!(base_name.as_str(), "FlatMap" | "FlattenCompat" | "Chain" | "Fuse")
+            && !def.krate().is_local
+            && (full_name.contains("iter") || full_name.contains("slice"))
+        {
             let name = chc_fresh_name("__opaque_iter_adapter_agg");
             debug!(
                 adt_name = %adt_name,
@@ -108,7 +139,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "translate_adt_aggregate: opaque iterator adapter -> symbolic ptr_sort"
             );
             self.record_aggregate_gap("adt_opaque_iterator_adapter_symbolic");
-            return Some(Some(declare_pending_var(name, ptr_sort())));
+            return Some(Some(Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_COLLECTION_STATE,
+                name,
+                ptr_sort(),
+            )));
         }
 
         // Part of #3687: BigInt/BigUint -> SMT Int, BigRational/Ratio -> SMT Real.
@@ -121,7 +157,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "translate_adt_aggregate: BigInt/BigUint -> unconstrained Int"
             );
             self.record_aggregate_gap("adt_bigint_unconstrained");
-            return Some(Some(declare_pending_var(name, Sort::int())));
+            return Some(Some(Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_BIGNUM_VALUE,
+                name,
+                Sort::int(),
+            )));
         }
         if base_name == "BigRational" || base_name == "Ratio" {
             let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -132,7 +173,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "translate_adt_aggregate: BigRational/Ratio -> unconstrained Real"
             );
             self.record_aggregate_gap("adt_bigrational_unconstrained");
-            return Some(Some(declare_pending_var(name, Sort::real())));
+            return Some(Some(Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_BIGNUM_VALUE,
+                name,
+                Sort::real(),
+            )));
         }
 
         // #1979: Layout packs fields as concat(size, align).
@@ -253,18 +299,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Union aggregate construction.
     ///
     /// Models as BV write to union-sized bitvector. Matches translate_adt_sort
-    /// which encodes unions as Sort::bitvec(byte_size * 8).
+    /// which encodes unions as Sort::bitvec(byte_size * 8). The field's bytes
+    /// are its memory image (`codegen_stmt_union_bits.rs`).
     pub(in crate::codegen_ay::chc) fn translate_union_aggregate(
         &mut self,
         def: AdtDef,
-        variant_idx: rustc_public::ty::VariantIdx,
+        _variant_idx: rustc_public::ty::VariantIdx,
         args: &GenericArgs,
         operands: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
-        let variants = def.variants();
         let adt_name = Self::adt_sort_name(def, args);
-        let variant_index = variant_idx.to_index();
 
         let union_ty = rustc_public::ty::Ty::from_rigid_kind(RigidTy::Adt(def, args.clone()));
         let layout = union_ty.layout().ok()?;
@@ -279,14 +324,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             debug!(adt_name = %adt_name, bits, "union aggregate: ZST field -> bv zero");
             return Some(Expr::bitvec_const(0u64, bits));
         }
-        // Translate the single operand and coerce to union width.
-        let variant = &variants[variant_index];
-        let field_ty = if !variant.fields().is_empty() {
-            let f = &variant.fields()[0];
-            Self::resolve_generic_ty(f.ty(), args)
-        } else {
-            None
-        };
+        // The field written is the one the operand is: a union's single
+        // variant lists EVERY field, and the aggregate names the active one
+        // separately, so `variant.fields()[0]` is the first declared field
+        // whichever field `U { x: v }` writes. The operand's own type is the
+        // active field's type.
+        let field_ty = operands[0].ty(self.body.locals()).ok().map(|ty| self.resolve_body_ty(ty));
         // Check if the field is ZST
         let field_is_zst = field_ty
             .and_then(|ty| ty.layout().ok())
@@ -296,12 +339,43 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = format!("union_zst_{undef_id}");
             debug!(adt_name = %adt_name, bits, "union aggregate: ZST field -> unconstrained");
-            return Some(declare_pending_var(name, Sort::bitvec(bits)));
+            return Some(ExactVar::nondet(name, Sort::bitvec(bits)));
         }
         if let Some(val) = self.translate_operand_with_modified(&operands[0], modified_locals) {
-            let result = coerce_bitvec_width_safe(val, bits, SignExtension::ZeroExtend);
-            debug!(adt_name = %adt_name, bits, "union aggregate: field -> coerced BV");
-            return Some(result);
+            // Write the field's MEMORY image into the low bytes; the bytes past
+            // the field are uninitialized (fresh). The old coercion passed a
+            // struct datatype through, and the assignment flattened it in
+            // DECLARATION order, MSB first — `lo` of `U { w: Words { lo, hi }
+            // }` landed in the high half (bug_union_struct_as_u128 PROVED) — and
+            // zero-extended a narrow field, so the union's tail read as zero
+            // where Rust leaves it uninitialized. A field the layout lane does
+            // not model makes the whole union fresh.
+            use super::codegen_stmt_union_bits::UnionLane;
+            let lane = match field_ty {
+                Some(field_ty) => self.union_bits_of_field_write(None, bits, field_ty, &val),
+                None => UnionLane::Unmodeled("union field type unresolved"),
+            };
+            return Some(match lane {
+                UnionLane::Exact(image) => {
+                    debug!(adt_name = %adt_name, bits, "union aggregate: field in memory order");
+                    image
+                }
+                UnionLane::Unmodeled(why) => {
+                    debug!(
+                        adt_name = %adt_name,
+                        bits,
+                        why,
+                        sort = ?val.sort(),
+                        "union aggregate: field layout not modeled; fresh union"
+                    );
+                    let booked = self.record_sound_fallback_reason("transmute_layout_fallback");
+                    Havoc::booked(
+                        booked,
+                        chc_fresh_name("__union_layout_nondet"),
+                        Sort::bitvec(bits),
+                    )
+                }
+            });
         }
         None
     }

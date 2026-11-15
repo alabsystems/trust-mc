@@ -94,7 +94,23 @@ fn is_harness(instance: Instance, tcx: TyCtxt) -> bool {
         ],
     ];
     harness_identifiers.iter().any(|attr_path| {
-        tcx.has_attrs_with_path(rustc_internal::internal(tcx, instance.def.def_id()), attr_path)
+        #[cfg(not(trust_toolchain))]
+        let has_attr = tcx
+            .has_attrs_with_path(rustc_internal::internal(tcx, instance.def.def_id()), attr_path);
+        // Trust removed `has_attrs_with_path`, whose body was exactly this expression.
+        #[cfg(all(trust_toolchain, not(version("1.101"))))]
+        let has_attr = tcx
+            .get_attrs_by_path(rustc_internal::internal(tcx, instance.def.def_id()), attr_path)
+            .next()
+            .is_some();
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        let has_attr = {
+            use rustc_ast::attr::AttributeExt;
+            tcx.get_all_attrs(rustc_internal::internal(tcx, instance.def.def_id()))
+                .iter()
+                .any(|attr| attr.path_matches(attr_path))
+        };
+        has_attr
     })
 }
 

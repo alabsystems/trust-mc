@@ -4,6 +4,9 @@
 //
 //! Pointer-wrapper helpers for virtual-inline nested call handling.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 
 use super::super::ChcCtx;
@@ -68,8 +71,9 @@ fn record_inline_loaded_value_vtable_forward(
         store_ty.kind()
         && let Some(variant) = def.variants().first()
         && variant.fields().len() == 1
+        && let Some(field_ty) = mono_ty::field_ty(&variant.fields()[0], &args)
     {
-        let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
+        let field_ty = ctx.resolve_body_ty(field_ty);
         if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr.clone()));
         }
@@ -96,8 +100,9 @@ fn record_inline_loaded_wrapper_payload_vtable_forward(
         store_ty.kind()
         && let Some(variant) = def.variants().first()
         && variant.fields().len() == 1
+        && let Some(field_ty) = mono_ty::field_ty(&variant.fields()[0], &args)
     {
-        let field_ty = ctx.resolve_body_ty(variant.fields()[0].ty_with_args(&args));
+        let field_ty = ctx.resolve_body_ty(field_ty);
         if let Some(field_loaded) = ctx.load_from_memory_untyped(addr.clone(), field_ty) {
             record_inline_heap_vtable_forward(ctx, &field_loaded, Some(vtable_expr));
         }
@@ -182,7 +187,7 @@ pub(super) fn resolve_inline_ref_local_target_place(
                         Some(place.clone())
                     }
                 }
-                rustc_public::mir::Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                rustc_public::mir::Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                 | rustc_public::mir::Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                     if src.projection.is_empty() =>
                 {
@@ -321,9 +326,17 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
     let obj_id = ctx.heap_state.next_heap_alloc_id()?;
     let arg_ty = args.first().and_then(|arg| arg.ty(outer_body.locals()).ok())?;
     let store_ty = ctx.resolve_body_ty(arg_ty);
+    // The inner allocation holds the header and the value, sized as the
+    // non-inline `Rc::new` lane sizes it (`rc_inner_model_size`): the value's
+    // size alone left a payload read past the recorded size.
     let size_expr = ctx
         .get_type_size(store_ty)
-        .map(|size| Expr::bitvec_const(size as u128, 32))
+        .zip(ctx.get_type_align(store_ty))
+        .map(|(size, align)| {
+            let inner =
+                super::super::codegen_call_dispatch_dyn_rc::rc_inner_model_size(size as u64, align);
+            Expr::bitvec_const(inner as u128, 32)
+        })
         .unwrap_or_else(|| {
             ctx.record_sound_fallback_reason("inline_rc_arc_new_size_unknown");
             inline_alloc_size_expr(ctx, callee_path, args, outer_body, translated_args)
@@ -333,10 +346,19 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
     // An allocation base minted from a fresh obj_id: an address by
     // construction, with nothing inferred from its width.
     let alloc_ptr = Loc::of_address(Expr::bitvec_const((obj_id as u128) << 32, POINTER_WIDTH));
-    let header_size = 2u64 * (POINTER_WIDTH as u64 / 8);
+    // The value's field offset in the real `RcInner<T>`, which every reader
+    // computes (`rc_value_offset`).
+    let value_offset = super::super::codegen_call_dispatch_dyn_rc::rc_value_offset(
+        ctx.get_type_align(store_ty).unwrap_or(1),
+    );
+    if value_offset > 16 {
+        ctx.record_sound_fallback_reason(
+            super::super::codegen_call_dispatch_dyn_rc::RC_VALUE_OVERALIGNED,
+        );
+    }
     // Past the header, still inside the same allocation: still an address.
     let value_ptr = Loc::of_address(
-        alloc_ptr.as_expr().clone().bvadd(Expr::bitvec_const(header_size as u128, POINTER_WIDTH)),
+        alloc_ptr.as_expr().clone().bvadd(Expr::bitvec_const(value_offset as u128, POINTER_WIDTH)),
     );
     let value_expr = translated_args[0].clone();
     let mut extra = Vec::new();
@@ -356,11 +378,15 @@ pub(super) fn try_inline_rc_arc_new<'tcx, 'body>(
     // Previously, decomposition success skipped the whole-struct store,
     // causing a store/load type-key mismatch: stores went to `mem_bool` but
     // loads read from `mem_Table` → unconstrained → false CTREX.
-    ctx.try_decompose_struct_store(value_ptr.as_expr(), &value_expr, store_ty, &mut extra);
-    if let Some(store_constraint) = ctx.build_memory_store(value_ptr.clone(), value_expr, store_ty)
-    {
-        extra.push(store_constraint);
-    }
+    // A fresh allocation's initializer: both views together (`heap_unsize_alias.rs`).
+    ctx.with_coherent_object_stores(|ctx| {
+        ctx.try_decompose_struct_store(value_ptr.as_expr(), &value_expr, store_ty, &mut extra);
+        if let Some(store_constraint) =
+            ctx.build_memory_store(value_ptr.clone(), value_expr, store_ty)
+        {
+            extra.push(store_constraint);
+        }
+    });
     ctx.suppress_heap_store_checks = prev_suppress;
     ctx.heap_state.pending_updates.extend(extra);
 
@@ -433,11 +459,15 @@ pub(super) fn try_inline_box_new<'tcx, 'body>(
         alloc_ptr.as_expr(),
         &mut extra,
     );
-    ctx.try_decompose_struct_store(alloc_ptr.as_expr(), &value_expr, store_ty, &mut extra);
-    if let Some(store_constraint) = ctx.build_memory_store(alloc_ptr.clone(), value_expr, store_ty)
-    {
-        extra.push(store_constraint);
-    }
+    // A fresh allocation's initializer: both views together (`heap_unsize_alias.rs`).
+    ctx.with_coherent_object_stores(|ctx| {
+        ctx.try_decompose_struct_store(alloc_ptr.as_expr(), &value_expr, store_ty, &mut extra);
+        if let Some(store_constraint) =
+            ctx.build_memory_store(alloc_ptr.clone(), value_expr, store_ty)
+        {
+            extra.push(store_constraint);
+        }
+    });
     ctx.suppress_heap_store_checks = prev_suppress;
     record_inline_heap_vtable_forward(ctx, alloc_ptr.as_expr(), payload_vtable.clone());
     record_inline_loaded_value_vtable_forward(ctx, alloc_ptr.as_expr(), store_ty, payload_vtable);

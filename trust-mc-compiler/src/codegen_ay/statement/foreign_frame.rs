@@ -93,6 +93,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return false,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return false,
         };
         let ref_base = self.ssa_base_name(place);
         let Some(pointee_base) = self

@@ -8,11 +8,16 @@
 //! Raw pointer comparison: `inline_known_calls_raw_ptr.rs`
 //! SIMD intrinsics: `inline_known_calls_simd.rs`
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{LocalDecl, Operand};
 use rustc_public::ty::{AdtKind, RigidTy, TyKind};
 use tracing::debug;
 
+use super::ChcCtx;
 use super::codegen_call_cmp_string::bit_intrinsics::inline_bit_intrinsic_expr;
 use super::codegen_call_cmp_string::float_predicates::{
     build_float_predicate_expr, detect_float_predicate,
@@ -23,7 +28,6 @@ use super::inline_known_calls_raw_ptr::{
     inline_plain_eq_expr, inline_raw_pointer_cmp_expr, operand_is_raw_pointer_like,
 };
 use super::inline_known_calls_simd::inline_simd_intrinsic_expr;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
 use crate::codegen_ay::chc::call::inline_known_calls_math::{
     infer_inline_arith_signedness, inline_exact_math_call, inline_saturating_arith_expr,
     inline_wrapping_arith_expr,
@@ -31,7 +35,7 @@ use crate::codegen_ay::chc::call::inline_known_calls_math::{
 use crate::codegen_ay::chc::codegen_expr_array_eq::{
     build_spec_array_eq, recover_spec_array_eq_len,
 };
-use crate::codegen_ay::chc::pointer_step::{step_split_pointer, step_split_pointer_sub};
+use crate::codegen_ay::chc::pointer_step::step_pointer_data_keep_metadata;
 use crate::codegen_ay::chc::stubs_option_helpers::OptionHelpers;
 use crate::codegen_ay::chc::ty_signedness;
 use crate::codegen_ay::ptr_repr::PtrRepr;
@@ -51,6 +55,10 @@ use crate::codegen_ay::types::{
 ///
 /// FAIL-CLOSED: without a resolved receiver type or a known pointee size this
 /// returns `None` (no inline) rather than falling back to a byte-sized step.
+///
+/// The step is exact mod 2^64 (`step_wrapping_pointer`), as on the statement
+/// path: the wrapping family is defined out of bounds, and the in-bounds lane
+/// step keeps only the low 32 bits of the byte offset.
 fn inline_wrapping_ptr_arith_expr<'tcx, 'body>(
     ctx: &ChcCtx<'tcx, 'body>,
     callee_path: &str,
@@ -86,13 +94,9 @@ fn inline_wrapping_ptr_arith_expr<'tcx, 'body>(
     }
     let count = coerce_bitvec_width(count, POINTER_WIDTH, SignExtension::ZeroExtend);
     let offset_bytes = count.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH));
-    let step = if is_sub {
-        step_split_pointer_sub(ptr, offset_bytes)
-    } else {
-        step_split_pointer(ptr, offset_bytes)
-    };
+    let stepped = ctx.step_wrapping_address(ptr, offset_bytes, is_sub);
     debug!(elem_size, is_sub, "CHC: inline wrapping pointer arith - ptr +/- count * sizeof(T)");
-    Some(step.result)
+    Some(stepped)
 }
 
 /// Inline pure call patterns that do not expose a simple MIR body.
@@ -100,7 +104,7 @@ pub(in crate::codegen_ay) fn inline_known_call_expr<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
     func: &Operand,
     translated_args: &[Expr],
-    first_arg: Option<&Operand>,
+    arg_operands: &[Operand],
     caller_locals: &[LocalDecl],
 ) -> Option<Expr> {
     let callee_path = ctx.resolve_callee_path(func).or_else(|| ctx.resolve_fn_def_name(func))?;
@@ -109,7 +113,7 @@ pub(in crate::codegen_ay) fn inline_known_call_expr<'tcx, 'body>(
         func,
         &callee_path,
         translated_args,
-        first_arg,
+        arg_operands,
         caller_locals,
     )
 }
@@ -124,9 +128,31 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
     func: &Operand,
     callee_path: &str,
     translated_args: &[Expr],
-    first_arg: Option<&Operand>,
+    arg_operands: &[Operand],
     caller_locals: &[LocalDecl],
 ) -> Option<Expr> {
+    let first_arg = arg_operands.first();
+    // The comparison fast paths below compare encodings. A comparison whose
+    // `==` or order is not its encodings' (a float, a reference or a
+    // hand-written `PartialEq` in it; `codegen_call_cmp_semantic.rs`) is
+    // refused, and the caller walks the callee's body; so is one whose
+    // compared type is unknown here (a call through a fn pointer).
+    if let Some(kind) = crate::codegen_ay::shared::compare_loops::comparison_call(callee_path) {
+        if matches!(kind, crate::codegen_ay::shared::compare_loops::ComparisonCall::Eq { .. })
+            && ctx.has_heterogeneous_sequence_elements(func, caller_locals)
+        {
+            return None;
+        }
+        let faithful = first_arg.and_then(|arg| arg.ty(caller_locals).ok()).is_some_and(|ty| {
+            crate::codegen_ay::shared::compare_loops::comparison_is_faithful(
+                kind,
+                ctx.resolve_body_ty(ty),
+            )
+        });
+        if !faithful {
+            return None;
+        }
+    }
     if let Some(kind) = detect_float_predicate(&callee_path) {
         if translated_args.len() != 1 {
             return None;
@@ -180,15 +206,22 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
     {
         return Some(expr);
     }
-    if let Some(expr) =
-        inline_iter_compare_expr(ctx, func, callee_path, translated_args, caller_locals)
+    if let Some(expr) = super::inline_iterator_eq::inline_iterator_eq_expr(
+        ctx,
+        func,
+        callee_path,
+        translated_args,
+        arg_operands,
+        caller_locals,
+    ) {
+        return Some(expr);
+    }
+    // `iter_compare` also implements cmp_by/partial_cmp_by/eq_by. Its third
+    // argument is an arbitrary comparator, so equal iterator states or even
+    // equal elements do not establish its ControlFlow result. Walk its body.
+    if !compared_type_holds_address(ctx, first_arg, caller_locals)
+        && let Some(expr) = inline_datatype_partial_eq_expr(callee_path, translated_args)
     {
-        return Some(expr);
-    }
-    if let Some(expr) = inline_chars_iterator_eq_expr(callee_path, translated_args) {
-        return Some(expr);
-    }
-    if let Some(expr) = inline_datatype_partial_eq_expr(callee_path, translated_args) {
         return Some(expr);
     }
     if let Some(expr) = inline_option_result_predicate_expr(ctx, callee_path, translated_args) {
@@ -200,7 +233,7 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
         return Some(expr);
     }
     if let Some(expr) =
-        inline_primitive_cmp_expr(callee_path, translated_args, first_arg, caller_locals)
+        inline_primitive_cmp_expr(ctx, callee_path, translated_args, first_arg, caller_locals)
     {
         return Some(expr);
     }
@@ -215,8 +248,16 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
     }
     // Part of #3875: SpecArrayEq::spec_eq — route fixed-size array equality
     // through the shared helper (inline body has a loop the walker can't handle).
-    if let Some(expr) =
-        inline_spec_array_eq_expr(callee_path, translated_args, first_arg, caller_locals)
+    if let Some(is_ne) = ctx.spec_array_comparison_for_operand(func, caller_locals)
+        && let Some(expr) = inline_spec_array_eq_expr(
+            ctx,
+            callee_path,
+            is_ne,
+            ctx.spec_array_elements_are_faithful(func, caller_locals),
+            translated_args,
+            first_arg,
+            caller_locals,
+        )
     {
         return Some(expr);
     }
@@ -252,7 +293,9 @@ fn inline_pointer_utility_expr<'tcx, 'body>(
     translated_args: &[Expr],
 ) -> Option<Expr> {
     let stub = ctx.stub_registry.lookup(callee_path)?;
-    if let Some(expr) = inline_ptr_wrapping_byte_expr(stub, translated_args) {
+    if let Some(expr) = inline_ptr_wrapping_byte_expr_with(stub, translated_args, |p, k, sub| {
+        ctx.step_wrapping_address(p, k, sub)
+    }) {
         return Some(expr);
     }
     match stub {
@@ -326,7 +369,7 @@ fn option_payload_signedness(output_ty: rustc_public::ty::Ty) -> bool {
     {
         for variant in def.variants() {
             if let Some(field) = variant.fields().first() {
-                return ty_signedness(field.ty_with_args(&args)).unwrap_or(false);
+                return mono_ty::field_ty(field, &args).and_then(ty_signedness).unwrap_or(false);
             }
         }
     }
@@ -390,7 +433,22 @@ fn inline_nonzero_new_expr<'tcx, 'body>(
     Some(Expr::ite(is_some, some_expr, none_expr))
 }
 
+#[cfg(test)]
 fn inline_ptr_wrapping_byte_expr(stub: StubKind, translated_args: &[Expr]) -> Option<Expr> {
+    inline_ptr_wrapping_byte_expr_with(
+        stub,
+        translated_args,
+        crate::codegen_ay::chc::pointer_step::step_wrapping_pointer,
+    )
+}
+
+/// The wrapping byte step of `stub`, with `step` the address step
+/// (`ChcCtx::step_wrapping_address` in a body).
+fn inline_ptr_wrapping_byte_expr_with(
+    stub: StubKind,
+    translated_args: &[Expr],
+    step: impl FnOnce(Expr, Expr, bool) -> Expr,
+) -> Option<Expr> {
     let is_sub = matches!(stub, StubKind::PtrWrappingByteSub);
     let is_byte_offset = matches!(stub, StubKind::PtrWrappingByteOffset);
     if !matches!(
@@ -403,22 +461,25 @@ fn inline_ptr_wrapping_byte_expr(stub: StubKind, translated_args: &[Expr]) -> Op
         return None;
     }
 
-    let ptr = coerce_inline_ptr_width(translated_args.first()?.clone(), SignExtension::ZeroExtend)?;
     let count_ext =
         if is_byte_offset { SignExtension::SignExtend } else { SignExtension::ZeroExtend };
     let byte_count = coerce_inline_ptr_width(translated_args.get(1)?.clone(), count_ext)?;
 
-    // Split-add keeps the obj_id lane intact so the eventual deref's heap
-    // bounds check still sees a foldable obj_id (whole-width bvadd smears a
-    // symbolic count across the id bits and the bounds clause gets dropped).
     // Wrapping pointer arithmetic is defined even out of bounds, so no UB is
-    // emitted here; an OOB deref of the result is caught by heap_access_checks.
-    // Lane wrap at ±4GiB folds into the offset lane (obj_size is bv32, so
-    // affected allocations are outside the model envelope anyway).
-    Some(if is_sub {
-        step_split_pointer_sub(ptr, byte_count).result
-    } else {
-        step_split_pointer(ptr, byte_count).result
+    // emitted here, and the step is exact mod 2^64 (`step_wrapping_pointer`),
+    // as on the statement path (`translate_ptr_wrapping_byte_call`). This used
+    // the in-bounds lane step, which drops the count's high 32 bits and the
+    // carry out of the low lane: `p.wrapping_byte_add(1 << 32) == p` was
+    // derivable. A symbolic count leaves the result's obj_id lane symbolic,
+    // so a later deref gets the conservative `obj_valid` select from
+    // heap_access_checks instead of a resolved allocation bound.
+    //
+    // A fat operand (`*const [T]`, `*const str`, `*const dyn Trait`) keeps its
+    // metadata half: `wrapping_byte_*` is `cast::<u8>().wrapping_*(n)
+    // .with_metadata_of(self)`, so only the data word moves.
+    step_pointer_data_keep_metadata(translated_args.first()?.clone(), |ptr| {
+        let ptr = coerce_inline_ptr_width(ptr, SignExtension::ZeroExtend)?;
+        Some(step(ptr, byte_count, is_sub))
     })
 }
 
@@ -502,7 +563,7 @@ fn inline_option_unwrap_expr<'tcx, 'body>(
             }
             let is_some = ctx.option_is_some(receiver.clone());
             let inner = ctx.option_unwrap_value_on_some_path(receiver)?;
-            let fallback = super::declare_pending_var(
+            let fallback = ExactVar::nondet(
                 super::chc_fresh_name("__assert_fail_inline_option_unwrap"),
                 inner.sort().clone(),
             );
@@ -533,6 +594,34 @@ fn inline_option_unwrap_or_expr<'tcx, 'body>(
         }
         _ => None,
     }
+}
+
+/// Does the type an inlined `PartialEq::eq(&T, &T)` compares hold an address?
+///
+/// `PartialEq` on a type that holds a reference compares REFERENTS: `Option<&u8>`
+/// ends in `*l == *r`. SMT structural equality on the translated datatype
+/// compares the reference VALUES, i.e. addresses, so `Some(&x) == Some(&5)` with
+/// `x == 5` folded to false and `!(o == Some(&5))` was proved under --ay-chc
+/// (tools/soundness-duals/negative/joined_enum_referent_duals.rs). Such a
+/// comparison must not take [`inline_datatype_partial_eq_expr`]. A type this
+/// cannot classify counts as holding one: the fast path is skipped, never trusted.
+fn compared_type_holds_address<'tcx, 'body>(
+    ctx: &ChcCtx<'tcx, 'body>,
+    first_arg: Option<&Operand>,
+    caller_locals: &[LocalDecl],
+) -> bool {
+    let Some(arg_ty) = first_arg.and_then(|arg| arg.ty(caller_locals).ok()) else {
+        return true;
+    };
+    let compared = match ctx.resolve_body_ty(arg_ty).kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => pointee,
+        _ => arg_ty,
+    };
+    super::inline_ref_arg_binding::ty_holds_address(
+        ctx,
+        compared,
+        super::inline_ref_arg_binding::SHAPE_DEPTH,
+    )
 }
 
 /// Inline `PartialEq::eq` / `PartialEq::ne` for Datatype-sorted types.
@@ -623,149 +712,8 @@ fn inline_char_from_u32_expr<'tcx, 'body>(
     Some(Expr::ite(is_some, some_expr, none_expr))
 }
 
-struct IteratorEqParts {
-    ptr: Option<Expr>,
-    data: Expr,
-    len: Expr,
-    pos: Expr,
-}
-
-fn inline_chars_iterator_eq_expr(callee_path: &str, translated_args: &[Expr]) -> Option<Expr> {
-    if translated_args.len() != 2
-        || !callee_path.ends_with("::eq")
-        || !callee_path.contains("Iterator")
-        || callee_path.contains("PartialEq")
-    {
-        return None;
-    }
-
-    iterator_eq_condition(translated_args.first()?, translated_args.get(1)?)
-}
-
-fn inline_iter_compare_expr<'tcx, 'body>(
-    ctx: &mut ChcCtx<'tcx, 'body>,
-    func: &Operand,
-    callee_path: &str,
-    translated_args: &[Expr],
-    caller_locals: &[LocalDecl],
-) -> Option<Expr> {
-    if !callee_path.ends_with("iter_compare") || translated_args.len() < 2 {
-        return None;
-    }
-    debug!(
-        args_len = translated_args.len(),
-        arg0_sort = translated_args.first().map(|arg| format!("{}", arg.sort())),
-        arg1_sort = translated_args.get(1).map(|arg| format!("{}", arg.sort())),
-        "inline iter_compare: attempting iterator-state fast path"
-    );
-    let Some(state_eq) = iterator_eq_condition(translated_args.first()?, translated_args.get(1)?)
-    else {
-        debug!("inline iter_compare: iterator-state extraction failed");
-        return None;
-    };
-    let output_ty =
-        ctx.resolve_body_ty(func.ty(caller_locals).ok()?.kind().fn_sig()?.skip_binder().output());
-    let Some(target_sort) = ChcCtx::translate_ty(output_ty) else {
-        debug!("inline iter_compare: output sort translation failed");
-        return None;
-    };
-    let result = build_iter_compare_control_flow_result(&target_sort, state_eq);
-    if result.is_none() {
-        debug!(sort = %target_sort, "inline iter_compare: ControlFlow result construction failed");
-    }
-    result
-}
-
-fn iterator_eq_condition(lhs_expr: &Expr, rhs_expr: &Expr) -> Option<Expr> {
-    let lhs = iterator_eq_parts(lhs_expr)?;
-    let rhs = iterator_eq_parts(rhs_expr)?;
-    let storage_eq = match (lhs.ptr, rhs.ptr) {
-        (Some(lhs_ptr), Some(rhs_ptr)) if lhs_ptr.sort() == rhs_ptr.sort() => lhs_ptr.eq(rhs_ptr),
-        _ => lhs.data.eq(rhs.data),
-    };
-    Expr::try_and_many(vec![storage_eq, lhs.len.eq(rhs.len), lhs.pos.eq(rhs.pos)]).ok()
-}
-
-fn build_iter_compare_control_flow_result(target_sort: &Sort, state_eq: Expr) -> Option<Expr> {
-    let dt = target_sort.datatype_sort()?;
-    let continue_ctor = dt.constructors.iter().find(|ctor| ctor.name.contains("Continue"))?;
-    let break_ctor = dt.constructors.iter().find(|ctor| ctor.name.contains("Break"))?;
-    let ordering_sort = continue_ctor.fields.first()?.sort.clone();
-    let equal = if let Some(ordering_dt) = ordering_sort.datatype_sort() {
-        let equal_ctor =
-            ordering_dt.constructors.iter().find(|ctor| ctor.name.contains("Equal"))?;
-        Expr::datatype_constructor(
-            &*ordering_dt.name,
-            &*equal_ctor.name,
-            Vec::new(),
-            ordering_sort.clone(),
-        )
-    } else if let Some(width) = ordering_sort.bitvec_width() {
-        Expr::bitvec_const(0u64, width)
-    } else {
-        return None;
-    };
-    let continue_equal = Expr::datatype_constructor(
-        &*dt.name,
-        &*continue_ctor.name,
-        vec![equal],
-        target_sort.clone(),
-    );
-    let break_payload_sort = break_ctor.fields.first()?.sort.clone();
-    let break_payload =
-        declare_pending_var(chc_fresh_name("__iter_compare_break"), break_payload_sort);
-    let break_expr = Expr::datatype_constructor(
-        &*dt.name,
-        &*break_ctor.name,
-        vec![break_payload],
-        target_sort.clone(),
-    );
-    Expr::try_ite(state_eq, continue_equal, break_expr).ok()
-}
-
-fn iterator_eq_parts(expr: &Expr) -> Option<IteratorEqParts> {
-    let iter = iterator_eq_carrier(expr.clone(), 0)?;
-    let dt_name = iter.sort().datatype_name()?.to_owned();
-    let pos = iter.clone().field_select(&dt_name, "fld_pos", Sort::bitvec(POINTER_WIDTH));
-    let vec_sort = ChcCtx::get_dt_field_sort(&iter, "fld_vec")?;
-    let vec = iter.clone().field_select(&dt_name, "fld_vec", vec_sort);
-    let vec_dt_name = vec.sort().datatype_name()?.to_owned();
-    let ptr = ChcCtx::get_dt_field_sort(&vec, "fld_ptr")
-        .map(|ptr_sort| vec.clone().field_select(&vec_dt_name, "fld_ptr", ptr_sort));
-    let len = vec.clone().field_select(&vec_dt_name, "fld_len", Sort::bitvec(POINTER_WIDTH));
-    let data_sort = ChcCtx::get_dt_field_sort(&vec, "fld_data")?;
-    let data = vec.field_select(&vec_dt_name, "fld_data", data_sort);
-    Some(IteratorEqParts { ptr, data, len, pos })
-}
-
-fn iterator_eq_carrier(expr: Expr, depth: usize) -> Option<Expr> {
-    if ChcCtx::get_dt_field_sort(&expr, "fld_pos").is_some()
-        && ChcCtx::get_dt_field_sort(&expr, "fld_vec").is_some()
-    {
-        return Some(expr);
-    }
-    if depth >= 4 {
-        return None;
-    }
-    let sort = expr.sort().clone();
-    let dt = sort.datatype_sort()?;
-    if dt.constructors.len() != 1 {
-        return None;
-    }
-    let ctor = dt.constructors.first()?;
-    for field in &ctor.fields {
-        if !field.sort.is_datatype() {
-            continue;
-        }
-        let child = expr.clone().field_select(&dt.name, &field.name, field.sort.clone());
-        if let Some(carrier) = iterator_eq_carrier(child, depth + 1) {
-            return Some(carrier);
-        }
-    }
-    None
-}
-
 fn inline_primitive_cmp_expr(
+    ctx: &ChcCtx<'_, '_>,
     callee_path: &str,
     translated_args: &[Expr],
     first_arg: Option<&Operand>,
@@ -776,6 +724,11 @@ fn inline_primitive_cmp_expr(
         return inline_raw_pointer_cmp_expr(method, translated_args);
     }
     match method {
+        // Plain SMT equality is `PartialEq` only for a type that holds no
+        // reference: for `Option<&u8>` (or `&u8` itself) `eq` compares REFERENTS
+        // and the translated terms are addresses. Same gate, same reason, as the
+        // datatype fast path (`compared_type_holds_address`).
+        "eq" | "ne" if compared_type_holds_address(ctx, first_arg, caller_locals) => None,
         "eq" | "ne" => inline_plain_eq_expr(method == "eq", translated_args),
         // Part of #4203: Handle ordering comparisons for BV types inside
         // inlined function bodies. Without this, nested calls to
@@ -983,7 +936,7 @@ fn inline_bv_clamp_expr(
     // If min > max the clamp contract is violated. Use a fresh symbolic as
     // the panic placeholder (mirrors the raw-pointer clamp in
     // inline_known_calls_raw_ptr.rs).
-    let fallback = super::declare_pending_var(
+    let fallback = ExactVar::nondet(
         super::chc_fresh_name("__assert_fail_inline_bv_clamp"),
         val.sort().clone(),
     );
@@ -1064,36 +1017,54 @@ fn inline_ub_checks_expr(callee_path: &str, translated_args: &[Expr]) -> Option<
     }
     let method = callee_path.rsplit("::").next()?;
     match method {
-        // Verification keeps UB checks enabled so std/core precondition guards
-        // remain reachable instead of leaving their Bool destinations nondet.
-        "check_language_ub" | "check_library_ub" => Some(Expr::bool_const(true)),
-        "ub_checks" if callee_path.contains("intrinsics::") => Some(Expr::bool_const(true)),
+        // UB checks evaluate to false, as Kani (see
+        // `rustc_compat::runtime_checks_value`); the destination is decided, not
+        // left nondeterministic.
+        "check_language_ub" | "check_library_ub" => Some(Expr::bool_const(false)),
+        "ub_checks" if callee_path.contains("intrinsics::") => Some(Expr::bool_const(false)),
         _ => None,
     }
 }
 
-/// Part of #3875: Inline `SpecArrayEq::spec_eq` for fixed-size scalar arrays.
+/// Model `SpecArrayEq::{spec_eq,spec_ne}` only for established array data.
 ///
-/// `spec_eq(&[T; N], &[U; N]) -> bool` delegates to slice comparison which has
-/// a loop the inline walker cannot handle. Route the semantics through the
-/// shared helper so both flat-BV and Array-sorted layouts use the same
-/// fixed-array contract.
+/// Nested callers hand over untagged terms. Match the declared array sort at
+/// exactly one reference boundary, rather than interpreting any bitvector as
+/// a value. An inner reference (`&&[T; N]`) is not an array datum.
 fn inline_spec_array_eq_expr(
+    ctx: &ChcCtx<'_, '_>,
     callee_path: &str,
+    negated: bool,
+    faithful_elements: bool,
     translated_args: &[Expr],
     first_arg: Option<&Operand>,
     caller_locals: &[LocalDecl],
 ) -> Option<Expr> {
-    if translated_args.len() != 2 {
+    let [lhs, rhs] = translated_args else { return None };
+    let arg_ty = ctx.resolve_body_ty(first_arg?.ty(caller_locals).ok()?);
+    let value_ty = match arg_ty.kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => {
+            ctx.resolve_body_ty(pointee)
+        }
+        _ => arg_ty,
+    };
+    let TyKind::RigidTy(RigidTy::Array(_, len_const)) = value_ty.kind() else {
+        return None;
+    };
+    let expected = ChcCtx::translate_ty(value_ty)?;
+    if !expected.is_array() || lhs.sort() != &expected || rhs.sort() != &expected {
         return None;
     }
-    if !callee_path.contains("SpecArrayEq") || !callee_path.contains("spec_eq") {
+    let declared_len = len_const.eval_target_usize().ok()? as usize;
+    if declared_len != 0 && !faithful_elements {
         return None;
     }
-    let lhs = &translated_args[0];
-    let rhs = &translated_args[1];
-    let len = recover_spec_array_eq_len(Some(callee_path), first_arg, caller_locals);
-    build_spec_array_eq(lhs, rhs, len)
+    let len = recover_spec_array_eq_len(Some(callee_path), first_arg, caller_locals)?;
+    if len != declared_len {
+        return None;
+    }
+    let eq = build_spec_array_eq(lhs, rhs, Some(len))?;
+    Some(if negated { eq.not() } else { eq })
 }
 
 /// Part of #4101: Inline `std::intrinsics::raw_eq` for the inline walker.
@@ -1154,18 +1125,18 @@ mod tests {
     use ay_bindings::Expr;
 
     #[test]
-    fn test_inline_ub_checks_expr_returns_true_for_check_language_ub() {
+    fn test_inline_ub_checks_expr_returns_false_for_check_language_ub() {
         let expr = inline_ub_checks_expr("core::ub_checks::check_language_ub", &[])
             .expect("check_language_ub should inline");
         assert!(expr.sort().is_bool(), "UB checks should return Bool");
-        assert_eq!(expr.to_string(), "true");
+        assert_eq!(expr.to_string(), "false");
     }
 
     #[test]
-    fn test_inline_ub_checks_expr_returns_true_for_intrinsics_ub_checks() {
+    fn test_inline_ub_checks_expr_returns_false_for_intrinsics_ub_checks() {
         let expr = inline_ub_checks_expr("core::intrinsics::ub_checks", &[]).expect("ub_checks");
         assert!(expr.sort().is_bool(), "ub_checks should return Bool");
-        assert_eq!(expr.to_string(), "true");
+        assert_eq!(expr.to_string(), "false");
     }
 
     #[test]
@@ -1219,98 +1190,6 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_chars_iterator_eq_uses_remaining_iterator_state() {
-        let vec_sort = crate::codegen_ay::test_fixtures::vec_sort(Sort::bitvec(8));
-        let iter_sort = crate::codegen_ay::names::struct_sort(
-            "SliceIter_bv8",
-            [("fld_vec", vec_sort.clone()), ("fld_pos", Sort::bitvec(64))],
-        );
-        let chars_sort =
-            crate::codegen_ay::names::struct_sort("Chars_bv8", [("fld_iter", iter_sort.clone())]);
-        let data = Expr::var("bytes", Sort::array(Sort::bitvec(64), Sort::bitvec(8)));
-        let vec = Expr::datatype_constructor(
-            "Vec",
-            "Vec_mk",
-            vec![
-                Expr::bitvec_const(0u64, 64),
-                Expr::bitvec_const(1u64, 64),
-                Expr::bitvec_const(1u64, 64),
-                data,
-            ],
-            vec_sort,
-        );
-        let iter = Expr::datatype_constructor(
-            "SliceIter_bv8",
-            "SliceIter_bv8_mk",
-            vec![vec, Expr::bitvec_const(0u64, 64)],
-            iter_sort,
-        );
-        let chars = Expr::datatype_constructor("Chars_bv8", "Chars_bv8_mk", vec![iter], chars_sort);
-
-        let expr = inline_chars_iterator_eq_expr(
-            "core::iter::traits::iterator::Iterator::eq",
-            &[chars.clone(), chars],
-        )
-        .expect("Iterator::eq over Chars should inline");
-
-        assert!(expr.sort().is_bool(), "iterator eq result must be Bool");
-        let expr_text = expr.to_string();
-        // At ay 232304e1, try_field_select constant-folds selector-over-constructor
-        // for single-ctor datatypes, so the fld_ptr/fld_data selector-name text this
-        // test used to key on is folded away. Pin the structural result instead:
-        // pointer identity + remaining iterator state, folded to constants, with NO
-        // reference to the pruned backing array `bytes` (which would appear only if
-        // the encoding regressed to the data-array fallback).
-        assert_eq!(
-            expr_text,
-            "(and (= #x0000000000000000 #x0000000000000000) (= #x0000000000000001 #x0000000000000001) (= #x0000000000000000 #x0000000000000000))",
-            "chars-iterator eq must fold to remaining-state identity ptr(0)==ptr(0) ^ len(1)==len(1) ^ pos(0)==pos(0), with no dependence on the pruned backing array `bytes`: {expr_text}"
-        );
-    }
-
-    #[test]
-    fn test_build_iter_compare_result_continues_with_equal_ordering() {
-        let no_fields: Vec<(&str, Sort)> = Vec::new();
-        let ordering_sort = Sort::enum_type(
-            "OrderingProof",
-            vec![("Less", no_fields.clone()), ("Equal", no_fields.clone()), ("Greater", no_fields)],
-        );
-        let control_flow_sort = Sort::enum_type(
-            "ControlFlowProof",
-            vec![
-                ("Break", vec![("value", Sort::bool())]),
-                ("Continue", vec![("value", ordering_sort)]),
-            ],
-        );
-
-        let result =
-            build_iter_compare_control_flow_result(&control_flow_sort, Expr::bool_const(true))
-                .expect("iter_compare result should build for ControlFlow<_, Ordering>");
-
-        assert_eq!(result.sort(), &control_flow_sort);
-        assert!(result.to_string().contains("Continue"), "expected Continue branch: {result}");
-        assert!(result.to_string().contains("Equal"), "expected Equal payload: {result}");
-    }
-
-    #[test]
-    fn test_build_iter_compare_result_accepts_bitvec_ordering() {
-        let control_flow_sort = Sort::enum_type(
-            "ControlFlowBvOrderingProof",
-            vec![
-                ("Break", vec![("value", Sort::bool())]),
-                ("Continue", vec![("value", Sort::bitvec(8))]),
-            ],
-        );
-
-        let result =
-            build_iter_compare_control_flow_result(&control_flow_sort, Expr::bool_const(true))
-                .expect("iter_compare result should build for bitvector Ordering payload");
-
-        assert_eq!(result.sort(), &control_flow_sort);
-        assert!(result.to_string().contains("#x00"), "expected Equal as Ordering=0: {result}");
-    }
-
-    #[test]
     fn test_inline_ptr_wrapping_byte_offset_coerces_int_count_to_bv64() {
         let ptr = Expr::bitvec_const(0x1000u64, POINTER_WIDTH);
         let count = Expr::int_const(7);
@@ -1334,23 +1213,108 @@ mod tests {
         assert_eq!(expr, Expr::bitvec_const(0x0FFCu64, POINTER_WIDTH));
     }
 
-    /// Split-add must preserve a constant obj_id lane through a symbolic count:
-    /// the heap bounds check at the eventual deref requires the obj_id to fold.
+    /// A wrapping byte step with a symbolic count is full-width address
+    /// arithmetic: the count's high 32 bits and the carry out of the low lane
+    /// reach the result. The lane step used to keep the obj_id lane constant,
+    /// which made `p.wrapping_byte_add(1 << 32) == p` derivable.
     #[test]
-    fn test_inline_ptr_wrapping_byte_add_preserves_const_obj_id() {
-        use crate::codegen_ay::chc::expr::codegen_expr_heap_bv_eval::const_bv_value;
-
+    fn test_inline_ptr_wrapping_byte_add_symbolic_count_is_full_width() {
         // ptr = concat(obj_id=0x42, offset=0x10), count symbolic.
         let ptr = Expr::bitvec_const(0x42u64, 32).concat(Expr::bitvec_const(0x10u64, 32));
         let count = Expr::var("sym_count", Sort::bitvec(POINTER_WIDTH));
+        let expr = inline_ptr_wrapping_byte_expr(
+            StubKind::PtrWrappingByteAdd,
+            &[ptr.clone(), count.clone()],
+        )
+        .expect("wrapping_byte_add should inline");
+
+        assert_eq!(
+            expr,
+            crate::codegen_ay::chc::pointer_step::identity_address_view(
+                crate::codegen_ay::chc::pointer_step::identity_address_view(ptr).bvadd(count)
+            ),
+            "wrapping byte step must be a full-width add on the address view"
+        );
+    }
+
+    /// A constant 2^32-byte wrapping step moves the address: the carry lands in
+    /// the lane's high offset bits, not in the object field (object 0x42 stays).
+    #[test]
+    fn test_inline_ptr_wrapping_byte_add_two_pow_32_moves_the_address() {
+        let ptr = Expr::bitvec_const(0x0000_0042_0000_0010u64, POINTER_WIDTH);
+        let count = Expr::bitvec_const(1u64 << 32, POINTER_WIDTH);
         let expr = inline_ptr_wrapping_byte_expr(StubKind::PtrWrappingByteAdd, &[ptr, count])
             .expect("wrapping_byte_add should inline");
+        assert_eq!(expr, Expr::bitvec_const(0x0001_0042_0000_0010u64, POINTER_WIDTH));
+    }
 
-        let obj_id = expr.extract(63, 32);
-        let (value, width) = const_bv_value(&obj_id)
-            .expect("obj_id lane must const-fold after split-add with symbolic count");
-        assert_eq!(width, 32);
-        assert_eq!(value, num_bigint::BigInt::from(0x42u32));
+    /// A large backwards wrapping byte step keeps every bit of the count.
+    #[test]
+    fn test_inline_ptr_wrapping_byte_sub_symbolic_count_is_full_width() {
+        let ptr = Expr::var("p", Sort::bitvec(POINTER_WIDTH));
+        let count = Expr::var("k", Sort::bitvec(POINTER_WIDTH));
+        let expr = inline_ptr_wrapping_byte_expr(
+            StubKind::PtrWrappingByteSub,
+            &[ptr.clone(), count.clone()],
+        )
+        .expect("wrapping_byte_sub should inline");
+        assert_eq!(
+            expr,
+            crate::codegen_ay::chc::pointer_step::identity_address_view(
+                crate::codegen_ay::chc::pointer_step::identity_address_view(ptr).bvsub(count)
+            ),
+            "wrapping byte sub must be a full-width subtraction on the address view"
+        );
+    }
+
+    /// A fat slice pointer keeps its length through a byte step: only the data
+    /// word moves (ptr_to_ref_cast/slice check_with_byte_add_sub_pass).
+    #[test]
+    fn test_inline_ptr_wrapping_byte_add_keeps_fat_pointer_metadata() {
+        use crate::codegen_ay::chc::expr::codegen_expr_heap_bv_eval::const_bv_value;
+
+        let len = Expr::bitvec_const(5u64, POINTER_WIDTH);
+        let data = Expr::bitvec_const(0x2_0000_0000u64, POINTER_WIDTH);
+        let fat = len.concat(data);
+        let count = Expr::bitvec_const(3u64, POINTER_WIDTH);
+        let expr = inline_ptr_wrapping_byte_expr(StubKind::PtrWrappingByteAdd, &[fat, count])
+            .expect("wrapping_byte_add on a fat pointer should inline");
+
+        assert_eq!(expr.sort().bitvec_width(), Some(2 * POINTER_WIDTH));
+        let (meta, _) = const_bv_value(&expr.clone().extract(127, 64)).expect("metadata folds");
+        assert_eq!(meta, num_bigint::BigInt::from(5u32), "slice length must survive");
+        let (addr, _) = const_bv_value(&expr.extract(63, 0)).expect("data word folds");
+        assert_eq!(addr, num_bigint::BigInt::from(0x2_0000_0003u64));
+    }
+
+    /// add-then-sub by the same symbolic count on a fat pointer is the original
+    /// pointer, metadata included, once the data words cancel.
+    #[test]
+    fn test_inline_ptr_wrapping_byte_add_sub_roundtrip_keeps_symbolic_metadata() {
+        let fat = Expr::var("fat_ptr", Sort::bitvec(2 * POINTER_WIDTH));
+        let count = Expr::var("k", Sort::bitvec(POINTER_WIDTH));
+        let added = inline_ptr_wrapping_byte_expr(
+            StubKind::PtrWrappingByteAdd,
+            &[fat.clone(), count.clone()],
+        )
+        .expect("add inlines");
+        let back = inline_ptr_wrapping_byte_expr(StubKind::PtrWrappingByteSub, &[added, count])
+            .expect("sub inlines");
+        assert_eq!(back.sort().bitvec_width(), Some(2 * POINTER_WIDTH));
+        // The metadata half is the operand's own high half, not padding.
+        let rendered = back.to_string();
+        assert!(rendered.contains("(_ extract 127 64)"), "metadata taken from operand: {rendered}");
+        assert!(!rendered.contains("zero_extend"), "no widened-thin padding: {rendered}");
+    }
+
+    /// A thin pointer is unchanged: same width, same value as before.
+    #[test]
+    fn test_inline_ptr_wrapping_byte_add_thin_pointer_unchanged() {
+        let ptr = Expr::bitvec_const(0x1000u64, POINTER_WIDTH);
+        let count = Expr::bitvec_const(2u64, POINTER_WIDTH);
+        let expr = inline_ptr_wrapping_byte_expr(StubKind::PtrWrappingByteAdd, &[ptr, count])
+            .expect("thin wrapping_byte_add inlines");
+        assert_eq!(expr, Expr::bitvec_const(0x1002u64, POINTER_WIDTH));
     }
 
     #[test]
@@ -1548,5 +1512,61 @@ mod tests {
             inline_mutex_new_expr("std::sync::Mutex::<i64>::new", &[a, b]).is_none(),
             "Mutex::new with 2 args should be rejected"
         );
+    }
+
+    #[test]
+    fn test_fixed_array_inline_comparison_requires_array_data_and_keeps_polarity() {
+        use crate::codegen_ay::chc::ChcConfig;
+        use crate::codegen_ay::context::with_test_ay_ctx_for_source;
+        use crate::codegen_ay::test_fixtures::find_instance_by_suffix;
+        use rustc_public::CrateDef;
+        use rustc_public::mir::Place;
+        with_test_ay_ctx_for_source("pub fn arrays(value: [u32; 2]) { let _ = value; }", |ctx| {
+            let body = find_instance_by_suffix(ctx.tcx, "arrays").body().unwrap();
+            let chc = ChcCtx::new(ctx.tcx, &body, "arrays", ChcConfig::default());
+            let arg = Operand::Copy(Place { local: 1, projection: vec![] });
+            let eq_path = "<u32 as core::array::equality::SpecArrayEq<u32, 2>>::spec_eq";
+            let ne_path = "<u32 as core::array::equality::SpecArrayEq<u32, 2>>::spec_ne";
+            let pointer = Expr::var("pointer", Sort::bv64());
+            assert!(
+                inline_spec_array_eq_expr(
+                    &chc,
+                    eq_path,
+                    false,
+                    true,
+                    &[pointer.clone(), pointer],
+                    Some(&arg),
+                    body.locals()
+                )
+                .is_none()
+            );
+            let array = Expr::const_array(Sort::bv64(), Expr::bitvec_const(5u64, 32));
+            let args = [array.clone(), array];
+            let eq = inline_spec_array_eq_expr(
+                &chc,
+                eq_path,
+                false,
+                true,
+                &args,
+                Some(&arg),
+                body.locals(),
+            )
+            .unwrap();
+            let ne = inline_spec_array_eq_expr(
+                &chc,
+                ne_path,
+                true,
+                true,
+                &args,
+                Some(&arg),
+                body.locals(),
+            )
+            .unwrap();
+            assert_eq!(ne, eq.not());
+            assert!(
+                inline_spec_array_eq_expr(&chc, eq_path, false, true, &args, None, body.locals())
+                    .is_none()
+            );
+        });
     }
 }

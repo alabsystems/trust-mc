@@ -40,8 +40,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.assign_value_to_place(destination, true_expr);
             return target;
         }
-        if method == "check_language_ub" {
-            debug!("AY codegen: handling ub_checks language UB check (skip)");
+        // `check_language_ub()` / `check_library_ub()`: false, as Kani (see
+        // `rustc_compat::runtime_checks_value`). Returning without assigning
+        // the destination left it nondeterministic, so the precondition ran on
+        // some paths.
+        if method == "check_language_ub" || method == "check_library_ub" {
+            debug!("AY codegen: ub_checks {method} -> false (Kani parity)");
+            self.assign_value_to_place(destination, Expr::bool_const(false));
             return target;
         }
         None

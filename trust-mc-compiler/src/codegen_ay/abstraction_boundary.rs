@@ -9,7 +9,7 @@
 
 use crate::codegen_ay::diagnostics::record_unstubbed_abstraction;
 use crate::codegen_ay::stubs::StubRegistry;
-use crate::kani_middle::reachability::AbstractionBoundary;
+use crate::kani_middle::reachability::{AbstractionBoundary, AbstractionCallsite};
 use crate::kani_middle::stable_atomic_policy;
 
 pub(in crate::codegen_ay) struct AYAbstractionBoundary {
@@ -65,8 +65,34 @@ impl AbstractionBoundary for AYAbstractionBoundary {
         is_handler_backed_ay_abstraction(path)
     }
 
+    fn begin_inventory(&self) {
+        super::unstubbed_accounting::begin_inventory();
+    }
+
+    fn finish_inventory(&self) {
+        super::unstubbed_accounting::finish_inventory();
+    }
+
+    fn record_reachable_body(
+        &self,
+        caller: rustc_public::mir::mono::Instance,
+        body: &rustc_public::mir::Body,
+    ) {
+        super::unstubbed_accounting::record_reachable_body(caller, body);
+    }
+
     fn record_unstubbed_abstraction(&self, path: &str) {
         record_unstubbed_abstraction(path);
+    }
+
+    fn record_unstubbed_call(
+        &self,
+        path: &str,
+        callee: rustc_public::mir::mono::Instance,
+        site: Option<AbstractionCallsite<'_>>,
+        identity_established: bool,
+    ) {
+        super::unstubbed_accounting::record_pending(path, callee, site, identity_established);
     }
 }
 

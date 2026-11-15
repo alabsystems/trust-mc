@@ -95,6 +95,18 @@ fn probe_bytes() -> Option<u8> {
     s.bytes().nth(0)
 }
 
+fn probe_chars_nth4() -> Option<char> {
+    "abcdef".chars().nth(4)
+}
+
+fn probe_chars_nth2() -> Option<char> {
+    "abcdef".chars().nth(2)
+}
+
+fn probe_bytes_nth4() -> Option<u8> {
+    "abcdef".bytes().nth(4)
+}
+
 fn probe_projection() -> Option<char> {
     let mut buf = String::from("123456");
     let my_str = MyStr::new(&mut buf);
@@ -445,4 +457,53 @@ fn test_library_string_helper_boundary_stays_internal() {
             == 2,
         "only the core/std macro variants should retain root-level string helper entry points"
     );
+}
+
+/// `chars().nth(k)` runs `Chars::advance_by`, a loop of one pass per skipped
+/// char, and Kani fails its unwinding assertion unless `k < U` (measured for
+/// `k` in 0..=5, `U` in 1..=6). The helper has no loop, so under a declared
+/// bound the rewrite dropped that failure: `chars().nth(4)` under
+/// `#[kani::unwind(3)]` verified clean (walker fail-closed review 6 round 3,
+/// finding 6). Under a bound only a constant `k < U` is rewritten; `bytes()`
+/// (a slice index in std) and an unbounded unit are rewritten as before.
+#[test]
+fn test_chars_nth_rewrite_respects_the_declared_unwind() {
+    with_test_tcx_for_source(SIMPLE_STR_ITER_SOURCE, |tcx| {
+        let run = |suffix: &str, unwind: Option<u32>| {
+            let instance = find_instance_by_suffix(tcx, suffix);
+            let body = instance.body().expect("probe should have a body");
+            SimpleStrIterPass::with_declared_unwind(unwind).transform(tcx, body, instance).0
+        };
+        assert!(!run("probe_chars_nth4", Some(3)), "k = 4 >= U = 3: the std call stays");
+        assert!(run("probe_chars_nth2", Some(3)), "k = 2 < U = 3: rewritten");
+        assert!(run("probe_chars_nth4", Some(5)), "k = 4 < U = 5: rewritten");
+        assert!(run("probe_chars_nth4", None), "no declared bound: rewritten");
+        assert!(run("probe_bytes_nth4", Some(3)), "bytes().nth is loop-free: rewritten");
+    });
+}
+
+/// The pass starts at the unit's smallest bound and is re-keyed per harness
+/// (`BodyTransformation::set_harness_declared_unwind`): a harness declaring
+/// `unwind(8)` gets the rewrite of `chars().nth(4)` even when another harness
+/// of the unit declares `unwind(3)` (walker fail-closed review 6 round 3,
+/// `str_chars_nth_unwind_dual.rs` `n1_chars_nth_u8_safe`, which failed
+/// against main's proof), and the next `unwind(3)` harness keeps the std call.
+#[test]
+fn test_chars_nth_rewrite_follows_the_harness_bound() {
+    use crate::kani_middle::transform::TransformPass;
+    with_test_tcx_for_source(SIMPLE_STR_ITER_SOURCE, |tcx| {
+        let instance = find_instance_by_suffix(tcx, "probe_chars_nth4");
+        let mut pass = SimpleStrIterPass::with_declared_unwind(Some(3));
+        let mut run = |pass: &mut SimpleStrIterPass| {
+            let body = instance.body().expect("probe should have a body");
+            pass.transform(tcx, body, instance).0
+        };
+        assert!(!run(&mut pass), "the unit's bound 3: the std call stays");
+        pass.set_harness_declared_unwind(Some(8));
+        assert!(run(&mut pass), "a harness with unwind(8): rewritten");
+        pass.set_harness_declared_unwind(Some(3));
+        assert!(!run(&mut pass), "the next harness with unwind(3): the std call stays");
+        pass.set_harness_declared_unwind(None);
+        assert!(run(&mut pass), "a harness with no bound: rewritten");
+    });
 }

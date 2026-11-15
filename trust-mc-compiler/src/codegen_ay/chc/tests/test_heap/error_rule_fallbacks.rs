@@ -93,7 +93,7 @@ fn test_emit_error_rule_for_condition_unsupported_sort_emits_conservative_rule()
 
         // The emitted rule should target the error relation.
         let last_rule = chc_ctx.vc.rules.last().expect("at least one rule");
-        assert_eq!(last_rule.head.name, "error", "Conservative rule must target error relation");
+        assert!(is_error_check_rule(last_rule), "Conservative rule must target the error family, got {}", last_rule.head.name);
     });
 }
 
@@ -139,7 +139,9 @@ fn test_emit_error_rule_for_condition_bool_sort_emits_negated_rule() {
 
         // The rule should contain a negation (violation = !cond), not be unconditional.
         let last_rule = chc_ctx.vc.rules.last().expect("at least one rule");
-        assert_eq!(last_rule.head.name, "error", "Rule must target error");
+        // BSEM-18: the check rule targets its per-property `error_p{id}` relation
+        // (bridged to `error` by `register_error_head`).
+        assert!(is_error_check_rule(last_rule), "Rule must target the error family, got {}", last_rule.head.name);
         // The body should have more constraints than just stmt_constraints
         // (the violation constraint is appended).
         let body_constraints = &last_rule.body.constraints;
@@ -270,7 +272,9 @@ fn test_false_check_produces_unconditional_error_rule() {
 
         // The rule body should contain `not(false)` = `true`, making it unconditional.
         let last_rule = chc_ctx.vc.rules.last().expect("at least one rule");
-        assert_eq!(last_rule.head.name, "error", "Rule must target error");
+        // BSEM-18: the check rule targets its per-property `error_p{id}` relation
+        // (bridged to `error` by `register_error_head`).
+        assert!(is_error_check_rule(last_rule), "Rule must target the error family, got {}", last_rule.head.name);
 
         // The body constraints should include the negated false (= true).
         let body_constraints = &last_rule.body.constraints;

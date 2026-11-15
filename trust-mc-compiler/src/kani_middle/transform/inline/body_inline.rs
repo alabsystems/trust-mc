@@ -20,11 +20,22 @@ use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AggregateKind, BasicBlock, BasicBlockIdx, Body, Local, Mutability, Operand, Place,
-    ProjectionElem, RawPtrKind, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+    ProjectionElem, RawPtrKind, Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use rustc_public::ty::{RigidTy, Span, Ty, TyKind, UintTy};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
+
+fn mapped_explicit_storage_lives(body: &Body, local_map: &HashMap<Local, Local>) -> HashSet<Local> {
+    body.blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement.kind {
+            StatementKind::StorageLive(local) => local_map.get(&local).copied(),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Inline a function body at a call site.
 ///
@@ -54,6 +65,7 @@ pub(super) fn inline_function(
         debug!("inline_function: callee has no locals, skipping inline");
         return None;
     }
+    let first_frame_local = caller.locals().len();
 
     // C-variadic specialization: the call site's own MIR carries the actual
     // argument sequence, so the `...` parameter is modelled as that list plus a
@@ -152,13 +164,13 @@ pub(super) fn inline_function(
         // Named parameters bind 1:1, exactly as in a non-variadic call.
         for i in 0..plan.named_count {
             let caller_arg_local = local_map[&(i + 1)];
-            stmts.push(Statement {
-                kind: StatementKind::Assign(
+            stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
                     Place::from(caller_arg_local),
-                    Rvalue::Use(call_args[i].clone()),
+                    rvalue_use!(Rvalue::Use(call_args[i].clone())),
                 ),
-                span: call_span,
-            });
+                call_span,
+            ));
         }
 
         // Each actual variadic argument is COPIED at the call site: arguments
@@ -166,13 +178,13 @@ pub(super) fn inline_function(
         // must not disturb what a fetch reads.
         for (k, actual_ty) in plan.actual_tys.iter().enumerate() {
             let local = caller.new_local(*actual_ty, call_span, Mutability::Mut);
-            stmts.push(Statement {
-                kind: StatementKind::Assign(
+            stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
                     Place::from(local),
-                    Rvalue::Use(call_args[plan.named_count + k].clone()),
+                    rvalue_use!(Rvalue::Use(call_args[plan.named_count + k].clone())),
                 ),
-                span: call_span,
-            });
+                call_span,
+            ));
             va_actual_locals.push(local);
         }
 
@@ -186,10 +198,10 @@ pub(super) fn inline_function(
             Mutability::Mut,
         );
         let zero = caller.new_uint_operand(0, UintTy::Usize, call_span);
-        stmts.push(Statement {
-            kind: StatementKind::Assign(Place::from(va_cursor_local), Rvalue::Use(zero)),
-            span: call_span,
-        });
+        stmts.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(va_cursor_local), rvalue_use!(Rvalue::Use(zero))),
+            call_span,
+        ));
 
         stmts
     } else if needs_untuple {
@@ -206,14 +218,18 @@ pub(super) fn inline_function(
             let callee_arg_local = 1; // local 1 = self
             let caller_arg_local = local_map[&callee_arg_local];
             let rvalue = match env_arg {
-                Operand::Copy(place) => Rvalue::Use(Operand::Copy(place.clone())),
-                Operand::Move(place) => Rvalue::Use(Operand::Move(place.clone())),
-                Operand::Constant(c) => Rvalue::Use(Operand::Constant(c.clone())),
+                Operand::Copy(place) => rvalue_use!(Rvalue::Use(Operand::Copy(place.clone()))),
+                Operand::Move(place) => rvalue_use!(Rvalue::Use(Operand::Move(place.clone()))),
+                Operand::Constant(c) => rvalue_use!(Rvalue::Use(Operand::Constant(c.clone()))),
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(checks) => {
+                    rvalue_use!(Rvalue::Use(Operand::RuntimeChecks(checks.clone())))
+                }
             };
-            stmts.push(Statement {
-                kind: StatementKind::Assign(Place::from(caller_arg_local), rvalue),
-                span: call_span,
-            });
+            stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(Place::from(caller_arg_local), rvalue),
+                call_span,
+            ));
         }
 
         // Remaining args: un-tuple call_args[1] into individual callee arg locals
@@ -222,6 +238,8 @@ pub(super) fn inline_function(
         let tuple_place = match &call_args[1] {
             Operand::Copy(p) | Operand::Move(p) => p.clone(),
             Operand::Constant(_) => unreachable!("tuple_arg_is_place check ensures this"),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => unreachable!("tuple_arg_is_place check ensures this"),
         };
 
         // Extract each field from the tuple for callee arg locals 2, 3, ...
@@ -237,11 +255,11 @@ pub(super) fn inline_function(
             let field_place = Place { local: tuple_place.local, projection: field_projection };
 
             let caller_arg_local = local_map[&callee_arg_idx];
-            let rvalue = Rvalue::Use(Operand::Copy(field_place));
-            stmts.push(Statement {
-                kind: StatementKind::Assign(Place::from(caller_arg_local), rvalue),
-                span: call_span,
-            });
+            let rvalue = rvalue_use!(Rvalue::Use(Operand::Copy(field_place)));
+            stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(Place::from(caller_arg_local), rvalue),
+                call_span,
+            ));
         }
 
         stmts
@@ -259,14 +277,18 @@ pub(super) fn inline_function(
             let callee_arg_local = 1; // local 1 = self
             let caller_arg_local = local_map[&callee_arg_local];
             let rvalue = match env_arg {
-                Operand::Copy(place) => Rvalue::Use(Operand::Copy(place.clone())),
-                Operand::Move(place) => Rvalue::Use(Operand::Move(place.clone())),
-                Operand::Constant(c) => Rvalue::Use(Operand::Constant(c.clone())),
+                Operand::Copy(place) => rvalue_use!(Rvalue::Use(Operand::Copy(place.clone()))),
+                Operand::Move(place) => rvalue_use!(Rvalue::Use(Operand::Move(place.clone()))),
+                Operand::Constant(c) => rvalue_use!(Rvalue::Use(Operand::Constant(c.clone()))),
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(checks) => {
+                    rvalue_use!(Rvalue::Use(Operand::RuntimeChecks(checks.clone())))
+                }
             };
-            stmts.push(Statement {
-                kind: StatementKind::Assign(Place::from(caller_arg_local), rvalue),
-                span: call_span,
-            });
+            stmts.push(crate::rustc_compat::mir_statement(
+                StatementKind::Assign(Place::from(caller_arg_local), rvalue),
+                call_span,
+            ));
         }
 
         // Remaining args: pack into tuple for local 2
@@ -274,10 +296,10 @@ pub(super) fn inline_function(
         let tuple_rvalue = Rvalue::Aggregate(AggregateKind::Tuple, tuple_operands);
         let callee_arg_local = 2; // local 2 = args tuple
         let caller_arg_local = local_map[&callee_arg_local];
-        stmts.push(Statement {
-            kind: StatementKind::Assign(Place::from(caller_arg_local), tuple_rvalue),
-            span: call_span,
-        });
+        stmts.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(caller_arg_local), tuple_rvalue),
+            call_span,
+        ));
 
         stmts
     } else {
@@ -289,18 +311,30 @@ pub(super) fn inline_function(
 
                 call_args.get(i).map(|arg_operand| {
                     let rvalue = match arg_operand {
-                        Operand::Copy(place) => Rvalue::Use(Operand::Copy(place.clone())),
-                        Operand::Move(place) => Rvalue::Use(Operand::Move(place.clone())),
-                        Operand::Constant(c) => Rvalue::Use(Operand::Constant(c.clone())),
+                        Operand::Copy(place) => {
+                            rvalue_use!(Rvalue::Use(Operand::Copy(place.clone())))
+                        }
+                        Operand::Move(place) => {
+                            rvalue_use!(Rvalue::Use(Operand::Move(place.clone())))
+                        }
+                        Operand::Constant(c) => {
+                            rvalue_use!(Rvalue::Use(Operand::Constant(c.clone())))
+                        }
+                        #[cfg(trust_toolchain)]
+                        Operand::RuntimeChecks(checks) => {
+                            rvalue_use!(Rvalue::Use(Operand::RuntimeChecks(checks.clone())))
+                        }
                     };
-                    Statement {
-                        kind: StatementKind::Assign(Place::from(caller_arg_local), rvalue),
-                        span: call_span,
-                    }
+                    crate::rustc_compat::mir_statement(
+                        StatementKind::Assign(Place::from(caller_arg_local), rvalue),
+                        call_span,
+                    )
                 })
             })
             .collect()
     };
+
+    let explicit_lives = mapped_explicit_storage_lives(callee, &local_map);
 
     // Clone callee blocks with remapped locals and block indices
     let callee_blocks = &callee.blocks;
@@ -347,15 +381,42 @@ pub(super) fn inline_function(
         Vec::new()
     };
 
+    // Include the fresh argument, variadic and fetch-check temporaries. A
+    // plain return destination is caller-owned and outside this range. The
+    // projected return temporary survives until its post-return copy.
+    let frame_locals: Vec<Local> = (first_frame_local..caller.locals().len()).collect();
+    for (callee_block, new_block) in callee_blocks.iter().zip(&mut new_blocks) {
+        if matches!(callee_block.terminator.kind, TerminatorKind::Return) {
+            for &local in &frame_locals {
+                if Some(local) != ret_tmp {
+                    new_block.statements.push(crate::rustc_compat::mir_statement(
+                        StatementKind::StorageDead(local),
+                        call_span,
+                    ));
+                }
+            }
+        }
+    }
+
     // Replace the Call terminator with Goto to inlined entry
     let call_block = caller.block_mut(call_bb_idx);
+    for &local in &frame_locals {
+        if !explicit_lives.contains(&local) {
+            call_block.statements.push(crate::rustc_compat::mir_statement(
+                StatementKind::StorageLive(local),
+                call_span,
+            ));
+        }
+    }
     for stmt in init_stmts {
         call_block.statements.push(stmt);
     }
 
     let inlined_entry = caller_blocks_base;
-    call_block.terminator =
-        Terminator { kind: TerminatorKind::Goto { target: inlined_entry }, span: call_span };
+    call_block.terminator = crate::rustc_compat::mir_terminator(
+        TerminatorKind::Goto { target: inlined_entry },
+        call_span,
+    );
 
     // Add all inlined blocks to caller
     for new_block in new_blocks {
@@ -365,23 +426,29 @@ pub(super) fn inline_function(
     // For projected destinations, add post_return_bb that copies ret_tmp to call_dest
     if let Some(ret_tmp_local) = ret_tmp {
         // Create statement: call_dest = move ret_tmp
-        let assign_stmt = Statement {
-            kind: StatementKind::Assign(
+        let assign_stmt = crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 call_dest.clone(),
-                Rvalue::Use(Operand::Move(Place::from(ret_tmp_local))),
+                rvalue_use!(Rvalue::Use(Operand::Move(Place::from(ret_tmp_local)))),
             ),
-            span: call_span,
-        };
+            call_span,
+        );
 
         // Create terminator: goto call_target (or Unreachable if no target)
         let post_return_terminator = if let Some(target) = call_target {
-            Terminator { kind: TerminatorKind::Goto { target }, span: call_span }
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, call_span)
         } else {
-            Terminator { kind: TerminatorKind::Unreachable, span: call_span }
+            crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, call_span)
         };
 
-        let post_return_bb =
-            BasicBlock { statements: vec![assign_stmt], terminator: post_return_terminator };
+        let end_return_storage = crate::rustc_compat::mir_statement(
+            StatementKind::StorageDead(ret_tmp_local),
+            call_span,
+        );
+        let post_return_bb = BasicBlock {
+            statements: vec![assign_stmt, end_return_storage],
+            terminator: post_return_terminator,
+        };
 
         caller.push_block(post_return_bb);
 
@@ -423,6 +490,8 @@ pub(super) fn resolve_drop_terminators<F>(
     body_provider: &mut F,
     max_drops: usize,
     drops_resolved: &mut usize,
+    preserve_native_thin_boxes: bool,
+    preserve_native_dyn_boxes: bool,
 ) -> bool
 where
     F: FnMut(Instance) -> Option<Body>,
@@ -458,6 +527,21 @@ where
             Ok(ty) => ty,
             Err(_) => continue,
         };
+        if preserve_native_thin_boxes
+            && crate::codegen_ay::native_bmc_box_drop_is_modeled(tcx, drop_ty)
+        {
+            continue;
+        }
+        if preserve_native_dyn_boxes
+            && crate::codegen_ay::native_global_box_pointee(tcx, drop_ty).is_some_and(|inner| {
+                matches!(
+                    inner.kind(),
+                    rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Dynamic(..))
+                )
+            })
+        {
+            continue;
+        }
 
         // Part of #4067: Preserve Arc/Rc/Mutex/RwLock Drop terminators for CHC handlers.
         if let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _)) =
@@ -485,9 +569,9 @@ where
             && let Some(rustc_public::ty::GenericArgKind::Type(elem_ty)) = args.0.first()
             && Instance::resolve_drop_in_place(*elem_ty).is_empty_shim()
         {
-            let span = mutable_body.blocks()[drop_bb_idx].terminator.span;
+            let span = mir_span!(mutable_body.blocks()[drop_bb_idx].terminator);
             mutable_body.block_mut(drop_bb_idx).terminator =
-                Terminator { kind: TerminatorKind::Goto { target }, span };
+                crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, span);
             debug!(
                 "resolve_drop: bb{} benign inline container {} (empty-drop elem) → Goto bb{}",
                 drop_bb_idx,
@@ -503,9 +587,9 @@ where
 
         // Empty drop shim → replace with Goto (no drop glue needed).
         if drop_instance.is_empty_shim() {
-            let span = mutable_body.blocks()[drop_bb_idx].terminator.span;
+            let span = mir_span!(mutable_body.blocks()[drop_bb_idx].terminator);
             mutable_body.block_mut(drop_bb_idx).terminator =
-                Terminator { kind: TerminatorKind::Goto { target }, span };
+                crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, span);
             debug!(
                 "resolve_drop: bb{} empty shim for {} → Goto bb{}",
                 drop_bb_idx,
@@ -563,7 +647,7 @@ where
 ///
 /// The drop shim takes `*mut T` (local 1) and returns `()` (local 0).
 /// Internal `Call` terminators are picked up by call inlining in later iterations.
-fn inline_drop_shim(
+pub(super) fn inline_drop_shim(
     tcx: TyCtxt<'_>,
     callee_instance: Instance,
     caller: &mut MutableBody,
@@ -577,8 +661,9 @@ fn inline_drop_shim(
         debug!("inline_drop_shim: callee has no locals, skipping");
         return;
     }
+    let first_frame_local = caller.locals().len();
 
-    let drop_span = caller.blocks()[drop_bb_idx].terminator.span;
+    let drop_span = mir_span!(caller.blocks()[drop_bb_idx].terminator);
 
     // Build local map: callee local → caller local.
     let mut local_map: HashMap<Local, Local> = HashMap::new();
@@ -610,15 +695,19 @@ fn inline_drop_shim(
 
     // Create the initialization statement: ptr_local = &raw mut drop_place.
     // This gives the shim a raw pointer to the value being dropped.
-    let init_stmt = local_map.get(&1).map(|&ptr_local| Statement {
-        kind: StatementKind::Assign(
-            Place::from(ptr_local),
-            Rvalue::AddressOf(RawPtrKind::Mut, drop_place.clone()),
-        ),
-        span: drop_span,
+    let init_stmt = local_map.get(&1).map(|&ptr_local| {
+        crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
+                Place::from(ptr_local),
+                Rvalue::AddressOf(RawPtrKind::Mut, drop_place.clone()),
+            ),
+            drop_span,
+        )
     });
 
     // Remap callee blocks: offset all block indices by the current block count.
+    let frame_locals: Vec<Local> = (first_frame_local..caller.locals().len()).collect();
+    let explicit_lives = mapped_explicit_storage_lives(callee, &local_map);
     let caller_blocks_base = caller.num_blocks();
     let block_map = |callee_bb: BasicBlockIdx| -> BasicBlockIdx { caller_blocks_base + callee_bb };
     let remap_ty = |ty| monomorphize_ty(tcx, callee_instance, ty);
@@ -628,20 +717,38 @@ fn inline_drop_shim(
 
     let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
     for callee_block in &callee.blocks {
-        let new_block =
+        let mut new_block =
             remap_block_with_ty(callee_block, &local_map, &block_map, return_target, &remap_ty);
+        if matches!(callee_block.terminator.kind, TerminatorKind::Return) {
+            for &local in &frame_locals {
+                new_block.statements.push(crate::rustc_compat::mir_statement(
+                    StatementKind::StorageDead(local),
+                    drop_span,
+                ));
+            }
+        }
         new_blocks.push(new_block);
     }
 
     // Replace the Drop terminator: add init stmt + Goto to shim entry.
     let call_block = caller.block_mut(drop_bb_idx);
+    for &local in &frame_locals {
+        if !explicit_lives.contains(&local) {
+            call_block.statements.push(crate::rustc_compat::mir_statement(
+                StatementKind::StorageLive(local),
+                drop_span,
+            ));
+        }
+    }
     if let Some(stmt) = init_stmt {
         call_block.statements.push(stmt);
     }
 
     let inlined_entry = caller_blocks_base;
-    call_block.terminator =
-        Terminator { kind: TerminatorKind::Goto { target: inlined_entry }, span: drop_span };
+    call_block.terminator = crate::rustc_compat::mir_terminator(
+        TerminatorKind::Goto { target: inlined_entry },
+        drop_span,
+    );
 
     // Add all inlined blocks to caller.
     for new_block in new_blocks {

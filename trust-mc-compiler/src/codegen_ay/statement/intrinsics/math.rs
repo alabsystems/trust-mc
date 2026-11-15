@@ -24,7 +24,7 @@ use ay_bindings::{Expr, RoundingMode, Sort};
 use rustc_public::mir::{BasicBlockIdx, BinOp, Operand, Place};
 use tracing::debug;
 
-use super::bmc_fp_theory::{bmc_fp_fma, bmc_fp_minmax, bmc_fp_round_to_integral, bmc_fp_sqrt};
+use super::bmc_fp_theory::{bmc_fp_fma, bmc_fp_round_to_integral, bmc_fp_sqrt};
 use crate::codegen_ay::statement::StatementCodegen;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -70,6 +70,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let result = if lhs.sort().is_bitvec() {
             use crate::codegen_ay::float_arithmetic::bv_float_binop;
             let width = lhs.sort().bitvec_width()?;
+            // Kani `--nan-check` parity: Kani lowers these intrinsics to the
+            // plain float operator, which the NaN check instruments. With the
+            // operand-finiteness violations above, the only NaN left to catch
+            // is fdiv_fast(±0, ±0); the exact predicate captures just that.
+            if self.ctx.config.nan_checks {
+                self.emit_float_nan_check(op, &lhs, &rhs, width);
+            }
             bv_float_binop(op, lhs, rhs, width)?
         } else {
             let is_signed = self.is_signed_integer_op(&args[0], &args[1]);
@@ -138,6 +145,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let dest_name = self.ssa_name_from_base(&base_name, true);
         let dest_expr = self.ctx.declare_var(&dest_name, Sort::bitvec(32));
         self.env_update(base_name, dest_expr);
+        // The fresh value stands in for the intrinsic's real result, so a proof
+        // over it is sound but a counterexample that reads it is not evidence of
+        // a bug: `x.powf(2.0) >= 0.0` for `x` in (1, 65535) was certified Genuine
+        // (kani/Intrinsics/Math/Arith/powf32.rs, exposed once `u16 as f32` stopped
+        // reinterpreting bits and the assumption stopped being vacuous). SAT-only
+        // taint, like the other false-certificate sites.
+        self.ctx.bmc_sound_havoc("math_intrinsic_fresh_value");
         target
     }
 
@@ -178,6 +192,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let dest_name = self.ssa_name_from_base(&base_name, true);
         let dest_expr = self.ctx.declare_var(&dest_name, Sort::bitvec(64));
         self.env_update(base_name, dest_expr);
+        // The fresh value stands in for the intrinsic's real result, so a proof
+        // over it is sound but a counterexample that reads it is not evidence of
+        // a bug: `x.powf(2.0) >= 0.0` for `x` in (1, 65535) was certified Genuine
+        // (kani/Intrinsics/Math/Arith/powf32.rs, exposed once `u16 as f32` stopped
+        // reinterpreting bits and the assumption stopped being vacuous). SAT-only
+        // taint, like the other false-certificate sites.
+        self.ctx.bmc_sound_havoc("math_intrinsic_fresh_value");
         target
     }
 
@@ -244,16 +265,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let bits1 = self.try_extract_f32_const(arg1)?;
             let val1 = f32::from_bits(bits1);
             return Some(val0.copysign(val1).to_bits());
-        } else if intrinsic_name.ends_with("minnumf32") {
+        } else if intrinsic_name.ends_with("minnumf32") || intrinsic_name.ends_with("maxnumf32") {
             let arg1 = args.get(1)?;
             let bits1 = self.try_extract_f32_const(arg1)?;
             let val1 = f32::from_bits(bits1);
-            return Some(val0.min(val1).to_bits());
-        } else if intrinsic_name.ends_with("maxnumf32") {
-            let arg1 = args.get(1)?;
-            let bits1 = self.try_extract_f32_const(arg1)?;
-            let val1 = f32::from_bits(bits1);
-            return Some(val0.max(val1).to_bits());
+            // Decided by IEEE comparison where every toolchain agrees; opposite zeros, two NaNs
+            // and a signalling NaN have no single constant (`float_minmax`), so
+            // `try_exact_bv_math` encodes the choice or the relation. Never the host's `min`.
+            let is_min = intrinsic_name.ends_with("minnumf32");
+            return crate::codegen_ay::float_minmax::minmax_num_fold_f32(is_min, val0, val1)
+                .map(f32::to_bits);
         } else if intrinsic_name.ends_with("fmaf32") {
             // fma(a, b, c) = a * b + c
             let arg1 = args.get(1)?;
@@ -335,16 +356,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let bits1 = self.try_extract_f64_const(arg1)?;
             let val1 = f64::from_bits(bits1);
             return Some(val0.copysign(val1).to_bits());
-        } else if intrinsic_name.ends_with("minnumf64") {
+        } else if intrinsic_name.ends_with("minnumf64") || intrinsic_name.ends_with("maxnumf64") {
             let arg1 = args.get(1)?;
             let bits1 = self.try_extract_f64_const(arg1)?;
             let val1 = f64::from_bits(bits1);
-            return Some(val0.min(val1).to_bits());
-        } else if intrinsic_name.ends_with("maxnumf64") {
-            let arg1 = args.get(1)?;
-            let bits1 = self.try_extract_f64_const(arg1)?;
-            let val1 = f64::from_bits(bits1);
-            return Some(val0.max(val1).to_bits());
+            // See the f32 arm.
+            let is_min = intrinsic_name.ends_with("minnumf64");
+            return crate::codegen_ay::float_minmax::minmax_num_fold_f64(is_min, val0, val1)
+                .map(f64::to_bits);
         } else if intrinsic_name.ends_with("fmaf64") {
             // fma(a, b, c) = a * b + c
             let arg1 = args.get(1)?;
@@ -439,14 +458,90 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return bmc_fp_fma(arg0_expr, arg1_expr, arg2_expr, width);
         }
 
-        // minnum/maxnum: FP theory min/max with NaN propagation.
-        if intrinsic_name.ends_with("minnumf32") || intrinsic_name.ends_with("minnumf64") {
+        // minnum/maxnum (Trust: minimum_number_nsz_* / maximum_number_nsz_*): the exact
+        // result where the contract determines it, and a fresh choice where it does not
+        // (opposite zeros, two NaNs), in bitvector form. `fp.min` / `fp.max` left opposite
+        // zeros to the solver's discretion, and a solver or its simplifier may pick one. See
+        // `float_minmax`.
+        let minmax_kind = if intrinsic_name.ends_with("minnumf32")
+            || intrinsic_name.ends_with("minnumf64")
+        {
+            Some(true)
+        } else if intrinsic_name.ends_with("maxnumf32") || intrinsic_name.ends_with("maxnumf64") {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(is_min) = minmax_kind {
             let arg1_expr = self.codegen_operand(args.get(1)?)?;
-            return bmc_fp_minmax(arg0_expr, arg1_expr, width, true);
-        }
-        if intrinsic_name.ends_with("maxnumf32") || intrinsic_name.ends_with("maxnumf64") {
-            let arg1_expr = self.codegen_operand(args.get(1)?)?;
-            return bmc_fp_minmax(arg0_expr, arg1_expr, width, false);
+            // Both arguments known bit for bit (the operands are often SSA names bound to
+            // constants that `try_fold_math_*` does not see through): decide the case here.
+            // A determined result is exact on the host (one NaN returns the other argument,
+            // unequal values the smaller/larger, identical zeros themselves), and a
+            // non-deterministic one needs no FP term at all. Keeping FP ops off ground inputs
+            // matters: the solver decided `fp.min` of constants, and stopped deciding it once
+            // the term also carried the fresh choices below.
+            let ground = |expr: &Expr| match self.resolve_concrete_expr(expr).value() {
+                ay_bindings::ExprValue::BitVecConst { value, width: w } if *w == width => {
+                    value.to_u64_digits().1.first().copied().or(Some(0))
+                }
+                _ => None,
+            };
+            if let (Some(bits0), Some(bits1)) = (ground(&arg0_expr), ground(&arg1_expr)) {
+                // Decided by IEEE comparison, never the host's `min` / `max` (`float_minmax`).
+                let (concrete, nondeterministic, both_nan) = match width {
+                    32 => {
+                        let (a, b) = (f32::from_bits(bits0 as u32), f32::from_bits(bits1 as u32));
+                        (
+                            crate::codegen_ay::float_minmax::minmax_num_fold_f32(is_min, a, b)
+                                .map(|r| u64::from(r.to_bits())),
+                            crate::codegen_ay::float_minmax::minmax_num_result_is_nondeterministic_f32(a, b),
+                            a.is_nan() && b.is_nan(),
+                        )
+                    }
+                    64 => {
+                        let (a, b) = (f64::from_bits(bits0), f64::from_bits(bits1));
+                        (
+                            crate::codegen_ay::float_minmax::minmax_num_fold_f64(is_min, a, b)
+                                .map(f64::to_bits),
+                            crate::codegen_ay::float_minmax::minmax_num_result_is_nondeterministic_f64(a, b),
+                            a.is_nan() && b.is_nan(),
+                        )
+                    }
+                    _ => return None,
+                };
+                if let Some(bits) = concrete {
+                    return Some(Expr::bitvec_const(bits as u128, width));
+                }
+                if nondeterministic {
+                    // Opposite zeros (either argument) or two NaNs (any NaN).
+                    if both_nan {
+                        let nan_name = self.ctx.fresh_name("minmax_num_nan_result");
+                        let nan_result = self.ctx.declare_var(&nan_name, Sort::bitvec(width));
+                        self.ctx.assert(crate::codegen_ay::float_minmax::ieee_is_nan_bv(
+                            &nan_result,
+                            width,
+                        )?);
+                        return Some(nan_result);
+                    }
+                    let choice_name = self.ctx.fresh_name("minmax_num_equal_choice");
+                    let choice = self.ctx.declare_var(&choice_name, Sort::bool());
+                    return Some(Expr::ite(choice, arg0_expr, arg1_expr));
+                }
+                // A signalling NaN argument: the toolchains' run times differ on it, so the
+                // symbolic term below decides it as the contract does (the other argument),
+                // identically on both routes.
+            }
+            let choice_name = self.ctx.fresh_name("minmax_num_equal_choice");
+            let choice = self.ctx.declare_var(&choice_name, Sort::bool());
+            let nan_name = self.ctx.fresh_name("minmax_num_nan_result");
+            let nan_result = self.ctx.declare_var(&nan_name, Sort::bitvec(width));
+            let (term, nan_result_is_nan) = crate::codegen_ay::float_minmax::minmax_num_bv_term(
+                is_min, &arg0_expr, &arg1_expr, choice, nan_result, width,
+            )?;
+            // Only constrains a fresh variable, so it can never make the query infeasible.
+            self.ctx.assert(nan_result_is_nan);
+            return Some(term);
         }
 
         None

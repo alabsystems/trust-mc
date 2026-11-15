@@ -26,6 +26,8 @@
 //!   * a false "not defined" keeps the pre-existing fail-closed `error()`.
 //! Neither direction can produce a false proof.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
 use rustc_public::ty::{RigidTy, Ty, TyKind};
@@ -96,12 +98,85 @@ pub(in crate::codegen_ay) fn foreign_link_symbol(tcx: TyCtxt<'_>, func_ty: Ty) -
 /// Does `ty` carry interior mutability (is it non-`Freeze`)? Fails toward
 /// `true` — i.e. toward havoc — for a type with unresolved parameters.
 pub(in crate::codegen_ay) fn ty_has_interior_mut(tcx: TyCtxt<'_>, ty: Ty) -> bool {
-    use rustc_middle::ty::TypeVisitableExt;
-    let internal_ty = rustc_public::rustc_internal::internal(tcx, ty);
-    if internal_ty.has_param() {
+    // Rule A's one parameter test (`shared::mono_ty`): deep, type and const
+    // parameters. Lifetimes are erased before the `Freeze` query.
+    if crate::codegen_ay::shared::mono_ty::has_unresolved_params(ty) {
         return true;
     }
+    let internal_ty =
+        tcx.erase_and_anonymize_regions(rustc_public::rustc_internal::internal(tcx, ty));
     !internal_ty.is_freeze(tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
+}
+
+/// Can a COPY of a value of `ty` go STALE — can the copy reach, through a
+/// pointer it holds or an `UnsafeCell` it contains, state that another alias
+/// may mutate while the copy lives?
+///
+/// This is the question a slice-view copy has to answer, and it is NOT
+/// `Freeze`: `&Cell<u8>`, `Box<Cell<u8>>`, `Rc<Cell<u8>>` and `Arc<AtomicU8>`
+/// are every one of them `Freeze` by type, yet the copy holds the same pointer
+/// and the state behind it keeps changing. Deciding on `Freeze` let both lanes
+/// copy such views: `let view: &[&Cell<u8>] = &refs[..]; view[1].set(7);
+/// assert!(cells[1].get() == 2)` verified SUCCESSFUL in BMC and
+/// `let view: &[Rc<Cell<u8>>] = &arr[..]; shared.set(7);
+/// assert!(view[0].get() == 7)` FAILED with a Genuine counterexample in CHC
+/// (negative/frozen_views_indirect.rs, main 31793ccc3 and bundle edec8fd8a).
+///
+/// It is also not "contains a pointer": `&str`, `String` and `Vec<u8>` all hold
+/// pointers to plain data, and a copy of one of those is exactly as good as the
+/// original, so those views stay exact.
+///
+/// Fails toward `true` — the caller then fails closed — for unresolved
+/// parameters, for anything opaque (`dyn`, closures, coroutines) and for a type
+/// nested deeper than [`COPY_STALENESS_DEPTH`] (a recursive type reaches it).
+pub(in crate::codegen_ay) fn ty_copy_can_go_stale(tcx: TyCtxt<'_>, ty: Ty) -> bool {
+    ty_copy_can_go_stale_at(tcx, ty, 0)
+}
+
+/// Nesting budget for [`ty_copy_can_go_stale`].
+const COPY_STALENESS_DEPTH: u32 = 12;
+
+fn ty_copy_can_go_stale_at(tcx: TyCtxt<'_>, ty: Ty, depth: u32) -> bool {
+    if depth > COPY_STALENESS_DEPTH {
+        return true;
+    }
+    // An `UnsafeCell` reachable BY VALUE settles it without any recursion.
+    if ty_has_interior_mut(tcx, ty) {
+        return true;
+    }
+    let TyKind::RigidTy(rigid) = ty.kind() else {
+        return true; // generic param / alias / bound: not certain
+    };
+    match rigid {
+        RigidTy::Bool
+        | RigidTy::Char
+        | RigidTy::Int(_)
+        | RigidTy::Uint(_)
+        | RigidTy::Float(_)
+        | RigidTy::Never
+        | RigidTy::Str
+        | RigidTy::Foreign(_)
+        | RigidTy::FnDef(..)
+        | RigidTy::FnPtr(_) => false,
+        RigidTy::Array(elem, _) | RigidTy::Slice(elem) | RigidTy::Pat(elem, _) => {
+            ty_copy_can_go_stale_at(tcx, elem, depth + 1)
+        }
+        RigidTy::Tuple(tys) => tys.into_iter().any(|t| ty_copy_can_go_stale_at(tcx, t, depth + 1)),
+        // The copy holds the SAME pointer, so whatever the pointee can reach,
+        // the copy can reach. `Box`, `Rc`, `Arc` and `NonNull` arrive here as
+        // ADTs and reach their raw pointer field by the arm below.
+        RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _) => {
+            ty_copy_can_go_stale_at(tcx, pointee, depth + 1)
+        }
+        RigidTy::Adt(def, args) => def.variants().into_iter().any(|v| {
+            v.fields().into_iter().any(|f| {
+                crate::codegen_ay::shared::mono_ty::field_ty(&f, &args)
+                    .is_none_or(|t| ty_copy_can_go_stale_at(tcx, t, depth + 1))
+            })
+        }),
+        // Dynamic, Closure, Coroutine*, CoroutineWitness: opaque.
+        _ => true,
+    }
 }
 
 /// Can an opaque C callee legally write through an argument of this type?

@@ -17,9 +17,9 @@
 //! Pattern adapted from trust_wp's solver-level regression guards
 //! (crates/trust_wp-ay/src/tests/loops/tests.rs).
 //!
-//! Run this lane with the repository's pinned nightly toolchain and the corpus
-//! feature that admits this module:
-//! `cargo test -p trust-mc-compiler --features compiler-corpus-tests ay_guard_`.
+//! Run this lane on the repository's Trust pin with the corpus feature that
+//! admits this module:
+//! `targo --unverified test -p trust-mc-engine --lib --features compiler-corpus-tests ay_guard_`.
 
 // Test code: unwrap/panic are acceptable for assertions
 #![allow(clippy::unwrap_used, clippy::panic)]

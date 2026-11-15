@@ -9,17 +9,15 @@ use super::super::ChcCtx;
 use super::super::codegen_types::CodegenTypes;
 use super::super::inline_shared::{PlaceResolver, inline_operand_to_expr};
 use super::InlineReturn;
-use super::drop_placeholder_dispatch::{
-    forwarded_heap_vtable_for_expr, resolve_nested_drop_arg_value,
-    try_inline_dyn_drop_dispatch_call,
-};
+use super::drop_placeholder_dispatch::try_inline_dyn_drop_dispatch_call;
 use super::pointer_wrapper::{
     resolve_inline_ref_local_target_place, resolve_nested_ref_arg_referent,
 };
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use crate::codegen_ay::chc::rules::codegen_rules::transition_drop::{
-    collect_box_dyn_dealloc_effects, collect_shared_pointer_dealloc_effects,
-    shared_pointer_inner_ty, shared_pointer_value_ptr_for_drop,
-    shared_pointer_value_ptr_from_obj_id, try_translate_shared_pointer_inner_drop,
+    collect_shared_pointer_dealloc_effects, shared_pointer_inner_ty,
+    shared_pointer_value_ptr_for_drop, shared_pointer_value_ptr_from_obj_id,
+    try_translate_shared_pointer_inner_drop,
 };
 use crate::codegen_ay::chc::rules::codegen_rules_helpers::rust_dealloc_base_ptr_for_known_alloc_id;
 use crate::codegen_ay::provenance::{Loc, Val};
@@ -174,118 +172,74 @@ pub(super) fn try_inline_shared_pointer_drop_call<'tcx, 'body>(
     Some(InlineReturn::value_only(Expr::bitvec_const(0u64, POINTER_WIDTH)))
 }
 
-pub(super) fn try_inline_dyn_drop_call<'tcx, 'body>(
-    ctx: &mut ChcCtx<'tcx, 'body>,
+pub(super) fn try_inline_dyn_drop_call(
+    ctx: &mut ChcCtx<'_, '_>,
+    func: &Operand,
     callee_path: &str,
     args: &[Operand],
-    outer_body: &rustc_public::mir::Body,
-    local_exprs: &HashMap<usize, Expr>,
+    body: &rustc_public::mir::Body,
+    values: &HashMap<usize, Expr>,
     resolver: &PlaceResolver<'_>,
-    inline_vtable_ids: &HashMap<usize, Expr>,
-    inline_alloc_ids: &HashMap<usize, u32>,
-    inline_depth: usize,
+    vtables: &HashMap<usize, Expr>,
+    _allocations: &HashMap<usize, u32>,
+    depth: usize,
 ) -> Option<InlineReturn> {
-    if !callee_path.contains("Drop>::drop") && !callee_path.contains("drop_in_place") {
+    if !callee_path.contains("drop_in_place") {
         return None;
     }
-
-    let pointee_ty = args.first().and_then(|arg| {
-        let arg_ty = ctx.resolve_body_ty(arg.ty(outer_body.locals()).ok()?);
-        match arg_ty.kind() {
-            TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
-            | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => Some(ctx.resolve_body_ty(pointee)),
-            _ => None,
-        }
-    })?;
-
-    let arg_base_local =
-        args.first().and_then(|arg| unprojected_inline_drop_arg_base_local(outer_body, arg));
-
-    if matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
-        let dyn_arg =
-            inline_operand_to_expr(ctx, args.first()?, local_exprs, resolver, outer_body.locals())?;
-        // The inline callee's `self` PARAMETER is an untyped `Expr` slot, and
-        // the fallback lane hands back the untranslated arg, so the wave-11 tag
-        // ends at this crossing.
-        let self_expr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&dyn_arg)
-            .map(Loc::into_expr)
-            .unwrap_or(dyn_arg.clone());
-        let inline_vtable =
-            arg_base_local.and_then(|local_idx| inline_vtable_ids.get(&local_idx).cloned());
-        let known_vtable =
-            arg_base_local.and_then(|local_idx| ctx.known_vtable_expr_for_local(local_idx));
-        let embedded_vtable = ctx.extract_embedded_vtable_expr(&dyn_arg).map(Val::into_expr);
-        let vtable_disc = inline_vtable.or(known_vtable).or(embedded_vtable);
-        return try_inline_dyn_drop_dispatch_call(
-            ctx,
-            pointee_ty,
-            self_expr,
-            vtable_disc,
-            outer_body,
-            local_exprs,
-            inline_vtable_ids,
-            arg_base_local,
-            inline_depth,
-        );
-    }
-
-    let TyKind::RigidTy(RigidTy::Adt(_, args_ty)) = pointee_ty.kind() else {
-        return None;
-    };
-    let inner_dyn_ty = match args_ty.0.first() {
-        Some(rustc_public::ty::GenericArgKind::Type(inner))
-            if matches!(
-                ctx.resolve_body_ty(*inner).kind(),
-                TyKind::RigidTy(RigidTy::Dynamic(..))
-            ) =>
-        {
-            ctx.resolve_body_ty(*inner)
+    let argument = args.first()?;
+    let ty = ctx.resolve_body_ty(argument.ty(body.locals()).ok()?);
+    let pointee = match ty.kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+            ctx.resolve_body_ty(inner)
         }
         _ => return None,
     };
-    let box_expr = resolve_nested_drop_arg_value(
+    // Drop::drop(Box) itself only frees storage; it must never execute the
+    // pointee destructor a second time. Model only the actual complete glue.
+    let TyKind::RigidTy(RigidTy::FnDef(def, generics)) = func.ty(body.locals()).ok()?.kind() else {
+        return None;
+    };
+    let instance = rustc_public::mir::mono::Instance::resolve(def, &generics).ok()?;
+    if Some(instance) != crate::codegen_ay::shared::mono_ty::drop_in_place(pointee) {
+        return None;
+    }
+    let local = unprojected_inline_drop_arg_base_local(body, argument);
+    if let TyKind::RigidTy(RigidTy::Adt(def, generics)) = pointee.kind()
+        && def.is_box()
+        && matches!(generics.0.first(),Some(GenericArgKind::Type(inner)) if matches!(inner.kind(),TyKind::RigidTy(RigidTy::Dynamic(..))))
+    {
+        let result = (|| {
+            crate::codegen_ay::shared::native_box_drop::native_global_box_pointee(
+                ctx.tcx, pointee,
+            )?;
+            let place = rustc_public::mir::Place { local: local?, projection: vec![] };
+            let origin = ctx.inline_native_dyn_origin(&Operand::Copy(place), body.locals())?;
+            crate::codegen_ay::chc::rules::codegen_rules::transition_drop::translate_native_dyn_box_drop(ctx,pointee,&origin,ctx.current_encode_bb,depth)
+        })();
+        if result.is_none() {
+            ctx.record_sound_fallback_reason("native_box_drop_call_exact_origin_required");
+        }
+        return Some(result.unwrap_or_else(|| InlineReturn::value_only(Expr::bool_const(true))));
+    }
+    if !matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+        return None;
+    }
+    let value = inline_operand_to_expr(ctx, argument, values, resolver, body.locals())?;
+    let pointer = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&value)
+        .map(Loc::into_expr)
+        .unwrap_or(value.clone());
+    let metadata = local
+        .and_then(|local| vtables.get(&local).cloned())
+        .or_else(|| ctx.extract_embedded_vtable_expr(&value).map(Val::into_expr));
+    super::super::native_dyn_drop::translate_bound_dyn_drop(
         ctx,
-        args.first()?,
-        pointee_ty,
-        outer_body,
-        local_exprs,
-        resolver,
+        pointee,
+        pointer,
+        metadata,
+        ctx.current_encode_bb,
+        depth,
     )
-    .or_else(|| {
-        inline_operand_to_expr(ctx, args.first()?, local_exprs, resolver, outer_body.locals())
-    })?;
-    let bv_ptr = crate::codegen_ay::chc::dyn_coercion::extract_pointer_expr(&box_expr)?;
-    // Two untyped consumers: the inline `self` parameter slot and the
-    // deallocation helper (itself still `Expr`-taking). Tag dropped once.
-    let bv_ptr = bv_ptr.into_expr();
-    let inline_vtable =
-        arg_base_local.and_then(|local_idx| inline_vtable_ids.get(&local_idx).cloned());
-    let known_vtable =
-        arg_base_local.and_then(|local_idx| ctx.known_vtable_expr_for_local(local_idx));
-    let embedded_vtable = ctx
-        .extract_embedded_vtable_expr(&box_expr)
-        .map(Val::into_expr)
-        .or_else(|| forwarded_heap_vtable_for_expr(ctx, &box_expr));
-    let vtable_disc = inline_vtable.or(known_vtable).or(embedded_vtable);
-    let inline_result = try_inline_dyn_drop_dispatch_call(
-        ctx,
-        inner_dyn_ty,
-        bv_ptr.clone(),
-        vtable_disc,
-        outer_body,
-        local_exprs,
-        inline_vtable_ids,
-        arg_base_local,
-        inline_depth,
-    )
-    .unwrap_or_else(|| InlineReturn::value_only(Expr::bitvec_const(0u64, POINTER_WIDTH)));
-
-    let known_alloc_id =
-        arg_base_local.and_then(|local_idx| inline_alloc_ids.get(&local_idx).copied());
-    let dealloc_effects = collect_box_dyn_dealloc_effects(ctx, bv_ptr, known_alloc_id)?;
-    ctx.heap_state.pending_checks.extend(dealloc_effects.pending_checks);
-    ctx.heap_state.pending_updates.extend(dealloc_effects.pending_updates);
-    Some(inline_result)
 }
 
 pub(super) fn inline_trivial_drop_placeholder<'tcx, 'body>(
@@ -378,7 +332,12 @@ fn inline_noop_call_placeholder<'tcx, 'body>(
         _ => {
             let dest_sort = ChcCtx::translate_ty(dest_ty)?;
             ctx.record_aggregate_gap("inline_drop_placeholder_symbolic");
-            super::super::declare_pending_var(super::super::chc_fresh_name(fresh_name), dest_sort)
+            Havoc::mint(
+                ctx,
+                sound_havoc::UNTRACKED_WALKER_VALUE,
+                super::super::chc_fresh_name(fresh_name),
+                dest_sort,
+            )
         }
     };
     Some(InlineReturn::value_only(value))
@@ -494,7 +453,7 @@ fn trace_rc_local_to_concrete_inline(
             if place.local != local_idx || !place.projection.is_empty() {
                 continue;
             }
-            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src)) = rhs
+            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src), ..) = rhs
                 && src.projection.is_empty()
                 && src.local != local_idx
             {

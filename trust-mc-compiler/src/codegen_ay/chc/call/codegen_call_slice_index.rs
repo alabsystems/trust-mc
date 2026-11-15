@@ -80,6 +80,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "CHC slice index: ZST element; emitting Unit constructor"
             );
             let output_args = self.build_output_args(modified_locals, &[dest_local]);
+            // Design 4: `&x[..]` of a ZST slice or array is the whole slice, and
+            // its length is the source's; the canonical zero below would read
+            // as length 0 in a wide `&[()]` slot.
+            if let Some(idx_op) = index_arg
+                && Self::is_range_full_operand(self.tcx, idx_op, self.body.locals())
+                && crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::is_slice_len_pointer_ty(
+                    self.body.locals()[dest_local].ty,
+                )
+                && let Some(whole) = self.whole_slice_value_of(slice_arg, modified_locals)
+                && let Some((_, dest_var)) = self.resolve_destination(dest_local)
+                && let Some(eq) = self.make_coerced_eq_constraint(
+                    &dest_var,
+                    whole,
+                    dest_var.sort(),
+                    dest_local,
+                    "codegen_call_slice::SliceIndex_ZST_RangeFull",
+                )
+            {
+                self.emit_goto_rule_extra(from_app, target, &output_args, stmt_constraints, vec![eq]);
+                return;
+            }
             return self.emit_slice_index_zst(
                 dest_local,
                 target,
@@ -87,6 +108,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 stmt_constraints,
                 &output_args,
             );
+        }
+
+        // A slice view (`s[..]`, `s[a..b]`, `s[..b]`, `s[a..]`) is lowered below to
+        // a copy of the referent's elements, which goes stale when a copy of the
+        // element type can reach state another alias mutates: `let sub =
+        // &source[1..]; lhs[1].set(7); assert!(sub[0].get() == 2)` verified
+        // SUCCESSFUL on main 31793ccc3. The view is havocked and the harness fails
+        // closed instead.
+        //
+        // The test is `ty_copy_can_go_stale`, not `ty_has_interior_mut`: an element
+        // that is a POINTER to interior-mutable state (`&Cell<u8>`, `Rc<Cell<u8>>`,
+        // `Arc<AtomicU8>`) is `Freeze`, so the interior-mut test let the copy
+        // through and `let view: &[Rc<Cell<u8>>] = &arr[..]; shared.set(7);
+        // assert!(view[0].get() == 7)` FAILED with a Genuine counterexample
+        // (negative/frozen_views_indirect.rs). `RangeFull` is in the list for the
+        // same reason — its "identity" lowering is a materialized copy too.
+        if let Some(idx_op) = index_arg
+            && (Self::is_range_type_operand(self.tcx, idx_op, self.body.locals())
+                || Self::is_range_to_operand(self.tcx, idx_op, self.body.locals())
+                || Self::is_range_from_operand(self.tcx, idx_op, self.body.locals())
+                || Self::is_range_full_operand(self.tcx, idx_op, self.body.locals()))
+            && self.chc_slice_elem_ty(slice_arg).is_some_and(|elem| {
+                crate::codegen_ay::foreign_defs::ty_copy_can_go_stale(self.tcx, elem)
+            })
+        {
+            debug!(fn_name = %self.fn_name, "CHC slice index: sub-slice of interior-mutable elements; fail closed");
+            self.record_sound_fallback_reason("slice_view_copy_can_go_stale");
+            emit_sound_fallback_goto(
+                self,
+                from_app,
+                target,
+                modified_locals,
+                &[dest_local],
+                stmt_constraints,
+            );
+            return;
         }
 
         // Part of #3327, #3551: Detect Range/RangeInclusive slice indexing.
@@ -216,7 +273,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // kind of test this refactor exists to remove.
             let oob = idx.clone().bvuge(len_coerced);
             debug!(fn_name = %self.fn_name, "CHC slice index: emitting bounds_check error rule");
-            let error_app = RelationApp::new("error", Vec::new());
+            // An out-of-bounds index panics: a registered `assertion`-class property
+            // (Kani's class for a panic), so a `should_panic` harness can stand on it.
+            // `bb` is metadata only.
+            let error_app = self.register_error_head(
+                trust_mc_core::violation::PropertyKind::Assertion,
+                target,
+                Some("index out of bounds: the len is less than or equal to the index".to_string()),
+            );
             let body =
                 RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
             self.vc.add_rule(Rule::new(body, error_app));
@@ -309,6 +373,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Same pattern as VecAsSlice (codegen_call_vec_ops_views.rs:146).
         if let Some(ref elem) = elem_expr {
             self.ref_resolution.const_ref_values.insert(dest_local, elem.clone());
+            // The reference's register gets the ELEMENT below (or stays free on
+            // the memory-bridge lane), never its address: a reader that takes
+            // it for an address fails closed (`book_escaping_index_value_refs`).
+            if matches!(
+                self.body.locals()[dest_local].ty.kind(),
+                TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))
+            ) {
+                self.ref_resolution.index_value_ref_dests.insert(dest_local);
+            }
         }
 
         // Flush pending_checks from load_from_memory (bypasses encode_block_statements). #3359.
@@ -448,7 +521,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3528: Filter superseded store chain constraints.
         let filtered_stmts = super::heap_store_chains::filter_superseded_store_chains(
             stmt_constraints,
-            &mem_constraints,
+            &mut mem_constraints,
         );
         let effective_stmts: &[Expr] = filtered_stmts.as_deref().unwrap_or(stmt_constraints);
 
@@ -832,22 +905,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Split-add keeps the obj_id lane intact for symbolic indices (#3921):
         // whole-width bvadd smears the index across the id bits and the load's
         // heap bounds check gets dropped for non-foldable obj_ids.
-        let byte_offset = if elem_size <= 1 {
-            idx.clone()
-        } else {
-            idx.clone().bvmul(Expr::bitvec_const(elem_size as i128, POINTER_WIDTH))
-        };
+        //
         // Byte-offset arithmetic on an address is still an address (wave 11's
         // `Loc` producer rule), so the `Loc` the caller established is inherited
         // here rather than re-minted — which lets the load go through the typed
         // `load_from_memory` instead of the deprecated untyped shim.
-        let elem_addr = Loc::of_address(
-            crate::codegen_ay::chc::pointer_step::step_split_pointer(
-                ptr.as_expr().clone(),
-                byte_offset,
-            )
-            .result,
+        let step = crate::codegen_ay::chc::pointer_step::step_split_pointer_index(
+            ptr.as_expr().clone(),
+            crate::codegen_ay::types::coerce_bitvec_width_safe(
+                idx.clone(),
+                POINTER_WIDTH,
+                crate::codegen_ay::types::SignExtension::ZeroExtend,
+            ),
+            elem_size,
         );
+        // The lane step is exact only when the index's byte offset fits the
+        // lane without a carry; otherwise the access is out of bounds and the
+        // truncated address would alias a low element (see
+        // `step_split_pointer_index`). State it as a memory-safety check.
+        if let Some(exact) = step.same_object_ok.filter(|e| *e != Expr::bool_const(true)) {
+            self.heap_state.pending_checks.push(exact);
+        }
+        let elem_addr = Loc::of_address(step.result);
         debug!(fn_name = %self.fn_name, ?elem_size, "CHC slice index: pointer deref via memory model");
         self.load_from_memory(elem_addr, elem_ty).map(Val::into_expr)
     }

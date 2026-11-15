@@ -119,6 +119,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Expr::var(len_var_name, ptr_sort())
     }
 
+    /// The length a READ-ONLY query sees at this point of the block: the post
+    /// state when a statement earlier in the same block wrote the tracked length
+    /// (`_7 = &(_1.0)` propagates the field's length into `_7`'s sidecar), the
+    /// input variable otherwise.
+    ///
+    /// [`Self::collection_current_len`] always reads the input, which is right
+    /// for a write that chains on it (a call is a block's terminator, so no two
+    /// length-writing calls share a rule), but a query after a same-block
+    /// statement write read the stale entry value: `Vec::len(&w.v)` right after
+    /// `_7 = &(w.v)` read `_7`'s length as it was before the block, a free
+    /// value, and `assert!(w.v.len() <= 2)` on a `bounded_any::<_, 2>()`
+    /// FAILED certified Genuine (bounded_any_model_dual.rs,
+    /// derived_len_bound_safe). Never use it for a length the same query writes.
+    pub(in crate::codegen_ay::chc) fn collection_len_for_query(&self, len_var_name: &str) -> Expr {
+        if self.collections.len_state.modified_len_vars.contains(len_var_name) {
+            Expr::var(crate::codegen_ay::names::out_name(len_var_name), ptr_sort())
+        } else {
+            Expr::var(len_var_name, ptr_sort())
+        }
+    }
+
     /// Set a collection's tracked length to `new_len`, emitting constraint
     /// and marking modified. Returns true if length var was found.
     pub(in crate::codegen_ay::chc) fn collection_len_set(

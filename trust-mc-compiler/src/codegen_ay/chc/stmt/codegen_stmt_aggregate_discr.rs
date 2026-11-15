@@ -4,6 +4,9 @@
 
 //! Discriminant extraction for CHC encoding (#2246, #2306).
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -17,7 +20,17 @@ use tracing::{debug, warn};
 use super::codegen_stmt_aggregate_adt::sign_extend_discr_val;
 use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 
-use super::{ChcCtx, declare_pending_var};
+use super::ChcCtx;
+
+/// Rule E: the unresolved-referent discriminant symbol ranges over every
+/// variant's discriminant value, a sound value havoc (audited in
+/// `codegen_ctx::fallback_soundness`).
+pub(in crate::codegen_ay::chc) const DISCR_UNRESOLVED_REFERENT: &str = "discr_unresolved_referent";
+
+/// Rule E: the unresolved-referent discriminant reached on a place with NO
+/// deref, where the place itself should have translated: fail-closed.
+pub(in crate::codegen_ay::chc) const DISCR_UNRESOLVED_DIRECT_PLACE: &str =
+    "discr_unresolved_direct_place";
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Infer discriminant (true_val, false_val) for a flattened enum local.
@@ -121,37 +134,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         (1, 0)
     }
 
-    /// Translates a Discriminant rvalue to a AY expression.
-    /// Handles: BV-flattened enums (#3215), Option/Result, unit enums, general ADT enums.
-    pub(in crate::codegen_ay::chc) fn translate_discriminant(
+    /// The discriminant VALUE of a flattened enum local, read from its tag
+    /// slot `fld0` by the local's own flattening: an `EnumBvLayout` tag (a
+    /// Bool for two constructors, else a constructor index) mapped through
+    /// the layout's discriminants, or a flattened Bool tag mapped through
+    /// [`Self::infer_flattened_discr`]. `None` when the local is neither, or
+    /// its tag slot does not translate. `translate_discriminant` reads a
+    /// bare flattened local through it, and the flattened enum memory mirror
+    /// (`try_decompose_flattened_enum_field_stores`) writes the tag bytes from
+    /// it.
+    pub(in crate::codegen_ay::chc) fn flattened_local_discriminant(
         &mut self,
-        place: &Place,
+        local_idx: usize,
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
         // #3215: BV-flattened multi-ctor enum — tag at fld0 (Bool or BV(n)).
-        let local_idx: usize = place.local;
-        if place.projection.is_empty() {
-            if let Some(layout) = self.flatten.enum_bv_layouts.get(&local_idx) {
-                if let Some(tag) = self.flattened_local_field_expr(local_idx, 0, modified_locals) {
-                    let d = |v: u64| Expr::bitvec_const(v, POINTER_WIDTH);
-                    let discr = if layout.num_constructors == 2 && tag.sort().is_bool() {
-                        Expr::ite(tag, d(layout.discriminants[1]), d(layout.discriminants[0]))
-                    } else {
-                        let last = *layout
-                            .discriminants
-                            .last()
-                            .expect("invariant: enum_bv_layouts has ≥2 discriminants");
-                        layout.discriminants.iter().enumerate().rev().skip(1).fold(
-                            d(last),
-                            |acc, (i, &dv)| {
-                                let cond =
-                                    tag.clone().eq(Expr::bitvec_const(i as u64, layout.tag_bits));
-                                Expr::ite(cond, d(dv), acc)
-                            },
-                        )
-                    };
-                    return Some(discr);
-                }
+        if let Some(layout) = self.flatten.enum_bv_layouts.get(&local_idx) {
+            if let Some(tag) = self.flattened_local_field_expr(local_idx, 0, modified_locals) {
+                let d = |v: u64| Expr::bitvec_const(v, POINTER_WIDTH);
+                let discr = if layout.num_constructors == 2 && tag.sort().is_bool() {
+                    Expr::ite(tag, d(layout.discriminants[1]), d(layout.discriminants[0]))
+                } else {
+                    let last = *layout
+                        .discriminants
+                        .last()
+                        .expect("invariant: enum_bv_layouts has ≥2 discriminants");
+                    layout.discriminants.iter().enumerate().rev().skip(1).fold(
+                        d(last),
+                        |acc, (i, &dv)| {
+                            let cond =
+                                tag.clone().eq(Expr::bitvec_const(i as u64, layout.tag_bits));
+                            Expr::ite(cond, d(dv), acc)
+                        },
+                    )
+                };
+                return Some(discr);
             }
         }
 
@@ -159,7 +176,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // discriminant proxy is the Bool at state_vars[vec_idx + 0].
         // General scalar tuples (e.g., (usize, u32)) also live in
         // flattened_tuple_locals but fld0 is NOT Bool — guard on sort.
-        if place.projection.is_empty() && self.flatten.flattened_tuple_locals.contains(&local_idx) {
+        if self.flatten.flattened_tuple_locals.contains(&local_idx) {
             if let Some(discr_bool) = self.flattened_local_field_expr(local_idx, 0, modified_locals)
             {
                 if discr_bool.sort().is_bool() {
@@ -181,6 +198,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     "CHC: translate_discriminant on non-enum flattened tuple — skipping"
                 );
             }
+        }
+        None
+    }
+
+    /// Translates a Discriminant rvalue to a AY expression.
+    /// Handles: BV-flattened enums (#3215), Option/Result, unit enums, general ADT enums.
+    pub(in crate::codegen_ay::chc) fn translate_discriminant(
+        &mut self,
+        place: &Place,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        let local_idx: usize = place.local;
+        if place.projection.is_empty()
+            && let Some(discr) = self.flattened_local_discriminant(local_idx, modified_locals)
+        {
+            return Some(discr);
         }
 
         // #2876: Resolve place type, falling back to manual deref peeling if needed.
@@ -331,7 +364,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         label, "CHC translate_discriminant: symbolic discriminant (#2618)"
                     );
                     self.record_aggregate_gap("discr_symbolic_discriminant_2618");
-                    let discr = declare_pending_var(discr_name, ptr_sort());
+                    let discr = Havoc::mint(
+                        self,
+                        sound_havoc::UNTRACKED_DISCRIMINANT,
+                        discr_name,
+                        ptr_sort(),
+                    );
                     // Constrain to valid range [0, 2): both types have exactly 2 variants.
                     let upper = Expr::bitvec_const(2u64, POINTER_WIDTH);
                     self.heap_state.pending_updates.push(discr.clone().bvult(upper));
@@ -359,6 +397,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 return Some(Expr::bitvec_const(discr_val, POINTER_WIDTH));
             }
+        }
+
+        // Rule E, exact arm (design trust-mc-reds-final §4.4): an enum whose
+        // layout is `VariantsShape::Single { index }` — every other variant
+        // uninhabited, e.g. `enum E { A(Infallible), B }` — has exactly one
+        // possible discriminant, the VALUE of that variant
+        // (`discriminant_for_variant`, the encoder's value convention), whatever
+        // the place. Before, an unresolved place fell to a symbol confined to
+        // the INDEX range `[0, n)`, which excludes the value whenever it is not
+        // the index, and a counterexample through it was certified Genuine
+        // (`zst_enum_variant_index_dual.rs::safe_iflet_b_direct`).
+        if let Some(discr) = self.single_layout_enum_discriminant(ty) {
+            return Some(discr);
         }
 
         // Part of #3798: Discriminant(*_ref) on ordinary `&_local` references
@@ -405,23 +456,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     return Some(Expr::bitvec_const(discr as u128, POINTER_WIDTH));
                 }
             }
-            // #2876: Pointer-deref fallback — constrained symbolic discriminant.
+            // #2876 and Rule E (design trust-mc-reds-final §4.4): the
+            // unresolved-referent discriminant. The place's value is unknown, so
+            // its discriminant is a symbol ranging over the discriminant VALUES
+            // of the enum's variants (`discriminant_for_variant`, the encoder's
+            // convention), never the index range `[0, n)`, which excludes a real
+            // value whenever explicit discriminants exist. It is a sound value
+            // havoc, booked as one (`DISCR_UNRESOLVED_REFERENT`, an audited
+            // SoundHavoc reason) with its identity, so a counterexample that
+            // reads it is OverApproximation unless recertified. Only a place
+            // with a Deref reaches it legitimately; any other is booked
+            // fail-closed as well.
             if let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind()
+                && def.kind() == rustc_public::ty::AdtKind::Enum
                 && !def.variants().is_empty()
             {
-                let num_variants = def.variants().len();
                 let discr_name =
                     crate::codegen_ay::names::discr_sym_name(place.local, place.projection.len());
                 warn!(
                     local = place.local,
-                    num_variants,
-                    "CHC translate_discriminant: pointer-deref fallback — \
-                     constrained symbolic discriminant [0, {num_variants})"
+                    "CHC translate_discriminant: unresolved referent — symbolic discriminant \
+                     over the variants' discriminant values"
                 );
                 self.record_aggregate_gap("discr_pointer_deref_fallback");
-                let discr = declare_pending_var(discr_name, ptr_sort());
-                let upper = Expr::bitvec_const(num_variants as u64, POINTER_WIDTH);
-                self.heap_state.pending_updates.push(discr.clone().bvult(upper));
+                let booked = self.record_sound_fallback_reason_identified(
+                    DISCR_UNRESOLVED_REFERENT,
+                    Some(&discr_name),
+                );
+                if !place.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)) {
+                    self.record_sound_fallback_reason(DISCR_UNRESOLVED_DIRECT_PLACE);
+                }
+                let discr = Havoc::booked(booked, discr_name, ptr_sort());
+                let range = self.enum_discriminant_value_set(def, &discr);
+                self.heap_state.pending_updates.push(range);
                 return Some(discr);
             }
             // Part of #3798: `discriminant_value(&non_enum)` can lower to
@@ -447,6 +514,55 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Handles unit enums, option-like, 2-variant both-payload, general N-variant,
         // BV-flattened, coroutine fallback, and non-enum zero.
         self.translate_adt_discriminant(place, ty, enum_expr)
+    }
+
+    /// The discriminant of an enum whose layout is `VariantsShape::Single`:
+    /// the value of its one inhabited variant. `None` for any other type.
+    pub(in crate::codegen_ay::chc) fn single_layout_enum_discriminant(
+        &self,
+        ty: rustc_public::ty::Ty,
+    ) -> Option<Expr> {
+        use rustc_public::abi::VariantsShape;
+        use rustc_public_bridge::IndexedVal;
+        let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+            return None;
+        };
+        if def.kind() != rustc_public::ty::AdtKind::Enum || def.variants().len() < 2 {
+            return None;
+        }
+        let VariantsShape::Single { index } = ty.layout().ok()?.shape().variants else {
+            return None;
+        };
+        let internal_def = rustc_internal::internal(self.tcx, def);
+        let discr = internal_def
+            .discriminant_for_variant(self.tcx, InternalVariantIdx::from_usize(index.to_index()));
+        let value = sign_extend_discr_val(discr.val, discr.ty, self.tcx, POINTER_WIDTH);
+        Some(Expr::bitvec_const(value, POINTER_WIDTH))
+    }
+
+    /// `discr` is the discriminant VALUE of one of `def`'s variants: the
+    /// disjunction of `discr == discriminant_for_variant(v)` over every
+    /// variant (a superset of the inhabited ones, so a sound range).
+    pub(in crate::codegen_ay::chc) fn enum_discriminant_value_set(
+        &self,
+        def: rustc_public::ty::AdtDef,
+        discr: &Expr,
+    ) -> Expr {
+        let internal_def = rustc_internal::internal(self.tcx, def);
+        let mut values: Vec<u128> = (0..def.variants().len())
+            .map(|idx| {
+                let d = internal_def
+                    .discriminant_for_variant(self.tcx, InternalVariantIdx::from_usize(idx));
+                sign_extend_discr_val(d.val, d.ty, self.tcx, POINTER_WIDTH)
+            })
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+            .into_iter()
+            .map(|v| discr.clone().eq(Expr::bitvec_const(v, POINTER_WIDTH)))
+            .reduce(Expr::or)
+            .unwrap_or_else(|| Expr::bool_const(false))
     }
 
     fn try_coroutine_discriminant_expr(expr: &Expr) -> Option<Expr> {

@@ -20,8 +20,8 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_simd::{
     SimdIntrinsicKind, SimdLayoutInfo, coerce_to_pointer_width, emit_simd_dest_constraint,
-    emit_simd_sound_fallback, extract_simd_layout, neutral_simd_result_array_like,
-    resolve_simd_array,
+    emit_simd_dest_constraint_guarded, emit_simd_sound_fallback, extract_simd_layout,
+    neutral_simd_result_array_like, resolve_simd_array,
 };
 use crate::codegen_ay::chc::stmt::codegen_stmt::codegen_stmt_safety_checks::{
     division_by_zero_condition, signed_div_overflow_condition,
@@ -30,12 +30,28 @@ use crate::codegen_ay::float_arithmetic::bv_float_binop_chc;
 use crate::codegen_ay::float_compare::{bv_float_gt, bv_float_lt};
 use crate::codegen_ay::types::POINTER_WIDTH;
 
+/// Which call reached the element-wise binop encoding. The two share the lane
+/// arithmetic but not the preconditions: the raw intrinsic leaves them to its
+/// caller (a violation is UB), while the portable-SIMD operator checks them in
+/// its own body (core_simd `int_divrem_guard`): it panics on a zero divisor
+/// lane and defines `MIN / -1` by dividing that lane by 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::codegen_ay::chc) enum SimdBinopOrigin {
+    /// `core::intrinsics::simd::simd_*`, called directly.
+    RawIntrinsic,
+    /// A `<Simd<T, N> as core::ops::*>` impl, intercepted in place of its body
+    /// (codegen_call_simd_lib.rs `detect_simd_arith_op`) only when the callee
+    /// resolves to core's own impl (`callee_is_core_instance`).
+    PortableOperator,
+}
+
 /// Element-wise binary op handler (add, sub, mul, div, rem, and, or, xor).
 pub(in crate::codegen_ay::chc) fn codegen_simd_elementwise_binop(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
     target: BasicBlockIdx,
     kind: SimdIntrinsicKind,
+    origin: SimdBinopOrigin,
 ) {
     let dest_local: usize = dcx.destination.local;
 
@@ -50,16 +66,29 @@ pub(in crate::codegen_ay::chc) fn codegen_simd_elementwise_binop(
         // per-lane BV predicates identical to the scalar div/rem checks and carry
         // no memory-model dependency. Emitted regardless of whether the result
         // encodes precisely so the UB is caught even on the sound-fallback path.
-        emit_simd_div_rem_safety_checks(ctx, dcx, &lhs, &rhs, &layout, kind);
+        emit_simd_div_rem_safety_checks(ctx, dcx, &lhs, &rhs, &layout, kind, origin);
         // Part of the UB-soundness fixes: emit per-lane arithmetic overflow
         // error rules for simd_add / simd_sub / simd_mul. Kani reports these as
-        // "attempt to compute simd_<op> which would overflow" — the SIMD path
-        // must mirror the scalar overflow check (gated by overflow_checks) so a
-        // program that can overflow any lane is never proved safe.
+        // "attempt to compute simd_<op> which would overflow" whatever
+        // `--no-overflow-checks` says, so a program that can overflow any lane
+        // is never proved safe.
         emit_simd_arith_overflow_checks(ctx, dcx, &lhs, &rhs, &layout, kind);
 
+        // The portable operator panics on a zero divisor lane before it
+        // divides, so it returns only where every divisor lane is nonzero.
+        // Without that guard the code after a panicking division stayed
+        // reachable, and its checks reported failures Rust never reaches: a
+        // non-panic one among them fails a `#[kani::should_panic]` harness
+        // whose only real failure is the expected panic. The raw intrinsic's
+        // zero lane is UB, reported as such; its successor is left as it was.
+        let continues = (origin == SimdBinopOrigin::PortableOperator
+            && !layout.is_float
+            && matches!(kind, SimdIntrinsicKind::Div | SimdIntrinsicKind::Rem))
+        .then(|| divisor_lanes_nonzero(&rhs, &layout))
+        .flatten();
+
         if let Some(result) = build_elementwise_result(Some(ctx), &lhs, &rhs, &layout, kind) {
-            emit_simd_dest_constraint(ctx, dcx, target, dest_local, result);
+            emit_simd_dest_constraint_guarded(ctx, dcx, target, dest_local, result, continues);
         } else {
             debug!("CHC simd binop: symbolic float lane not soundly encodable, sound fallback");
             emit_simd_sound_fallback(ctx, dcx, target);
@@ -77,9 +106,10 @@ pub(in crate::codegen_ay::chc) fn codegen_simd_elementwise_binop(
 /// (produces ±inf/NaN), so float lanes are skipped. For each integer lane the
 /// divisor-nonzero predicate `b != 0` is emitted (unless the divisor lane is a
 /// nonzero `BitVecConst`, in which case the check is trivially satisfiable and
-/// skipped), and for signed lanes the `!(a == INT_MIN && b == -1)` predicate is
-/// emitted. Both reuse the scalar div/rem predicates so the SIMD and scalar
-/// paths cannot drift.
+/// skipped), and for signed lanes of the raw intrinsic the
+/// `!(a == INT_MIN && b == -1)` predicate is emitted (the portable operator
+/// defines that lane). Both reuse the scalar div/rem predicates so the SIMD
+/// and scalar paths cannot drift.
 fn emit_simd_div_rem_safety_checks(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
@@ -87,18 +117,33 @@ fn emit_simd_div_rem_safety_checks(
     rhs: &Expr,
     layout: &SimdLayoutInfo,
     kind: SimdIntrinsicKind,
+    origin: SimdBinopOrigin,
 ) {
     if layout.is_float || !matches!(kind, SimdIntrinsicKind::Div | SimdIntrinsicKind::Rem) {
         return;
     }
+    // A zero divisor lane. For the raw intrinsic it is UB (core
+    // intrinsics/simd `# Safety`: "`rhs` must not contain any zero elements"),
+    // never a panic, and `DivisionByZero` reports as the panic class
+    // `division_by_zero`, which would let a `#[kani::should_panic]` harness bank
+    // it; Kani leaves it to CBMC's `division-by-zero` class, which its
+    // should_panic does not accept. The BMC lane's `simd_div_by_zero_check`
+    // makes the same split. The portable operator panics before it divides
+    // (core_simd `int_divrem_guard`), so that origin keeps the panic kind.
+    // CBMC's "division by zero" text is carried for the UB kind, whose default
+    // text is generic.
+    let (zero_kind, zero_message) = match origin {
+        SimdBinopOrigin::RawIntrinsic => {
+            (PropertyKind::UndefinedBehavior, Some("division by zero".to_string()))
+        }
+        SimdBinopOrigin::PortableOperator => (PropertyKind::DivisionByZero, None),
+    };
     for i in 0..layout.lane_count {
         let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
         let a = lhs.clone().select(idx.clone());
         let b = rhs.clone().select(idx);
         // Divide-by-zero: divisor lane must be nonzero. Skip only when the
         // divisor lane is a proven-nonzero constant.
-        // Kani parity: CBMC reports this class as "division by zero" — the
-        // DivisionByZero kind text supplies exactly that Description line.
         if !is_nonzero_bitvec_const(&b)
             && let Some(nonzero) = division_by_zero_condition(&b)
         {
@@ -107,15 +152,28 @@ fn emit_simd_div_rem_safety_checks(
                 nonzero,
                 dcx.stmt_constraints,
                 dcx.bb_idx,
-                PropertyKind::DivisionByZero,
-                None,
+                zero_kind,
+                zero_message.clone(),
             );
         }
         // Signed overflow: INT_MIN / -1. Constant-folds to trivially-true (and is
         // skipped by emit_error_rule_for_condition) when operands are constants.
         // Kani parity: Kani's simd overflow check text is
         // "attempt to compute {intrinsic} which would overflow".
+        //
+        // Raw intrinsic only. core_simd `int_divrem_guard` (ops.rs) divides
+        // every lane where `lhs == MIN && rhs == -1` by 1 instead, so the
+        // operator returns MIN (div) and 0 (rem) there, with no panic and no
+        // UB, and Kani, which runs that body, reports nothing. The lane value
+        // `build_elementwise_result` encodes needs no rewrite for it: SMT-LIB
+        // `bvsdiv(MIN, -1)` is MIN and `bvsrem(MIN, -1)` is 0, core_simd's
+        // results. This rule constrains no successor state, so leaving it out
+        // removes only a check Rust does not make. Emitted, it was a false
+        // alarm, and beside a real zero-lane panic it put the non-panic class
+        // `arithmetic_overflow` among a `#[kani::should_panic]` harness's
+        // failures.
         if layout.is_signed
+            && origin == SimdBinopOrigin::RawIntrinsic
             && let Some(no_overflow) = signed_div_overflow_condition(&a, &b)
         {
             let intrinsic_name = match kind {
@@ -134,6 +192,25 @@ fn emit_simd_div_rem_safety_checks(
     }
 }
 
+/// Every divisor lane of `rhs` is nonzero; `None` when a lane is not a
+/// bitvector (the successor is then left unguarded, which can only add
+/// failures).
+pub(in crate::codegen_ay::chc) fn divisor_lanes_nonzero(
+    rhs: &Expr,
+    layout: &SimdLayoutInfo,
+) -> Option<Expr> {
+    let mut all = None;
+    for i in 0..layout.lane_count {
+        let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
+        let lane = division_by_zero_condition(&rhs.clone().select(idx))?;
+        all = Some(match all {
+            None => lane,
+            Some(prev) => Expr::and(prev, lane),
+        });
+    }
+    all
+}
+
 /// Returns `true` when `expr` is a `BitVecConst` proven to be nonzero.
 ///
 /// A constant that does not fit in `u64` (very large or negative bit pattern)
@@ -147,11 +224,21 @@ fn is_nonzero_bitvec_const(expr: &Expr) -> bool {
 }
 
 /// Shift handler (shl, shr). shr uses bvashr for signed, bvlshr for unsigned.
+///
+/// The raw `simd_shl`/`simd_shr` intrinsic shifts by the lane's distance and
+/// is UB on one `>=` the lane width (or negative, signed): the per-lane
+/// checks. The portable `<<`/`>>` operator is core_simd's `wrap_bitshift`
+/// (core_simd ops.rs): it masks every distance lane with `BITS - 1` before
+/// the intrinsic, so it can neither panic nor reach that UB, and its lane
+/// value is the shift by the masked distance. Checking the unmasked distance
+/// raised a false alarm there, and shifting by it gave SMT-LIB's out-of-range
+/// shift (0, or the sign fill), a lane value core_simd never computes.
 pub(in crate::codegen_ay::chc) fn codegen_simd_shift(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
     target: BasicBlockIdx,
     kind: SimdIntrinsicKind,
+    origin: SimdBinopOrigin,
 ) {
     let dest_local: usize = dcx.destination.local;
 
@@ -166,7 +253,9 @@ pub(in crate::codegen_ay::chc) fn codegen_simd_shift(
         // amount is >= the lane bit-width or (signed shift amount) is negative.
         // Reuses the scalar shift-distance predicate so the SIMD and scalar
         // paths cannot drift.
-        emit_simd_shift_safety_checks(ctx, dcx, &lhs, &rhs, &layout);
+        if origin == SimdBinopOrigin::RawIntrinsic {
+            emit_simd_shift_safety_checks(ctx, dcx, &lhs, &rhs, &layout);
+        }
 
         let mut result =
             neutral_simd_result_array_like(&lhs, layout.elem_width).unwrap_or_else(|| lhs.clone());
@@ -174,6 +263,15 @@ pub(in crate::codegen_ay::chc) fn codegen_simd_shift(
             let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
             let a = lhs.clone().select(idx.clone());
             let b = rhs.clone().select(idx.clone());
+            let b = match origin {
+                SimdBinopOrigin::RawIntrinsic => b,
+                // `rhs & (BITS - 1)`; BITS is a power of two, so this is the
+                // distance modulo the lane width, for a signed lane too.
+                SimdBinopOrigin::PortableOperator => b.bvand(Expr::bitvec_const(
+                    u128::from(layout.elem_width - 1),
+                    layout.elem_width,
+                )),
+            };
             let val = match kind {
                 SimdIntrinsicKind::Shl => a.bvshl(b),
                 SimdIntrinsicKind::Shr if layout.is_signed => a.bvashr(b),

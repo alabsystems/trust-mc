@@ -6,6 +6,7 @@
 //!
 //! Extracted from `codegen_copy.rs` — Part of #4206.
 
+use super::copy_shadow::CopyFamilySource;
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::types::POINTER_WIDTH;
 use crate::kani_middle::abi::LayoutOf;
@@ -49,7 +50,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             });
 
         // Try to get constant count
-        let count_const = self.try_eval_const_operand(count);
+        let count_const = self.copy_count_const(count);
 
         debug!(
             "codegen_write_bytes: element_size={}, span={:?}, count_const={:?}",
@@ -87,12 +88,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             dst, count, element_size, "memset destination region writeable",
         );
 
+        // A write of nothing leaves the memory image and the ssa environment in
+        // agreement (`mark_byte_copy_into_stack_local`).
+        let writes_nothing = count_const == Some(0) || element_size == 0;
+
         // Defer location formatting until an error path needs it (Part of #2267).
         let location = || format!("{:?}", span);
 
         // Get dst pointer expression
         let Some(dst_val) = self.codegen_operand(dst) else {
-            self.ctx.unsupported("WriteBytes: failed to codegen dst pointer", location());
+            // The write is dropped here, and `unsupported` alone demotes nothing.
+            self.ctx
+                .unsupported_with_fallback("WriteBytes: failed to codegen dst pointer", location());
+            self.mark_byte_copy_into_stack_local(dst, writes_nothing, "write_bytes_into_stack_local");
             return;
         };
         let val_expr = self.codegen_operand(val);
@@ -114,13 +122,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
             } else {
                 // Non-bitvector value - treat as u8
-                self.ctx.unsupported("WriteBytes: non-bitvector value", location());
+                // The write is dropped here, and `unsupported` alone demotes nothing.
+                self.ctx.unsupported_with_fallback("WriteBytes: non-bitvector value", location());
+                self.mark_byte_copy_into_stack_local(dst, writes_nothing, "write_bytes_into_stack_local");
                 return;
             }
         } else {
-            self.ctx.unsupported("WriteBytes: failed to codegen value", location());
+            // The write is dropped here, and `unsupported` alone demotes nothing.
+            self.ctx.unsupported_with_fallback("WriteBytes: failed to codegen value", location());
+            self.mark_byte_copy_into_stack_local(dst, writes_nothing, "write_bytes_into_stack_local");
             return;
         };
+
+        // The byte unroll below reaches `memory` only, which no typed read of
+        // an address-taken local consults: encode the write exactly, or demote
+        // (copy_shadow.rs).
+        if self.encode_copy_family_write(
+            "write_bytes",
+            dst,
+            &dst_ptr,
+            CopyFamilySource::Fill(&byte_val),
+            count,
+            element_size,
+            false,
+        ) {
+            return;
+        }
+
+        // Not encoded exactly (the encoder demoted it): the unroll below writes
+        // the memory image only.
+        self.mark_byte_copy_into_stack_local(dst, writes_nothing, "write_bytes_into_stack_local");
 
         // Maximum bytes to unroll (avoid explosion for large writes)
         const MAX_UNROLL_BYTES: usize = 128;
@@ -137,7 +168,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         let offset = Expr::bitvec_const(i as u128, POINTER_WIDTH);
                         let addr = dst_ptr.clone().bvadd(offset);
                         // Store the byte value at this address
-                        self.ctx.store_memory(addr, byte_val.clone());
+                        self.store_memory_byte_on_path(addr, byte_val.clone(), "write_bytes store");
                     }
                 } else {
                     // Too large to unroll - treat as unsupported with warning
@@ -186,7 +217,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         let dst_addr = dst_ptr.clone().bvadd(offset);
                         let dst_byte = self.ctx.load_memory(dst_addr.clone());
                         let value = Expr::ite(guard, byte_val.clone(), dst_byte);
-                        self.ctx.store_memory(dst_addr, value);
+                        self.store_memory_byte_on_path(dst_addr, value, "write_bytes store");
                     }
                 } else {
                     self.ctx.unsupported_with_fallback(

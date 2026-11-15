@@ -1,7 +1,7 @@
 {
-  "denominator": 504,
-  "provenance": "fresh public corpus over the included Kani verification suites, 2026-06-15",
-  "row_sha256": "62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf",
+  "denominator": 485,
+  "provenance": "frozen public corpus, 2026-06-15; source-oracle corrections, 2026-11-14",
+  "row_sha256": "ffdde89eb28c7e8c1a4c73897e1b2c3c47078bd718046294ece8babcebe4c40f",
   "rows": [
     {
       "expected": "PROOF",
@@ -55,6 +55,12 @@
       "expected": "PROOF",
       "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
       "harness": "check_dangling_zst",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
+      "harness": "check_invalid_ptr",
       "lane": "tests/expected"
     },
     {
@@ -258,6 +264,12 @@
     {
       "expected": "PROOF",
       "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
+      "harness": "check_reverse_is_its_own_inverse",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
       "harness": "check_reverse_is_its_own_inverse_incomplete",
       "lane": "tests/expected"
     },
@@ -299,6 +311,18 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/coroutines/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/coroutines/pin/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/cover/cover-fail/main.rs",
       "harness": "cover_overconstrained",
       "lane": "tests/expected"
@@ -313,6 +337,12 @@
       "expected": "PROOF",
       "file": "tests/expected/cover/cover-pass/main.rs",
       "harness": "cover_sorted",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/cover/cover-unreachable/main.rs",
+      "harness": "cover_unreachable",
       "lane": "tests/expected"
     },
     {
@@ -749,12 +779,6 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
-      "harness": "modify_harness",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/expected/function-contract/modifies/expr_pass.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -773,12 +797,6 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
-      "harness": "modify_harness",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/expected/function-contract/modifies/field_pass.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -793,12 +811,6 @@
       "expected": "PROOF",
       "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
       "harness": "main",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
-      "harness": "modify_harness",
       "lane": "tests/expected"
     },
     {
@@ -847,12 +859,6 @@
       "expected": "PROOF",
       "file": "tests/expected/function-contract/modifies/havoc_pass_reordered.rs",
       "harness": "copy_replace",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
-      "harness": "check_modify",
       "lane": "tests/expected"
     },
     {
@@ -949,6 +955,12 @@
       "expected": "PROOF",
       "file": "tests/expected/function-contract/multiple_replace_pass.rs",
       "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/function-contract/mutable-references/mut_ref_ensures_and_modifies.rs",
+      "harness": "divide_by_harness",
       "lane": "tests/expected"
     },
     {
@@ -1415,6 +1427,18 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/niche/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/niche2/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/nondet-slice-len/main.rs",
       "harness": "check_possible_slice_lengths",
       "lane": "tests/expected"
@@ -1667,6 +1691,12 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/report/unsupported/reachable/test.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/report/unsupported/unreachable/test.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -1727,8 +1757,20 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/slice-pattern-array/main.rs",
+      "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/slice/main.rs",
       "harness": "main",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/slice_c_str/c_str_unsupported.rs",
+      "harness": "check_c_str",
       "lane": "tests/expected"
     },
     {
@@ -1853,6 +1895,12 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-diverging-variants.rs",
+      "harness": "access_padding_unsupported",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-multiple-variants.rs",
       "harness": "access_padding_init_a",
       "lane": "tests/expected"
@@ -1873,12 +1921,6 @@
       "expected": "PROOF",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-single-variant.rs",
       "harness": "access_padding_init",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/atomic/atomic.rs",
-      "harness": "local_atomic_uninit",
       "lane": "tests/expected"
     },
     {
@@ -1927,6 +1969,12 @@
       "expected": "PROOF",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_copy_safe",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
+      "harness": "check_typed_swap_nonoverlapping_safe",
       "lane": "tests/expected"
     },
     {
@@ -1998,19 +2046,7 @@
     {
       "expected": "PROOF",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
-      "harness": "pointer_union_should_fail",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "pointer_union_should_pass",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
-      "harness": "transmute_into_union_should_fail",
       "lane": "tests/expected"
     },
     {
@@ -2022,31 +2058,13 @@
     {
       "expected": "PROOF",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
-      "harness": "transmute_union_should_fail",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "transmute_union_should_pass",
       "lane": "tests/expected"
     },
     {
       "expected": "PROOF",
       "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
-      "harness": "uber_union_should_fail",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
       "harness": "uber_union_should_pass",
-      "lane": "tests/expected"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
-      "harness": "union_as_subfields_should_fail",
       "lane": "tests/expected"
     },
     {
@@ -2094,6 +2112,12 @@
     {
       "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/char_validity.rs",
+      "harness": "check_char_ok",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/char_validity.rs",
       "harness": "check_valid_char_wrappers",
       "lane": "tests/expected"
     },
@@ -2119,6 +2143,18 @@
       "expected": "PROOF",
       "file": "tests/expected/valid-value-checks/constants.rs",
       "harness": "transmute_valid_bool",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/custom_niche.rs",
+      "harness": "check_copy_nonoverlap",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/custom_niche.rs",
+      "harness": "check_copy_nonoverlap_ub",
       "lane": "tests/expected"
     },
     {
@@ -2159,6 +2195,18 @@
     },
     {
       "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/write_invalid.rs",
+      "harness": "write_invalid_bytes_no_ub_with_spurious_cex",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
+      "file": "tests/expected/valid-value-checks/write_invalid.rs",
+      "harness": "write_valid_before_read",
+      "lane": "tests/expected"
+    },
+    {
+      "expected": "PROOF",
       "file": "tests/expected/vecdq/main.rs",
       "harness": "main",
       "lane": "tests/expected"
@@ -2184,12 +2232,6 @@
     {
       "expected": "PROOF",
       "file": "tests/prusti/Ackermann_function.rs",
-      "harness": "main",
-      "lane": "tests/prusti"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/prusti/Binary_search.rs",
       "harness": "main",
       "lane": "tests/prusti"
     },
@@ -2669,12 +2711,6 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/basic/add.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/basic/arith.rs",
       "harness": "main",
       "lane": "tests/smack"
@@ -2693,43 +2729,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/basic/arith_assume3.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/basic/div.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/basic/mod.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/basic/mul.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/basic/sub.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/functions/closure.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/functions/closure_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
@@ -2741,43 +2741,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/functions/double_fail.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/generics/generic_function.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/generics/generic_function1.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/generics/generic_function2.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/generics/generic_function3.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/generics/generic_function4.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/generics/generic_function5.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
@@ -2789,37 +2753,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/loops/gauss_sum_nondet_fail.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/loops/iterator.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/loops/iterator_fail.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/overflow/add_overflow.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/overflow/mul_overflow.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/overflow/sub_overflow.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
@@ -2831,19 +2765,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/recursion/fac_fail.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/recursion/fib.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/recursion/fib_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
@@ -2855,19 +2777,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/structures/option_fail.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/structures/point.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/structures/point_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
     },
@@ -2879,31 +2789,7 @@
     },
     {
       "expected": "PROOF",
-      "file": "tests/smack/vector/vec11.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/vector/vec12.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/vector/vec13.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
       "file": "tests/smack/vector/vec_resize.rs",
-      "harness": "main",
-      "lane": "tests/smack"
-    },
-    {
-      "expected": "PROOF",
-      "file": "tests/smack/vector/vec_resize_fail.rs",
       "harness": "main",
       "lane": "tests/smack"
     },

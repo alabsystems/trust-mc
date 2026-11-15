@@ -8,6 +8,8 @@
 # per-invocation with CARGO_BUILD_JOBS if a smaller host returns.
 [build]
 jobs = 12
+# No rustc wrapper is configured. scripts/trustc-private-wrapper.sh (the opt-in
+# TRUST_PRIVATE_SYSROOTS overlay of a bootstrap rustc-private sysroot) ships unwired.
 
 # Git authentication: use system git client instead of libgit2.
 [net]
@@ -21,6 +23,9 @@ build-dev = "run --target-dir target/tools -p build-trust-mc -- build-dev"
 bundle = "run -p build-trust-mc -- bundle"
 
 [env]
+# The private driver target list is owned by trustc-private-wrapper.sh.
+# Authenticated Targo reserves TRUST_* authority variables and rejects them
+# in Cargo's [env] table, including during metadata resolution.
 # Runtime parallelism limits to prevent OOM (#3061).
 # force=true ensures these override any shell-level settings.
 # Reduced from 4→2 after repeated kernel panics (2026-03-01).
@@ -29,22 +34,10 @@ RAYON_NUM_THREADS = { value = "2", force = true }
 RUST_TEST_THREADS = { value = "2", force = true }
 [target.'cfg(all())']
 rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
-    # PIN-COUPLED FLAG, ACTIVE. The pin is `channel = "trust"`
-    # (rust-toolchain.toml); it went back there on 2026-08-27 in 5965f22a, once
-    # Trust's stage2 sysroot carried the complete rustc-dev closure, and this
-    # flag was reinstated in the same commit. It is meaningful ONLY under
-    # `trust`: upstream nightly rejects it as an unknown unstable option and
-    # kills every rustc invocation including cargo's `--print` probes, so
-    # COMMENT IT OUT AGAIN if the pin ever moves off `trust`. It is needed
-    # because trust's verifier is FAIL-CLOSED by default and tries to prove
-    # panic-freedom for EVERY unit including third-party build scripts —
-    # without it the build dies in `libc`'s build script. SPELLING: both work on the
-    # linked stage (re-probed 2026-08-26); `-Ztrust-verify=off` is the one
-    # `-Z help` advertises. "wave-2 deleted -Zno-trust-verify=yes" was wrong.
-    # Probe: `rustc +trust -Z help | grep trust-verify`.
-    # The frozen nightly-2025-12-03 pin now lives in rust-toolchain.legacy.toml
-    # (Kani-compatibility lane only; Cargo does not read it).
-    "-Ztrust-verify=off",
+    # Verification policy belongs to authenticated `targo trust`, which records
+    # each unit's scope and result. Keep compiler verification switches out of
+    # Cargo rustflags, including host and dependency tables. An explicitly
+    # unverified development build uses `targo --unverified` instead.
 
     # Purposefully disabled lints
     "-Aclippy::expect_fun_call",
@@ -55,3 +48,6 @@ rustflags = [ # Global lints/warnings. Need to use underscore instead of -.
     "-Aclippy::needless-borrow",
     "-Aclippy::bool-to-int-with-if",
 ]
+
+# Doctests follow the explicitly selected Targo lane too; there is no separate
+# rustdoc verification exemption here.

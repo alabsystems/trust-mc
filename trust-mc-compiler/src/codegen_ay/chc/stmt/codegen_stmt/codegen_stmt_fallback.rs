@@ -32,16 +32,31 @@ fn try_extract_data_obj_id(expr: &Expr) -> Option<u32> {
     // Propagating obj_id 0 into `known_alloc_ids` / `alloc_result_locals` would
     // (a) make null-deref checks vacuously skipped (#null-fix), and
     // (b) cause store/load codegen to address the null region.
-    ChcCtx::try_extract_obj_id(expr)
+    //
+    // A `known_alloc_ids` entry also carries an implicit offset of ZERO, so only
+    // a constant address at an allocation's BASE names one. `(obj, 1)` is the
+    // second byte of `obj`: recording `obj` for it re-derived the provenance the
+    // `&(*base).f` arm below drops, and the store through `&raw mut (*p).b`
+    // landed on field `a`.
+    let base_obj_id = |addr: &Expr| {
+        ChcCtx::try_extract_constant_addr(addr)
+            .and_then(|(obj_id, offset)| (offset == 0).then_some(obj_id))
+    };
+    base_obj_id(expr)
         .or_else(|| {
             let width = expr.sort().bitvec_width()?;
             let ptr_width = crate::codegen_ay::types::POINTER_WIDTH;
             (width == 2 * ptr_width).then(|| {
                 let data_ptr = expr.clone().extract(ptr_width - 1, 0);
-                ChcCtx::try_extract_obj_id(&data_ptr)
+                base_obj_id(&data_ptr)
             })?
         })
-        .filter(|&obj_id| obj_id != 0)
+        // An id at or past OBJECT_ID_LIMIT is no allocation's either (high
+        // offset bits, or an object field no id reaches: a pointer made from
+        // an integer that names no object).
+        .filter(|&obj_id| {
+            obj_id != 0 && obj_id < crate::codegen_ay::chc::heap::stack_address::OBJECT_ID_LIMIT
+        })
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -74,7 +89,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // across blocks. Instead, leave output universally quantified.
         let is_deref_load = matches!(
             rhs,
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 if place.projection.first()
                     == Some(&ProjectionElem::Deref)
         );
@@ -128,7 +143,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else if is_deref_load || is_ref_to_flattened {
             if is_deref_load
                 && self.track_level >= ChcTrackLevel::Ptr
-                && let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rhs
+                && let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) = rhs
                 && matches!(place.projection.first(), Some(ProjectionElem::Deref))
                 && matches!(
                     self.body.locals()[place.local].ty.kind(),
@@ -247,9 +262,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // NaN-generation obligation for float value binops,
                     // gated on `--nan-check` (see codegen_stmt_safety_checks.rs).
                     //
-                    // OFF by default, matching Kani. Producing a NaN is DEFINED
-                    // behaviour in Rust, not UB, so this is a lint and not a
-                    // safety property. It used to be pushed unconditionally,
+                    // OFF by default. Kani's default is ON (kani-driver passes
+                    // CBMC `--nan-check` whenever overflow checks are on), so
+                    // this is a deliberate difference, see the driver's
+                    // `--nan-check`. Producing a NaN is DEFINED behaviour in
+                    // Rust, not UB. The obligation used to be pushed unconditionally,
                     // which made EVERY harness containing symbolic float
                     // arithmetic report a false FAILURE: the obligation ranges
                     // over an unconstrained select from the uninterpreted
@@ -273,25 +290,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         self.is_signed_integer_op(lhs_op, rhs_op)
                             .unwrap_or_else(|| signedness_fallback_for_arithmetic("chc_safety"))
                     };
+                    // None of these is gated by `--no-overflow-checks`. They
+                    // are UB of an unsafe intrinsic (`unchecked_*`, a lowered
+                    // `unchecked_div`/`unchecked_rem`), which Kani's compiler
+                    // asserts whatever that flag says (it only takes CBMC's
+                    // instrumentation off), or, after a source `/` or `%`, the
+                    // redundant twin of a MIR `Assert` this lane keeps
+                    // (`emit_assert_error_rule_shared`), unsatisfiable under its
+                    // guarded goto. Gated, the flag dropped the only check of the
+                    // UB: a false proof. The BMC lane records the same checks
+                    // ungated (statement/rvalue.rs, `label_to_property_kind`).
                     match op {
                         BinOp::AddUnchecked | BinOp::SubUnchecked | BinOp::MulUnchecked => {
-                            if self.overflow_checks
-                                && let Some(c) =
-                                    Self::unchecked_overflow_condition(*op, &le, &re, signed())
+                            if let Some(c) =
+                                Self::unchecked_overflow_condition(*op, &le, &re, signed())
                             {
                                 debug!(?op, "CHC: overflow check (#3299)");
                                 safety_checks.push(c);
                             }
                         }
                         BinOp::ShlUnchecked | BinOp::ShrUnchecked => {
-                            if self.overflow_checks {
-                                let d_signed = self.operand_signedness(rhs_op).unwrap_or(false);
-                                if let Some(c) =
-                                    unchecked_shift_distance_condition(&le, &re, d_signed)
-                                {
-                                    debug!(?op, "CHC: shift distance check (#3363)");
-                                    safety_checks.push(c);
-                                }
+                            let d_signed = self.operand_signedness(rhs_op).unwrap_or(false);
+                            if let Some(c) = unchecked_shift_distance_condition(&le, &re, d_signed)
+                            {
+                                debug!(?op, "CHC: shift distance check (#3363)");
+                                safety_checks.push(c);
                             }
                         }
                         BinOp::Div | BinOp::Rem => {
@@ -299,11 +322,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 debug!(?op, "CHC: div-by-zero check (#3363)");
                                 safety_checks.push(c);
                             }
-                            if self.overflow_checks && signed() {
-                                if let Some(c) = signed_div_overflow_condition(&le, &re) {
-                                    debug!(?op, "CHC: signed div overflow (#3363)");
-                                    safety_checks.push(c);
-                                }
+                            if signed()
+                                && let Some(c) = signed_div_overflow_condition(&le, &re)
+                            {
+                                debug!(?op, "CHC: signed div overflow (#3363)");
+                                safety_checks.push(c);
                             }
                         }
                         _ => {}
@@ -369,6 +392,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if !lhs.projection.is_empty() {
             return;
         }
+        // An integer is an ADDRESS, not an identity term (Kani's layout,
+        // heap/stack_address.rs: `region << 48 | offset`), so its bits name no
+        // allocation. Decoding a constant integer as `(object, offset)` gave
+        // `let a: usize = 5 << 32` the allocation of stack slot 5, and the
+        // pointer made from it (`ptr::without_provenance(a)`) then read that
+        // slot through `known_alloc_ids`, clean, where Kani reports an invalid
+        // integer address (`int_to_ptr_const_lane_dual.rs::
+        // bug_plain_without_provenance_hi5`, found merging main dbfe268fc into
+        // fix/chc-lost-writes). A pointer made from an integer takes its
+        // allocation from the integer-to-pointer lane's result instead.
+        if self.body.locals().get(local_idx).is_some_and(|decl| {
+            matches!(
+                self.resolve_body_ty(decl.ty).kind(),
+                TyKind::RigidTy(RigidTy::Int(_) | RigidTy::Uint(_) | RigidTy::Float(_))
+            )
+        }) {
+            self.known_alloc_ids.remove(&local_idx);
+            return;
+        }
+        // An allocation id is a per-local fact, not a per-path one. A destination
+        // that several statements or calls assign would keep whichever producer
+        // was translated last, so it records none (and drops any it had).
+        if self.local_has_multiple_whole_definitions(local_idx) {
+            self.known_alloc_ids.remove(&local_idx);
+            self.ref_resolution.alloc_result_locals.remove(&local_idx);
+            return;
+        }
 
         // Field-0 data-pointer provenance forward (Box<dyn>/drop-glue lane).
         // A drop reads the container's data-pointer field through `&mut self`:
@@ -392,7 +442,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // slot's object here is the ADDRESS-USED-AS-VALUE shape: `*FOO` then
         // reads `FOO`'s own 8-byte slot as an `i32`, a cell the entry mirror
         // never writes at that type, so `assert_eq!(*FOO, 12)` is refutable.
-        if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rhs
+        if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rhs
             && matches!(p.projection.as_slice(), [ProjectionElem::Deref])
             && let Some(&vec_idx) = self.ref_resolution.static_ref_to_state_idx.get(&p.local)
             && Self::deref_pointee_ty(self.body.locals()[p.local].ty).is_some_and(|pointee| {
@@ -430,7 +480,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // source pointer local's alloc_id (which still names the outer
             // allocation). Reusing `p.local` here makes nested Box/Rc deref
             // chains follow the wrong object on the next load.
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                 if matches!(p.projection.first(), Some(ProjectionElem::Deref)) =>
             {
                 try_extract_data_obj_id(rhs_expr)
@@ -455,11 +505,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // generic arm used to capture the shape first, leaving it dead.
             // `deref_load_referent_local` matches only that exact shape, so
             // Box/Rc/NonNull deref chains keep their inheritance.
-            if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rhs
+            if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rhs
                 && matches!(p.projection.first(), Some(ProjectionElem::Deref))
                 && let Some(referent) = self.deref_load_referent_local(p.local)
             {
-                let forwarded = self.known_alloc_ids.get(&referent).copied();
+                // `(*_p).f` reads `_L.f`, which holds `_L`'s pointer value only
+                // when `f` is a transparent wrapper field; `(*_p).1` of a pair
+                // is a different pointer.
+                let reads_referent_value = self.body.locals().get(referent).is_some_and(|decl| {
+                    Self::field_chain_is_transparent(decl.ty, &p.projection[1..])
+                });
+                let forwarded = if reads_referent_value {
+                    self.known_alloc_ids.get(&referent).copied()
+                } else {
+                    None
+                };
                 debug!(
                     local_idx,
                     ptr_local = p.local,
@@ -479,30 +539,57 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 return;
             }
+            // A LOAD through a pointer to a STACK slot whose referent the MIR walk
+            // could not name (`deref_load_referent_local` above declined): the loaded
+            // value is the slot's content, never a pointer into the slot's own object.
+            // The generic arm below would copy the slot's id onto it — the
+            // ADDRESS-used-as-VALUE shape — and the next deref of the destination
+            // reads the slot as the pointee. Leave the destination without an id.
+            if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) = rhs
+                && matches!(p.projection.first(), Some(ProjectionElem::Deref))
+                && self.local_holds_stack_slot_address(p.local)
+            {
+                debug!(
+                    local_idx,
+                    ptr_local = p.local,
+                    "CHC: load through a stack-slot pointer — the slot's alloc_id is not the \
+                     loaded value's (fail closed)"
+                );
+                self.known_alloc_ids.remove(&local_idx);
+                self.ref_resolution.alloc_result_locals.remove(&local_idx);
+                return;
+            }
             let src_local_for_alloc = match rhs {
-                Rvalue::ShallowInitBox(Operand::Copy(p) | Operand::Move(p), _)
-                | Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
-                // Cast preserves pointer identity (ptr casts, unsized coercions).
-                | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => {
+                // A whole local, or a transparent wrapper field of it, holds the
+                // source's pointer value. A field of a larger aggregate does not
+                // (`copy (pair.1)` inherited the pair's FIRST pointer), and a load
+                // through a pointer yields a pointer stored in memory, not the one
+                // that addressed it: the loaded-value arms above already took every
+                // load whose allocation is known, and `*d = 9` through
+                // `d = copy (*outer)` wrote into `outer`'s box.
+                Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
+                | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                    if self.read_keeps_pointer_value(rhs, p) =>
+                {
                     Some(p.local)
                 }
-                Rvalue::ShallowInitBox(..) | Rvalue::Use(..) | Rvalue::Cast(..) => {
-                    None
-                }
+                #[cfg(not(trust_toolchain))]
+                Rvalue::ShallowInitBox(Operand::Copy(p) | Operand::Move(p), _) => Some(p.local),
+                Rvalue::Use(..) | Rvalue::Cast(..) => None,
+                #[cfg(not(trust_toolchain))]
+                Rvalue::ShallowInitBox(..) => None,
                 // Aggregate construction wrapping a pointer (NonNull, Rc, Box):
                 // find the first operand that carries an alloc_id.
-                Rvalue::Aggregate(_, operands) => {
-                    operands.iter().find_map(|op| match op {
-                        Operand::Copy(p) | Operand::Move(p) => {
-                            if self.known_alloc_ids.contains_key(&p.local) {
-                                Some(p.local)
-                            } else {
-                                None
-                            }
+                Rvalue::Aggregate(_, operands) => operands.iter().find_map(|op| match op {
+                    Operand::Copy(p) | Operand::Move(p) => {
+                        if self.known_alloc_ids.contains_key(&p.local) {
+                            Some(p.local)
+                        } else {
+                            None
                         }
-                        _ => None,
-                    })
-                }
+                    }
+                    _ => None,
+                }),
                 // Ref to a Deref place: _20 = &mut (*_28) — the reference
                 // points into the same allocation as the deref base.
                 // Part of #3589: Without this, Rc::new stores through a
@@ -558,14 +645,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => None,
             };
             let rhs_alloc_id = match rhs {
-                Rvalue::ShallowInitBox(..)
-                | Rvalue::Use(..)
-                | Rvalue::Cast(..)
-                | Rvalue::Aggregate(..)
-                | Rvalue::Ref(..) => try_extract_data_obj_id(rhs_expr),
+                Rvalue::Use(..) | Rvalue::Cast(..) | Rvalue::Aggregate(..) | Rvalue::Ref(..) => {
+                    try_extract_data_obj_id(rhs_expr)
+                }
+                #[cfg(not(trust_toolchain))]
+                Rvalue::ShallowInitBox(..) => try_extract_data_obj_id(rhs_expr),
                 Rvalue::CopyForDeref(_) => None,
                 _ => None,
             };
+            // Same rule for the source: a copy of a multi-producer pointer inherits
+            // no allocation (its `known_alloc_ids` entry names one producer).
+            let src_local_for_alloc =
+                src_local_for_alloc.filter(|&src| !self.local_has_multiple_whole_definitions(src));
             if let Some(src) = src_local_for_alloc {
                 if let Some(obj_id) = self
                     .known_alloc_ids
@@ -587,13 +678,43 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.ref_resolution.alloc_result_locals.insert(local_idx);
             } else if matches!(
                 rhs,
-                Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
-                    if matches!(p.projection.first(), Some(ProjectionElem::Deref))
+                Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                    if !p.projection.is_empty()
             ) || matches!(rhs, Rvalue::CopyForDeref(_))
             {
                 self.known_alloc_ids.remove(&local_idx);
             }
         }
+    }
+
+    /// Whether `_d = <rhs>` reading `p` gives `_d` exactly `p.local`'s pointer
+    /// value: a value-preserving cast (or none) of the whole local or of a
+    /// transparent wrapper field chain, never a load through a pointer.
+    fn read_keeps_pointer_value(&self, rhs: &Rvalue, p: &Place) -> bool {
+        use rustc_public::mir::CastKind;
+        if let Rvalue::Cast(kind, ..) = rhs
+            && !matches!(
+                kind,
+                CastKind::PtrToPtr
+                    | CastKind::Transmute
+                    | CastKind::PointerCoercion(_)
+                    | CastKind::PointerExposeAddress
+                    | CastKind::PointerWithExposedProvenance
+                    | CastKind::Subtype
+            )
+        {
+            return false;
+        }
+        if p.projection.is_empty() {
+            return true;
+        }
+        !p.projection.iter().any(|elem| matches!(elem, ProjectionElem::Deref))
+            && self
+                .body
+                .locals()
+                .get(p.local)
+                .is_some_and(|decl| Self::field_chain_is_transparent(decl.ty, &p.projection))
     }
 
     /// WRITER for the field-0 data-pointer provenance map
@@ -645,7 +766,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     fn try_field0_provenance_forward(&self, rhs: &Rvalue) -> Option<u32> {
         use rustc_public::mir::CastKind;
         let p = match rhs {
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) | Rvalue::CopyForDeref(p) => p,
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) | Rvalue::CopyForDeref(p) => p,
             // Value-preserving pointer casts keep provenance identity.
             Rvalue::Cast(kind, Operand::Copy(p) | Operand::Move(p), _)
                 if matches!(
@@ -701,13 +822,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 continue;
             };
+            // The same writes as the entry rule (`collect_const_ref_memory_constraints`),
+            // which seeds a cell only at its key's registered sort: one key can carry
+            // both an array's per-element cells and its whole value at offset 0, and
+            // replaying the other one, coerced, would overwrite element 0.
+            if *value.sort() != declared_elem_sort {
+                continue;
+            }
 
             let arr_sort = ay_bindings::Sort::array(
                 crate::codegen_ay::types::ptr_sort(),
                 declared_elem_sort.clone(),
             );
             let arr_out_name = crate::codegen_ay::names::out_name(&arr_name);
-            let promoted_addr = self.heap_state.promoted_const_address_for(promoted_obj_id);
+            let promoted_addr =
+                crate::codegen_ay::chc::decl::global_objects::object_base_for(promoted_obj_id);
             let addr = if byte_offset == 0 {
                 promoted_addr
             } else {

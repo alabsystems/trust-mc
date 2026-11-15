@@ -63,7 +63,7 @@ fn run_adapter_dispatch_with_stub(stub: StubKind) {
             stmt_constraints: &stmt_constraints,
             modified_locals: &modified_locals,
         };
-        chc_ctx.codegen_call_iterator_adapter(&cx);
+        chc_ctx.codegen_call_iterator_adapter(&cx, None);
 
         let after_rules = chc_ctx.vc.rules.len();
         // Every dispatch should produce at least one rule
@@ -139,13 +139,14 @@ fn test_dispatch_range_spec_next_empty_args_fail_closed() {
             stmt_constraints: &stmt_constraints,
             modified_locals: &modified_locals,
         };
-        chc_ctx.codegen_call_iterator_adapter(&cx);
+        chc_ctx.codegen_call_iterator_adapter(&cx, None);
 
         // RangeSpecNext failure should produce an error rule
         let last_rule = chc_ctx.vc.rules.last().expect("should have emitted a rule");
-        assert_eq!(
-            last_rule.head.name, "error",
-            "RangeSpecNext with empty args should produce fail-closed error rule"
+        assert!(
+            is_error_check_rule(last_rule),
+            "RangeSpecNext with empty args should produce fail-closed error rule, got {}",
+            last_rule.head.name
         );
     });
 }

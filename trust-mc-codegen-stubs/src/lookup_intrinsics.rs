@@ -200,7 +200,7 @@ impl StubRegistry {
             "Option",
             "Result",
         ];
-        if EXCLUDED_TYPES.iter().any(|t| path.contains(t)) {
+        if EXCLUDED_TYPES.iter().any(|&t| path.contains(t)) {
             return false;
         }
 
@@ -269,6 +269,14 @@ impl StubRegistry {
             // Structural reference adapters are intentionally handled by MIR/CHC
             // inline fast paths rather than stub translation.
             "as_ref" | "as_mut" => None,
+            // `unwrap_or_default` is deliberately NOT stubbed: the inline pass keeps
+            // it as a Call (the `unwrap` substring rule) and the BMC mini-inliner
+            // then runs the REAL body, so `T::default()` is whatever MIR says it
+            // is — a stub would have to invent a default per type. Measured: the
+            // inlined route proves `None::<u8>.unwrap_or_default() == 0` and
+            // fails the `== 1` variant; when the mini-inliner declines, the
+            // "Call terminator" fallback fails closed.
+            "unwrap_or_default" => None,
             _ => {
                 // non-enum: &str (method name)
                 tracing::warn!(method, path, "unhandled Option method in stub lookup");
@@ -298,6 +306,12 @@ impl StubRegistry {
             "expect" => Some(StubKind::ResultExpect),
             // Match unwrap_err BEFORE unwrap to avoid false suffix match
             "unwrap_err" => Some(StubKind::ResultUnwrapErr),
+            // `expect_err` is `unwrap_err` with a message: same Err-payload
+            // extraction, same panic-on-Ok obligation. The inline pass keeps it
+            // as a Call (has_special_codegen_handler) so this arm actually fires;
+            // inlined, its `unwrap_failed` Debug-formatting path demoted every
+            // harness with unconstrained assignments and nothing could PROVE.
+            "expect_err" => Some(StubKind::ResultUnwrapErr),
             "unwrap" => Some(StubKind::ResultUnwrap),
             // Result::copied / cloned are the same pass-through shape as the
             // existing Option::copied stub: preserve the outer enum and copy

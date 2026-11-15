@@ -159,7 +159,9 @@ fn test_mem_level_deref_store() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: nothing reads `*r` after the write, so write-only array elimination
+        // (85da41dad) removes the heap store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         assert!(!smt.is_empty(), "Mem-level VC should produce non-empty SMT output");
@@ -281,7 +283,9 @@ fn test_mem_level_read_and_write() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the written heap is never read again, so write-only array
+        // elimination (85da41dad) removes the store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         assert!(
             !vc.rules.is_empty(),
@@ -315,7 +319,9 @@ fn test_mem_level_array_write() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: nothing reads `*r` after the write, so write-only array elimination
+        // (85da41dad) removes the heap store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         assert!(!smt.is_empty(), "Mem-level array write should produce non-empty VC");
         // Should declare relations for basic blocks
@@ -364,7 +370,9 @@ fn test_mem_level_struct_field_write() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: nothing reads `*r` after the write, so write-only array elimination
+        // (85da41dad) removes the heap store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         assert!(!smt.is_empty(), "Mem-level struct field write should produce non-empty VC");

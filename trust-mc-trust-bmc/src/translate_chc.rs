@@ -24,25 +24,97 @@ use trust_ir::{Block, Function, Module};
 use trust_mc_core::chc::{ChcQuery, ChcVc, RelationApp, RelationDecl, Rule, RuleBody};
 
 use crate::coverage::{SemanticsFamily, family_for_inst};
+use crate::input::ModuleInput;
+use crate::signature_abi::first_typed_signature_abi;
 use crate::translate::{
-    TranslateOptions, bounded_output_out_of_range, const_to_expr,
-    integer_binop_div_by_zero_condition, integer_binop_no_overflow_condition, is_eq_comparable_ty,
-    is_ordered_scalar_ty, normalize_expr_to_ty, overflow_op_to_binop, switch_case_expr, ty_to_sort,
+    TranslateOptions, binop_is_floating_point, bounded_output_out_of_range, bv_rotate,
+    const_to_expr, integer_binop_div_by_zero_condition, integer_binop_no_overflow_condition,
+    integer_rotate_is_unencodable, is_eq_comparable_ty, is_ordered_scalar_ty, normalize_expr_to_ty,
+    overflow_op_to_binop, switch_case_expr, ty_to_sort,
 };
 
 const ERROR_REL: &str = "error";
 const DIRECT_CALL_SUMMARY_MAX_STATES: usize = 64;
 
+#[path = "translate_chc_large_block.rs"]
+mod large_block;
+
+pub use large_block::{LargeBlockEdge, LargeBlockErrorSite, LargeBlockMap, LargeBlockPath};
+
+#[path = "translate_chc_bulk_memory.rs"]
+mod bulk_memory;
+
+#[path = "translate_chc_ty_facts.rs"]
+mod ty_facts;
+
+#[path = "translate_chc_dataless_enum.rs"]
+mod dataless_enum;
+
+#[path = "translate_chc_construction_definedness.rs"]
+mod construction_definedness;
+
+#[cfg(test)]
+#[path = "translate_chc_bulk_memory_tests.rs"]
+mod bulk_memory_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_fat_pointer_cell_tests.rs"]
+mod fat_pointer_cell_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_liveness_tests.rs"]
+pub(crate) mod liveness_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_large_block_tests.rs"]
+mod large_block_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_opaque_fat_pointer_summary_tests.rs"]
+mod opaque_fat_pointer_summary_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_smt_array_tests.rs"]
+mod smt_array_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_source_reference_tests.rs"]
+mod source_reference_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_source_reference_product_tests.rs"]
+mod source_reference_product_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_source_initialized_value_tests.rs"]
+mod source_initialized_value_tests;
+
+#[cfg(test)]
+#[path = "translate_chc_tensor_region_tests.rs"]
+mod tensor_region_tests;
+
 /// Trust: cap on the number of scalar CHC leaves a single trackable aggregate may
-/// flatten into when its block-relation signature is declared. A nested fixed-size
-/// array such as `[[[u8; 256]; 256]; 256]` is "trackable" (every leaf is a scalar)
-/// yet expands to `256^3 ≈ 16.7M` permanently-declared CHC variables
-/// (`declare_relation_binding_rec` → `vc.declare_var` per leaf, plus a `flat_args`
-/// re-clone of the whole leaf vector at every relation application), which exhausts
-/// RAM + swap. Beyond this budget the aggregate is treated as NON-trackable so it
-/// falls back to a single opaque scalar var — the same fail-closed handling a
-/// `len > 256` array or an enum already gets (spurious-unverified, never a false
-/// proof). Regression guard for the array-aggregate arm added in `bd37bce4a`.
+/// flatten into when its block-relation signature is declared.
+///
+/// ARRAYS ARE NOT COUNTED BY LENGTH. A fixed-size array `[e; n]` is one SMT array
+/// per scalar leaf of `e` (`ArrayValue`), so it contributes `e`'s leaf count ONCE,
+/// whatever `n` is: `[[[u8; 256]; 256]; 256]` is ONE leaf of sort
+/// `(Array BV64 (Array BV64 (Array BV64 BV8)))`, not `256^3` variables.
+///
+/// What this still bounds is STRUCT-DAG expansion: `k` nested two-field structs
+/// flatten to `2^k` leaves, exponential in the program text, because every
+/// struct/tuple field is its own CHC column. Retiring this bound needs a
+/// datatype-sort model for ALL aggregates (registers and array elements alike)
+/// AND an engine whose cost for a datatype sort follows its type text. At the
+/// pinned ay it follows the flattened leaf count instead: the proof identity
+/// prints a datatype's whole definition at every variable occurrence, and its
+/// sort hash recurses through it. A datatype column there costs more than these
+/// columns, and it loses the verdict from 1024 leaves on. Deleting the bound
+/// would turn this bounded refusal into allocation proportional to `2^k` inside
+/// ay (measured: `docs/ay-asks/2026-10-01-datatype-sort-cost-follows-leaf-count`).
+/// Beyond the bound the aggregate is treated as NON-trackable and falls back to a
+/// single opaque scalar var — the same fail-closed handling an enum gets
+/// (spurious-unverified, never a false proof).
 const MAX_AGGREGATE_LEAVES: usize = 4096;
 
 /// Typed result of lowering one trust_ir function to a CHC verification condition.
@@ -51,14 +123,134 @@ const MAX_AGGREGATE_LEAVES: usize = 4096;
 pub struct ChcTranslationOutput {
     /// Generated typed CHC verification condition.
     pub vc: ChcVc,
+    /// Canonical whole-module input refusal, before any function translation.
+    /// Its VC contains an unconditional ownerless error fact. This is separate
+    /// from instruction diagnostics, which require a real function/block/site.
+    /// `None` for every canonically valid module, including unsupported semantics.
+    pub module_input_refusal: Option<String>,
     /// Fail-closed diagnostics emitted while lowering unsupported trust_ir semantics.
     pub diagnostics: Vec<TrustIrChcDiagnostic>,
+    /// Direct SELF-call sites modeled by the INDUCTIVE HYPOTHESIS (results
+    /// havoc'd, entry preconditions re-asserted over the actuals, NO error
+    /// rule). One row per admitted site. Demote-only transport: a refutation
+    /// whose derivation may pass through a havoc'd self-call result is held at
+    /// Unknown by the driver; a proof is a real proof (see
+    /// `try_self_call_inductive_hypothesis`). Disjoint from `diagnostics`, which
+    /// holds only the fail-closed error-rule sites.
+    pub inductive_hypothesis_sites: Vec<TrustIrChcDiagnostic>,
     /// One row per direct-call site, recording whether the modular call summary
     /// succeeded and -- when it did not -- the exact labelled exit it declined at.
     ///
     /// EMPTY unless `TranslateOptions::collect_call_summary_census` is set.
     /// Diagnostic only: nothing in the verdict path reads it.
     pub call_summary_census: Vec<CallSummaryAttempt>,
+    /// Deterministic work counters of this translation. Instrumentation only:
+    /// nothing in the verdict path reads them.
+    pub work: ChcTranslationWork,
+    /// How `vc`'s one query rule maps back to the per-block encoding, when the
+    /// function was translated with the large-block encoding
+    /// (`translate_chc_large_block.rs`): its error sites and transitions, from
+    /// which [`LargeBlockMap::counterexample_path`] recovers the block path of a
+    /// counterexample. `None` for a per-block translation.
+    pub large_block: Option<LargeBlockMap>,
+}
+
+/// Deterministic work counters of one function's CHC translation.
+///
+/// Pure instrumentation — nothing in the verdict path reads them. They exist so
+/// tests can pin that translation cost follows the program's size and the values
+/// that are actually live, not the product of blocks and threaded values nor the
+/// number of obligations asked of the function.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChcTranslationWork {
+    /// Instructions of the translated function handed to the per-instruction
+    /// translator. Call-summary interpretation of callee bodies is not included.
+    pub instructions_translated: u64,
+    /// `(block, value)` pairs entered into a live-in set, over the threaded SSA
+    /// values and the promoted cells together: the summed live-in sizes.
+    pub live_in_insertions: u64,
+    /// `(CFG edge, value)` pairs visited while propagating live-in sets to
+    /// predecessors: `Σ_b |live_in(b)| · |preds(b)|`.
+    pub live_in_edge_visits: u64,
+    /// Relation arguments declared across all block relations, counting every
+    /// flattened aggregate leaf.
+    pub relation_arguments: u64,
+    /// Reads of a relation-carried value (a threaded SSA value or a promoted
+    /// cell) in a non-entry block that did not define it and whose relation does
+    /// not carry it. Each such read becomes a fresh havoc — sound, but a lost
+    /// precision the liveness analysis exists to prevent — so the corpus tests
+    /// pin this at zero: the analysis must cover every read the translation
+    /// actually makes, not only the reads a use enumerator lists.
+    pub carried_value_misses: u64,
+    /// Linear passes over a summarized callee's body to gather the declared types
+    /// of its element operands (`callee_operand_tys_of`): at most one per distinct
+    /// callee a summary reads an element in, however many call sites and nested
+    /// summaries reach it.
+    pub callee_operand_type_passes: u64,
+    /// Blocks the large-block encoding merged into the function's one query
+    /// rule instead of giving them a relation (`translate_chc_large_block.rs`).
+    pub large_block_merged_blocks: u64,
+    /// Variables the large-block encoding declared: reachability, prefix,
+    /// selector and error-site Booleans, and column variables.
+    pub large_block_variables: u64,
+    /// Of those, definitional variables (`LargeBlockMap::columns`): a merged
+    /// block's input whose emitted in-edges pass one compound term, each link
+    /// of a column's selection chain (one per in-edge passing another term than
+    /// the column's most frequent one), and each cross-block fat-pointer part
+    /// variable.
+    pub large_block_column_variables: u64,
+    /// `(merged block, column)` pairs whose in-edge terms were compared: the
+    /// merged blocks' summed relation widths in the per-block encoding.
+    pub large_block_column_merges: u64,
+    /// Translations that abandoned the large-block encoding for the per-block
+    /// one because an emitted rule did not have the shape the encoding relies
+    /// on. Pinned at zero by the corpus tests.
+    pub large_block_fallbacks: u64,
+}
+
+impl ChcTranslationWork {
+    /// Add `other`'s counters to these (summing over several translations).
+    pub(crate) fn accumulate(&mut self, other: &Self) {
+        let Self {
+            instructions_translated,
+            live_in_insertions,
+            live_in_edge_visits,
+            relation_arguments,
+            carried_value_misses,
+            callee_operand_type_passes,
+            large_block_merged_blocks,
+            large_block_variables,
+            large_block_column_variables,
+            large_block_column_merges,
+            large_block_fallbacks,
+        } = *other;
+        self.instructions_translated += instructions_translated;
+        self.live_in_insertions += live_in_insertions;
+        self.live_in_edge_visits += live_in_edge_visits;
+        self.relation_arguments += relation_arguments;
+        self.carried_value_misses += carried_value_misses;
+        self.callee_operand_type_passes += callee_operand_type_passes;
+        self.large_block_merged_blocks += large_block_merged_blocks;
+        self.large_block_variables += large_block_variables;
+        self.large_block_column_variables += large_block_column_variables;
+        self.large_block_column_merges += large_block_column_merges;
+        self.large_block_fallbacks += large_block_fallbacks;
+    }
+}
+
+/// Which liveness analysis sizes the block relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessOracle {
+    /// Uses are every instruction's SSA operands; successors come only from a
+    /// block's terminator. The production analysis.
+    Precise,
+    /// The analysis this crate shipped before the precise one: it asked every
+    /// instruction for terminator successors, so any block holding an ordinary
+    /// instruction read every carried value. Kept only as the differential
+    /// oracle for the verdict-parity tests.
+    #[cfg(any(test, feature = "legacy-liveness-oracle"))]
+    Legacy,
 }
 
 /// Structured diagnostic for trust_ir constructs that were represented by a
@@ -104,11 +296,54 @@ pub enum TrustIrChcUnsupportedReason {
     OverflowIntrinsic,
     AggregateProjection,
     AggregateUpdate,
+    /// An array element index this lowering cannot place: not a bit-vector
+    /// (malformed IR), or — for an index whose declared type is not a known
+    /// integer type — a value with its top bit set below the array's length,
+    /// which names a real lane if the index is unsigned and is a negative
+    /// (undefined-behaviour) index if it is signed. Neither reading is assumed,
+    /// so the access fails closed there.
+    UnmodeledElementIndex,
+    /// An element read of an operand whose length this lowering does not know: a
+    /// sequence (no static length) or a value with no declared type. trust-ir makes
+    /// the read undefined behaviour when it is out of bounds, and no bound can be
+    /// stated without the length, so with memory bounds checked the read fails
+    /// closed (its value is an unconstrained one either way).
+    UnmodeledElementLength,
+    /// Aggregate construction outside the precisely tracked composite model.
+    AggregateConstruction,
+    /// Runtime closure target/capture construction has no exact value model.
+    ClosureConstruction,
+    /// Initialization of a consumed constructor operand was not established.
+    AggregateOperandDefinedness,
+    /// A constructor would materialize opaque address/metadata value tokens.
+    AggregateOpaqueValue,
+    /// Canonical call argument transport was not established (poison/unknown).
+    CallArgumentTransport,
+    /// A supported content-inspecting operation has unproved operand transport.
+    OperandConsumption,
     BindingFrame,
     BindingFrameSlotLoad,
     BindingFrameClose,
     SequenceMap,
     MemoryAccessWithoutPreciseModel,
+    /// A trust-ir WS3.20 `MemCopy` (`memcpy`/`memmove`) or `MemSet` through a
+    /// pointer with no exact place in a single-cell stack allocation (a pointer
+    /// parameter, a symbolic offset, a heap block), or a copy FROM such a pointer.
+    /// Its write is modeled soundly — every tracked cell the destination could
+    /// reach is havocked — but the range's in-bounds / non-overlap undefined
+    /// behaviour cannot be decided, so with memory bounds checked the instruction
+    /// fails closed wherever its byte count is nonzero
+    /// (`translate_chc_bulk_memory.rs`).
+    BulkMemoryTransfer,
+    /// A `MemCopy`/`MemSet` whose range is defined and in bounds of a TRACKED
+    /// stack cell but is not one whole object starting at the destination: a run
+    /// of `k` lanes of an array with `1 < k < len` (exact only as an array-range
+    /// write, `lambda i. ite(lo <= i < hi, ..)`, which neither `ay_bindings::Expr`
+    /// nor the CHC engine's `ay_chc::ChcExpr` can express in constant size), a
+    /// copy between objects of different types, or a fill of a non-integer leaf.
+    /// The cell is havocked and the error fires exactly where such a range is
+    /// written (`translate_chc_bulk_memory.rs`).
+    BulkMemoryUnplacedRange,
     HeapAllocation,
     GlobalAddress,
     SymbolAddress,
@@ -119,12 +354,32 @@ pub enum TrustIrChcUnsupportedReason {
     ReferenceCounting,
     ReferenceCountUniqueness,
     HeapDeallocation,
+    /// A trust-ir v47 `Drop { ty, ptr }`: `ty`'s drop glue run on the place at
+    /// `ptr`. The glue (user `Drop` impls, nested field drops, deallocation) is
+    /// not part of the node, so it may read or write anything reachable from
+    /// `ptr` and may panic; with no body to summarize it fails closed.
+    DropGlue,
     PointerMetadata,
     Switch,
     IndirectCall,
+    /// A trust-ir v53 `CallCannotUnwind` / `CallIndirectCannotUnwind`: a call
+    /// whose normal return means what `Call` / `CallIndirect` means, but at
+    /// which an unwind out of the callee must be stopped. Neither the boundary
+    /// nor its callee is modeled, so it fails closed.
+    NoUnwindCallBoundary,
+    /// A trust-ir v54 `AssertInvoke`: a sited check whose failure may enter an
+    /// in-frame landing pad. Its unwind edge has no model here (as `Invoke`'s
+    /// has none), so the terminator fails closed and its successors are never
+    /// reached through it.
+    UnwindingCheck,
     UnknownDirectCall,
     UnsupportedDirectCallSummary,
     RecursiveDirectCall,
+    /// NOT an unsupported construct: the LABEL of a direct self-call site the
+    /// translator modeled by the inductive hypothesis (see
+    /// `ChcTranslationOutput::inductive_hypothesis_sites`). Lives in this enum so
+    /// the demotion message can name it beside the fail-closed constructs.
+    RecursiveSelfCallInductiveHypothesis,
     Fence,
     EndBorrow,
     DialectOperation,
@@ -133,6 +388,19 @@ pub enum TrustIrChcUnsupportedReason {
     ReturnInstructionWithResults,
     UnreachableInstruction,
     NonBooleanCondition,
+    /// The module records a typed signature ABI (trust-ir wire v60
+    /// `FuncTy::abi`): transport (caller copies, argument extension, hidden
+    /// results, source-to-carrier bindings) this lowering does not model. It
+    /// is a property of the module, not of one instruction, so the function's
+    /// encoding gets an unconditional `error` rule (`crate::signature_abi`).
+    TypedSignatureAbiTransport,
+    /// A trust-ir v67-v70 tensor-region construct, named: one of the six
+    /// `Inst::Tensor*` instructions, or a `Const` that builds a
+    /// `Constant::TensorBlob` or has a `Ty::Tensor` type. No tensor value has
+    /// a sort here; the module input refuses every module storing one before
+    /// translation, so this fires only for a caller that bypassed it
+    /// (`crate::tensor_region`).
+    TensorRegion(crate::TensorConstruct),
 }
 
 impl TrustIrChcUnsupportedReason {
@@ -209,6 +477,10 @@ pub enum CallSummaryOutcome {
         /// that would hide the whole wave behind it.
         detail: Option<String>,
     },
+    /// A direct SELF-call modeled by the inductive hypothesis in the MAIN
+    /// translate (results havoc'd, entry preconditions re-asserted over the
+    /// actuals, no error rule); see `try_self_call_inductive_hypothesis`.
+    InductiveHypothesis,
     /// The interpreter was never reached: an earlier arm of `translate_call`
     /// took the site first.
     NotAttempted {
@@ -343,8 +615,11 @@ fn inst_opcode(inst: &Inst) -> String {
 /// that want different work:
 ///
 /// * `FatPtr` keeps its kind (`FatPtr_Str`, `FatPtr_Slice`, `FatPtr_TraitObject`,
-///   `FatPtr_ContainerLen`). `&str`, `&[T]` and `&dyn Trait` are three separate
-///   carrier decisions and reporting them as one number would repeat the
+///   `FatPtr_ContainerLen`, `FatPtr_ContainerVtable`). `&str`, `&[T]` and
+///   `&dyn Trait` are three separate carrier decisions — and the two container-
+///   tail kinds (`Arc<str>`'s and `Arc<dyn Any>`'s inner pointers) are two more,
+///   since their data pointer addresses a container HEADER rather than the
+///   content or the dispatched object — and reporting them as one number would repeat the
 ///   `signature_not_summary_value` mistake at the next level down. The match is
 ///   EXHAUSTIVE on purpose — a `_` arm would fold a kind added later into an
 ///   anonymous `Other` bucket, which is the attribution failure this census
@@ -363,6 +638,12 @@ fn ty_carrier(ty: &Ty) -> String {
                 FatPtrKind::Str => "Str",
                 FatPtrKind::TraitObject { .. } => "TraitObject",
                 FatPtrKind::ContainerLen => "ContainerLen",
+                // trust-ir v40: the `dyn`-tail container pointer (`*const
+                // ArcInner<dyn Any>` inside `Arc<dyn Any>`). Its OWN class, not
+                // `TraitObject`'s: the data pointer addresses the container
+                // header, nothing dispatches through it, and giving it a carrier
+                // is a separate decision from giving `&dyn Trait` one.
+                FatPtrKind::ContainerVtable => "ContainerVtable",
             };
             format!("FatPtr_{head}")
         }
@@ -370,7 +651,9 @@ fn ty_carrier(ty: &Ty) -> String {
     }
 }
 
-/// Translate every function in a `trust_ir::Module` into typed CHC VCs.
+/// Translate canonically valid functions into typed CHC VCs. Invalid modules
+/// yield one unconditional module-input error VC, even with no functions.
+/// A valid empty library has no function obligations and grants no authority.
 pub fn trust_ir_to_chc_vc(module: &Module, options: &TranslateOptions) -> Vec<ChcVc> {
     trust_ir_to_chc_translation_outputs(module, options)
         .into_iter()
@@ -384,12 +667,23 @@ pub fn trust_ir_to_chc_translation_outputs(
     module: &Module,
     options: &TranslateOptions,
 ) -> Vec<ChcTranslationOutput> {
-    module.functions.iter().map(|func| translate_function(func, module, options)).collect()
+    ModuleInput::new(module).chc_all(options, ChcEncoding::Automatic)
+}
+
+/// [`trust_ir_to_chc_translation_outputs`] in the per-block encoding (see
+/// [`trust_ir_function_to_chc_translation_output_per_block`]).
+pub fn trust_ir_to_chc_translation_outputs_per_block(
+    module: &Module,
+    options: &TranslateOptions,
+) -> Vec<ChcTranslationOutput> {
+    ModuleInput::new(module).chc_all(options, ChcEncoding::PerBlock)
 }
 
 /// Translate one function from a `trust_ir::Module` into a typed CHC VC.
 ///
-/// Returns `None` when `function` does not exist in `module`.
+/// Returns `None` for an actually absent function (selection refusal, never
+/// verification success). An existing selection in an invalid module gets an
+/// unconditional module-input error VC, without invented instruction ownership.
 pub fn trust_ir_function_to_chc_vc(
     module: &Module,
     function: FuncId,
@@ -401,22 +695,174 @@ pub fn trust_ir_function_to_chc_vc(
 /// Translate one function from a `trust_ir::Module` into a typed CHC VC plus
 /// fail-closed unsupported-construct diagnostics.
 ///
-/// Returns `None` when `function` does not exist in `module`.
+/// Complete canonical module validation precedes translation. Returns `None`
+/// only for an actually absent selection; invalidity of any function/table
+/// refuses every existing selection through `module_input_refusal`.
 pub fn trust_ir_function_to_chc_translation_output(
     module: &Module,
     function: FuncId,
     options: &TranslateOptions,
 ) -> Option<ChcTranslationOutput> {
-    module.function_by_id(function).map(|func| translate_function(func, module, options))
+    ModuleInput::new(module).chc_function(function, options)
+}
+
+pub(crate) fn trust_ir_function_to_chc_translation_output_with_source_references<'a>(
+    module: &'a Module,
+    function: FuncId,
+    options: &'a TranslateOptions,
+    facts: &'a crate::SourceReferenceFacts<'a>,
+) -> Option<ChcTranslationOutput> {
+    ModuleInput::new(module).chc_function_with_source_references(function, options, facts)
+}
+
+/// [`trust_ir_function_to_chc_translation_output`] with block relations sized by
+/// the liveness analysis this crate shipped before the precise one, which
+/// threads (almost) every carried value through every block. Exists only as the
+/// differential oracle of the verdict-parity tests; never enabled in production
+/// builds (`legacy-liveness-oracle` is a test-only feature).
+#[cfg(any(test, feature = "legacy-liveness-oracle"))]
+#[doc(hidden)]
+pub fn trust_ir_function_to_chc_translation_output_with_legacy_liveness(
+    module: &Module,
+    function: FuncId,
+    options: &TranslateOptions,
+) -> Option<ChcTranslationOutput> {
+    ModuleInput::new(module).chc_function_with_encoding(function, options, ChcEncoding::Legacy)
+}
+
+/// [`trust_ir_function_to_chc_translation_output`] in the PER-BLOCK encoding
+/// whatever the function's shape: one relation per block, one rule per emitted
+/// transition and error site, never the large-block query an acyclic function
+/// otherwise becomes (`translate_chc_large_block.rs`). The two encodings are
+/// equisatisfiable; this one is the reference the large-block tests compare
+/// against, and the one whose relations name each block's live values.
+///
+/// Canonical validity and absent-selection handling match the default entry.
+pub fn trust_ir_function_to_chc_translation_output_per_block(
+    module: &Module,
+    function: FuncId,
+    options: &TranslateOptions,
+) -> Option<ChcTranslationOutput> {
+    ModuleInput::new(module).chc_function_with_encoding(function, options, ChcEncoding::PerBlock)
+}
+
+#[derive(Clone, Copy)]
+enum ChcEncoding {
+    Automatic,
+    PerBlock,
+    #[cfg(any(test, feature = "legacy-liveness-oracle"))]
+    Legacy,
+}
+
+impl ModuleInput<'_> {
+    /// This output is about module invalidity, not a fabricated function/site.
+    fn chc_refusal(&self, options: &TranslateOptions) -> Option<ChcTranslationOutput> {
+        let reason = self.refusal_reason()?;
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::nullary(ERROR_REL));
+        vc.add_rule(Rule::new(RuleBody::empty(), RelationApp::nullary(ERROR_REL)));
+        vc.query = ChcQuery::new().with_target(ERROR_REL);
+        if let Some(timeout) = options.timeout_ms {
+            vc.query = vc.query.with_timeout(timeout);
+        }
+        Some(ChcTranslationOutput {
+            vc,
+            module_input_refusal: Some(reason.to_owned()),
+            diagnostics: Vec::new(),
+            inductive_hypothesis_sites: Vec::new(),
+            call_summary_census: Vec::new(),
+            work: ChcTranslationWork::default(),
+            large_block: None,
+        })
+    }
+
+    fn chc_all(
+        &self,
+        options: &TranslateOptions,
+        encoding: ChcEncoding,
+    ) -> Vec<ChcTranslationOutput> {
+        if let Some(refusal) = self.chc_refusal(options) {
+            return vec![refusal];
+        }
+        self.module()
+            .functions
+            .iter()
+            .map(|func| translate_function_with_encoding(func, self.module(), options, encoding))
+            .collect()
+    }
+
+    pub(crate) fn chc_function(
+        &self,
+        function: FuncId,
+        options: &TranslateOptions,
+    ) -> Option<ChcTranslationOutput> {
+        self.chc_function_with_encoding(function, options, ChcEncoding::Automatic)
+    }
+
+    fn chc_function_with_encoding(
+        &self,
+        function: FuncId,
+        options: &TranslateOptions,
+        encoding: ChcEncoding,
+    ) -> Option<ChcTranslationOutput> {
+        let func = self.module().function_by_id(function)?;
+        Some(self.chc_refusal(options).unwrap_or_else(|| {
+            translate_function_with_encoding(func, self.module(), options, encoding)
+        }))
+    }
+
+    pub(crate) fn chc_function_with_source_references<'a>(
+        &'a self,
+        function: FuncId,
+        options: &'a TranslateOptions,
+        facts: &'a crate::SourceReferenceFacts<'a>,
+    ) -> Option<ChcTranslationOutput> {
+        let module = self.module();
+        if !facts.matches_module(module) {
+            return None;
+        }
+        let func = module.function_by_id(function)?;
+        Some(self.chc_refusal(options).unwrap_or_else(|| {
+            let mut translator = ChcFuncTranslator::new(func, module, options);
+            translator.source_consumption =
+                construction_definedness::Analysis::with_source_references(module, function, facts);
+            translator.translate()
+        }))
+    }
 }
 
 struct ChcFuncTranslator<'a> {
     func: &'a Function,
     module: &'a Module,
     options: &'a TranslateOptions,
+    source_consumption: construction_definedness::Analysis<'a>,
     vc: ChcVc,
     values: BTreeMap<ValueId, Expr>,
     aggregates: BTreeMap<ValueId, AggregateValue>,
+    // SSA values of a non-empty fixed-size array type, in the SMT-array model
+    // (`ArrayValue`). Cleared with `aggregates` at every block boundary.
+    arrays: BTreeMap<ValueId, ArrayValue>,
+    // Whether array CONTENT is modeled with SMT arrays in the block being
+    // translated (or, while relations are declared, the block being declared):
+    // `false` in a block reachable from a cycle of the CFG, where every array is
+    // shape-only (see `ArrayValue`). Set per block from `array_content_blocks`.
+    smt_arrays: bool,
+    // The blocks in which array content is modeled: every block that no cycle of
+    // the CFG reaches (`array_content_blocks`). Closed under predecessors, so a
+    // transition INTO such a block always leaves one too, and a transition from
+    // one into a cyclic region drops the array columns the target does not carry.
+    array_content_blocks: BTreeSet<BlockId>,
+    // The DECLARED type of every value used as the array or the index operand of
+    // an `ExtractElement`/`InsertElement` (block parameters and instruction
+    // results, `InstrNode::result_tys`), gathered once per function, linear in its
+    // size. An element index's signedness decides what its bits mean (trust-ir
+    // `runtime_index`), and an array operand with no binding in the block still
+    // has a length.
+    element_operand_tys: BTreeMap<ValueId, Ty>,
+    // Names of the fresh lane variables a flat array literal pins lane by lane
+    // (`define_array_lanes`): `select(L, k) = e` with `L` one of these is a
+    // DEFINITIONAL equality, which `vc_equates_array_terms_beyond` admits.
+    definitional_array_lanes: BTreeSet<String>,
     stack_cells: BTreeMap<ValueId, StackCell>,
     // Result pointers of every `Alloca` in the current block — owned stack memory.
     // A store/load through one is a SAFE access even when the value can't be
@@ -490,7 +936,13 @@ struct ChcFuncTranslator<'a> {
     /// Strictly MORE invalidation than before ⇒ strictly weaker ⇒ sound. It can only turn
     /// a precise tracked value into a havoc, never the reverse.
     function_escaped_bases: BTreeSet<ValueId>,
-    ptr_parts: BTreeMap<ValueId, (Expr, Expr)>,
+    // The parts a `PtrFromParts` built a fat pointer from (or a copy of one),
+    // per SSA value, with the block that built them: read as they are in that
+    // block, everywhere when they mention no variable, and — under the
+    // large-block encoding — in every block that block dominates
+    // (`ptr_parts_view`, `translate_chc_large_block.rs` fact 2). A copy of a
+    // fat pointer read where its parts are not exact is OPAQUE.
+    ptr_parts: BTreeMap<ValueId, PtrParts>,
     // Deterministic slice-length metadata per SSA fat value: the real
     // fat-pointer metadata IS a function of the value, so every `PtrMetadata`
     // read of the SAME `ValueId` must yield the SAME symbol — otherwise a
@@ -504,6 +956,23 @@ struct ChcFuncTranslator<'a> {
     // one symbol per value only removes valuations in which one value has two
     // metadata readings — no real execution is excluded.
     ptr_metadata_syms: BTreeMap<ValueId, Expr>,
+    // The metadata of an OPAQUE fat pointer (`PtrPartsView::Opaque`): a value
+    // built by `PtrFromParts` read where its parts are not exact. One fresh,
+    // UNBOUNDED havoc per SSA value (the metadata is a function of the value),
+    // never the `isize::MAX`-bounded `slice_len` symbol: whatever length a
+    // `PtrFromParts` was given is what the value carries.
+    ptr_opaque_metadata: BTreeMap<ValueId, Expr>,
+    // What each term mentions (variables, havocs), once per shared node.
+    term_facts: large_block::TermFacts,
+    // The large-block encoding of this function, when it applies
+    // (`translate_chc_large_block.rs`); `None` translates every block per block.
+    large_block: Option<large_block::LargeBlock>,
+    // Whether this translator may use the large-block encoding: off for the
+    // per-block oracles and for the per-block retranslation after a fallback.
+    allow_large_block: bool,
+    // The instruction of `current_block` being translated (large-block error
+    // sites record it).
+    current_instruction: usize,
     block_param_bindings: BTreeMap<BlockId, Vec<ValueBinding>>,
     // Immutable function parameters (entry-block params), threaded through every
     // block relation so dominance-scoped uses in downstream blocks resolve to the
@@ -512,12 +981,22 @@ struct ChcFuncTranslator<'a> {
     // Per-block subset of `threaded_params` actually carried by that block's
     // relation (excludes the entry block and any param the block redeclares).
     block_threaded_params: BTreeMap<BlockId, Vec<(ValueId, Ty)>>,
-    // Liveness over-approximation: the set of immutable entry-param `ValueId`s
-    // that are live-in at each block (referenced by the block or a block
-    // reachable from it without an intervening redefinition). Only live params
-    // are threaded into a block relation; threading a dead param is sound but
-    // imprecise, while *failing* to thread a live param would be unsound.
+    // Liveness over-approximation: the set of threaded `ValueId`s that are
+    // live-in at each block (read by the block's translation, or live-in at a
+    // successor its terminator transfers to, and not defined by the block).
+    // Only live values are threaded into a block relation; threading a dead
+    // value is sound but imprecise, while failing to thread one the block's
+    // translation reads loses precision (the read becomes a fresh havoc).
     block_live_params: BTreeMap<BlockId, std::collections::BTreeSet<u32>>,
+    // The defining block of every threaded value (entry params: the entry).
+    // Read only by the `carried_value_misses` instrumentation.
+    threaded_def_block: BTreeMap<u32, BlockId>,
+    // The block `translate_block` is translating, for the same instrumentation.
+    current_block: Option<BlockId>,
+    // Which liveness analysis sizes the block relations (see `LivenessOracle`).
+    liveness: LivenessOracle,
+    // Deterministic work counters; see `ChcTranslationWork`.
+    work: ChcTranslationWork,
     // Fresh formal-parameter expressions for each block's threaded prefix, in the
     // same order as `block_threaded_params`.
     block_threaded_bindings: BTreeMap<BlockId, Vec<ValueBinding>>,
@@ -531,10 +1010,50 @@ struct ChcFuncTranslator<'a> {
     block_live_cells: BTreeMap<BlockId, std::collections::BTreeSet<u32>>,
     block_cell_bindings: BTreeMap<BlockId, Vec<ValueBinding>>,
     diagnostics: Vec<TrustIrChcDiagnostic>,
+    // Self-call sites modeled by the inductive hypothesis; see
+    // `ChcTranslationOutput::inductive_hypothesis_sites`.
+    inductive_hypothesis_sites: Vec<TrustIrChcDiagnostic>,
     // One row per `Inst::Call` site when the census is enabled; see
     // `ChcTranslationOutput::call_summary_census`.
     call_summary_census: Vec<CallSummaryAttempt>,
+    // States the CURRENT top-level direct-call-summary attempt may still process,
+    // shared across every nesting depth. Reset at each depth-0 entry; see
+    // `DIRECT_CALL_SUMMARY_TOTAL_STATES`.
+    call_summary_states_left: usize,
+    // `element_operand_tys` of each callee a summary has read an array element in,
+    // computed on the callee's first `ExtractElement` and kept for this translator:
+    // the work is linear in the distinct callees' sizes, however many call sites
+    // and nested summaries reach them.
+    callee_operand_tys: BTreeMap<FuncId, std::rc::Rc<BTreeMap<ValueId, Ty>>>,
+    // Memoized type queries (composite shapes, byte layouts, lane evidence),
+    // once per distinct type: `translate_chc_ty_facts.rs`.
+    ty_facts: ty_facts::TyFacts,
     next_sym_id: u32,
+}
+
+/// What the translator recorded about the parts of a fat-pointer SSA value
+/// (`ChcFuncTranslator::ptr_parts`).
+#[derive(Debug, Clone)]
+enum PtrParts {
+    /// The data and metadata terms a `PtrFromParts` (or a copy of one) built it
+    /// from in `block`; `closed` when neither mentions a variable.
+    Exact { block: BlockId, data: Expr, metadata: Expr, closed: bool },
+    /// A copy of such a value made where its parts were not exact: nothing is
+    /// known of its metadata.
+    Opaque,
+}
+
+/// How the block being translated may read a fat pointer's parts
+/// (`ChcFuncTranslator::ptr_parts_view`).
+#[derive(Debug, Clone)]
+enum PtrPartsView {
+    /// Exactly these data and metadata terms.
+    Exact(Expr, Expr),
+    /// Built by a `PtrFromParts`, but its parts are not exact here: the data is
+    /// the value's own binding, the metadata an unbounded havoc.
+    Opaque,
+    /// No `PtrFromParts` built it: the historical reading (`slice_len`).
+    Unrecorded,
 }
 
 #[derive(Debug, Clone)]
@@ -587,43 +1106,325 @@ enum IndirectStoreOutcome {
     NoTrackedTarget,
 }
 
-/// Result of an exact-or-unknown CFG reachability query used by
-/// per-obligation narrowing.
-///
-/// `ProvenUnreachable` is authority-bearing: it is the only result that may
-/// suppress an unsupported-semantics error rule. Missing blocks, dangling
-/// successor ids, duplicate block ids, or malformed/unsupported terminators
-/// produce `Unknown`, which keeps the rule and therefore fails closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CfgReachability {
-    Reachable,
-    ProvenUnreachable,
-    Unknown,
-}
-
 #[derive(Debug, Clone)]
 enum ValueBinding {
     Scalar(Expr),
     Aggregate(AggregateValue),
+    Array(ArrayValue),
+}
+
+/// A fixed-size array value `[e; n]` with `n >= 1`, in the SMT-array model.
+///
+/// `lanes` has the SHAPE of ONE element's binding (a scalar, a struct of fields, or
+/// a nested array), but every scalar leaf in it is an SMT ARRAY
+/// `(Array (_ BitVec 64) S)` that maps a lane index to that leaf's value in that
+/// lane — a struct of arrays. A nested array element nests the sort. So the number
+/// of leaves, and with it the CHC relation columns and the size of every term built
+/// here, is the ELEMENT type's leaf count, whatever `len` is. `len` itself is read
+/// only to state the in-bounds obligation `index <u len`, as one BV64 constant.
+///
+/// The operations are McCarthy's exact functional-array semantics:
+/// `InsertElement` is `store`, `ExtractElement` is `select`, a uniform `[v; n]`
+/// (`ArraySplat`, `Constant::Splat`) is `((as const (Array BV64 S)) v)`.
+///
+/// JUNK-LANE INVARIANT. Lanes outside `[0, len)` are not part of the Rust value: a
+/// `const_array` pins them to `v`, a fresh array leaves them free, a `store` never
+/// reaches them through an in-bounds index. Nothing may let them constrain a
+/// feasible path, so (a) every element access carries its own in-bounds
+/// obligation — with memory checks on, an error rule after which the path
+/// continues only under `in_bounds`; with them off, a guard that havocs the read
+/// and the whole written array (never a dropped write) — and (b) NO encoder may
+/// assert SMT equality between two array-sorted terms as a hypothesis — two Rust
+/// arrays equal on `[0, len)` may differ on their junk lanes, so such an equality
+/// would make a feasible path infeasible and mint a false proof. Array values
+/// move only as relation arguments and through fresh definitional bindings; the
+/// one array-sorted equality emitted is a flat literal's definition of a lane of
+/// its own fresh lane variable (`define_array_lanes`); array-typed `ICmp` stays
+/// refused (`is_eq_comparable_ty`). `vc_equates_array_terms_beyond` checks (b) on
+/// every translation in debug builds.
+///
+/// SHAPE-ONLY ARRAYS. `lanes` is `None` when the array's CONTENT is not modeled
+/// — only its length is. That is how every array is carried in a block that a
+/// cycle of the CFG reaches (`ChcFuncTranslator::smt_arrays`,
+/// `array_content_blocks`): the native CHC engine (ay-chc at the pinned revision)
+/// answers Inconclusive for a problem with an array term in any clause reachable
+/// from a loop, so there the translation emits NO array term at all, while the
+/// blocks before the first loop — every block of an acyclic function — keep the
+/// full model. A read there is a fresh value, a write is absorbed, and the
+/// relations carry no column for the array; every access still carries its
+/// in-bounds obligation, which needs only the length. The choice is by the CFG's
+/// shape, never by a length. It costs precision the retired N-field model had
+/// for arrays of at most 256 lanes in the same place: that model's `ExtractElement`
+/// was always a fresh value too, but its stack cells answered constant GEP-lane
+/// loads and its relations carried every lane across the loop. Here such a load
+/// reads a fresh value. That gap closes when the engine decides array terms in a
+/// loop (docs/ay-asks/2026-09-28-array-column-in-loop-inconclusive).
+#[derive(Debug, Clone)]
+struct ArrayValue {
+    len: u64,
+    lanes: Option<Box<ValueBinding>>,
+}
+
+/// When an element access is in bounds (`ChcFuncTranslator::array_lane_access`).
+#[derive(Debug, Clone)]
+enum InBounds {
+    /// A constant lane below the length.
+    Always,
+    /// A constant lane at or past the length (or a negative one): undefined
+    /// behaviour on every execution that reaches it.
+    Never,
+    /// A symbolic lane: in bounds exactly when this Bool term holds.
+    When(Expr),
+}
+
+/// Where an element index of unknown signedness names a real lane if unsigned
+/// but is negative (undefined behaviour) if signed (`LaneAccess::ambiguous`).
+#[derive(Debug, Clone)]
+enum Ambiguity {
+    /// Nowhere: the index's type is known, or its two readings always agree.
+    Nowhere,
+    /// A constant index whose readings disagree.
+    Always,
+    /// A symbolic index: where this Bool term holds.
+    When(Expr),
+}
+
+/// One element access: the BV64 lane it names, and when that lane is real.
+#[derive(Debug, Clone)]
+struct LaneAccess {
+    lane: Expr,
+    /// When the access names lane `lane` below the length, under every reading of
+    /// the index's bits. Outside it and outside `ambiguous`, the access is out of
+    /// bounds under every reading: undefined behaviour.
+    in_bounds: InBounds,
+    /// `Nowhere` unless the index's declared type is not a known integer type
+    /// (`element_operand_tys` has none for it): where its TOP BIT is set and it is
+    /// below the length as an unsigned value, it names a real lane if it is
+    /// unsigned and is a negative (undefined-behaviour) index if it is signed. The
+    /// model assumes neither reading there (see `discharge_element_bounds`).
+    ambiguous: Ambiguity,
+}
+
+/// The lane an element access at the BV index `index` names in an array of `len`
+/// lanes, and when that access is in bounds (`ChcFuncTranslator::array_lane_access`,
+/// whose documentation states the rule): `signed` is the index's DECLARED
+/// signedness, `None` when it has no declared integer type. Shared by the block
+/// translator and the call-summary interpreter, so a read has ONE bounds rule
+/// whichever of them models it — an array's (its length) or a SIMD vector's (its
+/// lane count). `None` when `index` is not a bit-vector of width 1..=128
+/// (malformed IR).
+fn lane_access_of(index: Expr, signed: Option<bool>, len: u64) -> Option<LaneAccess> {
+    let width = index.sort().bitvec_width()?;
+    if width == 0 || width > 128 {
+        return None;
+    }
+    let top_bit = 1u128 << (width - 1);
+    if let Some(value) = bitvec_const_value(&index) {
+        let top_bit_set = value & top_bit != 0;
+        let below_len = value < u128::from(len);
+        let (in_bounds, ambiguous) = match signed {
+            Some(false) => (below_len, false),
+            Some(true) => (below_len && !top_bit_set, false),
+            None => (below_len && !top_bit_set, below_len && top_bit_set),
+        };
+        let lane = if in_bounds { u64::try_from(value).ok()? } else { 0 };
+        return Some(LaneAccess {
+            lane: Expr::bitvec_const(lane, 64),
+            in_bounds: if in_bounds { InBounds::Always } else { InBounds::Never },
+            ambiguous: if ambiguous { Ambiguity::Always } else { Ambiguity::Nowhere },
+        });
+    }
+    // `index <u len` reading the bits unsigned, at a width that holds both.
+    let unsigned_in_bounds = if width <= 64 {
+        let widened =
+            if width < 64 { index.clone().zero_extend(64 - width) } else { index.clone() };
+        widened.try_bvult(Expr::bitvec_const(len, 64)).ok()?
+    } else {
+        index.clone().try_bvult(Expr::bitvec_const(u128::from(len), width)).ok()?
+    };
+    // In bounds under both readings: non-negative signed, below the length.
+    let both_readings =
+        index.clone().try_bvult(Expr::bitvec_const(u128::from(len).min(top_bit), width)).ok()?;
+    let (in_bounds, ambiguous) = match signed {
+        Some(false) => (unsigned_in_bounds, Ambiguity::Nowhere),
+        Some(true) => (both_readings, Ambiguity::Nowhere),
+        None if u128::from(len) > top_bit => {
+            let top_bit_set =
+                index.clone().try_bvult(Expr::bitvec_const(top_bit, width)).ok()?.not();
+            (both_readings, Ambiguity::When(top_bit_set.and(unsigned_in_bounds)))
+        }
+        None => (both_readings, Ambiguity::Nowhere),
+    };
+    let lane = match width.cmp(&64) {
+        std::cmp::Ordering::Less => index.zero_extend(64 - width),
+        std::cmp::Ordering::Equal => index,
+        std::cmp::Ordering::Greater => index.extract(63, 0),
+    };
+    Some(LaneAccess { lane, in_bounds: InBounds::When(in_bounds), ambiguous })
+}
+
+/// The SMT sort of a lane index: `usize` on the pinned 64-bit target.
+fn array_index_sort() -> ay_bindings::Sort {
+    ay_bindings::Sort::bitvec(64)
+}
+
+/// The value of a bit-vector constant, when `expr` is one that fits 128 bits.
+fn bitvec_const_value(expr: &Expr) -> Option<u128> {
+    match expr.value() {
+        ay_bindings::ExprValue::BitVecConst { value, .. } => value.to_string().parse::<u128>().ok(),
+        _ => None,
+    }
+}
+
+/// `sort` lifted through `depth` enclosing arrays: `(Array BV64 … sort)`.
+fn lifted_sort(sort: ay_bindings::Sort, depth: u32) -> ay_bindings::Sort {
+    (0..depth).fold(sort, |inner, _| ay_bindings::Sort::array(array_index_sort(), inner))
+}
+
+impl ArrayValue {
+    /// An array whose content is not modeled, only its length (see the
+    /// shape-only note on the type).
+    fn shape_only(len: u64) -> Self {
+        Self { len, lanes: None }
+    }
+
+    /// `[v; len]`: every leaf of `v` becomes a constant array.
+    fn splat(len: u64, element: &ValueBinding) -> Option<Self> {
+        let lanes = element
+            .map_leaves(&mut |leaf| Expr::try_const_array(array_index_sort(), leaf.clone()).ok())?;
+        Some(Self { len, lanes: Some(Box::new(lanes)) })
+    }
+
+    /// The element at lane `index` (a BV64 term): `select` on every leaf. `None`
+    /// for a shape-only array (the caller reads a fresh value).
+    fn select(&self, index: &Expr) -> Option<ValueBinding> {
+        self.lanes.as_ref()?.map_leaves(&mut |leaf| leaf.clone().try_select(index.clone()).ok())
+    }
+
+    /// This array with lane `index` replaced by `element`: `store` on every leaf.
+    /// A shape-only array absorbs the write (its content is unconstrained anyway).
+    fn store(&self, index: &Expr, element: &ValueBinding) -> Option<Self> {
+        let Some(lanes) = &self.lanes else {
+            return Some(self.clone());
+        };
+        let lanes = lanes.zip_leaves(element, &mut |leaf, value| {
+            leaf.clone().try_store(index.clone(), value.clone()).ok()
+        })?;
+        Some(Self { len: self.len, lanes: Some(Box::new(lanes)) })
+    }
+}
+
+/// A summary may carry a fat pointer through typed value operations without
+/// interpreting its address or metadata. Keep that token separate from Scalar:
+/// a numeric consumer must decline rather than inspect placeholder pointer bits.
+/// No token identity or equality fact is represented. Exporting a token to the
+/// outer translator produces fresh havoc, including tokens in aggregate fields.
+#[derive(Debug, Clone)]
+enum CallSummaryBinding {
+    Scalar(Expr),
+    /// A canonical direct unwritten Struct/Tuple lane. It transports inside
+    /// its carrier but is NEVER an initialized unknown or scalar expression.
+    Uninit(Ty),
+    Aggregate(CallSummaryAggregate),
+    OpaqueFatPtr(FatPtrKind),
+    /// A non-empty array carried through the summary: `lanes` has the ELEMENT's
+    /// shape with SMT-array leaves, exactly as `ArrayValue` (a fat-pointer leaf
+    /// stays an opaque token).
+    Array(CallSummaryArray),
+}
+
+#[derive(Debug, Clone)]
+struct CallSummaryAggregate {
+    fields: Vec<CallSummaryBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct CallSummaryArray {
+    len: u64,
+    /// `None` for a shape-only array, as `ArrayValue::lanes`.
+    lanes: Option<Box<CallSummaryBinding>>,
 }
 
 #[derive(Debug, Clone)]
 struct DirectCallSummary {
-    returns: Vec<ValueBinding>,
+    returns: Vec<CallSummaryBinding>,
     error_conditions: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
 struct CallSummaryState {
     block: BlockId,
-    locals: BTreeMap<ValueId, ValueBinding>,
+    locals: BTreeMap<ValueId, CallSummaryBinding>,
     path_conditions: Vec<Expr>,
     visited_blocks: Vec<BlockId>,
+    /// PATH-LOCAL stack slots: `Alloca` result id -> cell type and current contents.
+    ///
+    /// Path-local is what makes this precise AND sound without any of the
+    /// whole-function aliasing machinery `translate_block` needs: each explored
+    /// summary path owns its own copy (cloned in `call_summary_successor_state`),
+    /// the exploration is acyclic (`visited_blocks`), and a slot is admitted only
+    /// when `call_summary_slot_is_directly_addressed` proves the alloca's address
+    /// NEVER leaves the `ptr` operand of a non-volatile `Load`/`Store` — so there
+    /// is no alias through which a write could be missed and no join at which two
+    /// different contents could be conflated.
+    slots: BTreeMap<ValueId, CallSummarySlot>,
 }
+
+/// One path-local stack cell. `value: None` means "not written on this path yet";
+/// a read of it HAVOCs (fresh unconstrained value), never fabricates a default.
+#[derive(Debug, Clone)]
+struct CallSummarySlot {
+    ty: Ty,
+    value: Option<CallSummaryBinding>,
+}
+
+/// The actual arguments handed to one `try_direct_call_summary` invocation.
+///
+/// The outermost invocation names them as `ValueId`s in the CALLER's value space
+/// (resolved with `resolve_call_summary_argument`); a NESTED invocation — the
+/// interpreter summarizing a call it met inside a callee body — has already
+/// resolved them into the enclosing summary's `locals`, and those bindings live in
+/// no `ValueId` space the outer translator can name. Keeping the two spellings in
+/// one type is what stops the recursion seam from re-resolving a nested actual
+/// against the WRONG value space, which would silently bind a fresh symbol.
+#[derive(Clone, Copy)]
+enum CallSummaryArgs<'a> {
+    Caller(&'a [ValueId]),
+    Bindings {
+        values: &'a [CallSummaryBinding],
+        defined: &'a [bool],
+        transport: &'a [bool],
+        reference_inputs: &'a [bool],
+        enclosing_transport_defined: bool,
+    },
+}
+
+impl CallSummaryArgs<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Caller(ids) => ids.len(),
+            Self::Bindings { values, .. } => values.len(),
+        }
+    }
+}
+
+/// How deep the summary interpreter may follow a call it meets INSIDE a callee
+/// body. Depth 0 is the callee itself; depth 1 is the closure a `core` combinator
+/// wrapper invokes. A CHAINED combinator needs four:
+/// `and_then`(0) → outer closure(1) → `map`(2) → inner closure(3) is what
+/// `a3d_kernel::IntervalI64::add`'s single expression lowers to. This is only a
+/// TERMINATION guard (mutual recursion A→B→A unfolds until it trips, then declines
+/// fail-closed); the real cost bound is the SHARED state budget below.
+pub(crate) const DIRECT_CALL_SUMMARY_MAX_DEPTH: usize = 6;
+
+/// States the whole summary attempt (all depths together) may process. Without a
+/// SHARED budget the per-invocation limit compounds: 64 states each spawning a
+/// nested summary of 64 more is 64^(depth+1) worst case.
+const DIRECT_CALL_SUMMARY_TOTAL_STATES: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct CallSummaryReturn {
-    values: Vec<ValueBinding>,
+    values: Vec<CallSummaryBinding>,
     path_conditions: Vec<Expr>,
 }
 
@@ -637,7 +1438,106 @@ impl ValueBinding {
             Self::Aggregate(aggregate) => {
                 aggregate.fields.iter().flat_map(ValueBinding::flat_args).collect()
             }
+            // One column per element leaf (each an SMT array), never per lane; a
+            // shape-only array has none.
+            Self::Array(array) => {
+                array.lanes.as_ref().map(|lanes| lanes.flat_args()).unwrap_or_default()
+            }
         }
+    }
+
+    /// The arguments this binding passes to a relation declared with
+    /// `smt_arrays` (`declare_relation_binding_lifted`): `flat_args` for a
+    /// relation that carries array columns; for one that does not (a block
+    /// reachable from a cycle) every array contributes nothing, whatever content
+    /// the source block modeled for it.
+    fn relation_args(&self, smt_arrays: bool) -> Vec<Expr> {
+        if smt_arrays {
+            return self.flat_args();
+        }
+        match self {
+            Self::Scalar(expr) => vec![expr.clone()],
+            Self::Aggregate(aggregate) => {
+                aggregate.fields.iter().flat_map(|field| field.relation_args(false)).collect()
+            }
+            Self::Array(_) => Vec::new(),
+        }
+    }
+
+    /// `false` iff some array in this binding is shape-only (content not modeled).
+    fn has_array_content(&self) -> bool {
+        match self {
+            Self::Scalar(_) => true,
+            Self::Aggregate(aggregate) => aggregate.fields.iter().all(Self::has_array_content),
+            Self::Array(array) => {
+                array.lanes.as_ref().is_some_and(|lanes| lanes.has_array_content())
+            }
+        }
+    }
+
+    /// This binding with every scalar leaf replaced by `f(leaf)`, keeping the
+    /// shape (and every nested array's `len`). `None` when `f` declines a leaf.
+    fn map_leaves(&self, f: &mut impl FnMut(&Expr) -> Option<Expr>) -> Option<Self> {
+        Some(match self {
+            Self::Scalar(expr) => Self::Scalar(f(expr)?),
+            Self::Aggregate(aggregate) => Self::Aggregate(AggregateValue {
+                fields: aggregate
+                    .fields
+                    .iter()
+                    .map(|field| field.map_leaves(f))
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            Self::Array(array) => Self::Array(ArrayValue {
+                len: array.len,
+                lanes: match &array.lanes {
+                    Some(lanes) => Some(Box::new(lanes.map_leaves(f)?)),
+                    None => None,
+                },
+            }),
+        })
+    }
+
+    /// Pair this binding's scalar leaves with `other`'s, which must have the same
+    /// shape (same variants, field counts and nested lengths); `None` otherwise or
+    /// when `f` declines a pair.
+    fn zip_leaves(
+        &self,
+        other: &Self,
+        f: &mut impl FnMut(&Expr, &Expr) -> Option<Expr>,
+    ) -> Option<Self> {
+        Some(match (self, other) {
+            (Self::Scalar(left), Self::Scalar(right)) => Self::Scalar(f(left, right)?),
+            (Self::Aggregate(left), Self::Aggregate(right))
+                if left.fields.len() == right.fields.len() =>
+            {
+                Self::Aggregate(AggregateValue {
+                    fields: left
+                        .fields
+                        .iter()
+                        .zip(&right.fields)
+                        .map(|(left, right)| left.zip_leaves(right, f))
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            }
+            (Self::Array(left), Self::Array(right)) if left.len == right.len => {
+                Self::Array(ArrayValue {
+                    len: left.len,
+                    lanes: match (&left.lanes, &right.lanes) {
+                        (Some(left), Some(right)) => Some(Box::new(left.zip_leaves(right, f)?)),
+                        (None, None) => None,
+                        _ => return None,
+                    },
+                })
+            }
+            _ => return None,
+        })
+    }
+
+    /// `ite(cond, self, other)` leaf by leaf (same shape required).
+    fn select_by(&self, cond: &Expr, other: &Self) -> Option<Self> {
+        self.zip_leaves(other, &mut |then_leaf, else_leaf| {
+            Expr::try_ite(cond.clone(), then_leaf.clone(), else_leaf.clone()).ok()
+        })
     }
 }
 
@@ -670,9 +1570,15 @@ impl<'a> ChcFuncTranslator<'a> {
             func,
             module,
             options,
+            source_consumption: construction_definedness::Analysis::new(module),
             vc: ChcVc::new(),
             values: BTreeMap::new(),
             aggregates: BTreeMap::new(),
+            arrays: BTreeMap::new(),
+            smt_arrays: false,
+            array_content_blocks: array_content_blocks(func),
+            element_operand_tys: element_operand_tys(func, module),
+            definitional_array_lanes: BTreeSet::new(),
             stack_cells: BTreeMap::new(),
             stack_ptrs: BTreeSet::new(),
             func_alloca_ptrs: BTreeSet::new(),
@@ -683,10 +1589,19 @@ impl<'a> ChcFuncTranslator<'a> {
             function_escaped_bases: BTreeSet::new(),
             ptr_parts: BTreeMap::new(),
             ptr_metadata_syms: BTreeMap::new(),
+            ptr_opaque_metadata: BTreeMap::new(),
+            term_facts: large_block::TermFacts::default(),
+            large_block: None,
+            allow_large_block: true,
+            current_instruction: 0,
             block_param_bindings: BTreeMap::new(),
             threaded_params: Vec::new(),
             block_threaded_params: BTreeMap::new(),
             block_live_params: BTreeMap::new(),
+            threaded_def_block: BTreeMap::new(),
+            current_block: None,
+            liveness: LivenessOracle::Precise,
+            work: ChcTranslationWork::default(),
             block_threaded_bindings: BTreeMap::new(),
             promoted_cells: Vec::new(),
             cell_def_block: BTreeMap::new(),
@@ -694,7 +1609,11 @@ impl<'a> ChcFuncTranslator<'a> {
             block_live_cells: BTreeMap::new(),
             block_cell_bindings: BTreeMap::new(),
             diagnostics: Vec::new(),
+            inductive_hypothesis_sites: Vec::new(),
             call_summary_census: Vec::new(),
+            call_summary_states_left: DIRECT_CALL_SUMMARY_TOTAL_STATES,
+            callee_operand_tys: BTreeMap::new(),
+            ty_facts: ty_facts::TyFacts::default(),
             next_sym_id: 0,
         }
     }
@@ -722,6 +1641,13 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn translate(mut self) -> ChcTranslationOutput {
+        // trust-ir wire v60: a typed signature ABI anywhere in the module is
+        // transport this lowering does not model (`crate::signature_abi`).
+        if first_typed_signature_abi(self.module).is_some() {
+            self.add_global_unsupported_error(
+                TrustIrChcUnsupportedReason::TypedSignatureAbiTransport,
+            );
+        }
         // R3: precompute the function-scoped owned-stack-slot facts (see the
         // `func_alloca_ptrs` field doc). Pure instruction-syntax scan — result
         // ids and declared types only, no value state.
@@ -737,17 +1663,82 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
             }
         }
+        // Design step 8e: an acyclic function is one large-block query
+        // (`translate_chc_large_block.rs`); planned before the relations are
+        // declared, because its merged blocks get none.
+        if self.allow_large_block {
+            self.large_block =
+                large_block::plan_large_block(self.func).map(large_block::LargeBlock::new);
+        }
         self.declare_block_relations();
         self.add_entry_rule();
 
-        for block in &self.func.blocks {
-            self.translate_block(block);
+        let func = self.func;
+        match self.large_block.as_ref().map(|large| large.plan.clone()) {
+            None => {
+                for block in &func.blocks {
+                    self.translate_block(block);
+                }
+            }
+            Some(plan) => {
+                // The per-block records the translation appends from here on
+                // are restored to block order afterwards (the region is
+                // translated in topological order).
+                let records = (
+                    self.diagnostics.len(),
+                    self.inductive_hypothesis_sites.len(),
+                    self.call_summary_census.len(),
+                );
+                for id in &plan.order {
+                    if let Some(block) = func.block(*id) {
+                        self.translate_block(block);
+                    }
+                }
+                // Blocks outside the region (unreachable from the entry) keep
+                // their per-block relation and rules.
+                for block in &func.blocks {
+                    if block.id != func.entry && !plan.merged.contains(&block.id) {
+                        self.translate_block(block);
+                    }
+                }
+                self.large_block_finish();
+                if self.large_block.as_ref().is_some_and(|large| large.violation.is_some()) {
+                    // The rules did not have the shape the encoding's argument
+                    // needs: translate the function per block instead.
+                    let mut per_block = ChcFuncTranslator::new(func, self.module, self.options);
+                    per_block.liveness = self.liveness;
+                    per_block.allow_large_block = false;
+                    let mut output = per_block.translate();
+                    output.work.large_block_fallbacks += 1;
+                    return output;
+                }
+                let position = |block: &BlockId| plan.position.get(block).copied();
+                self.diagnostics[records.0..].sort_by_key(|row| position(&row.block));
+                self.inductive_hypothesis_sites[records.1..]
+                    .sort_by_key(|row| position(&row.block));
+                self.call_summary_census[records.2..].sort_by_key(|row| position(&row.block));
+                self.work.large_block_merged_blocks += plan.merged.len() as u64;
+            }
         }
+        self.current_block = None;
+        let column_vars =
+            self.large_block.as_ref().map(|large| large.map.columns.clone()).unwrap_or_default();
+        // The junk-lane invariant (`ArrayValue`): no rule may equate two
+        // array-sorted terms. Checked on every translation a debug build makes.
+        debug_assert!(
+            !vc_equates_array_terms_beyond(&self.vc, &self.definitional_array_lanes, &column_vars),
+            "translate_chc asserted an equality between array-sorted terms in `{}`",
+            self.func.name
+        );
 
         ChcTranslationOutput {
             vc: self.vc,
+            module_input_refusal: None,
             diagnostics: self.diagnostics,
+            inductive_hypothesis_sites: self.inductive_hypothesis_sites,
             call_summary_census: self.call_summary_census,
+            work: self.work,
+            large_block: self.large_block.map(|large| large.map),
         }
     }
 
@@ -800,9 +1791,8 @@ impl<'a> ChcFuncTranslator<'a> {
         // type the relation cannot precisely carry is left un-threaded and fails closed
         // at the cross-block use — never a false proof. The "referenced outside its
         // defining block" gate is computed PRECISELY (`cross_block_general_results`)
-        // rather than relying on `compute_live_params`, whose conservative fallback
-        // carries every threaded value into every block: threading a result used only
-        // within its own block would merely bloat every relation with a dead column.
+        // before liveness runs, because threading a result used only within its own
+        // block would merely add a candidate that liveness then finds dead everywhere.
         // POINTER results are intentionally excluded (`is_precise_stack_scalar_ty` omits
         // `Ptr`) so instruction-result pointers do not enter `valid_ref_ptrs`; only the
         // `Undef` and sealed TLS-address special cases still thread pointer values.
@@ -810,7 +1800,13 @@ impl<'a> ChcFuncTranslator<'a> {
         for block in &self.func.blocks {
             for node in &block.body {
                 let threadable = match &node.inst {
-                    Inst::Undef { ty } if self.is_call_summary_value_ty(ty) => Some(ty.clone()),
+                    // Opaque fat-pointer summary tokens do not widen ordinary
+                    // cross-block threading or stack value support.
+                    Inst::Undef { ty }
+                        if is_call_summary_scalar_ty(ty) || self.is_composite_value_ty(ty) =>
+                    {
+                        Some(ty.clone())
+                    }
                     Inst::DialectOp(op) if node.results.len() == 1 && is_thread_local_addr(op) => {
                         Some(Ty::Ptr)
                     }
@@ -823,8 +1819,7 @@ impl<'a> ChcFuncTranslator<'a> {
                         .filter(|result| cross_block_general.contains(&result.index()))
                         .and_then(|_| {
                             self.threadable_result_ty(other).filter(|ty| {
-                                is_precise_stack_scalar_ty(ty)
-                                    || self.aggregate_field_tys(ty).is_some()
+                                is_precise_stack_scalar_ty(ty) || self.is_composite_value_ty(ty)
                             })
                         }),
                 };
@@ -859,6 +1854,7 @@ impl<'a> ChcFuncTranslator<'a> {
         // threads a value only where a downstream `resolve` could otherwise
         // observe it. See `compute_live_params` for the soundness argument.
         self.block_live_params = self.compute_live_params(&threaded, &def_block);
+        self.threaded_def_block = def_block;
 
         // mem2reg: promote single-cell allocas used through direct Load/Store and
         // narrowly guarded transparent derivations into a THREADED prefix of every
@@ -905,6 +1901,37 @@ impl<'a> ChcFuncTranslator<'a> {
         // (from `&self.func`) is live — disjoint fields.
         let module = self.module;
         for block in &self.func.blocks {
+            // A merged block of the large-block encoding gets no relation: only
+            // its column layout (S's signature), which its in-edges fill
+            // (`large_block_enter`).
+            if self.is_merged_block(block.id) {
+                let own_param_ids: std::collections::BTreeSet<u32> =
+                    block.params.iter().map(|(value, _)| value.index()).collect();
+                let live_here = self.block_live_params.get(&block.id);
+                let threaded_list: Vec<(ValueId, Ty)> = threaded
+                    .iter()
+                    .filter(|(value, _)| {
+                        !own_param_ids.contains(&value.index())
+                            && live_here.is_some_and(|live| live.contains(&value.index()))
+                    })
+                    .cloned()
+                    .collect();
+                let live_cells = self.block_live_cells.get(&block.id);
+                let cell_list: Vec<(ValueId, Ty)> = promoted
+                    .iter()
+                    .filter(|(cell, _)| {
+                        cell_def.get(&cell.index()) != Some(&block.id)
+                            && live_cells.is_some_and(|live| live.contains(&cell.index()))
+                    })
+                    .cloned()
+                    .collect();
+                self.block_threaded_params.insert(block.id, threaded_list);
+                self.block_promoted_cells.insert(block.id, cell_list);
+                continue;
+            }
+            // A block reachable from a cycle declares its arrays shape-only: no
+            // column (see `ArrayValue`, `array_content_blocks`).
+            let smt_arrays = self.array_content_blocks.contains(&block.id);
             let is_entry = block.id == self.func.entry;
             let own_param_ids: std::collections::BTreeSet<u32> =
                 block.params.iter().map(|(value, _)| value.index()).collect();
@@ -933,6 +1960,7 @@ impl<'a> ChcFuncTranslator<'a> {
                         &mut self.vc,
                         &format!("bb{}_thr_v{}", block.id.index(), value.index()),
                         ty,
+                        smt_arrays,
                         &mut arg_sorts,
                     );
                     threaded_bindings.push(binding);
@@ -966,6 +1994,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     &mut self.vc,
                     &format!("bb{}_cell_v{}", block.id.index(), cell.index()),
                     ty,
+                    smt_arrays,
                     &mut arg_sorts,
                 );
                 cell_bindings.push(binding);
@@ -979,11 +2008,13 @@ impl<'a> ChcFuncTranslator<'a> {
                     &mut self.vc,
                     &format!("bb{}_v{}", block.id.index(), value.index()),
                     ty,
+                    smt_arrays,
                     &mut arg_sorts,
                 );
                 bindings.push(binding);
             }
 
+            self.work.relation_arguments += arg_sorts.len() as u64;
             self.vc.add_relation(RelationDecl::new(block_relation_name(block.id), arg_sorts));
             self.block_param_bindings.insert(block.id, bindings);
             self.block_threaded_params.insert(block.id, threaded_list);
@@ -1020,9 +2051,19 @@ impl<'a> ChcFuncTranslator<'a> {
             | Inst::Copy { ty, .. }
             | Inst::Select { ty, .. }
             | Inst::Const { ty, .. }
+            | Inst::MakeAggregate { ty, .. }
             | Inst::Load { ty, .. }
             | Inst::LoadSlot { ty, .. }
-            | Inst::ExtractField { ty, .. } => ty.clone(),
+            | Inst::ExtractField { ty, .. }
+            // v50 `[value; n]`: a pure SSA value of its declared array type. The
+            // caller threads it only when that type is a trackable composite, and
+            // then the def block's binding is the exact SMT-array model.
+            | Inst::ArraySplat { ty, .. }
+            // Element read and write: exact `select` / `store` results (the
+            // element type, resp. the whole array type) — pure SSA values.
+            | Inst::ExtractElement { ty, .. }
+            | Inst::InsertElement { ty, .. } => ty.clone(),
+            Inst::MakeClosure { ty, .. } => Ty::Closure(*ty),
             Inst::ICmp { .. } | Inst::FCmp { .. } => Ty::Bool,
             Inst::Cast { dst_ty, .. } => dst_ty.clone(),
             Inst::Call { callee, .. } => {
@@ -1055,7 +2096,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     continue;
                 }
                 let carryable = self.threadable_result_ty(&node.inst).is_some_and(|ty| {
-                    is_precise_stack_scalar_ty(&ty) || self.aggregate_field_tys(&ty).is_some()
+                    is_precise_stack_scalar_ty(&ty) || self.is_composite_value_ty(&ty)
                 });
                 if carryable && let Some(result) = node.results.first() {
                     candidate_def.insert(result.index(), block.id);
@@ -1089,120 +2130,56 @@ impl<'a> ChcFuncTranslator<'a> {
         cross_block
     }
 
-    /// Backward liveness over-approximation for the immutable entry parameters.
+    /// Per-block live-in sets for relation-carried values: the threaded SSA
+    /// values (entry params and cross-block instruction results) or, for the
+    /// second call, the promoted mem2reg cells. `def_block` maps each carried id
+    /// to the one block that defines it (entry params: the entry block; a cell:
+    /// its `Alloca`'s block), which computes the value and therefore never
+    /// receives it.
     ///
-    /// Returns, per block, the subset of `entry_param` ids that are *live-in*:
-    /// referenced by an instruction in the block, or live-in at a successor and
-    /// not redeclared as the block's own parameter (the only way an SSA id is
-    /// "redefined" here is a back-edge target re-declaring the same id as a
-    /// block parameter, which the existing prefix logic already shadows).
+    /// Soundness (precision, not proof authority): a block relation carries a
+    /// value iff it is live-in there. Liveness is the least solution of
+    /// `live_in[B] = uses[B] ∪ ⋃_{S ∈ succ(B)} (live_in[S] \ own[B])`, where
+    /// `own[B]` is B's block params plus the carried values B defines, `uses[B]`
+    /// is every SSA operand of every instruction in B, and `succ(B)` is the set
+    /// of blocks B's TERMINATOR can transfer to. That covers every read the
+    /// translation makes of a carried value:
     ///
-    /// Soundness: the per-block use set is a sound over-approximation — every
-    /// statically enumerable read is recorded, and any instruction or
-    /// terminator this translator does not recognize marks *all* entry params
-    /// as used in that block (and, via the fixpoint, in every block that can
-    /// reach it). Consequently a parameter that any reachable block could read
-    /// is always threaded, so a downstream `resolve` always finds the threaded
-    /// binding rather than minting an unconstrained fresh symbolic. Dropping a
-    /// genuinely dead parameter changes neither the reachable states nor the
-    /// error rules; it only removes an unused relation column.
+    /// * inside B, `translate_node` reads a value only as an operand of the
+    ///   instruction it translates (a cell is reached through its own id as a
+    ///   Load/Store/GEP/Borrow operand; `ptr_provenance` is rebuilt per block
+    ///   from exactly such operands), and `uses[B]` lists every operand through
+    ///   trust-ir's canonical exhaustive walk;
+    /// * across B's outgoing edges, `add_transition_rule` reads the target's
+    ///   carried prefix in B's context, which the `live_in[S] \ own[B]` term
+    ///   covers — and the only transitions the translation emits are the
+    ///   `Br`/`CondBr`/`Switch` edges of B's terminator.
+    ///
+    /// A read that none of this listed would find no binding and become a fresh
+    /// havoc — never a false proof (havoc over-approximates), only a lost one.
+    /// `ChcTranslationWork::carried_value_misses` counts such reads and the
+    /// corpus tests pin it at zero. Dropping a column no read needs changes
+    /// neither the reachable states nor the error rules.
+    ///
+    /// The previous analysis asked EVERY instruction for terminator successors,
+    /// and every non-terminator answered "conservative", so any block holding an
+    /// ordinary instruction read every carried value: every relation carried
+    /// everything (measured: 14-15 values per relation at N=1 of the ever-init
+    /// family, 28 at N=2). It survives only as the differential oracle
+    /// (`LivenessOracle::Legacy`).
     fn compute_live_params(
-        &self,
+        &mut self,
         threaded: &[(ValueId, Ty)],
         def_block: &BTreeMap<u32, BlockId>,
     ) -> BTreeMap<BlockId, std::collections::BTreeSet<u32>> {
-        use std::collections::BTreeSet;
-
-        let param_ids: BTreeSet<u32> = threaded.iter().map(|(v, _)| v.index()).collect();
-        if param_ids.is_empty() {
-            return BTreeMap::new();
+        let carried: BTreeSet<u32> = threaded.iter().map(|(v, _)| v.index()).collect();
+        match self.liveness {
+            LivenessOracle::Precise => {
+                carried_live_in(self.func, &carried, def_block, &mut self.work)
+            }
+            #[cfg(any(test, feature = "legacy-liveness-oracle"))]
+            LivenessOracle::Legacy => legacy_carried_live_in(self.func, &carried, def_block),
         }
-
-        // Per-block direct uses (restricted to threaded values) and successors.
-        let mut direct_uses: BTreeMap<BlockId, BTreeSet<u32>> = BTreeMap::new();
-        let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
-        // The threaded values DEFINED in each block (entry params here, or an
-        // instruction result there). A value is never live-in to its own def
-        // block — that block computes it rather than receiving it — so it is
-        // excluded from both that block's direct uses and the live-out it
-        // propagates inward, exactly like a block's own params.
-        let mut block_defs: BTreeMap<BlockId, BTreeSet<u32>> = BTreeMap::new();
-        for (&id, &blk) in def_block {
-            if param_ids.contains(&id) {
-                block_defs.entry(blk).or_default().insert(id);
-            }
-        }
-
-        for block in &self.func.blocks {
-            let mut own: BTreeSet<u32> = block.params.iter().map(|(v, _)| v.index()).collect();
-            if let Some(defs) = block_defs.get(&block.id) {
-                own.extend(defs.iter().copied());
-            }
-
-            let mut raw_uses: Vec<ValueId> = Vec::new();
-            let mut succs: Vec<BlockId> = Vec::new();
-            let mut conservative = false;
-            for node in &block.body {
-                conservative |= collect_inst_value_uses(&node.inst, &mut raw_uses);
-                conservative |= collect_terminator_successors(&node.inst, &mut succs);
-            }
-
-            let mut uses: BTreeSet<u32> = if conservative {
-                // Unknown instruction/terminator: assume it reads every threaded
-                // value so liveness stays a sound over-approximation.
-                param_ids.clone()
-            } else {
-                raw_uses
-                    .into_iter()
-                    .map(|v| v.index())
-                    .filter(|id| param_ids.contains(id))
-                    .collect()
-            };
-            // A block reading an id it also declares/defines (own param or local
-            // instruction result) is reading the local definition, not the
-            // threaded value; do not count it.
-            for d in &own {
-                uses.remove(d);
-            }
-
-            direct_uses.insert(block.id, uses);
-            successors.insert(block.id, succs);
-        }
-
-        let mut live: BTreeMap<BlockId, BTreeSet<u32>> =
-            self.func.blocks.iter().map(|b| (b.id, BTreeSet::new())).collect();
-
-        // Standard backward-liveness fixpoint, where `defs[B]` = own params ∪
-        // locally-defined threaded values:
-        //   live_in[B] = uses[B] ∪ ⋃_{S ∈ succ(B)} (live_in[S] \ defs[B])
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for block in &self.func.blocks {
-                let mut next = direct_uses.get(&block.id).cloned().unwrap_or_default();
-                let mut own: BTreeSet<u32> = block.params.iter().map(|(v, _)| v.index()).collect();
-                if let Some(defs) = block_defs.get(&block.id) {
-                    own.extend(defs.iter().copied());
-                }
-                for succ in successors.get(&block.id).into_iter().flatten() {
-                    if let Some(succ_live) = live.get(succ) {
-                        for id in succ_live {
-                            if !own.contains(id) {
-                                next.insert(*id);
-                            }
-                        }
-                    }
-                }
-                if let Some(current) = live.get_mut(&block.id)
-                    && *current != next
-                {
-                    *current = next;
-                    changed = true;
-                }
-            }
-        }
-
-        live
     }
 
     /// mem2reg candidate analysis: find single-cell allocas whose result pointer is
@@ -1251,12 +2228,30 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn translate_block(&mut self, block: &Block) {
-        let Some(from) = self.block_app(block.id) else {
-            return;
+        // A merged block of the large-block encoding has no relation: its
+        // inputs are bound from the transitions emitted into it, and every rule
+        // it emits is absorbed into the function's one query rule, so `from` is
+        // never emitted (`translate_chc_large_block.rs`).
+        let from = if self.is_merged_block(block.id) {
+            self.large_block_enter(block);
+            RelationApp::nullary(ERROR_REL)
+        } else {
+            let Some(from) = self.block_app(block.id) else {
+                return;
+            };
+            if self.large_block.as_ref().is_some_and(|large| large.map.root == block.id) {
+                self.large_block_begin_root(block.id);
+            }
+            from
         };
+        self.current_block = Some(block.id);
+        // Array content is modeled here only when no cycle of the CFG reaches this
+        // block; the block's relation was declared the same way.
+        self.smt_arrays = self.array_content_blocks.contains(&block.id);
 
         self.values.clear();
         self.aggregates.clear();
+        self.arrays.clear();
         self.stack_cells.clear();
         self.stack_ptrs.clear();
         self.ptr_provenance.clear();
@@ -1299,6 +2294,9 @@ impl<'a> ChcFuncTranslator<'a> {
                     }
                     ValueBinding::Aggregate(aggregate) => {
                         self.aggregates.insert(*value, aggregate.clone());
+                    }
+                    ValueBinding::Array(array) => {
+                        self.arrays.insert(*value, array.clone());
                     }
                 }
             }
@@ -1356,17 +2354,23 @@ impl<'a> ChcFuncTranslator<'a> {
                     ValueBinding::Aggregate(aggregate) => {
                         self.aggregates.insert(*value, aggregate.clone());
                     }
+                    ValueBinding::Array(array) => {
+                        self.arrays.insert(*value, array.clone());
+                    }
                 }
             }
         }
 
         let mut path_constraints = Vec::new();
         for (instruction_index, node) in block.body.iter().enumerate() {
+            self.work.instructions_translated += 1;
+            self.current_instruction = instruction_index;
             if self.translate_node(node, block.id, instruction_index, &from, &mut path_constraints)
             {
                 break;
             }
         }
+        self.large_block_leave(block.id);
     }
 
     fn translate_node(
@@ -1379,6 +2383,27 @@ impl<'a> ChcFuncTranslator<'a> {
     ) -> bool {
         self.record_interior_pointer_escapes(&node.inst);
         self.invalidate_cells_escaping_into_call(&node.inst);
+        if !matches!(&node.inst, Inst::Call { .. })
+            && !construction_definedness::consumption_is_valid(
+                &self.source_consumption,
+                self.module,
+                self.func,
+                node,
+                None,
+                None,
+            )
+        {
+            // Retain the error at its original program point before any later
+            // constraint/unused-result shortcut can hide the inspection.
+            self.add_unsupported_error(
+                block,
+                instruction_index,
+                node,
+                TrustIrChcUnsupportedReason::OperandConsumption,
+                from,
+                path_constraints,
+            );
+        }
         match &node.inst {
             Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 self.translate_integer_binop(*op, ty, *lhs, *rhs, node, from, path_constraints);
@@ -1386,16 +2411,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 // havocs the result ("float_on_int"), so fail closed rather
                 // than let the unconstrained value silently feed obligations
                 // (mirrors the BMC lane's translate_integer_binop).
-                if matches!(
-                    op,
-                    BinOp::FAdd
-                        | BinOp::FSub
-                        | BinOp::FMul
-                        | BinOp::FDiv
-                        | BinOp::FRem
-                        | BinOp::FMin
-                        | BinOp::FMax
-                ) {
+                if binop_is_floating_point(*op) {
                     self.add_unsupported_error(
                         block,
                         instruction_index,
@@ -1404,6 +2420,25 @@ impl<'a> ChcFuncTranslator<'a> {
                         from,
                         path_constraints,
                     );
+                }
+                // A rotate is encoded EXACTLY (`bv_rotate`); only operands that
+                // are not same-width bit-vectors leave eval_binop a havoc, and
+                // that case fails closed like float-on-int. Both operands were
+                // bound by `translate_integer_binop` above, so these resolves
+                // return the same expressions it used.
+                if matches!(op, BinOp::RotL | BinOp::RotR) {
+                    let lhs_expr = self.resolve(*lhs, ty);
+                    let rhs_expr = self.resolve(*rhs, ty);
+                    if integer_rotate_is_unencodable(*op, ty, &lhs_expr, &rhs_expr) {
+                        self.add_unsupported_error(
+                            block,
+                            instruction_index,
+                            node,
+                            TrustIrChcUnsupportedReason::NonIntegerBinaryOperation,
+                            from,
+                            path_constraints,
+                        );
+                    }
                 }
                 false
             }
@@ -1421,17 +2456,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 let modeled_precisely =
                     matches!(ty, Ty::Bool) && matches!(op, BinOp::And | BinOp::Or | BinOp::Xor);
                 if !modeled_precisely {
-                    let reason = if ty.is_float()
-                        || matches!(
-                            op,
-                            BinOp::FAdd
-                                | BinOp::FSub
-                                | BinOp::FMul
-                                | BinOp::FDiv
-                                | BinOp::FRem
-                                | BinOp::FMin
-                                | BinOp::FMax
-                        ) {
+                    let reason = if ty.is_float() || binop_is_floating_point(*op) {
                         TrustIrChcUnsupportedReason::FloatingPointArithmetic
                     } else {
                         TrustIrChcUnsupportedReason::NonIntegerBinaryOperation
@@ -1447,8 +2472,74 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 false
             }
+            // trust-ir v67-v70 tensor region (`crate::tensor_region`): a
+            // constant of a tensor type, or a content-addressed `TensorBlob`,
+            // has no sort and no bits here, so it fails closed by name before
+            // the arm below could ask for either. Its result stays unbound.
+            Inst::Const { ty, value }
+                if let Some(construct) = crate::tensor_region::const_tensor_construct(ty, value) =>
+            {
+                self.add_unsupported_error(
+                    block,
+                    instruction_index,
+                    node,
+                    TrustIrChcUnsupportedReason::TensorRegion(construct),
+                    from,
+                    path_constraints,
+                );
+                false
+            }
             Inst::Const { ty, value } => {
-                if matches!(value, Constant::SymbolAddr { .. }) {
+                if matches!(ty, Ty::Enum(_)) {
+                    if let Some(binding) = dataless_enum::constant_tag(self.module, ty, value)
+                        .and_then(dataless_enum::binding)
+                    {
+                        self.bind_aggregate_result(node, binding, ty);
+                    } else {
+                        let result = self.fresh_symbolic("unmodeled_enum_const", ty);
+                        self.bind_first_result(node, result);
+                        self.add_unsupported_error(
+                            block, instruction_index, node,
+                            TrustIrChcUnsupportedReason::UnmodeledConstant,
+                            from, path_constraints,
+                        );
+                    }
+                    return false;
+                }
+                // trust-ir v50 `Splat { elem, len }` at a trackable array type is
+                // modeled exactly as one constant SMT array per leaf of `elem`'s
+                // exact encoding (`exact_constant_binding`), whatever `len` is; a
+                // list-spelled literal (`Array`, `Aggregate` at an array type,
+                // `Bytes` at `[u8; n]`) as fresh lanes pinned by one definitional
+                // equality per element (`define_array_lanes`), conjoined into ONE
+                // path constraint here — the literal's text, at constant depth. An
+                // array literal whose element has no exact encoding here gets fresh
+                // lanes: O(1) in `len`, no error.
+                let array_literal = match value {
+                    Constant::Splat { .. } | Constant::Array(_) => true,
+                    Constant::Aggregate(_) | Constant::Bytes { .. } => {
+                        matches!(self.composite_shape(ty), Some(CompositeShape::Array { .. }))
+                    }
+                    _ => false,
+                };
+                let mut definitions = Vec::new();
+                if array_literal
+                    && let Some(binding) = self.exact_constant_binding(ty, value, &mut definitions)
+                {
+                    if !definitions.is_empty() {
+                        path_constraints.push(Expr::and_many(definitions));
+                    }
+                    self.bind_binding_result(node, binding, ty);
+                } else if let Constant::Splat { .. } | Constant::Array(_) | Constant::Aggregate(_) =
+                    value
+                    && let Some(CompositeShape::Array { .. }) = self.composite_shape(ty)
+                {
+                    // An array literal with an element this lowering cannot encode
+                    // exactly: fresh lanes (the value of an unknown array), still
+                    // typed, so every element access keeps its bounds obligation.
+                    let havoc = self.fresh_value_binding("const_array", ty);
+                    self.bind_binding_result(node, havoc, ty);
+                } else if matches!(value, Constant::SymbolAddr { .. }) {
                     let result = self.fresh_symbolic("symbol_addr", ty);
                     self.bind_first_result(node, result);
                     self.add_unsupported_error(
@@ -1501,7 +2592,10 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 false
             }
-            Inst::Assert { cond } => {
+            // trust-ir v52 `kind` / v54 `site` name WHICH panic a failure is and
+            // the entry it would call; the check fails iff `cond` is false
+            // whatever they are, and a failed assert is a terminal panic.
+            Inst::Assert { cond, kind: _, site: _ } => {
                 if let Some(cond_expr) = self.resolve_bool_condition(
                     *cond,
                     block,
@@ -1611,16 +2705,22 @@ impl<'a> ChcFuncTranslator<'a> {
                 true
             }
             Inst::Copy { ty, operand } => {
-                if let Some(aggregate) = self.resolve_aggregate(*operand, ty) {
-                    self.bind_aggregate_result(node, aggregate, ty);
+                if let Some(binding) = self.resolve_composite(*operand, ty) {
+                    self.bind_binding_result(node, binding, ty);
                 } else {
                     let expr = self.resolve(*operand, ty);
                     self.bind_first_result(node, expr);
                 }
-                if let Some(result) = node.results.first()
-                    && let Some(parts) = self.ptr_parts.get(operand).cloned()
-                {
-                    self.ptr_parts.insert(*result, parts);
+                if let Some(result) = node.results.first() {
+                    self.copy_ptr_parts(*operand, *result);
+                }
+                // A thin-pointer `Copy` is the Rust producers' spelling of a borrow
+                // (`transparent_pointer_alias`), so it inherits the referent's
+                // interior-pointer provenance exactly as the `Borrow` arm does;
+                // without it `*(&mut local)` would lose its base and the write
+                // would reach no tracked cell.
+                if transparent_pointer_alias(&node.inst).is_some() {
+                    self.inherit_alias_provenance(node, *operand);
                 }
                 false
             }
@@ -1637,6 +2737,40 @@ impl<'a> ChcFuncTranslator<'a> {
                     self.bind_first_result(node, result);
                     return false;
                 };
+                if matches!(ty, Ty::Enum(_)) {
+                    let selected = self.aggregates.get(then_val)
+                        .zip(self.aggregates.get(else_val))
+                        .and_then(|(then_value, else_value)| dataless_enum::select_binding(
+                            self.module, ty, &cond_expr,
+                            &ValueBinding::Aggregate(then_value.clone()),
+                            &ValueBinding::Aggregate(else_value.clone()),
+                        ));
+                    if let Some(selected) = selected {
+                        self.bind_aggregate_result(node, selected, ty);
+                    } else {
+                        let result = self.fresh_symbolic("unmodeled_enum_select", ty);
+                        self.bind_first_result(node, result);
+                        self.add_unsupported_error(
+                            block, instruction_index, node,
+                            TrustIrChcUnsupportedReason::AggregateProjection,
+                            from, path_constraints,
+                        );
+                    }
+                    return false;
+                }
+                // An array-typed `Select` is `ite(cond, then, else)` leaf by leaf on
+                // the arrays' lanes, bound like any array value, so an element access
+                // on the result reads its lanes (and its bounds need no declared
+                // type). A mismatched arm (malformed IR) falls through below.
+                if let Some(CompositeShape::Array { .. }) = self.composite_shape(ty)
+                    && let Some(then_array) = self.resolve_array(*then_val, ty)
+                    && let Some(else_array) = self.resolve_array(*else_val, ty)
+                    && let Some(ValueBinding::Array(selected)) = ValueBinding::Array(then_array)
+                        .select_by(&cond_expr, &ValueBinding::Array(else_array))
+                {
+                    self.bind_array_result(node, selected, ty);
+                    return false;
+                }
                 // `resolve` is not type-checked: malformed TrustIR can bind an arm to a
                 // different carrier (Bool vs BV, or incompatible float widths). Width
                 // normalization repairs valid integer width drift, but deliberately
@@ -1707,12 +2841,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 // field is ever falsely proved. A scalar or opaque-field type keeps
                 // a single fresh symbolic, unchanged from before.
                 match self.fresh_call_summary_value("undef", ty) {
-                    Some(ValueBinding::Aggregate(aggregate)) => {
-                        self.bind_aggregate_result(node, aggregate, ty);
-                    }
-                    Some(ValueBinding::Scalar(expr)) => {
-                        self.bind_first_result(node, expr);
-                    }
+                    Some(binding) => self.bind_binding_result(node, binding, ty),
                     None => {
                         let result = self.fresh_symbolic("undef", ty);
                         self.bind_first_result(node, result);
@@ -1765,7 +2894,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     // counterexample (by-value matches, with no load, already proved).
                     // Sound: every field is a fresh unconstrained value.
                     if let Some(result_id) = node.results.first().copied() {
-                        self.resolve_aggregate(result_id, ty);
+                        self.resolve_composite(result_id, ty);
                     }
                     // A load annotated `ValidBorrow` is through a SAFE reference
                     // (`&T`/`&mut T`): the borrow checker guarantees the access is
@@ -1951,28 +3080,53 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 false
             }
+            // trust-ir WS3.20 bulk memory: `memcpy` / `memmove` (MemCopy) and
+            // `memset` (MemSet) over `bytes` bytes at `dst`, in an encoding whose
+            // size does not depend on `bytes` (`translate_chc_bulk_memory.rs`):
+            // exact undefined behaviour and an exact write where the range is one
+            // whole object of a stack cell; a havoc of every cell the write could
+            // reach, failing closed by name, where it is not. Never a dropped write,
+            // whatever `check_memory_bounds` says.
+            Inst::MemCopy { .. } | Inst::MemSet { .. } => {
+                self.translate_bulk_memory(node, block, instruction_index, from, path_constraints);
+                false
+            }
             Inst::PtrData { ptr_ty, ptr } => {
-                let data = self
-                    .ptr_parts
-                    .get(ptr)
-                    .map(|(data, _)| data.clone())
-                    .unwrap_or_else(|| self.resolve(*ptr, ptr_ty));
+                let data = match self.ptr_parts_view(*ptr) {
+                    PtrPartsView::Exact(data, _) => data,
+                    PtrPartsView::Opaque | PtrPartsView::Unrecorded => self.resolve(*ptr, ptr_ty),
+                };
                 self.bind_first_result(node, data);
                 false
             }
             Inst::PtrMetadata { ptr_ty, metadata_ty, ptr } => {
-                let metadata = if let Some((_, metadata)) = self.ptr_parts.get(ptr) {
-                    metadata.clone()
+                let view = self.ptr_parts_view(*ptr);
+                let metadata = if let PtrPartsView::Exact(_, metadata) = view {
+                    metadata
                 } else if matches!(metadata_ty, Ty::Unit) {
                     Expr::true_()
-                } else if matches!(metadata_ty, Ty::U64) {
+                } else if matches!(view, PtrPartsView::Opaque) {
+                    // A `PtrFromParts` value (or a copy) read where its parts are
+                    // not exact: its metadata is whatever it was built with, so an
+                    // UNBOUNDED havoc — the `slice_len` bound below is a fact
+                    // about a reference, not about a constructed pointer.
+                    self.opaque_ptr_metadata(*ptr, metadata_ty)
+                } else if matches!(metadata_ty, Ty::U64) && !fat_ptr_metadata_is_vtable_word(ptr_ty)
+                {
                     // A slice/str fat-pointer's metadata is its element/byte LENGTH
                     // (usize == U64). Model it as a symbolic instead of an opaque
                     // unsupported value, so the CHC/PDR lane can prove obligations over
                     // `s.len()` — e.g. `s.len() + 1` no-overflow and
                     // `while i < s.len() { i += 1 }`. Gated to `U64` so a `dyn Trait`
                     // vtable pointer (Ty::Ptr) is NOT mis-bounded — it keeps the
-                    // opaque-unsupported path below.
+                    // opaque-unsupported path below — AND gated on the KIND
+                    // (`fat_ptr_metadata_is_vtable_word`): `TraitObject` and its v40
+                    // `dyn`-tail sibling `ContainerVtable` carry an opaque VTABLE WORD
+                    // whatever `metadata_ty` a producer spelled, and a vtable word read
+                    // as a length is a type confusion, so those kinds take the refusal
+                    // below rather than a `slice_len` symbol. (trust-ir's validator
+                    // rejects the mis-spelling; this lane does not validate hand-built
+                    // modules, so the classification is enforced here as well.)
                     //
                     // Trust (P0 ZST-slice-length FALSE PROOF): the `len <= isize::MAX`
                     // upper bound is a theorem ONLY when the element is provably NON-ZST.
@@ -2044,7 +3198,19 @@ impl<'a> ChcFuncTranslator<'a> {
                 };
                 if let Some(result) = node.results.first() {
                     self.values.insert(*result, data_expr.clone());
-                    self.ptr_parts.insert(*result, (data_expr, metadata_expr));
+                    let closed = self.term_facts.is_closed(&data_expr)
+                        && self.term_facts.is_closed(&metadata_expr);
+                    if let Some(block) = self.current_block {
+                        self.ptr_parts.insert(
+                            *result,
+                            PtrParts::Exact {
+                                block,
+                                data: data_expr,
+                                metadata: metadata_expr,
+                                closed,
+                            },
+                        );
+                    }
                 }
                 false
             }
@@ -2142,9 +3308,7 @@ impl<'a> ChcFuncTranslator<'a> {
                     let value = self.resolve(*operand, src_ty);
                     self.bind_first_result(node, value);
                     if let Some(result) = node.results.first().copied() {
-                        if let Some(parts) = self.ptr_parts.get(operand).cloned() {
-                            self.ptr_parts.insert(result, parts);
-                        }
+                        self.copy_ptr_parts(*operand, result);
                         if let Some(sym) = self.ptr_metadata_syms.get(operand).cloned() {
                             self.ptr_metadata_syms.insert(result, sym);
                         }
@@ -2159,11 +3323,12 @@ impl<'a> ChcFuncTranslator<'a> {
                     && matches!(src_ty, Ty::FatPtr(_))
                     && is_thin_pointer_ty(dst_ty)
                 {
-                    let data = self
-                        .ptr_parts
-                        .get(operand)
-                        .map(|(data, _)| data.clone())
-                        .unwrap_or_else(|| self.resolve(*operand, src_ty));
+                    let data = match self.ptr_parts_view(*operand) {
+                        PtrPartsView::Exact(data, _) => data,
+                        PtrPartsView::Opaque | PtrPartsView::Unrecorded => {
+                            self.resolve(*operand, src_ty)
+                        }
+                    };
                     self.bind_first_result(node, data);
                     return false;
                 }
@@ -2221,17 +3386,182 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 false
             }
+            Inst::MakeAggregate { ty: ty @ Ty::Enum(_), variant, fields } => {
+                if let Some(binding) = dataless_enum::variant_tag(self.module, ty, *variant, fields)
+                    .and_then(dataless_enum::binding)
+                {
+                    self.bind_aggregate_result(node, binding, ty);
+                } else {
+                    let result = self.fresh_symbolic("unmodeled_enum_constructor", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block, instruction_index, node,
+                        TrustIrChcUnsupportedReason::AggregateConstruction,
+                        from, path_constraints,
+                    );
+                }
+                false
+            }
+            // `MakeAggregate` at a non-empty array type, one operand per lane: the
+            // flat definitional encoding of its operands (`eval_make_array`), one
+            // path constraint, exact. Field aggregates use their existing
+            // recursively tracked bindings below; other shapes fail closed.
+            Inst::MakeAggregate { ty, variant, fields }
+                if matches!(self.composite_shape(ty), Some(CompositeShape::Array { .. })) =>
+            {
+                let mut definitions = Vec::new();
+                if let Some(array) = self.eval_make_array(ty, *variant, fields, &mut definitions) {
+                    if !definitions.is_empty() {
+                        path_constraints.push(Expr::and_many(definitions));
+                    }
+                    self.bind_array_result(node, array, ty);
+                } else {
+                    let result = self.fresh_symbolic("make_aggregate_result", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block,
+                        instruction_index,
+                        node,
+                        TrustIrChcUnsupportedReason::AggregateConstruction,
+                        from,
+                        path_constraints,
+                    );
+                }
+                false
+            }
+            Inst::MakeAggregate { ty, variant, fields } => {
+                match self.eval_make_field_aggregate(ty, *variant, fields) {
+                    Ok(aggregate) => self.bind_aggregate_result(node, aggregate, ty),
+                    Err(reason) => {
+                    let result = self.fresh_symbolic("make_aggregate_result", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block,
+                        instruction_index,
+                        node,
+                        reason,
+                        from,
+                        path_constraints,
+                    );
+                    }
+                }
+                false
+            }
+            // Do not erase a runtime closure's target or treat its captures as
+            // an ordinary field constructor. Until closure values/application
+            // have an exact model, even an unused constructor must fail closed:
+            // consuming a poison capture is observable undefined behavior.
+            Inst::MakeClosure { ty, .. } => {
+                let result = self.fresh_symbolic("make_closure_result", &Ty::Closure(*ty));
+                self.bind_first_result(node, result);
+                self.add_unsupported_error(
+                    block,
+                    instruction_index,
+                    node,
+                    TrustIrChcUnsupportedReason::ClosureConstruction,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            // trust-ir v67-v69 tensor region (`crate::tensor_region`): no tensor
+            // value has a sort here, and the module input refuses every module
+            // that stores one before any function is translated. A caller that
+            // bypasses it still meets an unconditional error rule naming the
+            // instruction. Results stay unbound and operands unread: binding a
+            // result would need the tensor sort this lowering does not have.
+            Inst::TensorContract { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorContract,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            Inst::TensorMap { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorMap,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            Inst::TensorReduce { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorReduce,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            Inst::TensorView { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorView,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            Inst::TensorGather { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorGather,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            Inst::TensorScatter { .. } => {
+                self.add_tensor_region_error(
+                    crate::TensorConstruct::TensorScatter,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
+            // trust-ir v50 `ArraySplat` (`[value; n]`, `ty = Array(e, n)`): pure
+            // and total — no memory effect, no run-time obligation — so it never
+            // raises an error rule. A trackable array binds one constant SMT array
+            // per leaf of `value`'s binding (`eval_array_splat`), which is the
+            // instruction's exact denotation (the Lean law
+            // `ExtractElement i (splat v n) = v`, `i < n`) in constant size
+            // whatever `n` is. An array whose element this model does not track
+            // is ONE opaque fresh value: an unconstrained array over-approximates
+            // `[value; n]`, and every consumer that would need its lanes either
+            // havocs the read (`ExtractElement`) or fails closed
+            // (`InsertElement`).
+            Inst::ArraySplat { ty, value } => {
+                if let Some(binding) = self.eval_array_splat(ty, *value) {
+                    self.bind_binding_result(node, binding, ty);
+                } else {
+                    let result = self.fresh_symbolic("array_splat", ty);
+                    self.bind_first_result(node, result);
+                }
+                false
+            }
             Inst::ExtractField { ty, aggregate, field } => {
                 if let Some(binding) = self.eval_extract_field(*aggregate, *field) {
                     // Trust (#46): the extracted field may itself be a nested
                     // aggregate (e.g. the tuple payload of `Some((a,b))`) — bind it as
                     // an aggregate so a SUBSEQUENT ExtractField on this result resolves.
-                    match binding {
-                        ValueBinding::Scalar(expr) => self.bind_first_result(node, expr),
-                        ValueBinding::Aggregate(aggregate) => {
-                            self.bind_aggregate_result(node, aggregate, ty)
-                        }
-                    }
+                    self.bind_binding_result(node, binding, ty);
                 } else {
                     let result = self.fresh_symbolic("unsupported_result", ty);
                     self.bind_first_result(node, result);
@@ -2263,20 +3593,28 @@ impl<'a> ChcFuncTranslator<'a> {
                 }
                 false
             }
-            Inst::ExtractElement { ty: dst_ty, .. } => {
-                // An array/vector element READ. Model the element as a fresh
-                // unconstrained value and do NOT fail closed: an unknown read value
-                // can never make a dependent obligation falsely provable, and the
-                // access's bounds safety is carried by the separately-emitted bounds
-                // `Assert` — exactly as a `ValidBorrow` load is modeled above (see
-                // `Inst::Load`). Failing closed here instead poisons the whole
-                // function CHC and blocks that bounds obligation from ever being
-                // proved (e.g. `arr[idx]` under a proven `idx < len` guard).
-                let result = self.fresh_symbolic("element_read", dst_ty);
-                self.bind_first_result(node, result);
+            // An array element READ: `select` on the array's SMT-array lanes, exact
+            // at any index, with its own in-bounds obligation
+            // (`translate_extract_element`). It never fails closed: a read this
+            // model cannot place (a SIMD vector, an unbound array value) is a
+            // fresh unconstrained value, which can never make a dependent
+            // obligation falsely provable.
+            Inst::ExtractElement { ty: dst_ty, array, index } => {
+                self.translate_extract_element(
+                    dst_ty,
+                    *array,
+                    *index,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                );
                 false
             }
-            Inst::UnOp { op, ty, operand } => {
+            // Exhaustive over `UnOp` (no wildcard): a new trust-ir variant is a
+            // compile error here until this lane decides to model or refuse it.
+            Inst::UnOp { op, ty, operand } => match op {
                 // Logical / bitwise NOT is a TOTAL function whose value must be
                 // BOUND, not havocked. An inlined `acc = !acc` (and `acc ^ true`,
                 // which trustc const-folds to `UnOp::Not`) otherwise fell through
@@ -2285,10 +3623,8 @@ impl<'a> ChcFuncTranslator<'a> {
                 // loop invariant (e.g. count-parity `acc <=> count[0]`) became
                 // unprovable. Model `Not` PRECISELY (bool -> logical not, integer
                 // -> bitwise complement), mirroring the direct-call summary
-                // interpreter's `UnOp::Not` arm. The remaining unary ops — the
-                // IEEE float ops and `CtPop` — keep the fail-closed
-                // fresh-symbolic modeling below (unchanged behavior).
-                if matches!(op, UnOp::Not) && (matches!(ty, Ty::Bool) || ty.is_integer()) {
+                // interpreter's `UnOp::Not` arm.
+                UnOp::Not if matches!(ty, Ty::Bool) || ty.is_integer() => {
                     let operand_expr = self.resolve(*operand, ty);
                     let result = if matches!(ty, Ty::Bool) {
                         operand_expr.not()
@@ -2296,7 +3632,7 @@ impl<'a> ChcFuncTranslator<'a> {
                         operand_expr.bvnot()
                     };
                     self.bind_first_result(node, result);
-                    return false;
+                    false
                 }
                 // Integer negation is likewise TOTAL over the two's-complement
                 // carrier (`bvneg`) and must be BOUND: the previous
@@ -2310,7 +3646,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 // (`bvneg_no_overflow`), a defensive unsigned negation traps
                 // unless the operand is zero, and a `Wrapping`-annotated node
                 // carries no obligation at all (wrap-around is defined).
-                if matches!(op, UnOp::Neg) && ty.is_integer() {
+                UnOp::Neg if ty.is_integer() => {
                     let operand_expr = normalize_expr_to_ty(&self.resolve(*operand, ty), ty);
                     if !node.proofs.contains(&ProofAnnotation::Wrapping) {
                         let no_overflow = if ty.is_signed() {
@@ -2329,40 +3665,64 @@ impl<'a> ChcFuncTranslator<'a> {
                         }
                     }
                     self.bind_first_result(node, operand_expr.bvneg());
-                    return false;
+                    false
                 }
-                let result = self.fresh_symbolic("unsupported_result", ty);
-                self.bind_first_result(node, result);
-                self.add_unsupported_error(
-                    block,
-                    instruction_index,
-                    node,
-                    unsupported_value_reason(&node.inst),
-                    from,
-                    path_constraints,
-                );
-                false
-            }
-            // An array/vector element WRITE. The symmetric counterpart of the
+                // Everything else keeps the fail-closed fresh-symbolic modeling
+                // (`UnaryOperation`): `Not`/`Neg` on a non-integer operand, the
+                // IEEE float ops, and the bit intrinsics `CtPop`/`CtLz`/`CtTz`/
+                // `BSwap`/`BitReverse`, none of which has an exact encoding here.
+                UnOp::Not
+                | UnOp::Neg
+                | UnOp::FNeg
+                | UnOp::FAbs
+                | UnOp::FSqrt
+                | UnOp::FFloor
+                | UnOp::FCeil
+                | UnOp::FTrunc
+                | UnOp::CtPop
+                | UnOp::CtLz
+                | UnOp::CtTz
+                | UnOp::BSwap
+                | UnOp::BitReverse => {
+                    let result = self.fresh_symbolic("unsupported_result", ty);
+                    self.bind_first_result(node, result);
+                    self.add_unsupported_error(
+                        block,
+                        instruction_index,
+                        node,
+                        unsupported_value_reason(&node.inst),
+                        from,
+                        path_constraints,
+                    );
+                    false
+                }
+            },
+            // An array element WRITE. The symmetric counterpart of the
             // `InsertField` arm above (struct/tuple field write): TrustIR
             // `InsertElement` is a PURE functional update — it READS `array` and
             // BINDS A NEW SSA result; the source value's binding is never mutated
             // (`trust_ir::interpret::eval_insert_element` clones before assigning).
             // So there is no in-place location whose tracked value a model could
-            // leave stale; the only thing that must be right is the RESULT binding.
-            //
-            // Before this arm existed, EVERY `InsertElement` fell into the
-            // fail-closed bucket below and emitted an UNCONDITIONALLY REACHABLE
-            // error rule, which makes every obligation in the enclosing function
-            // unprovable by construction — even though the READ side
-            // (`ExtractElement`) has long been modeled without failing closed and
-            // a `[T; N <= 256]` is already a fully trackable N-field aggregate
-            // (`immediate_aggregate_field_tys`). The pervasive shape this blocks is
-            // the `[core::fmt::rt::Argument; N]` array every `format!`/`write!`
-            // builds: one `InsertElement` at a CONSTANT index per format argument.
+            // leave stale; the only thing that must be right is the RESULT binding,
+            // which is `store` on the SMT-array lanes at any index, constant or
+            // symbolic, with its own in-bounds obligation (`eval_insert_element`).
+            // The pervasive shape is the `[core::fmt::rt::Argument; N]` array every
+            // `format!`/`write!` builds: one `InsertElement` at a CONSTANT index per
+            // format argument. A write this model cannot place keeps the
+            // fail-closed error rule below.
             Inst::InsertElement { ty, array, index, value } => {
-                if let Some(result) = self.eval_insert_element(ty, *array, *index, *value) {
-                    self.bind_aggregate_result(node, result, ty);
+                if let Some(result) = self.eval_insert_element(
+                    ty,
+                    *array,
+                    *index,
+                    *value,
+                    block,
+                    instruction_index,
+                    node,
+                    from,
+                    path_constraints,
+                ) {
+                    self.bind_array_result(node, result, ty);
                 } else {
                     let result = self.fresh_symbolic("unsupported_result", ty);
                     self.bind_first_result(node, result);
@@ -2469,28 +3829,10 @@ impl<'a> ChcFuncTranslator<'a> {
                 // local (e.g. `&mut iter` in a `for` loop's `next()`).
                 let result = self.resolve(*ptr, &Ty::Ptr);
                 self.bind_first_result(node, result);
-                if let Some(parts) = self.ptr_parts.get(ptr).cloned() {
-                    if let Some(result_id) = node.results.first() {
-                        self.ptr_parts.insert(*result_id, parts);
-                    }
+                if let Some(result_id) = node.results.first() {
+                    self.copy_ptr_parts(*ptr, *result_id);
                 }
-                // A borrow is a transparent alias, so it inherits the referent's
-                // interior-pointer provenance verbatim. Without this, `*(&mut local)`
-                // and `*(&mut local.field)` lose their base and the write is dropped.
-                // R3: a borrow of one of the FUNCTION's own allocas from a block
-                // other than the defining one roots the same {base, whole-cell}
-                // provenance the defining block would have inherited (see the GEP
-                // arm's alloca-root fallback for the rationale and scope).
-                let provenance = self.ptr_provenance.get(ptr).cloned().or_else(|| {
-                    self.func_alloca_ptrs
-                        .contains(ptr)
-                        .then(|| PtrProvenance { base: *ptr, lanes: Some(Vec::new()) })
-                });
-                if let Some(provenance) = provenance
-                    && let Some(result_id) = node.results.first()
-                {
-                    self.ptr_provenance.insert(*result_id, provenance);
-                }
+                self.inherit_alias_provenance(node, *ptr);
                 false
             }
             Inst::IsUnique { .. } => {
@@ -2541,11 +3883,21 @@ impl<'a> ChcFuncTranslator<'a> {
             | Inst::Retain { .. }
             | Inst::Release { .. }
             | Inst::Dealloc { .. }
+            | Inst::Drop { .. }
             | Inst::CloseFrame { .. }
             | Inst::CoroSuspend { .. }
             | Inst::Invoke { .. }
             | Inst::LandingPad { .. }
             | Inst::Resume { .. }
+            // trust-ir v53 no-unwind boundary calls and the unwinding twins
+            // (v54 `AssertInvoke`, v55 `DropInvoke`, v56 `InvokeIndirect`): no
+            // CHC model of the boundary, the unwind edge, the glue or the
+            // dispatch, so each fails closed by name (`unsupported_unit_reason`).
+            | Inst::CallCannotUnwind { .. }
+            | Inst::CallIndirectCannotUnwind { .. }
+            | Inst::AssertInvoke { .. }
+            | Inst::DropInvoke { .. }
+            | Inst::InvokeIndirect { .. }
             | Inst::DialectOp(_) => {
                 self.add_unsupported_error(
                     block,
@@ -2615,8 +3967,14 @@ impl<'a> ChcFuncTranslator<'a> {
         // `record_interior_pointer_escapes` treating those same positions as TRACKED.
         // The type-match half is unchanged: it guards a different false proof (a
         // silently-dropped mismatched-type Store leaving a stale value).
+        //
+        // A bulk `MemCopy`/`MemSet` through the cell's address is a TRACKED use for
+        // this decision (`BulkMemoryUse::Tracked`): `translate_bulk_memory` writes
+        // the cell exactly or havocs it, never leaving a stale value. The
+        // proof-authority gate and the promotion analysis keep the stricter
+        // classification, so no cell they admit or promote ever reaches one.
         if matches!(
-            stack_alloca_escape_classification(self.func, result),
+            stack_alloca_escape_classification_with(self.func, result, BulkMemoryUse::Tracked),
             StackCellEscape::Unbounded
         ) || !stack_alloca_cell_accesses_match_type(self.func, result, ty)
         {
@@ -2628,13 +3986,30 @@ impl<'a> ChcFuncTranslator<'a> {
     /// R66: is `ptr` the RESULT of a `GEP`? Used only to gate the diagnostic trace so
     /// ordinary provenance-free loads stop swamping the signal. No verdict effect.
     fn ptr_is_gep_derived(&self, ptr: ValueId) -> bool {
-        self.func.blocks.iter().flat_map(|b| b.body.iter()).any(|n| {
-            matches!(&n.inst, Inst::GEP { .. }) && n.results.iter().any(|r| *r == ptr)
-        })
+        self.func
+            .blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .any(|n| matches!(&n.inst, Inst::GEP { .. }) && n.results.iter().any(|r| *r == ptr))
     }
 
     fn translate_stack_load(&mut self, ty: &Ty, ptr: ValueId, node: &InstrNode) -> bool {
-        let Some(cell) = self.stack_cells.get(&ptr).cloned() else {
+        if !self.stack_cells.contains_key(&ptr) {
+            self.note_carried_cell_miss(ptr);
+        }
+        // Borrow/BorrowMut gives the alias a new SSA id while retaining the
+        // base cell's whole-object provenance. Resolve that empty lane path to
+        // the same cell as a direct load; matching the symbolic pointer value
+        // alone would not establish this identity. The exact cell type is still
+        // checked below, and an invalidated/absent cell supplies no stale value.
+        let cell = self.stack_cells.get(&ptr).or_else(|| {
+            let provenance = self.ptr_provenance.get(&ptr)?;
+            if !provenance.lanes.as_ref()?.is_empty() {
+                return None;
+            }
+            self.stack_cells.get(&provenance.base)
+        });
+        let Some(cell) = cell.cloned() else {
             // R63: INTERIOR-POINTER LANE READ — the mirror of the store side.
             //
             // This lookup is keyed by the LOAD's `ptr` operand, which for a GEP-derived
@@ -2656,7 +4031,11 @@ impl<'a> ChcFuncTranslator<'a> {
             // manufacture one.
             let Some(provenance) = self.ptr_provenance.get(&ptr).cloned() else {
                 lane_trace("exit1_no_provenance");
-                lane_trace_gep("exit1_no_provenance", self.ptr_is_gep_derived(ptr), &self.func.name);
+                lane_trace_gep(
+                    "exit1_no_provenance",
+                    self.ptr_is_gep_derived(ptr),
+                    &self.func.name,
+                );
                 return false;
             };
             let Some(lanes) = provenance.lanes else {
@@ -2664,8 +4043,8 @@ impl<'a> ChcFuncTranslator<'a> {
                 lane_trace_gep("exit2_lanes_none", self.ptr_is_gep_derived(ptr), &self.func.name);
                 return false;
             };
-            // Exactly one constant lane: a nested path is not modelled here, and the
-            // empty path is the whole cell, which the direct lookup above already covers.
+            // Exactly one constant lane: a nested path is not modelled here, and
+            // the empty whole-cell path is handled by the lookup above.
             let [(field, field_ty)] = lanes.as_slice() else {
                 let e3 = if lanes.is_empty() { "exit3a_empty_path" } else { "exit3b_nested_chain" };
                 lane_trace(e3);
@@ -2674,54 +4053,76 @@ impl<'a> ChcFuncTranslator<'a> {
             };
             if field_ty != ty {
                 lane_trace("exit4_field_ty_mismatch");
-                lane_trace_gep("exit4_field_ty_mismatch", self.ptr_is_gep_derived(ptr), &self.func.name);
+                lane_trace_gep(
+                    "exit4_field_ty_mismatch",
+                    self.ptr_is_gep_derived(ptr),
+                    &self.func.name,
+                );
                 return false;
             }
             let Some(base_cell) = self.stack_cells.get(&provenance.base).cloned() else {
                 lane_trace("exit5_base_not_tracked");
-                lane_trace_gep("exit5_base_not_tracked", self.ptr_is_gep_derived(ptr), &self.func.name);
+                lane_trace_gep(
+                    "exit5_base_not_tracked",
+                    self.ptr_is_gep_derived(ptr),
+                    &self.func.name,
+                );
                 return false;
             };
-            let ValueBinding::Aggregate(aggregate) = base_cell.value else {
-                lane_trace("exit6_base_not_aggregate");
-                lane_trace_gep("exit6_base_not_aggregate", self.ptr_is_gep_derived(ptr), &self.func.name);
-                return false;
-            };
-            let Some(leaf) = aggregate.fields.get(*field).cloned() else {
-                return false;
-            };
-            match leaf {
-                ValueBinding::Scalar(expr) => self.bind_first_result(node, expr),
-                ValueBinding::Aggregate(nested) => {
-                    self.bind_aggregate_result(node, nested, ty)
+            let leaf = match base_cell.value {
+                ValueBinding::Aggregate(aggregate) => aggregate.fields.get(*field).cloned(),
+                // An array cell's constant lane: `select` on its SMT-array lanes.
+                // `extend_exact_gep_lanes` admitted the lane only below the length.
+                ValueBinding::Array(array) if array.lanes.is_some() => u64::try_from(*field)
+                    .ok()
+                    .and_then(|lane| array.select(&Expr::bitvec_const(lane, 64))),
+                // A SHAPE-ONLY array cell (a block a cycle of the CFG reaches, see
+                // `ArrayValue`): the lane's VALUE is not modeled, but the ACCESS is
+                // to owned stack memory at a lane `extend_exact_gep_lanes` admitted
+                // below the length — valid by construction. So it reads a fresh
+                // value, exactly as a load of an untracked owned cell does
+                // (`known_stack` in the `Load` arm), and owes no memory error: a
+                // fail-closed error here would poison every obligation of the
+                // function over an access that is known to be in bounds.
+                ValueBinding::Array(_) => Some(self.fresh_value_binding("stack_lane_read", ty)),
+                ValueBinding::Scalar(_) => {
+                    lane_trace("exit6_base_not_aggregate");
+                    lane_trace_gep(
+                        "exit6_base_not_aggregate",
+                        self.ptr_is_gep_derived(ptr),
+                        &self.func.name,
+                    );
+                    return false;
                 }
-            }
+            };
+            let Some(leaf) = leaf else {
+                return false;
+            };
+            self.bind_binding_result(node, leaf, ty);
             return true;
         };
         if cell.ty != *ty {
             return false;
         }
 
-        match cell.value {
-            ValueBinding::Scalar(expr) => self.bind_first_result(node, expr),
-            ValueBinding::Aggregate(aggregate) => self.bind_aggregate_result(node, aggregate, ty),
-        }
+        self.bind_binding_result(node, cell.value, ty);
         true
     }
 
     fn translate_stack_store(&mut self, ty: &Ty, ptr: ValueId, value: ValueId) -> bool {
         let Some(cell_ty) = self.stack_cells.get(&ptr).map(|cell| cell.ty.clone()) else {
+            self.note_carried_cell_miss(ptr);
             return false;
         };
         if cell_ty != *ty {
             return false;
         }
 
-        let value_binding = if self.aggregate_field_tys(ty).is_some() {
-            let Some(aggregate) = self.resolve_aggregate(value, ty) else {
+        let value_binding = if self.is_composite_value_ty(ty) {
+            let Some(binding) = self.resolve_composite(value, ty) else {
                 return false;
             };
-            ValueBinding::Aggregate(aggregate)
+            binding
         } else if is_precise_stack_scalar_ty(ty) {
             ValueBinding::Scalar(self.resolve(value, ty))
         } else {
@@ -2748,9 +4149,10 @@ impl<'a> ChcFuncTranslator<'a> {
     ///
     /// Requiring the TOP BIT to be CLEAR makes the signed and unsigned readings
     /// provably agree, so this stays correct without consulting the index's
-    /// declared type (which this layer does not have). Declining is FAIL-CLOSED at
-    /// both call sites: the element-write path keeps its unconditional
-    /// `AggregateUpdate` error rule and the GEP path records an unknown offset.
+    /// declared type. Declining is FAIL-CLOSED at the one call site, the GEP lane
+    /// walk, which then records an unknown offset (a later store havocs the whole
+    /// cell). Element accesses do not use this: `array_lane_access` reads a
+    /// constant index by its declared signedness.
     fn constant_lane_index(&self, index: ValueId) -> Option<usize> {
         match self.values.get(&index)?.value() {
             ay_bindings::ExprValue::BitVecConst { value, width } => {
@@ -2794,65 +4196,54 @@ impl<'a> ChcFuncTranslator<'a> {
         Some(lanes)
     }
 
-    /// Aggregate lane selected exactly by one single-scale GEP step.
+    /// Aggregate lane selected exactly by one single-scale GEP step (memoized
+    /// per `(aggregate, field, pointee)` by `exact_gep_lane_ty`,
+    /// `translate_chc_ty_facts.rs`).
     ///
     /// Struct precision requires complete declared byte layout: every field must
     /// have an offset and a layout, every range must fit the struct, no starts may
-    /// alias, and no byte ranges may overlap. The selected field's declared start
-    /// must equal `field * size_of(pointee_ty)`. Missing metadata is not evidence
-    /// and therefore returns `None`. Arrays carry their own exact element stride
-    /// and remain precise when it agrees with the pointee layout.
-    fn exact_gep_lane_ty(&self, aggregate_ty: &Ty, field: usize, pointee_ty: &Ty) -> Option<Ty> {
-        let field_tys = self.aggregate_field_tys(aggregate_ty)?;
-        let field_ty = field_tys.get(field)?;
+    /// alias, and no byte ranges may overlap (`exact_struct_ranges`). The selected
+    /// field's declared start must equal `field * size_of(pointee_ty)`. Missing
+    /// metadata is not evidence and therefore returns `None`. Arrays carry their
+    /// own exact element stride and remain precise when it agrees with the
+    /// pointee layout.
+    fn exact_gep_lane_ty_uncached(
+        &self,
+        aggregate_ty: &Ty,
+        field: usize,
+        pointee_ty: &Ty,
+    ) -> Option<Ty> {
+        // The lane's type: a struct field, or an array's element for a lane below
+        // its length (an array's lanes are not a field list — `CompositeShape`).
+        let (field_tys, field_ty) = match self.composite_shape(aggregate_ty)? {
+            CompositeShape::Fields(field_tys) => {
+                let field_ty = field_tys.get(field)?.clone();
+                (field_tys, field_ty)
+            }
+            CompositeShape::Array { elem, len } => {
+                if u64::try_from(field).ok()? >= len {
+                    return None;
+                }
+                (Vec::new(), elem)
+            }
+        };
+        let field_ty = &field_ty;
         if field_ty != pointee_ty {
             return None;
         }
 
-        let pointee_layout = self.module.ty_layout_shape(pointee_ty).ok()?;
-        if pointee_layout.size_bits == 0 || pointee_layout.size_bits % 8 != 0 {
+        let pointee_bits = self.layout_fact(pointee_ty)?.size_bits;
+        if pointee_bits == 0 || pointee_bits % 8 != 0 {
             return None;
         }
-        let gep_offset_bits = pointee_layout.size_bits.checked_mul(u64::try_from(field).ok()?)?;
+        let gep_offset_bits = pointee_bits.checked_mul(u64::try_from(field).ok()?)?;
 
         match aggregate_ty {
             Ty::Struct(id) => {
-                let aggregate_layout = self.module.ty_layout_shape(aggregate_ty).ok()?;
-                let definition =
-                    self.module.structs.iter().find(|definition| definition.id == *id)?;
-                if definition.fields.len() != field_tys.len() {
-                    return None;
-                }
-
-                let mut ranges = Vec::with_capacity(definition.fields.len());
-                for (index, definition_field) in definition.fields.iter().enumerate() {
-                    if definition_field.ty != field_tys[index] {
-                        return None;
-                    }
-                    let start = definition_field.offset?.checked_mul(8)?;
-                    let size = self.module.ty_layout_shape(&definition_field.ty).ok()?.size_bits;
-                    let end = start.checked_add(size)?;
-                    if end > aggregate_layout.size_bits {
-                        return None;
-                    }
-                    ranges.push((start, end));
-                }
-
                 // The logical field identity must be unique at the selected byte
                 // address and the aggregate binding must not hide byte aliases.
-                for left in 0..ranges.len() {
-                    for right in (left + 1)..ranges.len() {
-                        let (left_start, left_end) = ranges[left];
-                        let (right_start, right_end) = ranges[right];
-                        if left_start == right_start
-                            || (left_start < right_end && right_start < left_end)
-                        {
-                            return None;
-                        }
-                    }
-                }
-
-                if ranges[field].0 != gep_offset_bits {
+                let ranges = self.exact_struct_ranges(*id, &field_tys)?;
+                if ranges.get(field)?.0 != gep_offset_bits {
                     return None;
                 }
                 Some(field_ty.clone())
@@ -2865,12 +4256,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 if element_ty != pointee_ty {
                     return None;
                 }
-                let aggregate_layout = self.module.ty_layout_shape(aggregate_ty).ok()?;
-                let trust_ir::TyLayoutKind::Array { stride_bits, .. } = aggregate_layout.kind
-                else {
-                    return None;
-                };
-                if stride_bits != pointee_layout.size_bits {
+                if self.layout_fact(aggregate_ty)?.stride_bits? != pointee_bits {
                     return None;
                 }
                 Some(field_ty.clone())
@@ -2913,8 +4299,8 @@ impl<'a> ChcFuncTranslator<'a> {
 
     /// Reset every precise cell a store through `ptr` could target. Used when the
     /// written value cannot be placed exactly — an unknown offset, a mismatched
-    /// type, a volatile or atomic store — and as the fallback of
-    /// `model_indirect_store`.
+    /// type, a volatile or atomic store, a bulk `MemCopy`/`MemSet` — and as the
+    /// fallback of `model_indirect_store`.
     fn invalidate_store_targets(&mut self, ptr: ValueId) -> IndirectStoreOutcome {
         if let Some(provenance) = self.ptr_provenance.get(&ptr).cloned() {
             // The referent is known exactly, so nothing else can be affected.
@@ -2953,11 +4339,14 @@ impl<'a> ChcFuncTranslator<'a> {
     ///   1. every GEP step must carry exact declared layout evidence making
     ///      TrustIR's byte stride coincide with a unique, non-overlapping aggregate
     ///      lane (or an exact array element stride);
-    ///   2. the cell's type is walked with `aggregate_field_tys` — the SAME table
+    ///   2. the cell's type is walked with `composite_shape` — the SAME table
     ///      `fresh_stack_cell_value` built the binding from and the `Load`/
-    ///      `ExtractField` path reads it back through;
+    ///      `ExtractField` path reads it back through (an array lane is admitted
+    ///      only below the length);
     ///   3. the stored type must equal the final lane type, and the binding tree
-    ///      must actually have an aggregate node at every step.
+    ///      must actually have a composite node at every step: a field is replaced
+    ///      in place, an array lane is `select`ed, updated and `store`d back
+    ///      (`update_binding_lane`).
     fn store_cell_lane(
         &mut self,
         base: ValueId,
@@ -2980,31 +4369,28 @@ impl<'a> ChcFuncTranslator<'a> {
             return false;
         }
 
-        let new_binding = if self.aggregate_field_tys(ty).is_some() {
-            let Some(aggregate) = self.resolve_aggregate(value, ty) else {
+        let new_binding = if self.is_composite_value_ty(ty) {
+            let Some(binding) = self.resolve_composite(value, ty) else {
                 return false;
             };
-            ValueBinding::Aggregate(aggregate)
+            binding
         } else if is_precise_stack_scalar_ty(ty) {
             ValueBinding::Scalar(self.resolve(value, ty))
         } else {
             return false;
         };
 
+        let Some(cell) = self.stack_cells.get(&base) else {
+            return false;
+        };
+        let path: Vec<usize> = lanes.iter().map(|(field, _)| *field).collect();
+        let Some(updated) = update_binding_lane(&cell.value, &path, new_binding) else {
+            return false;
+        };
         let Some(cell) = self.stack_cells.get_mut(&base) else {
             return false;
         };
-        let mut slot = &mut cell.value;
-        for (field, _) in lanes {
-            let ValueBinding::Aggregate(aggregate) = slot else {
-                return false;
-            };
-            let Some(next) = aggregate.fields.get_mut(*field) else {
-                return false;
-            };
-            slot = next;
-        }
-        *slot = new_binding;
+        cell.value = updated;
         true
     }
 
@@ -3085,6 +4471,28 @@ impl<'a> ChcFuncTranslator<'a> {
         }
     }
 
+    /// Give the result of a transparent alias of `referent` (a `Borrow`/`BorrowMut`,
+    /// or a thin-pointer `Copy`: [`transparent_pointer_alias`]) the referent's
+    /// interior-pointer provenance verbatim. Without this, `*(&mut local)` and
+    /// `*(&mut local.field)` lose their base and the write is dropped.
+    ///
+    /// R3: an alias of one of the FUNCTION's own allocas from a block other than the
+    /// defining one roots the same {base, whole-cell} provenance the defining block
+    /// would have inherited (see the GEP arm's alloca-root fallback for the
+    /// rationale and scope).
+    fn inherit_alias_provenance(&mut self, node: &InstrNode, referent: ValueId) {
+        let provenance = self.ptr_provenance.get(&referent).cloned().or_else(|| {
+            self.func_alloca_ptrs
+                .contains(&referent)
+                .then(|| PtrProvenance { base: referent, lanes: Some(Vec::new()) })
+        });
+        if let Some(provenance) = provenance
+            && let Some(result_id) = node.results.first()
+        {
+            self.ptr_provenance.insert(*result_id, provenance);
+        }
+    }
+
     /// Mark the base of every interior pointer this instruction uses in a position
     /// the cell model does not follow. Such a pointer may resurface as an unknown
     /// store target later in the block, so its cell must then be invalidated.
@@ -3116,10 +4524,20 @@ impl<'a> ChcFuncTranslator<'a> {
             | Inst::BorrowMut { .. }
             | Inst::EndBorrow { .. }
             | Inst::Dealloc { .. } => Vec::new(),
+            // A thin-pointer `Copy` is the Rust producers' spelling of a borrow
+            // (`transparent_pointer_alias`): its result inherits the referent's
+            // provenance in `translate_node`'s `Copy` arm, so the operand is a
+            // TRACKED position, not an escape. Any other `Copy` falls to `_`.
+            inst @ Inst::Copy { .. } if transparent_pointer_alias(inst).is_some() => Vec::new(),
             // `ptr` is tracked; the written VALUE puts a pointer into memory.
             Inst::Store { value, .. } | Inst::AtomicStore { value, .. } => vec![*value],
             // `base` is tracked; an index is an ordinary operand.
             Inst::GEP { indices, .. } => indices.clone(),
+            // Bulk memory reads and writes THROUGH `dst`/`src` (the arm models the
+            // write exactly or havocs every cell it could reach); it puts no
+            // address into memory. The byte count and fill byte are values.
+            Inst::MemCopy { bytes, .. } => vec![*bytes],
+            Inst::MemSet { byte, bytes, .. } => vec![*byte, *bytes],
             _ => uses,
         };
         for used in escaping {
@@ -3130,18 +4548,23 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn fresh_stack_cell_value(&mut self, ty: &Ty) -> Option<ValueBinding> {
-        if let Some(field_tys) = self.aggregate_field_tys(ty) {
-            let mut fields = Vec::with_capacity(field_tys.len());
-            for (field_index, field_ty) in field_tys.iter().enumerate() {
-                // Trust (#46): recurse for nested-aggregate fields.
-                fields.push(
-                    self.resolve_field_binding(
+        match self.composite_shape(ty) {
+            Some(CompositeShape::Fields(field_tys)) => {
+                let mut fields = Vec::with_capacity(field_tys.len());
+                for (field_index, field_ty) in field_tys.iter().enumerate() {
+                    // Trust (#46): recurse for nested-composite fields.
+                    fields.push(self.resolve_field_binding(
                         &format!("stack_init_field{field_index}"),
                         field_ty,
-                    )?,
-                );
+                    )?);
+                }
+                return Some(ValueBinding::Aggregate(AggregateValue { fields }));
             }
-            return Some(ValueBinding::Aggregate(AggregateValue { fields }));
+            // One fresh SMT array per element leaf, whatever the length.
+            Some(CompositeShape::Array { .. }) => {
+                return self.fresh_binding_lifted("stack_init", ty, 0);
+            }
+            None => {}
         }
 
         is_precise_stack_scalar_ty(ty)
@@ -3165,11 +4588,20 @@ impl<'a> ChcFuncTranslator<'a> {
 
         for case in cases {
             let Some(case_expr) = switch_case_expr(&case.value, &selector) else {
+                // A `Constant::TensorBlob` case (`crate::tensor_region`) is
+                // refused by name, not as a generic switch.
+                let reason = if crate::constant_carries_tensor_blob(&case.value) {
+                    TrustIrChcUnsupportedReason::TensorRegion(
+                        crate::TensorConstruct::TensorBlobConstant,
+                    )
+                } else {
+                    TrustIrChcUnsupportedReason::Switch
+                };
                 self.add_unsupported_error(
                     block,
                     instruction_index,
                     node,
-                    TrustIrChcUnsupportedReason::Switch,
+                    reason,
                     from,
                     path_constraints,
                 );
@@ -3356,6 +4788,55 @@ impl<'a> ChcFuncTranslator<'a> {
         let callee_func_ty = self.module.func_types.get(callee_func.ty.as_usize()).cloned();
         let callee_return_tys = callee_func_ty.as_ref().map(|func_ty| func_ty.returns.as_slice());
 
+        if !construction_definedness::consumption_is_valid(
+            &self.source_consumption,
+            self.module,
+            self.func,
+            node,
+            None,
+            None,
+        ) {
+            self.bind_symbolic_call_results(&callee_func.name, callee_return_tys, node);
+            self.record_call_summary_attempt(
+                callee,
+                Some(&callee_func.name),
+                block,
+                instruction_index,
+                CallSummaryOutcome::NotAttempted { reason: "call_argument_transport" },
+            );
+            self.add_unsupported_error(
+                block,
+                instruction_index,
+                node,
+                TrustIrChcUnsupportedReason::CallArgumentTransport,
+                from,
+                path_constraints,
+            );
+            return;
+        }
+
+        // Trust (2026-09-14): a DIRECT SELF-call first tries the inductive
+        // hypothesis (Park induction for recursive procedures); every fence miss
+        // falls through to the historical unconditional error rule below.
+        let mut ih_fence_miss: Option<&'static str> = None;
+        if callee == self.func.id {
+            match callee_func_ty.as_ref() {
+                Some(func_ty) => match self.try_self_call_inductive_hypothesis(
+                    &callee_func,
+                    func_ty,
+                    args,
+                    node,
+                    block,
+                    instruction_index,
+                    from,
+                    path_constraints,
+                ) {
+                    Ok(()) => return,
+                    Err(miss) => ih_fence_miss = Some(miss),
+                },
+                None => ih_fence_miss = Some("ih_fence:callee_func_ty_missing"),
+            }
+        }
         if self.is_recursive_direct_call(callee, &callee_func) {
             self.bind_symbolic_call_results(&callee_func.name, callee_return_tys, node);
             for (i, arg) in args.iter().enumerate() {
@@ -3370,7 +4851,9 @@ impl<'a> ChcFuncTranslator<'a> {
                 Some(&callee_func.name),
                 block,
                 instruction_index,
-                CallSummaryOutcome::NotAttempted { reason: "recursive_direct_call" },
+                CallSummaryOutcome::NotAttempted {
+                    reason: ih_fence_miss.unwrap_or("recursive_direct_call"),
+                },
             );
             self.add_unsupported_error(
                 block,
@@ -3383,54 +4866,14 @@ impl<'a> ChcFuncTranslator<'a> {
             return;
         }
 
-        // A WRAPPING arithmetic intrinsic (`u64::wrapping_add`, `i32::wrapping_sub`,
-        // `wrapping_mul`, …) reaches the trust-ir as a direct `Call` to a numeric
-        // method whose body the bounded summary interpreter does not model, so it
-        // otherwise falls through to the fresh-symbolic havoc below — leaving the
-        // result unbound and HAVOCKING any loop-carried cell it updates (e.g.
-        // `count = count.wrapping_add(1)` left `count'` free, so the count-parity loop
-        // invariant was unprovable). Model it PRECISELY as the corresponding MODULAR
-        // bitvector op (`bvadd`/`bvsub`/`bvmul`): wrap-around is DEFINED, so there is
-        // NO overflow obligation — mirroring `translate_integer_binop`'s `Wrapping`
-        // path and the compiler MIR path's `inline_wrapping_arith_expr`, which likewise
-        // resolve these directly to BV operations. Recognized by the callee's method
-        // name plus an integer-typed 2-in / 1-out signature of a single common width
-        // (the strong signal it is the numeric intrinsic, not an unrelated same-named
-        // user function of a different shape).
-        if let Some(op) = wrapping_arith_binop(&callee_func.name)
-            && args.len() == 2
-            && let Some(func_ty) = &callee_func_ty
-            && func_ty.params.len() == 2
-            && func_ty.returns.len() == 1
-        {
-            let lhs_ty = func_ty.params[0].clone();
-            let rhs_ty = func_ty.params[1].clone();
-            let ret_ty = func_ty.returns[0].clone();
-            let width = ret_ty.bit_width_with(HOST_POINTER_BITS);
-            if ret_ty.is_integer()
-                && lhs_ty.is_integer()
-                && rhs_ty.is_integer()
-                && width.is_some()
-                && lhs_ty.bit_width_with(HOST_POINTER_BITS) == width
-                && rhs_ty.bit_width_with(HOST_POINTER_BITS) == width
-            {
-                let lhs = self.resolve(args[0], &lhs_ty);
-                let rhs = self.resolve(args[1], &rhs_ty);
-                let result = self.eval_binop(op, &ret_ty, &lhs, &rhs);
-                self.bind_first_result(node, result);
-                self.record_call_summary_attempt(
-                    callee,
-                    Some(&callee_func.name),
-                    block,
-                    instruction_index,
-                    CallSummaryOutcome::NotAttempted { reason: "wrapping_arith_intrinsic" },
-                );
-                return;
-            }
-        }
-
+        // A name and signature do not authenticate an intrinsic. Interpret the
+        // provided body, or refuse the call if it cannot be summarized. Real
+        // modular arithmetic is represented by a Wrapping-tagged BinOp and is
+        // handled by the ordinary instruction semantics, including in summaries.
         let decline = DeclineSlot::default();
-        if let Some(summary) = self.try_direct_call_summary(&callee_func, args, &decline) {
+        if let Some(summary) =
+            self.try_direct_call_summary(&callee_func, CallSummaryArgs::Caller(args), &decline, 0)
+        {
             for condition in summary.error_conditions {
                 self.add_error_rule(from, path_constraints, condition);
             }
@@ -3448,6 +4891,7 @@ impl<'a> ChcFuncTranslator<'a> {
                 for ((result, ty), binding) in
                     node.results.iter().zip(callee_func_ty.returns.iter()).zip(summary.returns)
                 {
+                    let binding = self.materialize_call_summary_binding(binding);
                     self.bind_call_result(*result, binding, ty);
                 }
                 return;
@@ -3504,6 +4948,231 @@ impl<'a> ChcFuncTranslator<'a> {
         );
     }
 
+    /// Trust (2026-09-14): model a DIRECT SELF-call by the INDUCTIVE HYPOTHESIS.
+    ///
+    /// The whole-function panic-freedom aggregate asks "no `error` is reachable
+    /// from the entry relation, for every entry state satisfying the entry
+    /// `Assume`s (the bridge lowers `requires` clauses to exactly those)". Under
+    /// that reading the standard Hoare rule for recursive procedures applies:
+    /// assume the deeper activation is safe (its results are FRESH symbols, it
+    /// contributes NO error rule), and in exchange (1) re-assert every entry
+    /// precondition over the ACTUALS at the call site — the deeper activation is
+    /// covered by the same universal statement only if its input satisfies the
+    /// preconditions — and (2) keep every other obligation of the body exactly
+    /// where it is. Then, by induction on the call tree: a panicking execution
+    /// has an innermost panicking activation; every self-call before its panic
+    /// point RETURNED with some values (a panicking deeper call would be a
+    /// deeper panicking activation), those values are covered by the fresh
+    /// symbols, the activation's input satisfied the preconditions (re-asserted
+    /// by its caller), and so that activation is a witness against the VC —
+    /// contradiction. Multiple self-calls (a call TREE) are the same argument;
+    /// `first-party/clean/proofs/trust-soundness/general_recursion.lean`
+    /// kernel-checks the single-chain, precondition-free special case.
+    ///
+    /// FENCE (affirmative, every miss falls back to the error rule):
+    /// (a) arity matches the declared signature; (b) every parameter and every
+    /// result is a POINTER-FREE scalar (`is_precise_stack_scalar_ty`, NOT the
+    /// summary lane's predicate, which admits opaque `Ty::Ptr`), so the deeper
+    /// activation can reach no memory of this activation through its inputs and
+    /// hands none back; (c) the body is FRAME-LOCAL by an ALLOW-LIST of
+    /// instruction kinds — no global address, no indirect call, no pointer
+    /// forged from an integer, no fat-pointer part, no atomic/heap/dialect/
+    /// coroutine instruction, and every `Store` writes through a pointer derived
+    /// from this function's own `Alloca`s — so the deeper activation cannot
+    /// clobber this activation's tracked cells (a new `Inst` variant is refused
+    /// until listed); (d) every entry-block `Assume` that depends on a parameter
+    /// is RE-INSTANTIABLE over the actuals (comparisons, boolean connectives,
+    /// constants, copies); one that depends on a parameter through any other
+    /// shape declines the whole site. An `Assume` that depends on no parameter
+    /// (an authenticated fact about a value computed inside the activation) does
+    /// not narrow the ENTRY state and is left alone.
+    ///
+    /// Escaped-cell invalidation at this call is the same as at every other
+    /// call: `translate_node` runs `invalidate_cells_escaping_into_call` before
+    /// dispatching to this arm.
+    ///
+    /// DEMOTION: the site is recorded in `inductive_hypothesis_sites`, which the
+    /// bundle stamps as `inductive_hypothesis_site_count`; the driver holds any
+    /// REFUTATION of such an obligation at Unknown (a counterexample may pass
+    /// through a havoc'd self-call result) and declines the pre-solve refutation
+    /// lanes, exactly as for fail-closed lowering sites. A PROOF stands.
+    ///
+    /// Mutual recursion (`f -> g -> f`, at any cycle length) is NOT this arm:
+    /// the callee is not `self.func.id`, so the historical fail-closed handling
+    /// of the other function's summary is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    /// `Err` names the fence point that refused; the caller records it as the
+    /// site's census reason so a miss on a real body is attributable without a
+    /// debugger (v7/D3).
+    fn try_self_call_inductive_hypothesis(
+        &mut self,
+        callee_func: &Function,
+        callee_func_ty: &trust_ir::FuncTy,
+        args: &[ValueId],
+        node: &InstrNode,
+        block: BlockId,
+        instruction_index: usize,
+        from: &RelationApp,
+        path_constraints: &[Expr],
+    ) -> Result<(), &'static str> {
+        // (a) arity.
+        if callee_func_ty.params.len() != args.len()
+            || node.results.len() != callee_func_ty.returns.len()
+        {
+            return Err("ih_fence:arity");
+        }
+        // (b) pointer-free scalars only, both directions. `is_precise_stack_scalar_ty`
+        // admits an opaque `Ty::Ptr`; the exclusion is explicit and pinned.
+        let pointer_free_scalar =
+            |ty: &Ty| is_precise_stack_scalar_ty(ty) && !matches!(ty, Ty::Ptr | Ty::FatPtr(_));
+        if !callee_func_ty.params.iter().all(pointer_free_scalar)
+            || !callee_func_ty.returns.iter().all(pointer_free_scalar)
+        {
+            return Err("ih_fence:pointer_or_non_scalar_signature");
+        }
+        // (c) frame-local body.
+        if !self_call_body_is_frame_local(callee_func) {
+            return Err("ih_fence:body_not_frame_local");
+        }
+        // (d) entry preconditions over the actuals.
+        let Some(entry) = callee_func.block(callee_func.entry) else {
+            return Err("ih_fence:entry_block_missing");
+        };
+        if entry.params.len() != args.len() {
+            return Err("ih_fence:entry_param_arity");
+        }
+        let mut actuals: BTreeMap<ValueId, Expr> = BTreeMap::new();
+        for ((param, param_ty), arg) in entry.params.iter().zip(args) {
+            actuals.insert(*param, self.resolve(*arg, param_ty));
+        }
+        let mut reasserted = Vec::new();
+        for anode in &entry.body {
+            let Inst::Assume { cond } = &anode.inst else { continue };
+            match self.reinstantiate_entry_condition(entry, *cond, &actuals, 64) {
+                Some((true, expr)) => reasserted.push(expr),
+                Some((false, _)) => {}
+                None => return Err("ih_fence:entry_assume_unmodeled"),
+            }
+        }
+        // Admitted. (1) the deeper activation's input must satisfy every entry
+        // precondition: an error rule per precondition, negated, on this path.
+        for pre in reasserted {
+            self.add_error_rule(from, path_constraints, pre.not());
+        }
+        // (2) the inductive hypothesis: fresh results, no error rule.
+        self.bind_symbolic_call_results(
+            &callee_func.name,
+            Some(callee_func_ty.returns.as_slice()),
+            node,
+        );
+        self.record_call_summary_attempt(
+            callee_func.id,
+            Some(&callee_func.name),
+            block,
+            instruction_index,
+            CallSummaryOutcome::InductiveHypothesis,
+        );
+        self.inductive_hypothesis_sites.push(TrustIrChcDiagnostic {
+            function: self.func.name.clone(),
+            block,
+            instruction_index,
+            family: SemanticsFamily::Calls,
+            reason: TrustIrChcUnsupportedReason::RecursiveSelfCallInductiveHypothesis,
+            result_values: node.results.clone(),
+        });
+        Ok(())
+    }
+
+    /// Re-evaluate the boolean `value` (an entry-block `Assume` condition) with
+    /// the entry parameters replaced by `actuals`. `Some((depends_on_param,
+    /// expr))`, or `None` when any parameter-dependent leaf is a shape this
+    /// evaluator does not model (fail closed). Only the bridge's precondition
+    /// spellings are modeled: `ICmp` over parameters and constants, boolean
+    /// `And`/`Or`/`Xor`, the `Select`-spelled connectives, and `Copy`.
+    fn reinstantiate_entry_condition(
+        &mut self,
+        entry: &Block,
+        value: ValueId,
+        actuals: &BTreeMap<ValueId, Expr>,
+        fuel: u32,
+    ) -> Option<(bool, Expr)> {
+        if let Some(actual) = actuals.get(&value) {
+            return Some((true, actual.clone()));
+        }
+        if fuel == 0 {
+            return None;
+        }
+        let node = entry.body.iter().find(|n| n.results.first() == Some(&value))?;
+        match &node.inst {
+            // Evaluated from the INSTRUCTION, never from `self.values`: that map
+            // is cleared at every block boundary (`translate_block`), and the
+            // bridge places a self-call in a non-entry block behind the
+            // recursion guard — measured 2026-09-14 on
+            // `tests/ui/trust/native_recursive_requires_fresh_context.rs`, where
+            // the lookup form missed every entry constant and the fence fell
+            // through to the historical error rule. A constant with no exact
+            // bit-level encoding stays unmodeled (`None`).
+            Inst::Const { ty, value } => {
+                if matches!(value, Constant::SymbolAddr { .. }) {
+                    return None;
+                }
+                let expr = const_to_expr(ty, value)?;
+                Some((false, expr))
+            }
+            Inst::Copy { operand, .. } => {
+                self.reinstantiate_entry_condition(entry, *operand, actuals, fuel - 1)
+            }
+            Inst::ICmp { op, ty, lhs, rhs } => {
+                let (dl, l) = self.reinstantiate_entry_condition(entry, *lhs, actuals, fuel - 1)?;
+                let (dr, r) = self.reinstantiate_entry_condition(entry, *rhs, actuals, fuel - 1)?;
+                let expr = self.eval_icmp(*op, ty, &l, &r)?;
+                Some((dl || dr, expr))
+            }
+            Inst::BinOp {
+                op: op @ (BinOp::And | BinOp::Or | BinOp::Xor),
+                ty: Ty::Bool,
+                lhs,
+                rhs,
+            } => {
+                let (dl, l) = self.reinstantiate_entry_condition(entry, *lhs, actuals, fuel - 1)?;
+                let (dr, r) = self.reinstantiate_entry_condition(entry, *rhs, actuals, fuel - 1)?;
+                let expr = self.eval_binop(*op, &Ty::Bool, &l, &r);
+                Some((dl || dr, expr))
+            }
+            Inst::Select { ty: Ty::Bool, cond, then_val, else_val } => {
+                let (dc, c) =
+                    self.reinstantiate_entry_condition(entry, *cond, actuals, fuel - 1)?;
+                let (dt, t) =
+                    self.reinstantiate_entry_condition(entry, *then_val, actuals, fuel - 1)?;
+                let (de, e) =
+                    self.reinstantiate_entry_condition(entry, *else_val, actuals, fuel - 1)?;
+                if !c.sort().is_bool() || !t.sort().is_bool() || !e.sort().is_bool() {
+                    return None;
+                }
+                Some((dc || dt || de, Expr::ite(c, t, e)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `element_operand_tys` of the callee `callee_func`, computed on the first
+    /// request for it and shared by every later summary of it in this translator
+    /// (`callee_operand_tys`): linear in the sum of the distinct callees' sizes.
+    fn callee_operand_tys_of(
+        &mut self,
+        callee_func: &Function,
+    ) -> std::rc::Rc<BTreeMap<ValueId, Ty>> {
+        let module = self.module;
+        let passes = &mut self.work.callee_operand_type_passes;
+        self.callee_operand_tys
+            .entry(callee_func.id)
+            .or_insert_with(|| {
+                *passes += 1;
+                std::rc::Rc::new(element_operand_tys(callee_func, module))
+            })
+            .clone()
+    }
+
     fn is_recursive_direct_call(&self, callee: FuncId, callee_func: &Function) -> bool {
         callee == self.func.id
             || callee_func.blocks.iter().flat_map(|block| &block.body).any(
@@ -3523,11 +5192,19 @@ impl<'a> ChcFuncTranslator<'a> {
     fn try_direct_call_summary(
         &mut self,
         callee_func: &Function,
-        args: &[ValueId],
+        args: CallSummaryArgs<'_>,
         decline: &DeclineSlot,
+        depth: usize,
     ) -> Option<DirectCallSummary> {
-        let callee_func_ty = self.module.func_types.get(callee_func.ty.as_usize())
-            .or_decline(decline, "callee_func_ty_missing", line!())?.clone();
+        if !self.source_consumption.matches_function(callee_func) {
+            decline!(decline, "callee_source_body_mismatch");
+        }
+        let callee_func_ty = self
+            .module
+            .func_types
+            .get(callee_func.ty.as_usize())
+            .or_decline(decline, "callee_func_ty_missing", line!())?
+            .clone();
         // Split three ways deliberately. As ONE condition this was the census's
         // second-largest cause and it was a SUM: "the signature is not summary-
         // shaped" cannot tell an argument-count disagreement from a parameter
@@ -3536,8 +5213,7 @@ impl<'a> ChcFuncTranslator<'a> {
         if callee_func_ty.params.len() != args.len() {
             decline!(decline, "signature_param_count_mismatch");
         }
-        if let Some(ty) =
-            callee_func_ty.params.iter().find(|ty| !self.is_call_summary_value_ty(ty))
+        if let Some(ty) = callee_func_ty.params.iter().find(|ty| !self.is_call_summary_value_ty(ty))
         {
             // Carry the REJECTED CARRIER as a detail, on the same reasoning as the
             // `unmodeled_instruction` catch-all: "the interpreter has no carrier for
@@ -3555,26 +5231,130 @@ impl<'a> ChcFuncTranslator<'a> {
             return None;
         }
 
-        let entry_block = callee_func.block(callee_func.entry)
-            .or_decline(decline, "entry_block_missing", line!())?;
+        let entry_block = callee_func.block(callee_func.entry).or_decline(
+            decline,
+            "entry_block_missing",
+            line!(),
+        )?;
         if entry_block.params.len() != args.len() {
             decline!(decline, "entry_block_param_arity");
         }
 
+        let entry_defined: Vec<bool> = match args {
+            CallSummaryArgs::Caller(ids) => ids
+                .iter()
+                .map(|value| {
+                    construction_definedness::value_is_defined(
+                        &self.source_consumption,
+                        self.module,
+                        self.func,
+                        *value,
+                        None,
+                    )
+                })
+                .collect(),
+            CallSummaryArgs::Bindings { defined, .. } => {
+                if defined.len() != args.len() {
+                    decline!(decline, "nested_argument_definedness_arity");
+                }
+                defined.to_vec()
+            }
+        };
+        let entry_transport: Vec<bool> = match args {
+            CallSummaryArgs::Caller(ids) => ids
+                .iter()
+                .map(|value| {
+                    construction_definedness::value_is_transportable(
+                        &self.source_consumption,
+                        self.module,
+                        self.func,
+                        *value,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            CallSummaryArgs::Bindings { transport, .. } => {
+                if transport.len() != args.len() {
+                    decline!(decline, "nested_argument_transport_arity");
+                }
+                transport.to_vec()
+            }
+        };
+        let invocation_transport_defined = entry_transport.iter().all(|valid| *valid)
+            && match args {
+                CallSummaryArgs::Caller(_) => true,
+                CallSummaryArgs::Bindings { enclosing_transport_defined, .. } => {
+                    enclosing_transport_defined
+                }
+            };
+        if !invocation_transport_defined {
+            decline!(decline, "entry_argument_transport");
+        }
+        let reference_inputs = match args {
+            CallSummaryArgs::Caller(ids) => {
+                self.source_consumption.reference_arguments(self.func, callee_func, ids, None)
+            }
+            CallSummaryArgs::Bindings { reference_inputs, .. } => {
+                if reference_inputs.len() != args.len() {
+                    decline!(decline, "nested_argument_reference_arity");
+                }
+                reference_inputs.to_vec()
+            }
+        };
+        let _reference_scope =
+            self.source_consumption.enter_reference_arguments(callee_func.id, reference_inputs);
         let mut locals = BTreeMap::new();
-        for ((param, param_ty), arg) in entry_block.params.iter().zip(args.iter()) {
+        for (index, (param, param_ty)) in entry_block.params.iter().enumerate() {
             if !self.is_call_summary_value_ty(param_ty) {
                 decline!(decline, "entry_param_ty_unsupported");
             }
-            locals.insert(*param, self.resolve_call_summary_argument(*arg, param_ty)
-                .or_decline(decline, "argument_not_resolvable", line!())?);
+            let binding = match args {
+                // Outermost invocation: the actuals are `ValueId`s in the CALLER's
+                // (this translator's) value space.
+                CallSummaryArgs::Caller(ids) => {
+                    let arg =
+                        ids.get(index).or_decline(decline, "caller_argument_missing", line!())?;
+                    self.resolve_call_summary_argument(*arg, param_ty).or_decline(
+                        decline,
+                        "argument_not_resolvable",
+                        line!(),
+                    )?
+                }
+                // NESTED invocation: the actuals were already resolved by the
+                // enclosing summary. Re-check the CARRIER VARIANT against the
+                // declared parameter type — the same bar `call_summary_value`
+                // applies — so a wrongly-sorted term can never enter the callee
+                // model through the recursion seam.
+                CallSummaryArgs::Bindings { values: bindings, .. } => {
+                    let binding = bindings.get(index).or_decline(
+                        decline,
+                        "nested_argument_missing",
+                        line!(),
+                    )?;
+                    if !call_summary_binding_matches_type(param_ty, binding) {
+                        decline!(decline, "nested_argument_variant_mismatch");
+                    }
+                    binding.clone()
+                }
+            };
+            locals.insert(*param, binding);
         }
+
+        // The declared type of every array and index operand of the callee's element
+        // accesses, fetched on the callee's first `ExtractElement`: an element read's
+        // bounds obligation needs the index's signedness and the array's length
+        // (`ExtractElement` arm below). `callee_operand_tys_of` computes it once per
+        // callee for this translator, so an attempt that never meets a read does no
+        // work for it.
+        let mut callee_operand_tys: Option<std::rc::Rc<BTreeMap<ValueId, Ty>>> = None;
 
         let mut pending = vec![CallSummaryState {
             block: callee_func.entry,
             locals,
             path_conditions: Vec::new(),
             visited_blocks: Vec::new(),
+            slots: BTreeMap::new(),
         }];
         let mut returns = Vec::new();
         let mut error_conditions = Vec::new();
@@ -3583,9 +5363,19 @@ impl<'a> ChcFuncTranslator<'a> {
         // carries no per-level obligation (checked after the loop) — see the `Inst::Call` arm.
         let mut self_recursion_seen = false;
 
+        // A depth-0 entry starts a fresh top-level attempt, so it (and only it)
+        // resets the budget every nesting level then shares.
+        if depth == 0 {
+            self.call_summary_states_left = DIRECT_CALL_SUMMARY_TOTAL_STATES;
+        }
+
         let mut processed_states = 0;
         while let Some(mut state) = pending.pop() {
             processed_states += 1;
+            self.call_summary_states_left = self.call_summary_states_left.saturating_sub(1);
+            if self.call_summary_states_left == 0 {
+                decline!(decline, "shared_state_budget_exhausted");
+            }
             if processed_states > DIRECT_CALL_SUMMARY_MAX_STATES
                 || state.visited_blocks.contains(&state.block)
             {
@@ -3593,10 +5383,27 @@ impl<'a> ChcFuncTranslator<'a> {
             }
             state.visited_blocks.push(state.block);
 
-            let block = callee_func.block(state.block)
-                .or_decline(decline, "state_block_missing", line!())?;
+            let block = callee_func.block(state.block).or_decline(
+                decline,
+                "state_block_missing",
+                line!(),
+            )?;
             let mut terminated = false;
             for node in &block.body {
+                if !construction_definedness::consumption_is_valid(
+                    &self.source_consumption,
+                    self.module,
+                    callee_func,
+                    node,
+                    Some(&entry_defined),
+                    Some(&entry_transport),
+                ) {
+                    if matches!(&node.inst, Inst::Call { .. }) {
+                        decline!(decline, "call_argument_transport");
+                    } else {
+                        decline!(decline, "operand_consumption");
+                    }
+                }
                 match &node.inst {
                     Inst::Const { ty, value } if is_call_summary_scalar_ty(ty) => {
                         // A constant without an exact bit-level encoding
@@ -3605,21 +5412,88 @@ impl<'a> ChcFuncTranslator<'a> {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(const_to_expr(ty, value)
-                                .or_decline(decline, "const_no_exact_encoding", line!())?),
-                        ).or_decline(decline, "const_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(const_to_expr(ty, value).or_decline(
+                                decline,
+                                "const_no_exact_encoding",
+                                line!(),
+                            )?),
+                        )
+                        .or_decline(
+                            decline,
+                            "const_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    Inst::Const { ty: ty @ Ty::Enum(_), value } => {
+                        let aggregate = dataless_enum::constant_tag(self.module, ty, value)
+                            .and_then(dataless_enum::binding)
+                            .or_decline(decline, "dataless_enum_constant", line!())?;
+                        let binding = self
+                            .call_summary_binding_from_value(ValueBinding::Aggregate(aggregate), ty)
+                            .or_decline(decline, "dataless_enum_constant_binding", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, binding).or_decline(
+                            decline,
+                            "dataless_enum_constant_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    // A zero-sized constant (`_0 = const ()`, which upstream
+                    // 9f6141e78128 puts at the head of every drop shim) has
+                    // exactly one inhabitant: the empty aggregate. Bind it
+                    // exactly. Any other constant spelling, or a type with a
+                    // non-empty field list, falls through to the independently
+                    // checked aggregate carrier or declines (fail closed).
+                    Inst::Const { ty, value }
+                        if matches!(value, Constant::PhantomData)
+                            && aggregate_field_tys_of(self.module, ty)
+                                .is_some_and(|fields| fields.is_empty()) =>
+                    {
+                        bind_call_summary_result(
+                            &mut state.locals,
+                            node,
+                            CallSummaryBinding::Aggregate(CallSummaryAggregate {
+                                fields: Vec::new(),
+                            }),
+                        )
+                        .or_decline(
+                            decline,
+                            "zst_const_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    Inst::Const { ty: ty @ (Ty::Struct(_) | Ty::Tuple(_)), value } => {
+                        let binding = self
+                            .call_summary_constant_carrier(ty, value, true, 0)
+                            .or_decline(decline, "aggregate_const_no_exact_carrier", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, binding).or_decline(
+                            decline,
+                            "aggregate_const_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::Copy { ty, operand } if self.is_call_summary_value_ty(ty) => {
-                        let binding = call_summary_value(&state.locals, *operand, ty)
-                            .or_decline(decline, "copy_operand_unbound", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, binding)
-                            .or_decline(decline, "copy_bind_conflict", line!())?;
+                        let binding = call_summary_value(&state.locals, *operand, ty).or_decline(
+                            decline,
+                            "copy_operand_unbound",
+                            line!(),
+                        )?;
+                        bind_call_summary_result(&mut state.locals, node, binding).or_decline(
+                            decline,
+                            "copy_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
-                            .or_decline(decline, "int_binop_lhs_unbound", line!())?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
-                            .or_decline(decline, "int_binop_rhs_unbound", line!())?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs).or_decline(
+                            decline,
+                            "int_binop_lhs_unbound",
+                            line!(),
+                        )?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs).or_decline(
+                            decline,
+                            "int_binop_rhs_unbound",
+                            line!(),
+                        )?;
                         // Trust Gap 3: `Wrapping`-tagged ops carry no overflow obligation.
                         if !node.proofs.contains(&ProofAnnotation::Wrapping) {
                             if let Some(no_overflow) = integer_binop_no_overflow_condition(
@@ -3647,8 +5521,13 @@ impl<'a> ChcFuncTranslator<'a> {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(result),
-                        ).or_decline(decline, "int_binop_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(result),
+                        )
+                        .or_decline(
+                            decline,
+                            "int_binop_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::BinOp { op, ty, lhs, rhs } if matches!(ty, Ty::Bool) => {
                         // Logical And/Or/Xor on `Bool` carry no overflow/div-by-zero
@@ -3657,95 +5536,206 @@ impl<'a> ChcFuncTranslator<'a> {
                         // `x == i32::MIN && y == -1` (the signed-division overflow guard)
                         // threads through the summary instead of falling past the
                         // integer-only arm above to `_ => return None`.
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
-                            .or_decline(decline, "bool_binop_lhs_unbound", line!())?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
-                            .or_decline(decline, "bool_binop_rhs_unbound", line!())?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs).or_decline(
+                            decline,
+                            "bool_binop_lhs_unbound",
+                            line!(),
+                        )?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs).or_decline(
+                            decline,
+                            "bool_binop_rhs_unbound",
+                            line!(),
+                        )?;
                         let result = self.eval_binop(*op, ty, &lhs_expr, &rhs_expr);
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(result),
-                        ).or_decline(decline, "bool_binop_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(result),
+                        )
+                        .or_decline(
+                            decline,
+                            "bool_binop_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::ICmp { op, ty, lhs, rhs } => {
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
-                            .or_decline(decline, "icmp_lhs_unbound", line!())?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
-                            .or_decline(decline, "icmp_rhs_unbound", line!())?;
-                        let result = self.eval_icmp(*op, ty, &lhs_expr, &rhs_expr)
-                            .or_decline(decline, "icmp_unsupported_comparison", line!())?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs).or_decline(
+                            decline,
+                            "icmp_lhs_unbound",
+                            line!(),
+                        )?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs).or_decline(
+                            decline,
+                            "icmp_rhs_unbound",
+                            line!(),
+                        )?;
+                        let result = self.eval_icmp(*op, ty, &lhs_expr, &rhs_expr).or_decline(
+                            decline,
+                            "icmp_unsupported_comparison",
+                            line!(),
+                        )?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(result),
-                        ).or_decline(decline, "icmp_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(result),
+                        )
+                        .or_decline(
+                            decline,
+                            "icmp_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::Cast { op, src_ty, dst_ty, operand }
                         if is_call_summary_scalar_ty(src_ty)
                             && is_call_summary_scalar_ty(dst_ty) =>
                     {
-                        let operand = call_summary_scalar(&state.locals, *operand)
-                            .or_decline(decline, "cast_operand_unbound", line!())?;
-                        let result = eval_cast_expr(*op, src_ty, dst_ty, operand)
-                            .or_decline(decline, "cast_unsupported", line!())?;
+                        let operand = call_summary_scalar(&state.locals, *operand).or_decline(
+                            decline,
+                            "cast_operand_unbound",
+                            line!(),
+                        )?;
+                        let result = eval_cast_expr(*op, src_ty, dst_ty, operand).or_decline(
+                            decline,
+                            "cast_unsupported",
+                            line!(),
+                        )?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(result),
-                        ).or_decline(decline, "cast_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(result),
+                        )
+                        .or_decline(
+                            decline,
+                            "cast_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    Inst::Select { ty: ty @ Ty::Enum(_), cond, then_val, else_val } => {
+                        let cond = call_summary_bool(&state.locals, *cond).or_decline(
+                            decline,
+                            "enum_select_condition",
+                            line!(),
+                        )?;
+                        let then_value = call_summary_value(&state.locals, *then_val, ty)
+                            .or_decline(decline, "enum_select_then_unbound", line!())?;
+                        let else_value = call_summary_value(&state.locals, *else_val, ty)
+                            .or_decline(decline, "enum_select_else_unbound", line!())?;
+                        if construction_definedness::contains_opaque(&then_value)
+                            || construction_definedness::contains_opaque(&else_value)
+                        {
+                            decline!(decline, "enum_select_opaque_arm");
+                        }
+                        let then_value = self.materialize_call_summary_binding(then_value);
+                        let else_value = self.materialize_call_summary_binding(else_value);
+                        let selected = dataless_enum::select_binding(
+                            self.module,
+                            ty,
+                            &cond,
+                            &then_value,
+                            &else_value,
+                        )
+                        .or_decline(
+                            decline,
+                            "enum_select_carrier",
+                            line!(),
+                        )?;
+                        let selected = self
+                            .call_summary_binding_from_value(ValueBinding::Aggregate(selected), ty)
+                            .or_decline(decline, "enum_select_summary_carrier", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, selected).or_decline(
+                            decline,
+                            "enum_select_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::Select { ty, cond, then_val, else_val }
                         if is_call_summary_scalar_ty(ty) =>
                     {
-                        let cond_expr = call_summary_bool(&state.locals, *cond)
-                            .or_decline(decline, "select_cond_not_bool", line!())?;
+                        let cond_expr = call_summary_bool(&state.locals, *cond).or_decline(
+                            decline,
+                            "select_cond_not_bool",
+                            line!(),
+                        )?;
                         // Decline the summary when malformed TrustIR gives either arm
                         // an incompatible carrier. The caller then takes the existing
                         // fail-closed UnsupportedDirectCallSummary path.
                         let then_expr = normalize_expr_to_exact_ty(
-                            &call_summary_scalar(&state.locals, *then_val)
-                                .or_decline(decline, "select_then_unbound", line!())?,
+                            &call_summary_scalar(&state.locals, *then_val).or_decline(
+                                decline,
+                                "select_then_unbound",
+                                line!(),
+                            )?,
                             ty,
-                        ).or_decline(decline, "select_then_carrier_mismatch", line!())?;
+                        )
+                        .or_decline(
+                            decline,
+                            "select_then_carrier_mismatch",
+                            line!(),
+                        )?;
                         let else_expr = normalize_expr_to_exact_ty(
-                            &call_summary_scalar(&state.locals, *else_val)
-                                .or_decline(decline, "select_else_unbound", line!())?,
+                            &call_summary_scalar(&state.locals, *else_val).or_decline(
+                                decline,
+                                "select_else_unbound",
+                                line!(),
+                            )?,
                             ty,
-                        ).or_decline(decline, "select_else_carrier_mismatch", line!())?;
-                        let selected = Expr::try_ite(cond_expr, then_expr, else_expr).ok()
+                        )
+                        .or_decline(
+                            decline,
+                            "select_else_carrier_mismatch",
+                            line!(),
+                        )?;
+                        let selected = Expr::try_ite(cond_expr, then_expr, else_expr)
+                            .ok()
                             .or_decline(decline, "select_ite_ill_sorted", line!())?;
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(selected),
-                        ).or_decline(decline, "select_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(selected),
+                        )
+                        .or_decline(
+                            decline,
+                            "select_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::NullPtr => {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Scalar(Expr::bitvec_const(0u64, 64)),
-                        ).or_decline(decline, "nullptr_bind_conflict", line!())?;
+                            CallSummaryBinding::Scalar(Expr::bitvec_const(0u64, 64)),
+                        )
+                        .or_decline(
+                            decline,
+                            "nullptr_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::Undef { ty } if self.is_call_summary_value_ty(ty) => {
-                        let result = self.fresh_call_summary_value("call_undef", ty)
+                        let result = self
+                            .fresh_direct_call_summary_value("call_undef", ty)
                             .or_decline(decline, "undef_fresh_value_failed", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "undef_bind_conflict", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result).or_decline(
+                            decline,
+                            "undef_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::DialectOp(op) if node.results.len() == 1 && is_thread_local_addr(op) => {
-                        let result =
-                            self.fresh_call_summary_value("call_thread_local_addr", &Ty::Ptr)
-                                .or_decline(decline, "thread_local_addr_fresh_failed", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "thread_local_addr_bind_conflict", line!())?;
+                        let result = self
+                            .fresh_direct_call_summary_value("call_thread_local_addr", &Ty::Ptr)
+                            .or_decline(decline, "thread_local_addr_fresh_failed", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result).or_decline(
+                            decline,
+                            "thread_local_addr_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::ExtractField { ty, aggregate, field }
                         if self.is_call_summary_value_ty(ty) =>
                     {
                         // Trust (#46): a nested-aggregate field is read as its OWN nested
-                        // binding. `ValueBinding` already carries aggregates, so the field
+                        // binding. `CallSummaryBinding` already carries aggregates, so the field
                         // is taken whatever its shape; what must still hold is that the
                         // binding VARIANT matches the declared result type — the same bar
                         // `call_summary_value` applies on the `Inst::Copy` arm. A mismatch
@@ -3755,36 +5745,255 @@ impl<'a> ChcFuncTranslator<'a> {
                             .or_decline(decline, "extract_field_aggregate_unbound", line!())?
                             .fields
                             .get(*field as usize)
-                                .or_decline(decline, "extract_field_index_out_of_range", line!())?
+                            .or_decline(decline, "extract_field_index_out_of_range", line!())?
                             .clone();
-                        if is_call_summary_scalar_ty(ty)
-                            != matches!(&result, ValueBinding::Scalar(_))
-                        {
+                        if !call_summary_binding_matches_type(ty, &result) {
                             decline!(decline, "extract_field_binding_variant_mismatch");
                         }
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "extract_field_bind_conflict", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result).or_decline(
+                            decline,
+                            "extract_field_bind_conflict",
+                            line!(),
+                        )?;
                     }
-                    Inst::ExtractElement { ty, .. } if is_call_summary_scalar_ty(ty) => {
-                        // Array/vector element read: model the element as a fresh
-                        // unconstrained value (sound — an unknown read value cannot
-                        // make a dependent obligation falsely provable, and bounds are
-                        // carried by the separately-emitted Assert), mirroring
-                        // translate_block's ExtractElement arm. Scalar element results
-                        // only; an aggregate-element read falls through to fail closed.
-                        let result = self.fresh_call_summary_value("call_element_read", ty)
-                            .or_decline(decline, "extract_element_fresh_failed", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "extract_element_bind_conflict", line!())?;
+                    Inst::ExtractElement { ty, array, index } if is_call_summary_scalar_ty(ty) => {
+                        // An element READ carries its OWN in-bounds obligation, exactly
+                        // as `translate_extract_element` states it for a block of the
+                        // translated function: an out-of-bounds index is trust-ir
+                        // undefined behaviour however the producer guarded it, and the
+                        // summary's error conditions are the ONLY record of the callee's
+                        // obligations at the call site. (This arm used to read a fresh
+                        // value with no rule, relying on a separately emitted `Assert`
+                        // no validator requires — an out-of-bounds read in a summarized
+                        // callee then left the caller's CHC safe. Decision TMC-1 admits
+                        // array reads at the proof-authority gate, whose walk covers
+                        // every summarized callee, so this is load-bearing there.)
+                        //
+                        // The length is the array operand's declared one (a fixed-size
+                        // array's or a vector's), else its carried binding's; the index
+                        // is read by its declared signedness (`lane_access_of`). Any of
+                        // those unknown, or a sequence (no static length), declines the
+                        // summary: the caller then takes the fail-closed
+                        // `UnsupportedDirectCallSummary` path.
+                        let operand_tys = callee_operand_tys
+                            .get_or_insert_with(|| self.callee_operand_tys_of(callee_func))
+                            .clone();
+                        let len = match (operand_tys.get(array), state.locals.get(array)) {
+                            (Some(Ty::Array(_, len)), _) => *len,
+                            (Some(Ty::Vector(_, lanes)), _) => u64::from(*lanes),
+                            (None, Some(CallSummaryBinding::Array(carried))) => carried.len,
+                            _ => decline!(decline, "extract_element_length_unknown"),
+                        };
+                        let signed = operand_tys
+                            .get(index)
+                            .filter(|index_ty| index_ty.is_integer())
+                            .map(Ty::is_signed)
+                            .or_decline(decline, "extract_element_index_type_unknown", line!())?;
+                        let index_expr = call_summary_scalar(&state.locals, *index).or_decline(
+                            decline,
+                            "extract_element_index_unbound",
+                            line!(),
+                        )?;
+                        let access = lane_access_of(index_expr, Some(signed), len).or_decline(
+                            decline,
+                            "extract_element_index_not_bitvec",
+                            line!(),
+                        )?;
+                        // The lane's value: the exact `select` on a carried scalar-
+                        // element array whose sort is EXACTLY the result's — the bar
+                        // `translate_extract_element` sets (`binding_matches_ty_at`),
+                        // never a width-normalized one — else a fresh value (a
+                        // translation havoc: sound for a proof, and no refutation gate
+                        // grounds it). Where the lanes are not carried at all (the
+                        // caller's call site is in a block a cycle reaches, where it
+                        // carries arrays shape-only) the proof-authority gate has
+                        // already refused the call (`ProofGradeElementReads::
+                        // call_rejection`).
+                        let selected = match state.locals.get(array) {
+                            Some(CallSummaryBinding::Array(CallSummaryArray {
+                                lanes: Some(lanes),
+                                ..
+                            })) => match lanes.as_ref() {
+                                CallSummaryBinding::Scalar(column) => {
+                                    column.clone().try_select(access.lane.clone()).ok().filter(
+                                        |element| {
+                                            binding_matches_ty_at(
+                                                self.module,
+                                                &ValueBinding::Scalar(element.clone()),
+                                                ty,
+                                                0,
+                                            )
+                                        },
+                                    )
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let element = match selected {
+                            Some(element) => element,
+                            None => self.fresh_symbolic("call_element_read", ty),
+                        };
+                        // The obligation. With memory checks on it is recorded and the
+                        // path is NOT narrowed by the in-bounds condition: every later
+                        // condition of an out-of-bounds path is satisfiable only on
+                        // executions that already satisfy this read's own (weaker-
+                        // guarded) error condition, so "is error reachable" — and the
+                        // set of inputs that reach it — is the same either way, and
+                        // pushing the condition would copy one more conjunct into
+                        // every later obligation of the path (quadratic in the reads
+                        // of a callee block; `call_summary_guarded_condition` builds a
+                        // flat conjunction). The value read on such a path is a junk
+                        // lane nothing can observe without the read's error firing
+                        // first. The integer arms above treat their overflow and
+                        // division obligations the same way.
+                        //
+                        // With memory checks OFF there is no rule, as in
+                        // `discharge_element_bounds`, and the value outside the bounds
+                        // is a fresh one: an unchecked out-of-bounds read never reads a
+                        // modeled lane.
+                        let value = if self.options.check_memory_bounds {
+                            match access.in_bounds {
+                                InBounds::Always => {}
+                                InBounds::Never => {
+                                    error_conditions.push(call_summary_guarded_condition(
+                                        &state.path_conditions,
+                                        Expr::true_(),
+                                    ))
+                                }
+                                InBounds::When(in_bounds) => {
+                                    error_conditions.push(call_summary_guarded_condition(
+                                        &state.path_conditions,
+                                        in_bounds.not(),
+                                    ))
+                                }
+                            }
+                            element
+                        } else {
+                            match access.in_bounds {
+                                InBounds::Always => element,
+                                InBounds::Never => self.fresh_symbolic("call_element_read_oob", ty),
+                                InBounds::When(in_bounds) => {
+                                    let havoc = self.fresh_symbolic("call_element_read_oob", ty);
+                                    Expr::try_ite(in_bounds, element, havoc).ok().or_decline(
+                                        decline,
+                                        "extract_element_unchecked_ite",
+                                        line!(),
+                                    )?
+                                }
+                            }
+                        };
+                        bind_call_summary_result(
+                            &mut state.locals,
+                            node,
+                            CallSummaryBinding::Scalar(value),
+                        )
+                        .or_decline(
+                            decline,
+                            "extract_element_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    Inst::MakeAggregate { ty: ty @ Ty::Enum(_), variant, fields } => {
+                        let aggregate =
+                            dataless_enum::variant_tag(self.module, ty, *variant, fields)
+                                .and_then(dataless_enum::binding)
+                                .or_decline(decline, "dataless_enum_constructor", line!())?;
+                        let binding = self
+                            .call_summary_binding_from_value(ValueBinding::Aggregate(aggregate), ty)
+                            .or_decline(decline, "dataless_enum_constructor_binding", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, binding).or_decline(
+                            decline,
+                            "dataless_enum_constructor_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+                    Inst::MakeAggregate { ty, variant, fields }
+                        if self.aggregate_field_tys(ty).is_some() =>
+                    {
+                        let field_tys = self.aggregate_field_tys(ty).or_decline(
+                            decline,
+                            "make_aggregate_field_tys_missing",
+                            line!(),
+                        )?;
+                        if !matches!(ty, Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, 0))
+                            || variant.is_some()
+                            || fields.len() != field_tys.len()
+                        {
+                            decline!(decline, "make_aggregate_shape_mismatch");
+                        }
+                        if !construction_definedness::supported_type(self.module, ty) {
+                            decline!(decline, "make_aggregate_opaque_field_type");
+                        }
+                        if !invocation_transport_defined {
+                            decline!(decline, "make_aggregate_argument_transport_definedness");
+                        }
+                        let mut result = Vec::with_capacity(fields.len());
+                        for (field, field_ty) in fields.iter().zip(&field_tys) {
+                            if !construction_definedness::value_is_defined(
+                                &self.source_consumption,
+                                self.module,
+                                callee_func,
+                                *field,
+                                Some(&entry_defined),
+                            ) {
+                                decline!(decline, "make_aggregate_operand_definedness");
+                            }
+                            let binding = call_summary_value(&state.locals, *field, field_ty)
+                                .or_decline(decline, "make_aggregate_field_unbound", line!())?;
+                            // A field must carry its exact existing value, never
+                            // materialize an opaque token into a fresh fact.
+                            if construction_definedness::contains_opaque(&binding) {
+                                decline!(decline, "make_aggregate_opaque_field");
+                            }
+                            let binding = self.materialize_call_summary_binding(binding);
+                            let binding = match binding {
+                                ValueBinding::Scalar(expr) => ValueBinding::Scalar(
+                                    normalize_expr_to_exact_ty(&expr, field_ty).or_decline(
+                                        decline,
+                                        "make_aggregate_field_sort_mismatch",
+                                        line!(),
+                                    )?,
+                                ),
+                                composite => composite,
+                            };
+                            if !binding_matches_ty_at(self.module, &binding, field_ty, 0) {
+                                decline!(decline, "make_aggregate_field_shape_mismatch");
+                            }
+                            result.push(
+                                self.call_summary_binding_from_value(binding, field_ty)
+                                    .or_decline(
+                                        decline,
+                                        "make_aggregate_field_binding_mismatch",
+                                        line!(),
+                                    )?,
+                            );
+                        }
+                        bind_call_summary_result(
+                            &mut state.locals,
+                            node,
+                            CallSummaryBinding::Aggregate(CallSummaryAggregate { fields: result }),
+                        )
+                        .or_decline(
+                            decline,
+                            "make_aggregate_bind_conflict",
+                            line!(),
+                        )?;
                     }
                     Inst::InsertField { ty, aggregate, field, value }
                         if self.aggregate_field_tys(ty).is_some() =>
                     {
-                        let field_tys = self.aggregate_field_tys(ty)
-                            .or_decline(decline, "insert_field_field_tys_missing", line!())?;
+                        let field_tys = self.aggregate_field_tys(ty).or_decline(
+                            decline,
+                            "insert_field_field_tys_missing",
+                            line!(),
+                        )?;
                         let field_index = *field as usize;
-                        let value_ty = field_tys.get(field_index)
-                            .or_decline(decline, "insert_field_index_out_of_range", line!())?;
+                        let value_ty = field_tys.get(field_index).or_decline(
+                            decline,
+                            "insert_field_index_out_of_range",
+                            line!(),
+                        )?;
                         let mut result = call_summary_aggregate(&state.locals, *aggregate)
                             .or_decline(decline, "insert_field_aggregate_unbound", line!())?;
                         if result.fields.len() != field_tys.len() {
@@ -3806,14 +6015,20 @@ impl<'a> ChcFuncTranslator<'a> {
                         bind_call_summary_result(
                             &mut state.locals,
                             node,
-                            ValueBinding::Aggregate(result),
-                        ).or_decline(decline, "insert_field_bind_conflict", line!())?;
+                            CallSummaryBinding::Aggregate(result),
+                        )
+                        .or_decline(
+                            decline,
+                            "insert_field_bind_conflict",
+                            line!(),
+                        )?;
                     }
-                    Inst::Assert { cond } => {
+                    Inst::Assert { cond, kind: _, site: _ } => {
                         error_conditions.push(call_summary_guarded_condition(
                             &state.path_conditions,
                             call_summary_bool(&state.locals, *cond)
-                                .or_decline(decline, "assert_cond_not_bool", line!())?.not(),
+                                .or_decline(decline, "assert_cond_not_bool", line!())?
+                                .not(),
                         ));
                     }
                     Inst::Br { target, args } => {
@@ -3826,14 +6041,21 @@ impl<'a> ChcFuncTranslator<'a> {
                                 None,
                                 decline,
                             )
-                            .or_decline(decline, "br_successor_state", line!())?,
+                            .or_decline(
+                                decline,
+                                "br_successor_state",
+                                line!(),
+                            )?,
                         );
                         terminated = true;
                         break;
                     }
                     Inst::CondBr { cond, then_target, then_args, else_target, else_args } => {
-                        let cond_expr = call_summary_bool(&state.locals, *cond)
-                            .or_decline(decline, "condbr_cond_not_bool", line!())?;
+                        let cond_expr = call_summary_bool(&state.locals, *cond).or_decline(
+                            decline,
+                            "condbr_cond_not_bool",
+                            line!(),
+                        )?;
                         pending.push(
                             self.call_summary_successor_state(
                                 callee_func,
@@ -3843,7 +6065,11 @@ impl<'a> ChcFuncTranslator<'a> {
                                 Some(cond_expr.clone().not()),
                                 decline,
                             )
-                            .or_decline(decline, "condbr_else_successor_state", line!())?,
+                            .or_decline(
+                                decline,
+                                "condbr_else_successor_state",
+                                line!(),
+                            )?,
                         );
                         pending.push(
                             self.call_summary_successor_state(
@@ -3854,7 +6080,11 @@ impl<'a> ChcFuncTranslator<'a> {
                                 Some(cond_expr),
                                 decline,
                             )
-                            .or_decline(decline, "condbr_then_successor_state", line!())?,
+                            .or_decline(
+                                decline,
+                                "condbr_then_successor_state",
+                                line!(),
+                            )?,
                         );
                         terminated = true;
                         break;
@@ -3876,7 +6106,8 @@ impl<'a> ChcFuncTranslator<'a> {
                         for (value, ty) in values.iter().zip(callee_func_ty.returns.iter()) {
                             let binding = match call_summary_value(&state.locals, *value, ty) {
                                 Some(binding) => binding,
-                                None => self.fresh_call_summary_value("call_ret_havoc", ty)
+                                None => self
+                                    .fresh_direct_call_summary_value("call_ret_havoc", ty)
                                     .or_decline(decline, "return_havoc_unsupported_ty", line!())?,
                             };
                             resolved.push(binding);
@@ -3888,108 +6119,154 @@ impl<'a> ChcFuncTranslator<'a> {
                         terminated = true;
                         break;
                     }
-                    // SIGNED integer negation `-x` (e.g. `signed_min`'s
-                    // `-(1i128 << (width-1))`). The main translate leaves `Inst::UnOp`
-                    // UNSUPPORTED (havoc + error rule); the call-summary interpreter models
-                    // it precisely: result = `bvneg(x)`, and the OverflowNeg obligation
-                    // (`-x` overflows iff `x == INT_MIN`) is recorded as a guarded error —
-                    // redundant if the lowering also emits a separate neg-overflow `Assert`,
-                    // sound if it does not (it never masks a real neg overflow; an unguarded
-                    // `-(i128::MIN)` stays SAT/refutable). For a guarded operand
-                    // (`1 << (width-1)` under `width <= 127`, always `< 2^(w-1)`) it is UNSAT,
-                    // so the inlined negation discharges and the caller proves panic-free.
-                    // A `Wrapping` negation carries no obligation (matches the `BinOp` arm).
-                    Inst::UnOp { op: UnOp::Neg, ty, operand } if ty.is_integer() => {
-                        let operand_expr = normalize_expr_to_ty(
-                            &call_summary_scalar(&state.locals, *operand)
-                                .or_decline(decline, "neg_operand_unbound", line!())?,
-                            ty,
-                        );
-                        if !node.proofs.contains(&ProofAnnotation::Wrapping) {
-                            // Per-signedness exactness (aligned with the main
-                            // translator's `Neg` arm): signed negation traps
-                            // exactly at `INT_MIN`; a defensive unsigned
-                            // negation traps unless the operand is zero — the
-                            // signed `bvneg_no_overflow` predicate is
-                            // meaningless on an unsigned carrier.
-                            let no_overflow = if ty.is_signed() {
-                                operand_expr.clone().bvneg_no_overflow()
-                            } else {
-                                let width =
-                                    operand_expr.sort().bitvec_width().unwrap_or(HOST_POINTER_BITS);
-                                operand_expr.clone().eq(Expr::bitvec_const(0, width))
-                            };
-                            error_conditions.push(call_summary_guarded_condition(
-                                &state.path_conditions,
-                                no_overflow.not(),
-                            ));
-                        }
-                        bind_call_summary_result(
-                            &mut state.locals,
-                            node,
-                            ValueBinding::Scalar(operand_expr.bvneg()),
-                        ).or_decline(decline, "neg_bind_conflict", line!())?;
-                    }
-                    // Bitwise / logical NOT (`!x`) is TOTAL and modeled PRECISELY — a
-                    // Bool operand negates (`not`), a BitVec operand bit-complements
-                    // (`bvnot`), matching the main translate's precise `eval_binop`
-                    // handling of the other connectives. Precision here is load-bearing:
-                    // `xor_accumulate_parity`'s body lowers `a ^ true` to
-                    // `Select(true, !a, a)`, so a HAVOCED `!a` (the old fresh-symbolic
-                    // total-unop model) made the summarized result — and every loop cell
-                    // it updates — unconstrained, blocking the count-parity loop invariant
-                    // (`acc' = !acc` collapsed to a free variable). `not`/`bvnot` never
-                    // panic, so NO error condition is pushed. A non-scalar operand (never
-                    // produced under the `is_call_summary_scalar_ty` guard) fails closed.
-                    Inst::UnOp { op: UnOp::Not, ty, operand } if is_call_summary_scalar_ty(ty) => {
-                        let operand_expr = call_summary_scalar(&state.locals, *operand)
-                            .or_decline(decline, "not_operand_unbound", line!())?;
-                        let result = if operand_expr.sort().is_bool() {
-                            operand_expr.not()
-                        } else if operand_expr.sort().is_bitvec() {
-                            operand_expr.bvnot()
-                        } else {
-                            decline!(decline, "not_operand_ill_sorted");
-                        };
-                        bind_call_summary_result(
-                            &mut state.locals,
-                            node,
-                            ValueBinding::Scalar(result),
-                        ).or_decline(decline, "not_bind_conflict", line!())?;
-                    }
-                    // The remaining UNARY ops are TOTAL — population count `CtPop` and the
-                    // IEEE float unary ops (`FNeg`/`FAbs`/`FSqrt`/`FFloor`/`FCeil`/`FTrunc`)
-                    // — and NEVER panic (no overflow obligation, unlike the signed `Neg`
-                    // matched above, which carries the `x == INT_MIN` obligation), but have
-                    // no precise scalar model here. Model the result as a fresh-symbolic
-                    // value (sound over-approximation: the value is left unconstrained, so a
-                    // downstream use stays `unknown`, never falsely proved) and push NO error
-                    // condition, so the summary CONTINUES instead of declining the whole
-                    // callee. Without this arm a callee using `x.count_ones()` / `f.abs()`
-                    // hit the `_ => return None` fail-close and its caller was conservatively
-                    // modeled as may-panic (UNKNOWN) — a precision loss with no soundness
-                    // justification, since these ops cannot panic.
-                    Inst::UnOp {
-                        op:
+                    // Exhaustive over `UnOp` (no wildcard): a new trust-ir variant is
+                    // a compile error here until the summary interpreter decides
+                    // whether it is total, trapping, or unmodeled.
+                    Inst::UnOp { op, ty, operand } => {
+                        match op {
+                            // SIGNED integer negation `-x` (e.g. `signed_min`'s
+                            // `-(1i128 << (width-1))`), modeled precisely: result =
+                            // `bvneg(x)`, and the OverflowNeg obligation (`-x` overflows
+                            // iff `x == INT_MIN`) is recorded as a guarded error —
+                            // redundant if the lowering also emits a separate
+                            // neg-overflow `Assert`, sound if it does not (it never masks
+                            // a real neg overflow; an unguarded `-(i128::MIN)` stays
+                            // SAT/refutable). For a guarded operand (`1 << (width-1)`
+                            // under `width <= 127`, always `< 2^(w-1)`) it is UNSAT, so
+                            // the inlined negation discharges and the caller proves
+                            // panic-free. A `Wrapping` negation carries no obligation
+                            // (matches the `BinOp` arm).
+                            UnOp::Neg if ty.is_integer() => {
+                                let operand_expr = normalize_expr_to_ty(
+                                    &call_summary_scalar(&state.locals, *operand).or_decline(
+                                        decline,
+                                        "neg_operand_unbound",
+                                        line!(),
+                                    )?,
+                                    ty,
+                                );
+                                if !node.proofs.contains(&ProofAnnotation::Wrapping) {
+                                    // Per-signedness exactness (aligned with the main
+                                    // translator's `Neg` arm): signed negation traps
+                                    // exactly at `INT_MIN`; a defensive unsigned
+                                    // negation traps unless the operand is zero — the
+                                    // signed `bvneg_no_overflow` predicate is
+                                    // meaningless on an unsigned carrier.
+                                    let no_overflow = if ty.is_signed() {
+                                        operand_expr.clone().bvneg_no_overflow()
+                                    } else {
+                                        let width = operand_expr
+                                            .sort()
+                                            .bitvec_width()
+                                            .unwrap_or(HOST_POINTER_BITS);
+                                        operand_expr.clone().eq(Expr::bitvec_const(0, width))
+                                    };
+                                    error_conditions.push(call_summary_guarded_condition(
+                                        &state.path_conditions,
+                                        no_overflow.not(),
+                                    ));
+                                }
+                                bind_call_summary_result(
+                                    &mut state.locals,
+                                    node,
+                                    CallSummaryBinding::Scalar(operand_expr.bvneg()),
+                                )
+                                .or_decline(
+                                    decline,
+                                    "neg_bind_conflict",
+                                    line!(),
+                                )?;
+                            }
+                            // Bitwise / logical NOT (`!x`) is TOTAL and modeled PRECISELY
+                            // — a Bool operand negates (`not`), a BitVec operand
+                            // bit-complements (`bvnot`), matching the main translate's
+                            // precise handling. Precision here is load-bearing:
+                            // `xor_accumulate_parity`'s body lowers `a ^ true` to
+                            // `Select(true, !a, a)`, so a HAVOCED `!a` made the
+                            // summarized result — and every loop cell it updates —
+                            // unconstrained, blocking the count-parity loop invariant.
+                            // `not`/`bvnot` never panic, so NO error condition is pushed.
+                            UnOp::Not if is_call_summary_scalar_ty(ty) => {
+                                let operand_expr = call_summary_scalar(&state.locals, *operand)
+                                    .or_decline(decline, "not_operand_unbound", line!())?;
+                                let result = if operand_expr.sort().is_bool() {
+                                    operand_expr.not()
+                                } else if operand_expr.sort().is_bitvec() {
+                                    operand_expr.bvnot()
+                                } else {
+                                    decline!(decline, "not_operand_ill_sorted");
+                                };
+                                bind_call_summary_result(
+                                    &mut state.locals,
+                                    node,
+                                    CallSummaryBinding::Scalar(result),
+                                )
+                                .or_decline(
+                                    decline,
+                                    "not_bind_conflict",
+                                    line!(),
+                                )?;
+                            }
+                            // The remaining UNARY ops are TOTAL — population count
+                            // `CtPop`, the IEEE float unary ops (`FNeg`/`FAbs`/`FSqrt`/
+                            // `FFloor`/`FCeil`/`FTrunc`), and the WS3.20 bit intrinsics
+                            // (trust-ir defines `CtLz`/`CtTz` as TOTAL, `ctlz 0 = cttz 0 =
+                            // width`, and `BSwap`/`BitReverse` as total permutations of the
+                            // bits) — and NEVER panic (no overflow obligation, unlike the
+                            // signed `Neg` above), but have no precise scalar model here.
+                            // The result is a fresh-symbolic value (sound
+                            // over-approximation: a downstream use stays `unknown`, never
+                            // falsely proved) and NO error condition is pushed, so the
+                            // summary CONTINUES instead of declining the whole callee
+                            // (which would model the call as may-panic — a precision loss
+                            // with no soundness justification). The main translator still
+                            // fails them closed.
                             UnOp::CtPop
+                            | UnOp::CtLz
+                            | UnOp::CtTz
+                            | UnOp::BSwap
+                            | UnOp::BitReverse
                             | UnOp::FNeg
                             | UnOp::FAbs
                             | UnOp::FSqrt
                             | UnOp::FFloor
                             | UnOp::FCeil
-                            | UnOp::FTrunc,
-                        ty,
-                        operand,
-                    } if is_call_summary_scalar_ty(ty) => {
-                        // Resolve the operand to confirm it is in scope on this path (a missing
-                        // operand means a malformed CFG — decline, like the arms above). The
-                        // resolved value is unused: the result is havoc, never panics.
-                        let _ = call_summary_scalar(&state.locals, *operand)
-                            .or_decline(decline, "total_unop_operand_unbound", line!())?;
-                        let result = self.fresh_call_summary_value("call_unop_total", ty)
-                            .or_decline(decline, "total_unop_fresh_failed", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "total_unop_bind_conflict", line!())?;
+                            | UnOp::FTrunc
+                                if is_call_summary_scalar_ty(ty) =>
+                            {
+                                // Resolve the operand to confirm it is in scope on this
+                                // path (a missing operand means a malformed CFG — decline,
+                                // like the arms above). The resolved value is unused: the
+                                // result is havoc, never panics.
+                                let _ = call_summary_scalar(&state.locals, *operand).or_decline(
+                                    decline,
+                                    "total_unop_operand_unbound",
+                                    line!(),
+                                )?;
+                                let result = self
+                                    .fresh_direct_call_summary_value("call_unop_total", ty)
+                                    .or_decline(decline, "total_unop_fresh_failed", line!())?;
+                                bind_call_summary_result(&mut state.locals, node, result)
+                                    .or_decline(decline, "total_unop_bind_conflict", line!())?;
+                            }
+                            // Every op on an operand type the arms above do not take
+                            // (`Neg` on a non-integer, a non-scalar operand) is not
+                            // modeled — decline under its own census tag (these exits
+                            // used to reach the anonymous catch-all below).
+                            UnOp::Neg
+                            | UnOp::Not
+                            | UnOp::CtPop
+                            | UnOp::CtLz
+                            | UnOp::CtTz
+                            | UnOp::BSwap
+                            | UnOp::BitReverse
+                            | UnOp::FNeg
+                            | UnOp::FAbs
+                            | UnOp::FSqrt
+                            | UnOp::FFloor
+                            | UnOp::FCeil
+                            | UnOp::FTrunc => decline!(decline, "unop_operand_ty_unmodeled"),
+                        }
                     }
                     // A checked-arithmetic intrinsic (`a.overflowing_sub(b)` etc. — the
                     // lowering of a Rust `CheckedBinaryOp`, INCLUDING i128 negation as
@@ -4005,25 +6282,36 @@ impl<'a> ChcFuncTranslator<'a> {
                     // the main translate's `OverflowIntrinsic` unsupported path.
                     Inst::Overflow { op, ty, lhs, rhs } if ty.is_integer() => {
                         let binop = overflow_op_to_binop(*op);
-                        let lhs_expr = call_summary_scalar(&state.locals, *lhs)
-                            .or_decline(decline, "overflow_lhs_unbound", line!())?;
-                        let rhs_expr = call_summary_scalar(&state.locals, *rhs)
-                            .or_decline(decline, "overflow_rhs_unbound", line!())?;
+                        let lhs_expr = call_summary_scalar(&state.locals, *lhs).or_decline(
+                            decline,
+                            "overflow_lhs_unbound",
+                            line!(),
+                        )?;
+                        let rhs_expr = call_summary_scalar(&state.locals, *rhs).or_decline(
+                            decline,
+                            "overflow_rhs_unbound",
+                            line!(),
+                        )?;
                         let no_overflow = integer_binop_no_overflow_condition(
                             binop,
                             ty,
                             &lhs_expr,
                             &rhs_expr,
                             self.options,
-                        ).or_decline(decline, "overflow_no_semantics", line!())?;
+                        )
+                        .or_decline(
+                            decline,
+                            "overflow_no_semantics",
+                            line!(),
+                        )?;
                         let value = self.eval_binop(binop, ty, &lhs_expr, &rhs_expr);
                         let flag = no_overflow.not();
                         let mut results = node.results.iter();
                         if let Some(value_result) = results.next() {
-                            state.locals.insert(*value_result, ValueBinding::Scalar(value));
+                            state.locals.insert(*value_result, CallSummaryBinding::Scalar(value));
                         }
                         if let Some(flag_result) = results.next() {
-                            state.locals.insert(*flag_result, ValueBinding::Scalar(flag));
+                            state.locals.insert(*flag_result, CallSummaryBinding::Scalar(flag));
                         }
                     }
                     // A panic block (the FALSE side of an overflow / bounds / explicit
@@ -4072,8 +6360,9 @@ impl<'a> ChcFuncTranslator<'a> {
                             if !self.is_call_summary_value_ty(ty) {
                                 decline!(decline, "self_recursive_result_ty_unsupported");
                             }
-                            let havoc = self.fresh_call_summary_value("call_self_rec", ty)
-                                .or_decline(decline, "self_recursive_havoc_failed", line!())?;
+                            let havoc =
+                                self.fresh_direct_call_summary_value("call_self_rec", ty)
+                                    .or_decline(decline, "self_recursive_havoc_failed", line!())?;
                             state.locals.insert(*result, havoc);
                         }
                     }
@@ -4088,11 +6377,332 @@ impl<'a> ChcFuncTranslator<'a> {
                         // load). The access's bounds safety is carried by the
                         // separately-emitted bounds Assert. A raw-pointer load (no
                         // `ValidBorrow`) or a volatile load falls through to fail closed.
-                        let result = self.fresh_call_summary_value("call_load", ty)
+                        let result = self
+                            .fresh_direct_call_summary_value("call_load", ty)
                             .or_decline(decline, "valid_borrow_load_fresh_failed", line!())?;
-                        bind_call_summary_result(&mut state.locals, node, result)
-                            .or_decline(decline, "valid_borrow_load_bind_conflict", line!())?;
+                        bind_call_summary_result(&mut state.locals, node, result).or_decline(
+                            decline,
+                            "valid_borrow_load_bind_conflict",
+                            line!(),
+                        )?;
                     }
+                    // ------------------------------------------------------------------
+                    // THE RETURN-SLOT SHAPE. Everything from here to the nested `Call`
+                    // arm exists to interpret ONE lowering idiom that `core`'s `Option`
+                    // combinators are compiled into and that nothing above could cross:
+                    //
+                    //     %slot = Alloca<T>            ; the return place
+                    //     Assume(discr == 0 || discr == 1)
+                    //     Switch discr { 0 => none_arm, 1 => some_arm, default => bb_unreachable }
+                    //     some_arm: %r = Call closure(...); Store<T> %slot, %r; Br join
+                    //     none_arm: Store<T> %slot, None;                       Br join
+                    //     join:    %out = Load<T> %slot; Return %out
+                    //
+                    // Before this, the interpreter met `Alloca` at its catch-all and
+                    // declined, so EVERY caller of `Option::and_then` / `is_some_and` /
+                    // `map` / `map_or` fell back to `translate_call`'s unconditional
+                    // may-panic error rule (`UnsupportedDirectCallSummary`) and stayed
+                    // UNKNOWN — measured on a3d-kernel: 12 of 12 unknown rows, all of them
+                    // functions that pass a closure to a `core` `Option` combinator, and
+                    // every one attributed by `call-summary-census` to
+                    // `unmodeled_instruction/Alloca` (31 sites) or `.../Assume` (6 sites).
+                    // ------------------------------------------------------------------
+
+                    // A single-cell stack slot. ADMITTED ONLY when the alloca's address
+                    // provably never leaves the `ptr` operand of a non-volatile
+                    // `Load`/`Store` in this body (`call_summary_slot_is_directly_addressed`)
+                    // AND every such access names the cell's own type
+                    // (`stack_alloca_cell_accesses_match_type`).
+                    //
+                    // SOUNDNESS. The false proof this shape can mint is a DROPPED WRITE:
+                    // if a store can reach the cell through an alias the model does not
+                    // see, the later load returns the PRE-store value and the caller
+                    // proves something about a value the program never holds. Both halves
+                    // of the admission close that: with no `GEP`/`Borrow` derivation, no
+                    // call argument, no stored VALUE, no block argument and no return
+                    // carrying the address, the ONLY writer is a direct `Store` whose
+                    // `ptr` is this exact SSA id — which the `Inst::Store` arm below
+                    // models; and with every access at the cell type, no
+                    // differently-typed store can be silently dropped. Anything else
+                    // declines the whole summary, exactly as before this arm existed.
+                    // (`count: Some(_)` — a VLA — has no single cell and is left to the
+                    // catch-all.)
+                    Inst::Alloca { ty, count: None, .. }
+                        if self.is_call_summary_value_ty(ty) && node.results.len() == 1 =>
+                    {
+                        let result = *node.results.first().or_decline(
+                            decline,
+                            "alloca_result_missing",
+                            line!(),
+                        )?;
+                        if !call_summary_slot_is_directly_addressed(callee_func, result) {
+                            decline!(decline, "alloca_address_not_slot_confined");
+                        }
+                        if !stack_alloca_cell_accesses_match_type(callee_func, result, ty) {
+                            decline!(decline, "alloca_access_ty_mismatch");
+                        }
+                        // The POINTER itself is modeled opaquely (a fresh `Ptr` symbol),
+                        // so an incidental copy still type-checks; the CELL is tracked
+                        // separately, keyed by this SSA id.
+                        let ptr =
+                            CallSummaryBinding::Scalar(self.fresh_symbolic("call_slot", &Ty::Ptr));
+                        bind_call_summary_result(&mut state.locals, node, ptr).or_decline(
+                            decline,
+                            "alloca_bind_conflict",
+                            line!(),
+                        )?;
+                        state.slots.insert(result, CallSummarySlot { ty: ty.clone(), value: None });
+                    }
+
+                    // Write a tracked slot. Anything else — an untracked pointer, a
+                    // volatile access, a type the cell does not have, a value with no
+                    // binding on this path — declines. In particular a store through a
+                    // pointer this interpreter cannot attribute is NOT dropped: dropping
+                    // it is precisely the stale-read false proof described above.
+                    Inst::Store { ty, ptr, value, volatile, .. } if !*volatile => {
+                        let binding = call_summary_value(&state.locals, *value, ty).or_decline(
+                            decline,
+                            "store_value_unbound",
+                            line!(),
+                        )?;
+                        let slot = state.slots.get_mut(ptr).or_decline(
+                            decline,
+                            "store_target_not_tracked_slot",
+                            line!(),
+                        )?;
+                        if slot.ty != *ty {
+                            decline!(decline, "store_cell_ty_mismatch");
+                        }
+                        slot.value = Some(binding);
+                    }
+
+                    // Read a tracked slot. An UNWRITTEN cell reads as a fresh
+                    // unconstrained value (havoc ⊇ any real content — it can only leave a
+                    // dependent obligation unknown, never falsely proved); it must NEVER
+                    // read as a zero/default, which would be a fabricated fact.
+                    Inst::Load { ty, ptr, volatile, .. }
+                        if !*volatile && state.slots.contains_key(ptr) =>
+                    {
+                        let slot = state
+                            .slots
+                            .get(ptr)
+                            .or_decline(decline, "load_slot_missing", line!())?
+                            .clone();
+                        if slot.ty != *ty {
+                            decline!(decline, "load_cell_ty_mismatch");
+                        }
+                        let binding = match slot.value {
+                            Some(binding) => binding,
+                            None => self
+                                .fresh_direct_call_summary_value("call_slot_uninit", ty)
+                                .or_decline(decline, "load_uninit_havoc_failed", line!())?,
+                        };
+                        if !call_summary_binding_matches_type(ty, &binding) {
+                            decline!(decline, "load_binding_variant_mismatch");
+                        }
+                        bind_call_summary_result(&mut state.locals, node, binding).or_decline(
+                            decline,
+                            "load_bind_conflict",
+                            line!(),
+                        )?;
+                    }
+
+                    // A compiler-inserted fact about this path (the enum-validity
+                    // `discr ∈ {0,1}` that precedes every `Option`/`Result` switch).
+                    // Modeled EXACTLY as `translate_block`'s `Inst::Assume` arm models it
+                    // — pushed onto the path conditions — so folding a body into a caller
+                    // grants it no trust that translating the same body directly would
+                    // not already grant. Omitting it would be conservative, not unsound:
+                    // the unconstrained discriminant would make the switch's default edge
+                    // (an `Unreachable`, i.e. an error condition) SATISFIABLE and the
+                    // caller would refute rather than prove.
+                    Inst::Assume { cond } => {
+                        let cond_expr = call_summary_bool(&state.locals, *cond).or_decline(
+                            decline,
+                            "assume_cond_not_bool",
+                            line!(),
+                        )?;
+                        state.path_conditions.push(cond_expr);
+                    }
+
+                    // Multi-way branch. The case split is COMPLETE and DISJOINT — one
+                    // successor per case guarded by `selector == case`, plus the default
+                    // guarded by the conjunction of their negations — which is exactly
+                    // `translate_switch`'s encoding, and is precise rather than assumed.
+                    //
+                    // `exhaustive_enum_unreachable` is DELIBERATELY IGNORED. Using it to
+                    // prune the default edge would ASSUME the discriminant is in range;
+                    // instead the default edge is explored, reaches the `Unreachable`
+                    // block, and contributes its guarded error condition. That condition
+                    // is UNSAT exactly when a preceding `Assume` (or the incoming value)
+                    // already established the range — so the flag is never load-bearing
+                    // and a lowering that emitted it wrongly cannot launder a panic.
+                    Inst::Switch { value, default, default_args, cases, .. } => {
+                        let selector = call_summary_scalar(&state.locals, *value).or_decline(
+                            decline,
+                            "switch_selector_unbound",
+                            line!(),
+                        )?;
+                        let mut case_guards = Vec::with_capacity(cases.len());
+                        for case in cases {
+                            let case_expr = switch_case_expr(&case.value, &selector).or_decline(
+                                decline,
+                                "switch_case_not_encodable",
+                                line!(),
+                            )?;
+                            let guard = selector.clone().eq(case_expr);
+                            case_guards.push(guard.clone());
+                            pending.push(
+                                self.call_summary_successor_state(
+                                    callee_func,
+                                    &state,
+                                    case.target,
+                                    &case.args,
+                                    Some(guard),
+                                    decline,
+                                )
+                                .or_decline(
+                                    decline,
+                                    "switch_case_successor_state",
+                                    line!(),
+                                )?,
+                            );
+                        }
+                        let default_guard = match case_guards.len() {
+                            0 => None,
+                            1 => Some(case_guards[0].clone().not()),
+                            _ => Some(Expr::and_many(
+                                case_guards.into_iter().map(Expr::not).collect(),
+                            )),
+                        };
+                        pending.push(
+                            self.call_summary_successor_state(
+                                callee_func,
+                                &state,
+                                *default,
+                                default_args,
+                                default_guard,
+                                decline,
+                            )
+                            .or_decline(
+                                decline,
+                                "switch_default_successor_state",
+                                line!(),
+                            )?,
+                        );
+                        terminated = true;
+                        break;
+                    }
+
+                    // A call to a DIFFERENT function whose body this module already
+                    // holds — the combinator wrapper invoking the user's closure.
+                    // Summarize it RECURSIVELY and fold the result in:
+                    //   * every error condition it reports is re-guarded by THIS path's
+                    //     conditions and kept, so a panic inside the closure still
+                    //     reaches the caller's error relation (this is what makes an
+                    //     adversarial closure refute rather than prove);
+                    //   * its combined return values bind this call's results.
+                    // Declining anywhere inside the nested attempt declines the whole
+                    // outer summary — the existing fail-closed behaviour, unchanged.
+                    Inst::Call { callee, args: call_args }
+                        if *callee != callee_func.id
+                            && *callee != self.func.id
+                            && depth < DIRECT_CALL_SUMMARY_MAX_DEPTH =>
+                    {
+                        let nested_func = self.module.function_by_id(*callee).cloned().or_decline(
+                            decline,
+                            "nested_callee_not_in_module",
+                            line!(),
+                        )?;
+                        let nested_func_ty = self
+                            .module
+                            .func_types
+                            .get(nested_func.ty.as_usize())
+                            .cloned()
+                            .or_decline(decline, "nested_callee_func_ty_missing", line!())?;
+                        if nested_func_ty.params.len() != call_args.len() {
+                            decline!(decline, "nested_call_arg_arity");
+                        }
+                        if node.results.len() != nested_func_ty.returns.len() {
+                            decline!(decline, "nested_call_result_arity");
+                        }
+                        let mut arg_bindings = Vec::with_capacity(call_args.len());
+                        for (arg, param_ty) in call_args.iter().zip(nested_func_ty.params.iter()) {
+                            arg_bindings.push(
+                                call_summary_value(&state.locals, *arg, param_ty).or_decline(
+                                    decline,
+                                    "nested_call_arg_unbound",
+                                    line!(),
+                                )?,
+                            );
+                        }
+                        let arg_defined: Vec<bool> = call_args
+                            .iter()
+                            .map(|arg| {
+                                construction_definedness::value_is_defined(
+                                    &self.source_consumption,
+                                    self.module,
+                                    callee_func,
+                                    *arg,
+                                    Some(&entry_defined),
+                                )
+                            })
+                            .collect();
+                        let arg_transport: Vec<bool> = call_args
+                            .iter()
+                            .map(|arg| {
+                                construction_definedness::value_is_transportable(
+                                    &self.source_consumption,
+                                    self.module,
+                                    callee_func,
+                                    *arg,
+                                    Some(&entry_defined),
+                                    Some(&entry_transport),
+                                )
+                            })
+                            .collect();
+                        let arg_reference_inputs = self.source_consumption.reference_arguments(
+                            callee_func,
+                            &nested_func,
+                            call_args,
+                            Some(&entry_defined),
+                        );
+                        let nested = self
+                            .try_direct_call_summary(
+                                &nested_func,
+                                CallSummaryArgs::Bindings {
+                                    values: &arg_bindings,
+                                    defined: &arg_defined,
+                                    transport: &arg_transport,
+                                    reference_inputs: &arg_reference_inputs,
+                                    enclosing_transport_defined: invocation_transport_defined,
+                                },
+                                decline,
+                                depth + 1,
+                            )
+                            .or_decline(decline, "nested_call_summary_declined", line!())?;
+                        if nested.returns.len() != node.results.len() {
+                            decline!(decline, "nested_call_summary_return_arity");
+                        }
+                        for condition in nested.error_conditions {
+                            error_conditions.push(call_summary_guarded_condition(
+                                &state.path_conditions,
+                                condition,
+                            ));
+                        }
+                        for ((result, ty), binding) in node
+                            .results
+                            .iter()
+                            .zip(nested_func_ty.returns.iter())
+                            .zip(nested.returns)
+                        {
+                            if !call_summary_binding_matches_type(ty, &binding) {
+                                decline!(decline, "nested_call_result_variant_mismatch");
+                            }
+                            state.locals.insert(*result, binding);
+                        }
+                    }
+
                     // Any other instruction in the callee body is not modeled by the
                     // bounded summary interpreter — decline (fail closed / conservative).
                     _ => {
@@ -4150,8 +6760,37 @@ impl<'a> ChcFuncTranslator<'a> {
         if self_recursion_seen && !error_conditions.is_empty() {
             decline!(decline, "self_recursion_with_obligations");
         }
-        let returns = combine_call_summary_returns(&returns, callee_func_ty.returns.len())
-            .or_decline(decline, "returns_not_combinable", line!())?;
+        // A callee with NO return path and NO declared result: the `-> !` shape
+        // (trust-ir-bridge maps a `!` return to an empty result list, and ends every
+        // diverging site `Unreachable`, behind `Assume(false)` when the site is the
+        // never-typed call itself). `combine_call_summary_returns` has nothing to
+        // combine and refuses, and until 2026-09-27 that refusal declined the whole
+        // summary. So EVERY caller of a bundled `-> !` function got
+        // `translate_call`'s unconditional may-panic error rule
+        // (`UnsupportedDirectCallSummary`), even when the callee cannot panic.
+        // Measured on trust stage-1 98725f8d7d with `fn stop() -> ! { unsafe {
+        // c_exit(1) } }` and a caller whose other obligation was a guarded add.
+        //
+        // SOUND to summarize, and it is still exact about errors. The walk above
+        // explored EVERY path of the callee. Case splits are complete, and a revisit,
+        // an unmodelled instruction or a block with no terminator declines. Each
+        // path ended either in `Return`, which here none did, or in `Unreachable`,
+        // which pushed its guarded error condition into `error_conditions`. So
+        // every way through the callee is either charged to the caller as an error
+        // condition or infeasible. With zero declared results there is nothing to
+        // bind. The caller's continuation after the call is an over-approximation.
+        // It is kept, and it can only add error derivations, never remove one. A
+        // callee that DOES declare results keeps the refusal. It would need a
+        // havoc for a value no path produces, and nothing here requires it.
+        let returns = if returns.is_empty() && callee_func_ty.returns.is_empty() {
+            Vec::new()
+        } else {
+            combine_call_summary_returns(&returns, callee_func_ty.returns.len()).or_decline(
+                decline,
+                "returns_not_combinable",
+                line!(),
+            )?
+        };
         Some(DirectCallSummary { returns, error_conditions })
     }
 
@@ -4170,8 +6809,8 @@ impl<'a> ChcFuncTranslator<'a> {
             decline!(decline, "successor_block_revisit");
         }
 
-        let target_block = callee_func.block(target)
-            .or_decline(decline, "successor_block_missing", line!())?;
+        let target_block =
+            callee_func.block(target).or_decline(decline, "successor_block_missing", line!())?;
         if target_block.params.len() != args.len() {
             decline!(decline, "successor_param_arity_mismatch");
         }
@@ -4181,8 +6820,14 @@ impl<'a> ChcFuncTranslator<'a> {
             if !self.is_call_summary_value_ty(ty) {
                 decline!(decline, "successor_param_ty_unsupported");
             }
-            locals.insert(*param, call_summary_value(&state.locals, *arg, ty)
-                .or_decline(decline, "successor_arg_unbound", line!())?);
+            locals.insert(
+                *param,
+                call_summary_value(&state.locals, *arg, ty).or_decline(
+                    decline,
+                    "successor_arg_unbound",
+                    line!(),
+                )?,
+            );
         }
 
         let mut path_conditions = state.path_conditions.clone();
@@ -4194,6 +6839,12 @@ impl<'a> ChcFuncTranslator<'a> {
             locals,
             path_conditions,
             visited_blocks: state.visited_blocks.clone(),
+            // Stack cells are PATH state, exactly like `locals`: the successor
+            // inherits what this path wrote, and a sibling successor gets its own
+            // copy. Dropping this clone would silently reset every slot to
+            // "unwritten" at each edge, which reads back as a HAVOC — sound, but it
+            // is the whole reason the return-slot shape stays unprovable.
+            slots: state.slots.clone(),
         })
     }
 
@@ -4235,9 +6886,13 @@ impl<'a> ChcFuncTranslator<'a> {
         // evaluated in the *source* block's context: SSA params are in scope by
         // dominance, so forwarding the source's current binding is sound.
         let target_threaded = self.block_threaded_params.get(&target).cloned().unwrap_or_default();
+        // The target's relation carries array columns only when array content is
+        // modeled there; into a block reachable from a cycle every array is passed
+        // shape-only (no column), whatever this block modeled for it.
+        let target_smt_arrays = self.array_content_blocks.contains(&target);
         let mut head_args = Vec::new();
         for (value, ty) in &target_threaded {
-            head_args.extend(self.flatten_value_for_relation(*value, ty));
+            head_args.extend(self.flatten_value_for_relation(*value, ty, target_smt_arrays));
         }
         // mem2reg: forward the CURRENT (post-store) value of each cell the target
         // relation carries, evaluated in THIS (source) block's context. The source
@@ -4259,11 +6914,23 @@ impl<'a> ChcFuncTranslator<'a> {
                     })
                 }
             };
-            let flat = binding.flat_args();
+            let flat = self.binding_relation_args(binding, ty, target_smt_arrays);
             head_args.extend(flat);
         }
         for (arg, (_, ty)) in args.iter().zip(target_block.params.iter()) {
-            head_args.extend(self.flatten_value_for_relation(*arg, ty));
+            head_args.extend(self.flatten_value_for_relation(*arg, ty, target_smt_arrays));
+        }
+
+        if self.absorbing_large_block() {
+            self.large_block_transition(target, guard, path_constraints, head_args);
+            return;
+        }
+        if self.is_merged_block(target) {
+            // A block outside the large-block region (none of its relation's
+            // facts is derivable) transferring into a merged block, which has no
+            // relation: the rule could never fire (`translate_chc_large_block.rs`,
+            // fact 3).
+            return;
         }
 
         let mut constraints = path_constraints.to_vec();
@@ -4277,6 +6944,10 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn add_error_rule(&mut self, from: &RelationApp, path_constraints: &[Expr], condition: Expr) {
+        if self.absorbing_large_block() {
+            self.large_block_error(path_constraints, condition);
+            return;
+        }
         let mut constraints = path_constraints.to_vec();
         constraints.push(condition);
         self.vc.add_rule(Rule::new(
@@ -4294,6 +6965,30 @@ impl<'a> ChcFuncTranslator<'a> {
         from: &RelationApp,
         path_constraints: &[Expr],
     ) {
+        self.add_unsupported_error_when(
+            block,
+            instruction_index,
+            node,
+            reason,
+            from,
+            path_constraints,
+            Expr::true_(),
+        );
+    }
+
+    /// `add_unsupported_error` whose fail-closed error rule fires only where
+    /// `condition` holds on this path.
+    #[allow(clippy::too_many_arguments)]
+    fn add_unsupported_error_when(
+        &mut self,
+        block: BlockId,
+        instruction_index: usize,
+        node: &InstrNode,
+        reason: TrustIrChcUnsupportedReason,
+        from: &RelationApp,
+        path_constraints: &[Expr],
+        condition: Expr,
+    ) {
         self.diagnostics.push(TrustIrChcDiagnostic {
             function: self.func.name.clone(),
             block,
@@ -4302,120 +6997,28 @@ impl<'a> ChcFuncTranslator<'a> {
             reason,
             result_values: node.results.clone(),
         });
-        // PER-OBLIGATION NARROWING. In whole-function mode (narrow_to_target_block
-        // = None, the default everywhere today) this rule is always added, so a
-        // single unmodeled construct makes `error` reachable and sinks EVERY
-        // obligation of the function. When the caller is asking about ONE
-        // obligation whose assertion lives in `target`, an unsupported construct
-        // that cannot lie on an entry ->* site ->* target path cannot influence
-        // the states reaching that assertion — so its error rule would only
-        // poison a sibling obligation, never this one.
-        //
-        // SOUNDNESS: the exclusion fires ONLY when the site is provably OFF every
-        // entry->target path. Any uncertainty (unknown terminator, absent block,
-        // the site IS the target) leaves `site_can_precede_target` = true and the
-        // rule is added — over-approximate, never under. It can only DROP a rule
-        // that is irrelevant to this obligation; it can never mask a real
-        // violation, so it cannot produce a false PROVE.
-        if let Some(target) = self.options.narrow_to_target_block
-            && !self.site_can_precede_target(block, target)
-        {
-            return;
-        }
-        self.add_error_rule(from, path_constraints, Expr::true_());
+        self.add_error_rule(from, path_constraints, condition);
     }
 
-    /// Can an unsupported construct in `site` lie on an entry ->* site ->* target
-    /// path? True (include the rule) on ANY uncertainty. Only a site provably
-    /// unreachable-to-target OR unreachable-from-entry returns false.
-    fn site_can_precede_target(&self, site: BlockId, target: BlockId) -> bool {
-        let entry = self.func.entry;
-        // The site is irrelevant when EITHER half of
-        // `entry ->* site ->* target` is proven impossible. Unknown is not a
-        // proof: malformed or incomplete CFG information always keeps the rule.
-        !matches!(
-            (Self::cfg_reaches(self.func, entry, site), Self::cfg_reaches(self.func, site, target),),
-            (CfgReachability::ProvenUnreachable, _) | (_, CfgReachability::ProvenUnreachable)
-        )
-    }
-
-    /// Exact-or-unknown forward reachability over the TrustIR CFG.
-    ///
-    /// `ProvenUnreachable` requires a complete traversal of every block
-    /// reachable from `from`, with exactly one known terminator at the end of
-    /// each block and every successor resolving to exactly one block. Any
-    /// malformed or unsupported shape encountered on that reachable frontier
-    /// yields `Unknown`. Finding `to` is conclusive even if another frontier is
-    /// malformed, because narrowing keeps rules for `Reachable` and `Unknown`
-    /// alike.
-    fn cfg_reaches(func: &Function, from: BlockId, to: BlockId) -> CfgReachability {
-        let mut blocks = BTreeMap::new();
-        for block in &func.blocks {
-            if blocks.insert(block.id, block).is_some() {
-                return CfgReachability::Unknown;
-            }
-        }
-        if !blocks.contains_key(&from) || !blocks.contains_key(&to) {
-            return CfgReachability::Unknown;
-        }
-        if from == to {
-            return CfgReachability::Reachable;
-        }
-
-        let mut stack = vec![from];
-        let mut seen = BTreeSet::new();
-        let mut incomplete = false;
-        while let Some(b) = stack.pop() {
-            if !seen.insert(b) {
-                continue;
-            }
-            let Some(block) = blocks.get(&b) else {
-                incomplete = true;
-                continue;
-            };
-
-            let Some((terminator, prefix)) = block.body.split_last() else {
-                incomplete = true;
-                continue;
-            };
-            if prefix.iter().any(|node| node.inst.is_terminator()) {
-                incomplete = true;
-                continue;
-            }
-            let successors = match &terminator.inst {
-                Inst::Br { target, .. } => vec![*target],
-                Inst::CondBr { then_target, else_target, .. } => {
-                    vec![*then_target, *else_target]
-                }
-                Inst::Switch { default, cases, .. } => {
-                    let mut successors = vec![*default];
-                    successors.extend(cases.iter().map(|case| case.target));
-                    successors
-                }
-                Inst::Invoke { normal_dest, unwind_dest, .. } => {
-                    vec![*normal_dest, *unwind_dest]
-                }
-                Inst::Return { .. }
-                | Inst::CoroSuspend { .. }
-                | Inst::Resume { .. }
-                | Inst::Unreachable => Vec::new(),
-                _ => {
-                    incomplete = true;
-                    continue;
-                }
-            };
-            for successor in successors {
-                if successor == to {
-                    return CfgReachability::Reachable;
-                }
-                if blocks.contains_key(&successor) {
-                    stack.push(successor);
-                } else {
-                    incomplete = true;
-                }
-            }
-        }
-        if incomplete { CfgReachability::Unknown } else { CfgReachability::ProvenUnreachable }
+    /// The unconditional error rule that names a tensor-region instruction
+    /// (`crate::tensor_region`).
+    fn add_tensor_region_error(
+        &mut self,
+        construct: crate::TensorConstruct,
+        block: BlockId,
+        instruction_index: usize,
+        node: &InstrNode,
+        from: &RelationApp,
+        path_constraints: &[Expr],
+    ) {
+        self.add_unsupported_error(
+            block,
+            instruction_index,
+            node,
+            TrustIrChcUnsupportedReason::TensorRegion(construct),
+            from,
+            path_constraints,
+        );
     }
 
     fn add_global_unsupported_error(&mut self, reason: TrustIrChcUnsupportedReason) {
@@ -4428,6 +7031,73 @@ impl<'a> ChcFuncTranslator<'a> {
             result_values: Vec::new(),
         });
         self.vc.add_rule(Rule::new(RuleBody::empty(), RelationApp::nullary(ERROR_REL)));
+    }
+
+    /// `value`'s fat-pointer parts as the block being translated may read them
+    /// (`translate_chc_large_block.rs`, fact 2): EXACT when a `PtrFromParts` (or
+    /// a copy of one) built them in this block, when they mention no variable,
+    /// or — under the large-block encoding — when the block that built them
+    /// dominates this one (a compound part is then read through its part
+    /// variable); OPAQUE for any other read of such a value; `Unrecorded` for a
+    /// value no `PtrFromParts` built (a parameter, a load, a call result).
+    ///
+    /// The per-block encoding never reads an earlier block's non-closed parts:
+    /// in a later block's rule their variables would be free, unnamed as havocs,
+    /// and a refutation could pick them (the soundness review of 8e).
+    fn ptr_parts_view(&mut self, value: ValueId) -> PtrPartsView {
+        let Some(parts) = self.ptr_parts.get(&value).cloned() else {
+            return PtrPartsView::Unrecorded;
+        };
+        let PtrParts::Exact { block, data, metadata, closed } = parts else {
+            return PtrPartsView::Opaque;
+        };
+        let Some(here) = self.current_block else {
+            return PtrPartsView::Opaque;
+        };
+        if closed || block == here {
+            return PtrPartsView::Exact(data, metadata);
+        }
+        if self.large_block_dominates(block, here)
+            && let Some(data) = self.large_block_part(block, here, data)
+            && let Some(metadata) = self.large_block_part(block, here, metadata)
+        {
+            return PtrPartsView::Exact(data, metadata);
+        }
+        PtrPartsView::Opaque
+    }
+
+    /// Record for `to`, a copy of the fat pointer `from` made in the block being
+    /// translated (`Copy`, a same-type pointer cast, a borrow), what `from`'s
+    /// parts are here: exact parts become `to`'s own, built in this block; an
+    /// opaque `from` makes `to` opaque, with the same metadata symbol.
+    fn copy_ptr_parts(&mut self, from: ValueId, to: ValueId) {
+        let closed =
+            matches!(self.ptr_parts.get(&from), Some(PtrParts::Exact { closed: true, .. }));
+        match self.ptr_parts_view(from) {
+            PtrPartsView::Unrecorded => {}
+            PtrPartsView::Opaque => {
+                self.ptr_parts.insert(to, PtrParts::Opaque);
+                if let Some(symbol) = self.ptr_opaque_metadata.get(&from).cloned() {
+                    self.ptr_opaque_metadata.insert(to, symbol);
+                }
+            }
+            PtrPartsView::Exact(data, metadata) => {
+                if let Some(block) = self.current_block {
+                    self.ptr_parts.insert(to, PtrParts::Exact { block, data, metadata, closed });
+                }
+            }
+        }
+    }
+
+    /// The metadata of the opaque fat pointer `value`: one fresh, UNBOUNDED
+    /// havoc per SSA value (`ptr_opaque_metadata`).
+    fn opaque_ptr_metadata(&mut self, value: ValueId, metadata_ty: &Ty) -> Expr {
+        if let Some(symbol) = self.ptr_opaque_metadata.get(&value) {
+            return symbol.clone();
+        }
+        let symbol = self.fresh_symbolic("fat_metadata", metadata_ty);
+        self.ptr_opaque_metadata.insert(value, symbol.clone());
+        symbol
     }
 
     fn block_app(&self, block: BlockId) -> Option<RelationApp> {
@@ -4447,10 +7117,50 @@ impl<'a> ChcFuncTranslator<'a> {
         })
     }
 
+    /// Instrumentation for `ChcTranslationWork::carried_value_misses`: `value`
+    /// is being read with no binding in the current block. Counts it when it is
+    /// a threaded value defined in ANOTHER block that this (non-entry) block's
+    /// relation does not carry — the read the liveness analysis should have
+    /// seen. Never changes what the translation emits.
+    fn note_carried_value_miss(&mut self, value: ValueId) {
+        let Some(block) = self.current_block else {
+            return;
+        };
+        let id = value.index();
+        if block == self.func.entry
+            || self.threaded_def_block.get(&id).is_none_or(|def| *def == block)
+            || self.block_live_params.get(&block).is_some_and(|live| live.contains(&id))
+            || self
+                .func
+                .block(block)
+                .is_some_and(|b| b.params.iter().any(|(param, _)| param.index() == id))
+        {
+            return;
+        }
+        self.work.carried_value_misses += 1;
+    }
+
+    /// `note_carried_value_miss` for a promoted cell accessed through its own
+    /// pointer while absent from `stack_cells`.
+    fn note_carried_cell_miss(&mut self, cell: ValueId) {
+        let Some(block) = self.current_block else {
+            return;
+        };
+        let id = cell.index();
+        if block == self.func.entry
+            || self.cell_def_block.get(&id).is_none_or(|def| *def == block)
+            || self.block_live_cells.get(&block).is_some_and(|live| live.contains(&id))
+        {
+            return;
+        }
+        self.work.carried_value_misses += 1;
+    }
+
     fn resolve(&mut self, value: ValueId, ty: &Ty) -> Expr {
         if let Some(expr) = self.values.get(&value) {
             return expr.clone();
         }
+        self.note_carried_value_miss(value);
         let expr = self.fresh_symbolic(&format!("v{}", value.index()), ty);
         self.values.insert(value, expr.clone());
         expr
@@ -4502,6 +7212,25 @@ impl<'a> ChcFuncTranslator<'a> {
         }
     }
 
+    /// Bind an array result: its SMT-array binding, plus the same opaque scalar
+    /// placeholder an aggregate result gets for the `resolve` readers.
+    fn bind_array_result(&mut self, node: &InstrNode, array: ArrayValue, ty: &Ty) {
+        if let Some(result) = node.results.first() {
+            let opaque = self.fresh_symbolic("array", ty);
+            self.values.insert(*result, opaque);
+            self.arrays.insert(*result, array);
+        }
+    }
+
+    /// Bind `node`'s first result to `binding`, whatever its shape.
+    fn bind_binding_result(&mut self, node: &InstrNode, binding: ValueBinding, ty: &Ty) {
+        match binding {
+            ValueBinding::Scalar(expr) => self.bind_first_result(node, expr),
+            ValueBinding::Aggregate(aggregate) => self.bind_aggregate_result(node, aggregate, ty),
+            ValueBinding::Array(array) => self.bind_array_result(node, array, ty),
+        }
+    }
+
     fn bind_call_result(&mut self, result: ValueId, binding: ValueBinding, ty: &Ty) {
         match binding {
             ValueBinding::Scalar(expr) => {
@@ -4511,6 +7240,11 @@ impl<'a> ChcFuncTranslator<'a> {
                 let opaque = self.fresh_symbolic("call_aggregate", ty);
                 self.values.insert(result, opaque);
                 self.aggregates.insert(result, aggregate);
+            }
+            ValueBinding::Array(array) => {
+                let opaque = self.fresh_symbolic("call_array", ty);
+                self.values.insert(result, opaque);
+                self.arrays.insert(result, array);
             }
         }
     }
@@ -4535,9 +7269,22 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 
     fn fresh_symbolic(&mut self, prefix: &str, ty: &Ty) -> Expr {
-        let name = format!("{}_{}_{}", sanitize_name(&self.func.name), prefix, self.next_sym_id);
+        self.fresh_symbolic_lifted(prefix, ty, 0)
+    }
+
+    /// A fresh unconstrained variable of `ty`'s sort lifted through `depth`
+    /// enclosing arrays (`depth == 0` is `fresh_symbolic`).
+    ///
+    /// The ONE place this translator declares a variable that is not a block-
+    /// relation argument, and it declares it as a TRANSLATION HAVOC
+    /// (`ChcVc::declare_havoc_var`): a refutation gate must never take a constraint
+    /// on it — even an equality such as an assertion's `(= h 263)` — for a
+    /// definition of a program value (`trust_mc_driver`'s bounded-unroll grounding
+    /// gate reads the reserved name).
+    fn fresh_symbolic_lifted(&mut self, prefix: &str, ty: &Ty, depth: u32) -> Expr {
+        let stem = format!("{}_{}_{}", sanitize_name(&self.func.name), prefix, self.next_sym_id);
         self.next_sym_id += 1;
-        self.vc.declare_var(name, ty_to_sort(ty))
+        self.vc.declare_havoc_var(&stem, lifted_sort(ty_to_sort(ty), depth))
     }
 
     fn fresh_call_summary_value(&mut self, prefix: &str, ty: &Ty) -> Option<ValueBinding> {
@@ -4545,48 +7292,258 @@ impl<'a> ChcFuncTranslator<'a> {
             return Some(ValueBinding::Scalar(self.fresh_symbolic(prefix, ty)));
         }
 
-        let field_tys = self.aggregate_field_tys(ty)?;
-        let mut fields = Vec::with_capacity(field_tys.len());
-        for (field_index, field_ty) in field_tys.iter().enumerate() {
-            // Trust (#46): recurse for nested-aggregate fields.
-            fields.push(
-                self.resolve_field_binding(&format!("{prefix}_field{field_index}"), field_ty)?,
-            );
+        match self.composite_shape(ty)? {
+            CompositeShape::Fields(field_tys) => {
+                let mut fields = Vec::with_capacity(field_tys.len());
+                for (field_index, field_ty) in field_tys.iter().enumerate() {
+                    // Trust (#46): recurse for nested-aggregate fields.
+                    fields.push(self.resolve_field_binding(
+                        &format!("{prefix}_field{field_index}"),
+                        field_ty,
+                    )?);
+                }
+                Some(ValueBinding::Aggregate(AggregateValue { fields }))
+            }
+            CompositeShape::Array { .. } => self.fresh_binding_lifted(prefix, ty, 0),
         }
-        Some(ValueBinding::Aggregate(AggregateValue { fields }))
+    }
+
+    /// A fresh binding of `ty` — independent unconstrained leaves, the value of an
+    /// undefined / unknown `ty` — with every leaf lifted through `depth` enclosing
+    /// arrays. An array gets ONE fresh SMT array per leaf of its element, so its
+    /// cost is the element's leaf count, never its length. `None` when `ty` is
+    /// neither a scalar field nor a trackable composite.
+    fn fresh_binding_lifted(&mut self, prefix: &str, ty: &Ty, depth: u32) -> Option<ValueBinding> {
+        match self.composite_shape(ty) {
+            Some(CompositeShape::Fields(field_tys)) => {
+                let mut fields = Vec::with_capacity(field_tys.len());
+                for (index, field_ty) in field_tys.iter().enumerate() {
+                    fields.push(self.fresh_binding_lifted(
+                        &format!("{prefix}_f{index}"),
+                        field_ty,
+                        depth,
+                    )?);
+                }
+                Some(ValueBinding::Aggregate(AggregateValue { fields }))
+            }
+            Some(CompositeShape::Array { len, .. }) if !self.smt_arrays => {
+                Some(ValueBinding::Array(ArrayValue::shape_only(len)))
+            }
+            Some(CompositeShape::Array { elem, len }) => Some(ValueBinding::Array(ArrayValue {
+                len,
+                lanes: Some(Box::new(self.fresh_binding_lifted(
+                    &format!("{prefix}_lanes"),
+                    &elem,
+                    depth + 1,
+                )?)),
+            })),
+            None if is_scalar_field_ty(ty) => {
+                Some(ValueBinding::Scalar(self.fresh_symbolic_lifted(prefix, ty, depth)))
+            }
+            None => None,
+        }
+    }
+
+    /// Exact known scalar fields and explicit direct Uninit lanes, following
+    /// canonical constant placement. No arbitrary aggregate/opaque encoding or
+    /// initializedness fact is inferred from a fresh summary value.
+    fn call_summary_constant_carrier(
+        &self,
+        ty: &Ty,
+        constant: &Constant,
+        direct_uninit_lanes: bool,
+        depth: u32,
+    ) -> Option<CallSummaryBinding> {
+        if depth as usize >= construction_definedness::MAX_DEFINEDNESS_DEPTH {
+            return None;
+        }
+        if is_call_summary_scalar_ty(ty) {
+            return const_to_expr(ty, constant).map(CallSummaryBinding::Scalar);
+        }
+        if matches!((ty, constant), (Ty::Unit, Constant::PhantomData)) {
+            return Some(CallSummaryBinding::Aggregate(CallSummaryAggregate {
+                fields: Vec::new(),
+            }));
+        }
+        if !matches!(ty, Ty::Struct(_) | Ty::Tuple(_)) {
+            return None;
+        }
+        let Constant::Aggregate(constants) = constant else { return None };
+        let fields = self.aggregate_field_tys(ty)?;
+        if fields.len() != constants.len() {
+            return None;
+        }
+        let fields = fields
+            .iter()
+            .zip(constants)
+            .map(|(ty, constant)| {
+                if matches!(constant, Constant::Uninit) {
+                    direct_uninit_lanes.then(|| CallSummaryBinding::Uninit(ty.clone()))
+                } else {
+                    self.call_summary_constant_carrier(ty, constant, false, depth + 1)
+                }
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(CallSummaryBinding::Aggregate(CallSummaryAggregate { fields }))
+    }
+
+    fn fresh_direct_call_summary_value(
+        &mut self,
+        prefix: &str,
+        ty: &Ty,
+    ) -> Option<CallSummaryBinding> {
+        if let Ty::FatPtr(kind) = ty {
+            return Some(CallSummaryBinding::OpaqueFatPtr(*kind));
+        }
+        let binding = self.fresh_call_summary_value(prefix, ty)?;
+        self.call_summary_binding_from_value(binding, ty)
+    }
+
+    /// Import an existing value without importing numeric meaning for any fat
+    /// pointer leaf. Aggregate shaping retains the existing depth/leaf bounds.
+    fn call_summary_binding_from_value(
+        &self,
+        binding: ValueBinding,
+        ty: &Ty,
+    ) -> Option<CallSummaryBinding> {
+        match (binding, ty) {
+            (ValueBinding::Scalar(_), Ty::FatPtr(kind)) => {
+                Some(CallSummaryBinding::OpaqueFatPtr(*kind))
+            }
+            (ValueBinding::Scalar(expr), _) if is_scalar_field_ty(ty) => {
+                Some(CallSummaryBinding::Scalar(expr))
+            }
+            (ValueBinding::Aggregate(aggregate), _) => {
+                let fields = self.aggregate_field_tys(ty)?;
+                if fields.len() != aggregate.fields.len() {
+                    return None;
+                }
+                let fields = aggregate
+                    .fields
+                    .into_iter()
+                    .zip(fields.iter())
+                    .map(|(binding, ty)| self.call_summary_binding_from_value(binding, ty))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(CallSummaryBinding::Aggregate(CallSummaryAggregate { fields }))
+            }
+            // An array's lanes have its ELEMENT's shape, so they are imported
+            // against the element type. A fat-pointer leaf becomes the same opaque
+            // token a fat-pointer field does: a token carries no data, so the lanes
+            // of such a leaf carry none either.
+            (ValueBinding::Array(array), _) => {
+                let CompositeShape::Array { elem, len } = self.composite_shape(ty)? else {
+                    return None;
+                };
+                if len != array.len {
+                    return None;
+                }
+                let lanes = match array.lanes {
+                    Some(lanes) => {
+                        Some(Box::new(self.call_summary_binding_from_value(*lanes, &elem)?))
+                    }
+                    None => None,
+                };
+                Some(CallSummaryBinding::Array(CallSummaryArray { len, lanes }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Token-only fat values acquire fresh opaque placeholders at the boundary
+    /// back to ordinary translation. Reusing a token never creates an equality
+    /// between independently unknown addresses or metadata.
+    fn materialize_call_summary_binding(&mut self, binding: CallSummaryBinding) -> ValueBinding {
+        self.materialize_call_summary_binding_at(binding, 0)
+    }
+
+    /// `materialize_call_summary_binding` for a binding nested inside `depth`
+    /// arrays: a token inside array lanes becomes a fresh placeholder of the
+    /// LIFTED sort, so the lanes stay well-sorted relation columns.
+    fn materialize_call_summary_binding_at(
+        &mut self,
+        binding: CallSummaryBinding,
+        depth: u32,
+    ) -> ValueBinding {
+        match binding {
+            CallSummaryBinding::Scalar(expr) => ValueBinding::Scalar(expr),
+            CallSummaryBinding::Uninit(ty) => {
+                // Value overapproximation only. Source-SSA initializedness
+                // remains false until actual writes; every consuming ordinary
+                // and summary operation is checked independently. The explicit
+                // Uninit marker survives all operations INSIDE a summary.
+                self.fresh_binding_lifted("call_uninit_carrier", &ty, depth).unwrap_or_else(|| {
+                    ValueBinding::Scalar(self.fresh_symbolic_lifted(
+                        "call_uninit_carrier",
+                        &ty,
+                        depth,
+                    ))
+                })
+            }
+            CallSummaryBinding::OpaqueFatPtr(kind) => ValueBinding::Scalar(
+                self.fresh_symbolic_lifted("call_opaque_fat_ptr", &Ty::FatPtr(kind), depth),
+            ),
+            CallSummaryBinding::Aggregate(aggregate) => {
+                let fields = aggregate
+                    .fields
+                    .into_iter()
+                    .map(|field| self.materialize_call_summary_binding_at(field, depth))
+                    .collect();
+                ValueBinding::Aggregate(AggregateValue { fields })
+            }
+            CallSummaryBinding::Array(array) => ValueBinding::Array(ArrayValue {
+                len: array.len,
+                lanes: array.lanes.map(|lanes| {
+                    Box::new(self.materialize_call_summary_binding_at(*lanes, depth + 1))
+                }),
+            }),
+        }
     }
 
     fn aggregate_field_tys(&self, ty: &Ty) -> Option<Vec<Ty>> {
         aggregate_field_tys_of(self.module, ty)
     }
 
+    fn is_composite_value_ty(&self, ty: &Ty) -> bool {
+        is_composite_value_ty(self.module, ty)
+    }
+
     /// Trust (#46): build a fresh `ValueBinding` for a field of type `ty` — a scalar
-    /// gets a fresh symbol; a (possibly nested) aggregate is recursively built with
+    /// gets a fresh symbol; a (possibly nested) composite is recursively built with
     /// fresh leaves. Returns `None` if `ty` is neither scalar nor a trackable
-    /// aggregate (fail closed).
+    /// composite (fail closed).
     fn resolve_field_binding(&mut self, prefix: &str, ty: &Ty) -> Option<ValueBinding> {
-        if is_scalar_field_ty(ty) {
-            return Some(ValueBinding::Scalar(self.fresh_symbolic(prefix, ty)));
+        self.fresh_binding_lifted(prefix, ty, 0)
+    }
+
+    /// A fresh binding of `ty`, or a single fresh scalar placeholder when `ty` has
+    /// no tracked shape — the value of an unknown `ty` either way.
+    fn fresh_value_binding(&mut self, prefix: &str, ty: &Ty) -> ValueBinding {
+        match self.fresh_binding_lifted(prefix, ty, 0) {
+            Some(binding) => binding,
+            None => ValueBinding::Scalar(self.fresh_symbolic(prefix, ty)),
         }
-        let field_tys = self.aggregate_field_tys(ty)?;
-        let mut fields = Vec::with_capacity(field_tys.len());
-        for (index, field_ty) in field_tys.iter().enumerate() {
-            fields.push(self.resolve_field_binding(&format!("{prefix}_f{index}"), field_ty)?);
-        }
-        Some(ValueBinding::Aggregate(AggregateValue { fields }))
     }
 
     fn is_call_summary_value_ty(&self, ty: &Ty) -> bool {
-        is_call_summary_scalar_ty(ty) || self.aggregate_field_tys(ty).is_some()
+        is_call_summary_scalar_ty(ty)
+            || matches!(ty, Ty::FatPtr(_))
+            || self.is_composite_value_ty(ty)
     }
 
-    fn resolve_call_summary_argument(&mut self, value: ValueId, ty: &Ty) -> Option<ValueBinding> {
+    fn resolve_call_summary_argument(
+        &mut self,
+        value: ValueId,
+        ty: &Ty,
+    ) -> Option<CallSummaryBinding> {
+        if let Ty::FatPtr(kind) = ty {
+            return Some(CallSummaryBinding::OpaqueFatPtr(*kind));
+        }
         if is_call_summary_scalar_ty(ty) {
-            return Some(ValueBinding::Scalar(self.resolve(value, ty)));
+            return Some(CallSummaryBinding::Scalar(self.resolve(value, ty)));
         }
 
-        self.aggregate_field_tys(ty)?;
-        Some(ValueBinding::Aggregate(self.resolve_aggregate(value, ty)?))
+        let binding = self.resolve_composite(value, ty)?;
+        self.call_summary_binding_from_value(binding, ty)
     }
 
     fn resolve_aggregate(&mut self, value: ValueId, ty: &Ty) -> Option<AggregateValue> {
@@ -4595,9 +7552,10 @@ impl<'a> ChcFuncTranslator<'a> {
         }
 
         let field_tys = self.aggregate_field_tys(ty)?;
+        self.note_carried_value_miss(value);
         let mut fields = Vec::with_capacity(field_tys.len());
         for (field_index, field_ty) in field_tys.iter().enumerate() {
-            // Trust (#46): recurse so a nested-aggregate field gets a nested binding
+            // Trust (#46): recurse so a nested-composite field gets a nested binding
             // (fresh leaves), not a single scalar symbol.
             fields.push(self.resolve_field_binding(
                 &format!("v{}_field{}", value.index(), field_index),
@@ -4609,14 +7567,150 @@ impl<'a> ChcFuncTranslator<'a> {
         Some(aggregate)
     }
 
-    fn flatten_value_for_relation(&mut self, value: ValueId, ty: &Ty) -> Vec<Expr> {
-        self.resolve_aggregate(value, ty)
-            .map(|aggregate| ValueBinding::Aggregate(aggregate).flat_args())
-            .unwrap_or_else(|| vec![self.resolve(value, ty)])
+    /// The SMT-array binding of `value` at the non-empty array type `ty`: its
+    /// existing binding, or — for a value with none in this block — fresh
+    /// unconstrained lanes (one fresh SMT array per element leaf), recorded so
+    /// every later read of the same SSA value sees the same lanes. `None` when
+    /// `ty` is not a trackable non-empty array, or the existing binding has
+    /// another length (malformed IR; the caller fails closed).
+    fn resolve_array(&mut self, value: ValueId, ty: &Ty) -> Option<ArrayValue> {
+        let CompositeShape::Array { len, .. } = self.composite_shape(ty)? else {
+            return None;
+        };
+        if let Some(array) = self.arrays.get(&value) {
+            return (array.len == len).then(|| array.clone());
+        }
+        self.note_carried_value_miss(value);
+        let ValueBinding::Array(array) =
+            self.fresh_binding_lifted(&format!("v{}", value.index()), ty, 0)?
+        else {
+            return None;
+        };
+        self.arrays.insert(value, array.clone());
+        Some(array)
+    }
+
+    /// `value`'s binding at the trackable composite type `ty` (fields or SMT
+    /// arrays), or `None` when `ty` is not one.
+    fn resolve_composite(&mut self, value: ValueId, ty: &Ty) -> Option<ValueBinding> {
+        match self.composite_shape(ty)? {
+            CompositeShape::Fields(_) => {
+                self.resolve_aggregate(value, ty).map(ValueBinding::Aggregate)
+            }
+            CompositeShape::Array { .. } => self.resolve_array(value, ty).map(ValueBinding::Array),
+        }
+    }
+
+    /// `value`'s binding at `ty`, whatever its shape; `None` when `ty` is neither a
+    /// scalar field nor a trackable composite.
+    fn resolve_binding(&mut self, value: ValueId, ty: &Ty) -> Option<ValueBinding> {
+        if is_scalar_field_ty(ty) {
+            return Some(ValueBinding::Scalar(self.resolve(value, ty)));
+        }
+        self.resolve_composite(value, ty)
+    }
+
+    /// `value` as an ELEMENT of type `elem_ty` about to be spliced into array
+    /// lanes: a scalar is normalized to its exact carrier, and the whole binding
+    /// must have exactly `elem_ty`'s shape and sorts. `None` (the caller fails
+    /// closed or havocs) otherwise, so a mis-sorted term never reaches a column.
+    fn element_binding(&mut self, value: ValueId, elem_ty: &Ty) -> Option<ValueBinding> {
+        let binding = match self.resolve_binding(value, elem_ty)? {
+            ValueBinding::Scalar(expr) => {
+                ValueBinding::Scalar(normalize_expr_to_exact_ty(&expr, elem_ty)?)
+            }
+            composite => composite,
+        };
+        binding_matches_ty_at(self.module, &binding, elem_ty, 0).then_some(binding)
+    }
+
+    /// `value`'s arguments to a relation declared with `target_smt_arrays`.
+    fn flatten_value_for_relation(
+        &mut self,
+        value: ValueId,
+        ty: &Ty,
+        target_smt_arrays: bool,
+    ) -> Vec<Expr> {
+        if let Some(binding) = self.resolve_composite(value, ty) {
+            return self.binding_relation_args(binding, ty, target_smt_arrays);
+        }
+        if self.is_composite_value_ty(ty) {
+            // A composite value whose binding does not fit its declared type
+            // (malformed IR): forward fresh columns of the declared shape, so the
+            // relation application stays well-sorted, never a scalar placeholder.
+            let fresh = self.fresh_value_binding(&format!("v{}", value.index()), ty);
+            return self.binding_relation_args(fresh, ty, target_smt_arrays);
+        }
+        vec![self.resolve(value, ty)]
+    }
+
+    /// `binding`'s arguments to a relation declared with `target_smt_arrays`
+    /// (`ValueBinding::relation_args`). Into a relation that carries array
+    /// columns, a binding holding a shape-only array — which a block that models
+    /// array content never builds; this is defensive — forwards fresh columns of
+    /// `ty`'s shape instead, so the application always matches the signature.
+    fn binding_relation_args(
+        &mut self,
+        binding: ValueBinding,
+        ty: &Ty,
+        target_smt_arrays: bool,
+    ) -> Vec<Expr> {
+        if target_smt_arrays && !binding.has_array_content() {
+            let modeled_here = std::mem::replace(&mut self.smt_arrays, true);
+            let fresh = self.fresh_value_binding("relation_fill", ty);
+            self.smt_arrays = modeled_here;
+            return fresh.flat_args();
+        }
+        binding.relation_args(target_smt_arrays)
     }
 
     fn eval_extract_field(&mut self, aggregate: ValueId, field: u32) -> Option<ValueBinding> {
-        self.aggregates.get(&aggregate)?.fields.get(field as usize).cloned()
+        let Some(binding) = self.aggregates.get(&aggregate) else {
+            self.note_carried_value_miss(aggregate);
+            return None;
+        };
+        binding.fields.get(field as usize).cloned()
+    }
+
+    /// Build a complete field aggregate from the exact ordered operand
+    /// bindings. No unwritten seed, fresh field, or omitted operand enters this
+    /// constructor. The existing shape/sort checker also covers nested arrays
+    /// and aggregates; enums and other untracked shapes retain their refusal.
+    fn eval_make_field_aggregate(
+        &mut self,
+        ty: &Ty,
+        variant: Option<u32>,
+        fields: &[ValueId],
+    ) -> Result<AggregateValue, TrustIrChcUnsupportedReason> {
+        let field_tys = self
+            .aggregate_field_tys(ty)
+            .ok_or(TrustIrChcUnsupportedReason::AggregateConstruction)?;
+        if !matches!(ty, Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, 0))
+            || variant.is_some()
+            || fields.len() != field_tys.len()
+        {
+            return Err(TrustIrChcUnsupportedReason::AggregateConstruction);
+        }
+        if !construction_definedness::supported_type(self.module, ty) {
+            return Err(TrustIrChcUnsupportedReason::AggregateOpaqueValue);
+        }
+        let mut bindings = Vec::with_capacity(fields.len());
+        for (field, field_ty) in fields.iter().zip(&field_tys) {
+            if !construction_definedness::value_is_defined(
+                &self.source_consumption,
+                self.module,
+                self.func,
+                *field,
+                None,
+            ) {
+                return Err(TrustIrChcUnsupportedReason::AggregateOperandDefinedness);
+            }
+            bindings.push(
+                self.element_binding(*field, field_ty)
+                    .ok_or(TrustIrChcUnsupportedReason::AggregateConstruction)?,
+            );
+        }
+        Ok(AggregateValue { fields: bindings })
     }
 
     fn eval_insert_field(
@@ -4634,61 +7728,517 @@ impl<'a> ChcFuncTranslator<'a> {
         if result.fields.len() != field_tys.len() {
             return None;
         }
-        // Trust (#46): the inserted field may itself be a nested aggregate.
+        // Trust (#46): the inserted field may itself be a nested composite.
         result.fields[field_index] = if is_scalar_field_ty(&value_ty) {
             ValueBinding::Scalar(self.resolve(value, &value_ty))
         } else {
-            ValueBinding::Aggregate(self.resolve_aggregate(value, &value_ty)?)
+            self.resolve_composite(value, &value_ty)?
         };
         Some(result)
     }
 
-    /// EXACT model of an array/vector element WRITE, the element-index analogue of
-    /// [`Self::eval_insert_field`]. `Some` is returned ONLY when the update can be
-    /// expressed exactly; the caller keeps the pre-existing FAIL-CLOSED path
-    /// (an unconditionally reachable error rule) for `None` — deliberately NOT a
-    /// havoc that would forget the write.
+    /// The lane an element access at `index` names in an array of `len` lanes,
+    /// and when that access is in bounds.
     ///
-    /// Exactness requires ALL of:
-    /// * `ty` — which TrustIR fixes to be the ARRAY's own type, not the element's
-    ///   (`trust_ir::interpret::eval_insert_element` starts with
-    ///   `expect_ty(array, result_ty)`) — is a trackable aggregate. For `[T; N]`
-    ///   with `N <= 256` `immediate_aggregate_field_tys` already yields N copies of
-    ///   `T`, and `aggregate_field_tys` additionally enforces the flattened-leaf
-    ///   budget.
-    /// * the index is a COMPILE-TIME CONSTANT. A symbolic index names an unknown
-    ///   lane, for which "copy the aggregate and replace field i" is simply the
-    ///   WRONG model (it would leave every other lane readable as its old value
-    ///   while the real write could have landed on any of them), so it fails closed.
-    /// * that constant is IN BOUNDS. An out-of-bounds element write is TrustIR
-    ///   undefined behaviour (the interpreter raises `UndefinedBehavior`); there is
-    ///   no defined result to model, so it fails closed.
-    /// * the source array resolves to an aggregate binding of matching arity.
+    /// The lane is `index` as a `usize` bit-vector (BV64): zero-extended from a
+    /// narrower index, the low 64 bits of a wider one (exact whenever the access
+    /// is in bounds, since `len < 2^64`). `len` enters only as ONE constant.
     ///
-    /// Soundness of the exact arm rests on TrustIR `InsertElement` being a PURE
-    /// functional update — the result is a fresh SSA value and the source array
-    /// value keeps its own (still correct) binding — so modeling it cannot leave a
-    /// stale value readable through any surviving name.
+    /// SIGNEDNESS. An index's bits mean what its DECLARED type says (trust-ir
+    /// `interpret.rs :: runtime_index`): an unsigned index is its value, so a `u8`
+    /// of 200 names lane 200 of a `[T; 256]`; a signed index with its top bit set
+    /// is negative, which is undefined behaviour even where its bits read back as
+    /// an in-bounds unsigned value (`-1i8` is not lane 255). The declared type
+    /// comes from `element_operand_tys`:
+    ///
+    /// * unsigned: in bounds iff `index <u len`;
+    /// * signed: in bounds iff `index <u min(len, 2^(w-1))` at its width `w`, i.e.
+    ///   non-negative and below the length;
+    /// * not a known integer type: in bounds where both readings agree it is
+    ///   (`index <u min(len, 2^(w-1))`), and `ambiguous` where they disagree (top
+    ///   bit set, below the length unsigned). `discharge_element_bounds` assumes
+    ///   neither reading there.
+    ///
+    /// `None` when the index is not a bit-vector of width 1..=128 (malformed IR).
+    fn array_lane_access(&mut self, index: ValueId, len: u64) -> Option<LaneAccess> {
+        let declared = self.element_operand_tys.get(&index).filter(|ty| ty.is_integer()).cloned();
+        let signed = declared.as_ref().map(Ty::is_signed);
+        let index = self.resolve(index, declared.as_ref().unwrap_or(&Ty::Usize));
+        lane_access_of(index, signed, len)
+    }
+
+    /// Emit an element access's in-bounds obligation on this path, and return
+    /// where the access is EXACT from here on: `Always` (the plain `select` /
+    /// `store`), `Never` (no lane: the caller havocs), `When(c)` (exact under `c`,
+    /// a havoc outside it).
+    ///
+    /// With memory checks ON: an error rule where the access is out of bounds
+    /// under every reading of the index — trust-ir undefined behaviour — and,
+    /// where an index of unknown signedness reads differently signed and unsigned,
+    /// a DIAGNOSTIC-backed unsupported error (`UnmodeledElementIndex`), so that
+    /// case is never a clean refutation or a proof. The path then continues only
+    /// under `in_bounds`: execution does not continue past undefined behaviour, so
+    /// no later constraint of the path reads a junk lane, and every counterexample
+    /// through the access reads a real lane. This is neutral for "is `error`
+    /// reachable": a path on which the access can be out of bounds already
+    /// derives `error` at the access.
+    ///
+    /// With memory checks OFF there is no rule. The caller guards the access with
+    /// the returned condition: outside it a read is a fresh value and a write
+    /// havocs the whole array — never a dropped write, which would let a later
+    /// read see a value the program overwrote (turning off a diagnostic must never
+    /// turn on a stale read).
+    fn discharge_element_bounds(
+        &mut self,
+        access: &LaneAccess,
+        block: BlockId,
+        instruction_index: usize,
+        node: &InstrNode,
+        from: &RelationApp,
+        path_constraints: &mut Vec<Expr>,
+    ) -> InBounds {
+        if !self.options.check_memory_bounds {
+            return access.in_bounds.clone();
+        }
+        let (out_of_bounds, ambiguous) = match (&access.in_bounds, &access.ambiguous) {
+            (InBounds::Always, _) => return InBounds::Always,
+            (InBounds::Never, Ambiguity::Nowhere) => (Some(Expr::true_()), None),
+            (InBounds::Never, Ambiguity::Always) => (None, Some(Expr::true_())),
+            (InBounds::Never, Ambiguity::When(ambiguous)) => {
+                (Some(ambiguous.clone().not()), Some(ambiguous.clone()))
+            }
+            (InBounds::When(in_bounds), Ambiguity::Nowhere) => {
+                (Some(in_bounds.clone().not()), None)
+            }
+            (InBounds::When(_), Ambiguity::Always) => (None, Some(Expr::true_())),
+            (InBounds::When(in_bounds), Ambiguity::When(ambiguous)) => (
+                Some(in_bounds.clone().not().and(ambiguous.clone().not())),
+                Some(ambiguous.clone()),
+            ),
+        };
+        if let Some(out_of_bounds) = out_of_bounds {
+            self.add_error_rule(from, path_constraints, out_of_bounds);
+        }
+        if let Some(ambiguous) = ambiguous {
+            self.add_unsupported_error_when(
+                block,
+                instruction_index,
+                node,
+                TrustIrChcUnsupportedReason::UnmodeledElementIndex,
+                from,
+                path_constraints,
+                ambiguous,
+            );
+        }
+        match &access.in_bounds {
+            InBounds::Always => InBounds::Always,
+            InBounds::Never => {
+                // Undefined behaviour (or an unmodeled index) on every execution
+                // that gets here: no execution continues past it.
+                path_constraints.push(Expr::false_());
+                InBounds::Never
+            }
+            InBounds::When(in_bounds) => {
+                path_constraints.push(in_bounds.clone());
+                InBounds::Always
+            }
+        }
+    }
+
+    /// `ExtractElement { ty: dst_ty, array, index }`: `select` on every leaf of the
+    /// array's lanes — exact at a symbolic index as at a constant one — under the
+    /// access's own in-bounds obligation (`discharge_element_bounds`).
+    ///
+    /// The array is its binding in this block or, for an array value with none (an
+    /// array-typed result this model binds only as a placeholder, such as an
+    /// opaque call's), fresh lanes of its DECLARED type (`element_operand_tys`),
+    /// recorded so every read of that value agrees. Either way the access has a
+    /// length, so it always carries its bounds obligation. A read of a SHAPE-ONLY
+    /// array (a block a cycle reaches), of an array whose element this model does
+    /// not track, or of malformed IR whose element type is not the result type, is
+    /// a fresh value under the same obligation. A SIMD vector's lanes are not
+    /// modeled, but its length is its declared lane count, so its read is a fresh
+    /// value under the same obligation too (trust-ir makes an out-of-bounds vector
+    /// read undefined behaviour, `eval_extract_element`, exactly as an array's) —
+    /// the bound `try_direct_call_summary` states for the same read in a callee. An
+    /// operand whose length this model does not know (a sequence, or no declared
+    /// type) is a fresh value, and with memory checks on the read fails closed
+    /// (`UnmodeledElementLength`): its out-of-bounds case is undefined behaviour
+    /// this model cannot state, so the path can never be proved through it. An
+    /// index this model cannot place (not a bit-vector) fails closed.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_extract_element(
+        &mut self,
+        dst_ty: &Ty,
+        array: ValueId,
+        index: ValueId,
+        block: BlockId,
+        instruction_index: usize,
+        node: &InstrNode,
+        from: &RelationApp,
+        path_constraints: &mut Vec<Expr>,
+    ) {
+        let declared = self.element_operand_tys.get(&array).cloned();
+        let binding = match self.arrays.get(&array).cloned() {
+            Some(binding) => Some(binding),
+            None => match &declared {
+                Some(ty) => self.resolve_array(array, ty),
+                None => {
+                    self.note_carried_value_miss(array);
+                    None
+                }
+            },
+        };
+        let len = match (&binding, &declared) {
+            (Some(binding), _) => Some(binding.len),
+            (None, Some(Ty::Array(_, len))) => Some(*len),
+            (None, Some(Ty::Vector(_, lanes))) => Some(u64::from(*lanes)),
+            (None, _) => None,
+        };
+        let Some(len) = len else {
+            let havoc = self.fresh_value_binding("element_read", dst_ty);
+            self.bind_binding_result(node, havoc, dst_ty);
+            if self.options.check_memory_bounds {
+                self.add_unsupported_error(
+                    block,
+                    instruction_index,
+                    node,
+                    TrustIrChcUnsupportedReason::UnmodeledElementLength,
+                    from,
+                    path_constraints,
+                );
+            }
+            return;
+        };
+        let Some(access) = self.array_lane_access(index, len) else {
+            let havoc = self.fresh_value_binding("element_read", dst_ty);
+            self.bind_binding_result(node, havoc, dst_ty);
+            self.add_unsupported_error(
+                block,
+                instruction_index,
+                node,
+                TrustIrChcUnsupportedReason::UnmodeledElementIndex,
+                from,
+                path_constraints,
+            );
+            return;
+        };
+        // The lane's value: exact `select`, or a fresh value where the lanes are not
+        // modeled (see above). The obligation below needs only the length.
+        let element = match binding
+            .and_then(|binding| binding.select(&access.lane))
+            .filter(|element| binding_matches_ty_at(self.module, element, dst_ty, 0))
+        {
+            Some(element) => element,
+            None => self.fresh_value_binding("element_read", dst_ty),
+        };
+        let value = match self.discharge_element_bounds(
+            &access,
+            block,
+            instruction_index,
+            node,
+            from,
+            path_constraints,
+        ) {
+            InBounds::Always => element,
+            InBounds::Never => self.fresh_value_binding("element_read_oob", dst_ty),
+            InBounds::When(in_bounds) => {
+                let havoc = self.fresh_value_binding("element_read_oob", dst_ty);
+                match element.select_by(&in_bounds, &havoc) {
+                    Some(guarded) => guarded,
+                    None => havoc,
+                }
+            }
+        };
+        self.bind_binding_result(node, value, dst_ty);
+    }
+
+    /// EXACT model of an array element WRITE `InsertElement { ty, array, index,
+    /// value }` (`ty` is the ARRAY's own type — `trust_ir::interpret ::
+    /// eval_insert_element` starts with `expect_ty(array, result_ty)`): `store` on
+    /// every leaf of the lanes, at a symbolic index as at a constant one. TrustIR
+    /// `InsertElement` is a PURE functional update — the result is a fresh SSA value
+    /// and the source keeps its own (still correct) binding — so nothing stale
+    /// survives under any name.
+    ///
+    /// Its in-bounds obligation is the read's (`discharge_element_bounds`): with
+    /// memory checks on the path continues only in bounds, where the write is the
+    /// plain `store`; with them off the write is guarded, `ite(in_bounds, store,
+    /// havoc)`, so a write that is not known to land in bounds leaves an
+    /// unconstrained array — never the unchanged one, which would drop a write
+    /// the program may have made.
+    ///
+    /// `None` — the caller keeps the pre-existing FAIL-CLOSED path, deliberately NOT
+    /// a havoc that would forget the write — when `ty` is not a trackable non-empty
+    /// array (a SIMD vector, an empty array, an untrackable element), the element
+    /// does not have exactly the element type's shape and sorts, or the index is
+    /// not a bit-vector. No rule is added before that is known, so a declined
+    /// write adds only its fail-closed rule.
+    #[allow(clippy::too_many_arguments)]
     fn eval_insert_element(
         &mut self,
         ty: &Ty,
         array: ValueId,
         index: ValueId,
         value: ValueId,
-    ) -> Option<AggregateValue> {
-        let field_tys = self.aggregate_field_tys(ty)?;
-        let element_index = self.constant_lane_index(index)?;
-        let element_ty = field_tys.get(element_index)?.clone();
-        let mut result = self.resolve_aggregate(array, ty)?;
-        if result.fields.len() != field_tys.len() {
+        block: BlockId,
+        instruction_index: usize,
+        node: &InstrNode,
+        from: &RelationApp,
+        path_constraints: &mut Vec<Expr>,
+    ) -> Option<ArrayValue> {
+        let CompositeShape::Array { elem, len } = self.composite_shape(ty)? else {
+            return None;
+        };
+        let base = self.resolve_array(array, ty)?;
+        let access = self.array_lane_access(index, len)?;
+        let element = self.element_binding(value, &elem)?;
+        let stored = base.store(&access.lane, &element)?;
+        Some(
+            match self.discharge_element_bounds(
+                &access,
+                block,
+                instruction_index,
+                node,
+                from,
+                path_constraints,
+            ) {
+                InBounds::Always => stored,
+                InBounds::Never => self.fresh_array_value("element_write_oob", ty)?,
+                InBounds::When(in_bounds) => {
+                    let havoc = self.fresh_array_value("element_write_oob", ty)?;
+                    let ValueBinding::Array(guarded) = ValueBinding::Array(stored)
+                        .select_by(&in_bounds, &ValueBinding::Array(havoc))?
+                    else {
+                        return None;
+                    };
+                    guarded
+                }
+            },
+        )
+    }
+
+    /// Fresh unconstrained lanes of the non-empty array type `ty` (shape-only in a
+    /// block that does not model array content).
+    fn fresh_array_value(&mut self, prefix: &str, ty: &Ty) -> Option<ArrayValue> {
+        match self.fresh_binding_lifted(prefix, ty, 0)? {
+            ValueBinding::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    /// EXACT model of trust-ir v50 `ArraySplat { ty, value }` (`[value; n]`): one
+    /// constant SMT array per leaf of `value`'s binding, `((as const (Array BV64 S))
+    /// v)`, so a read of ANY in-bounds lane yields exactly `value` (the Lean law
+    /// `ExtractElement i (splat v n) = v`, `i < n`) — constant size whatever `n` is.
+    /// `[value; 0]` is the zero-field aggregate. `None` (the caller binds one opaque
+    /// fresh value) when `ty` is not a trackable array or `value` does not have the
+    /// element type's exact shape.
+    ///
+    /// Sound because `ArraySplat` is pure and total: the result is a fresh SSA
+    /// value and `value` keeps its own binding, so nothing stale survives. The
+    /// constant array also pins the lanes outside `[0, n)`; the junk-lane invariant
+    /// on `ArrayValue` is what keeps them from mattering.
+    fn eval_array_splat(&mut self, ty: &Ty, value: ValueId) -> Option<ValueBinding> {
+        match self.composite_shape(ty)? {
+            CompositeShape::Array { len, .. } if !self.smt_arrays => {
+                Some(ValueBinding::Array(ArrayValue::shape_only(len)))
+            }
+            CompositeShape::Array { elem, len } => {
+                let element = self.element_binding(value, &elem)?;
+                Some(ValueBinding::Array(ArrayValue::splat(len, &element)?))
+            }
+            CompositeShape::Fields(fields) if fields.is_empty() && matches!(ty, Ty::Array(..)) => {
+                Some(ValueBinding::Aggregate(AggregateValue { fields: Vec::new() }))
+            }
+            CompositeShape::Fields(_) => None,
+        }
+    }
+
+    /// `value`'s exact binding at `ty`, for the constants whose encoding is
+    /// exact: an integer / float / bool / vector literal at a scalar type
+    /// (`const_to_expr`, which answers `None` rather than approximate bits); a
+    /// (nested) `Splat` at a trackable array type of exactly its length, which is
+    /// one constant SMT array per leaf of the element; and a list-spelled array
+    /// literal — `Array`, the legacy `Aggregate` spelling at an array type, or
+    /// `Bytes` at `[u8; n]` — of exactly its length, encoded flat
+    /// (`define_array_lanes`), whose definitional lane equalities are appended to
+    /// `definitions` for the caller to add to the defining path. Every other
+    /// constant — `SymbolAddr`/`FnDef` (whose `const_to_expr` answer is a
+    /// placeholder, not the value), a struct aggregate, `Uninit` — answers `None`,
+    /// and the caller then discards `definitions`.
+    fn exact_constant_binding(
+        &mut self,
+        ty: &Ty,
+        value: &Constant,
+        definitions: &mut Vec<Expr>,
+    ) -> Option<ValueBinding> {
+        match value {
+            Constant::Int(_)
+            | Constant::U128(_)
+            | Constant::Float(_)
+            | Constant::Bool(_)
+            | Constant::Vector(_)
+                if is_scalar_field_ty(ty) =>
+            {
+                // The lane must inhabit the exact carrier a fresh field of `ty`
+                // gets (kind and width, not `Sort` equality), or relation
+                // threading would apply a mis-sorted argument.
+                normalize_expr_to_exact_ty(&const_to_expr(ty, value)?, ty).map(ValueBinding::Scalar)
+            }
+            Constant::Splat { elem, len } => match self.composite_shape(ty)? {
+                CompositeShape::Array { len: lanes, .. } if lanes == *len && !self.smt_arrays => {
+                    Some(ValueBinding::Array(ArrayValue::shape_only(lanes)))
+                }
+                CompositeShape::Array { elem: elem_ty, len: lanes } if lanes == *len => {
+                    let element = self.exact_constant_binding(&elem_ty, elem, definitions)?;
+                    Some(ValueBinding::Array(ArrayValue::splat(lanes, &element)?))
+                }
+                CompositeShape::Fields(fields)
+                    if fields.is_empty() && *len == 0 && matches!(ty, Ty::Array(..)) =>
+                {
+                    Some(ValueBinding::Aggregate(AggregateValue { fields: Vec::new() }))
+                }
+                CompositeShape::Array { .. } | CompositeShape::Fields(_) => None,
+            },
+            // A list-spelled array literal `[e0, e1, …]` (`Aggregate` is its legacy
+            // spelling at an array type, with the same contract): each element's
+            // exact binding, then the flat definitional encoding, one equality per
+            // element leaf — the literal's own text.
+            Constant::Array(elems) | Constant::Aggregate(elems) => {
+                match self.composite_shape(ty)? {
+                    CompositeShape::Array { len, .. }
+                        if u64::try_from(elems.len()).ok()? == len && !self.smt_arrays =>
+                    {
+                        Some(ValueBinding::Array(ArrayValue::shape_only(len)))
+                    }
+                    CompositeShape::Array { elem: elem_ty, len }
+                        if u64::try_from(elems.len()).ok()? == len =>
+                    {
+                        let mut elements = Vec::with_capacity(elems.len());
+                        for elem in elems {
+                            elements.push(self.exact_constant_binding(
+                                &elem_ty,
+                                elem,
+                                definitions,
+                            )?);
+                        }
+                        let array = self.define_array_lanes(ty, &elements, definitions)?;
+                        Some(ValueBinding::Array(array))
+                    }
+                    CompositeShape::Fields(fields)
+                        if fields.is_empty() && elems.is_empty() && matches!(ty, Ty::Array(..)) =>
+                    {
+                        Some(ValueBinding::Aggregate(AggregateValue { fields: Vec::new() }))
+                    }
+                    CompositeShape::Array { .. } | CompositeShape::Fields(_) => None,
+                }
+            }
+            // A byte string at `[u8; n]` (trust-ir executes it as `n` `u8` lanes and
+            // refuses any other element type): a list literal of its bytes.
+            Constant::Bytes { data, .. } => match self.composite_shape(ty)? {
+                CompositeShape::Array { elem: Ty::U8, len }
+                    if u64::try_from(data.len()).ok()? == len && !self.smt_arrays =>
+                {
+                    Some(ValueBinding::Array(ArrayValue::shape_only(len)))
+                }
+                CompositeShape::Array { elem: Ty::U8, len }
+                    if u64::try_from(data.len()).ok()? == len =>
+                {
+                    let elements: Vec<ValueBinding> = data
+                        .iter()
+                        .map(|byte| ValueBinding::Scalar(Expr::bitvec_const(*byte, 8)))
+                        .collect();
+                    Some(ValueBinding::Array(self.define_array_lanes(
+                        ty,
+                        &elements,
+                        definitions,
+                    )?))
+                }
+                CompositeShape::Fields(fields)
+                    if fields.is_empty() && data.is_empty() && matches!(ty, Ty::Array(..)) =>
+                {
+                    Some(ValueBinding::Aggregate(AggregateValue { fields: Vec::new() }))
+                }
+                CompositeShape::Array { .. } | CompositeShape::Fields(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The array of the non-empty array type `ty` whose lanes `0..elements.len()`
+    /// are exactly `elements` (each with the element type's exact shape and
+    /// sorts), encoded FLAT: fresh lanes `L` (one fresh SMT array per element leaf)
+    /// and, per element `k` and leaf, the definitional equality `select(L, k) =
+    /// e_k`, appended to `definitions`. The caller conjoins them into one term on
+    /// the defining path.
+    ///
+    /// Size is the elements' own (a literal's text; a `MakeAggregate`'s operand
+    /// list), and DEPTH is constant. A store chain `store(…store(a, 0, e0)…)` would
+    /// be as deep as the literal is long, and every recursive consumer of the term
+    /// (the solver's preprocessing, a `Drop` of the term) overflows its stack at
+    /// tens of thousands of elements — a process abort, not a fail-closed answer.
+    ///
+    /// The equalities are DEFINITIONAL: each names a distinct lane of the fresh
+    /// `L` exactly once, so for every value of the elements some `L` satisfies all
+    /// of them — they can never make a path infeasible. `L`'s lanes outside
+    /// `0..n` stay free: junk nothing reads (`ArrayValue`). A scalar leaf gives a
+    /// scalar equality; a leaf that is itself an array (a nested array element)
+    /// gives an array-sorted one whose left side is a lane of the fresh `L` — the
+    /// only array equality the junk-lane invariant admits, and `L` is recorded in
+    /// `definitional_array_lanes` so `vc_equates_array_terms_beyond` can tell.
+    ///
+    /// In a block that does not model array content this is the shape-only array.
+    fn define_array_lanes(
+        &mut self,
+        ty: &Ty,
+        elements: &[ValueBinding],
+        definitions: &mut Vec<Expr>,
+    ) -> Option<ArrayValue> {
+        let array = self.fresh_array_value("array_literal", ty)?;
+        let Some(lanes) = &array.lanes else {
+            return Some(array);
+        };
+        lanes.map_leaves(&mut |leaf| {
+            if let ay_bindings::ExprValue::Var { name } = leaf.value() {
+                self.definitional_array_lanes.insert(name.clone());
+            }
+            Some(leaf.clone())
+        })?;
+        for (lane, element) in elements.iter().enumerate() {
+            let slot = array.select(&Expr::bitvec_const(u64::try_from(lane).ok()?, 64))?;
+            slot.zip_leaves(element, &mut |slot_leaf, element_leaf| {
+                definitions.push(slot_leaf.clone().try_eq(element_leaf.clone()).ok()?);
+                Some(slot_leaf.clone())
+            })?;
+        }
+        Some(array)
+    }
+
+    /// `MakeAggregate { ty, fields }` at a non-empty array type `ty` with one
+    /// operand per lane (trust-ir `eval_make_aggregate`): the flat definitional
+    /// encoding of its operands (`define_array_lanes`), whose equalities go to
+    /// `definitions`. `None` (the caller keeps the fail-closed rule) for any other
+    /// type, a variant index, a lane count other than the length, or an operand
+    /// without the element type's exact shape.
+    fn eval_make_array(
+        &mut self,
+        ty: &Ty,
+        variant: Option<u32>,
+        fields: &[ValueId],
+        definitions: &mut Vec<Expr>,
+    ) -> Option<ArrayValue> {
+        let CompositeShape::Array { elem, len } = self.composite_shape(ty)? else {
+            return None;
+        };
+        if variant.is_some() || u64::try_from(fields.len()).ok()? != len {
             return None;
         }
-        result.fields[element_index] = if is_scalar_field_ty(&element_ty) {
-            ValueBinding::Scalar(self.resolve(value, &element_ty))
-        } else {
-            ValueBinding::Aggregate(self.resolve_aggregate(value, &element_ty)?)
-        };
-        Some(result)
+        let mut elements = Vec::with_capacity(fields.len());
+        for field in fields {
+            elements.push(self.element_binding(*field, &elem)?);
+        }
+        self.define_array_lanes(ty, &elements, definitions)
     }
 
     fn eval_binop(&mut self, op: BinOp, ty: &Ty, lhs: &Expr, rhs: &Expr) -> Expr {
@@ -4709,13 +8259,21 @@ impl<'a> ChcFuncTranslator<'a> {
                 BinOp::Shl => lhs.clone().bvshl(rhs.clone()),
                 BinOp::LShr => lhs.clone().bvlshr(rhs.clone()),
                 BinOp::AShr => lhs.clone().bvashr(rhs.clone()),
+                // trust-ir WS3.20 rotates: TOTAL (amount reduced modulo the
+                // width), encoded EXACTLY by the shared `bv_rotate`. The integer
+                // BinOp arm fails closed on the unencodable havoc; the direct-call
+                // summary keeps that havoc as a sound over-approximation (a rotate
+                // never traps, so no error condition is owed).
+                BinOp::RotL | BinOp::RotR => bv_rotate(lhs, rhs, matches!(op, BinOp::RotL))
+                    .unwrap_or_else(|| self.fresh_symbolic("rotate_unencodable", ty)),
                 BinOp::FAdd
                 | BinOp::FSub
                 | BinOp::FMul
                 | BinOp::FDiv
                 | BinOp::FRem
                 | BinOp::FMin
-                | BinOp::FMax => self.fresh_symbolic("float_on_int", ty),
+                | BinOp::FMax
+                | BinOp::FCopySign => self.fresh_symbolic("float_on_int", ty),
                 // Trust: the BOOLEAN connectives (trust-ir 4b06918) on an INTEGER
                 // type are ill-typed IR -- trust-ir's validator admits them on Bool
                 // (or bool-vector) only. Same fail-closed treatment as float-on-int:
@@ -4764,7 +8322,30 @@ impl<'a> ChcFuncTranslator<'a> {
                     .clone()
                     .try_ne(rhs.clone())
                     .unwrap_or_else(|_| self.fresh_symbolic("binop_result", ty)),
-                _ => self.fresh_symbolic("binop_result", ty),
+                // Every other op on `Bool` is ill-typed: havoc; the non-integer
+                // BinOp arm fails closed because only And/Or/Xor count as
+                // `modeled_precisely`. Listed, not `_`, so a new `BinOp` must be
+                // placed before this compiles (mirrors `translate::eval_binop`).
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::UDiv
+                | BinOp::SDiv
+                | BinOp::URem
+                | BinOp::SRem
+                | BinOp::FAdd
+                | BinOp::FSub
+                | BinOp::FMul
+                | BinOp::FDiv
+                | BinOp::FRem
+                | BinOp::FMin
+                | BinOp::FMax
+                | BinOp::FCopySign
+                | BinOp::Shl
+                | BinOp::LShr
+                | BinOp::AShr
+                | BinOp::RotL
+                | BinOp::RotR => self.fresh_symbolic("binop_result", ty),
             }
         } else {
             self.fresh_symbolic("binop_result", ty)
@@ -4846,12 +8427,12 @@ impl<'a> ChcFuncTranslator<'a> {
         for &idx in path {
             binding = match binding {
                 ValueBinding::Aggregate(agg) => agg.fields.get(idx as usize)?.clone(),
-                ValueBinding::Scalar(_) => return None,
+                ValueBinding::Scalar(_) | ValueBinding::Array(_) => return None,
             };
         }
         match binding {
             ValueBinding::Scalar(expr) => Some(expr),
-            ValueBinding::Aggregate(_) => None,
+            ValueBinding::Aggregate(_) | ValueBinding::Array(_) => None,
         }
     }
 
@@ -4884,12 +8465,45 @@ impl<'a> ChcFuncTranslator<'a> {
     }
 }
 
+#[cfg(test)]
 fn translate_function(
     func: &Function,
     module: &Module,
     options: &TranslateOptions,
 ) -> ChcTranslationOutput {
-    ChcFuncTranslator::new(func, module, options).translate()
+    translate_function_with_encoding(func, module, options, ChcEncoding::Automatic)
+}
+
+fn translate_function_with_encoding(
+    func: &Function,
+    module: &Module,
+    options: &TranslateOptions,
+    encoding: ChcEncoding,
+) -> ChcTranslationOutput {
+    let mut translator = ChcFuncTranslator::new(func, module, options);
+    match encoding {
+        ChcEncoding::Automatic => {}
+        ChcEncoding::PerBlock => translator.allow_large_block = false,
+        #[cfg(any(test, feature = "legacy-liveness-oracle"))]
+        ChcEncoding::Legacy => {
+            translator.liveness = LivenessOracle::Legacy;
+            translator.allow_large_block = false;
+        }
+    }
+    translator.translate()
+}
+
+/// `translate_function` in the per-block encoding, for the tests that read one
+/// block's relation or transition rules.
+#[cfg(test)]
+fn translate_function_per_block(
+    func: &Function,
+    module: &Module,
+    options: &TranslateOptions,
+) -> ChcTranslationOutput {
+    let mut translator = ChcFuncTranslator::new(func, module, options);
+    translator.allow_large_block = false;
+    translator.translate()
 }
 
 const POINTER_WIDTH: u32 = 64;
@@ -5062,7 +8676,8 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
         | Inst::Retain { ptr }
         | Inst::Release { ptr }
         | Inst::IsUnique { ptr }
-        | Inst::Dealloc { ptr } => {
+        | Inst::Dealloc { ptr }
+        | Inst::Drop { ptr, .. } => {
             uses.push(*ptr);
             false
         }
@@ -5075,6 +8690,28 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
         | Inst::AtomicRMW { ptr, value, .. } => {
             uses.push(*ptr);
             uses.push(*value);
+            false
+        }
+        // WS3.20 bulk memory: every operand is a value read. Enumerated exactly
+        // (not left to the conservative arm) so the alias analyses see WHICH
+        // pointers reach it. The proof-authority gate, the promotion analysis and
+        // `function_escaped_bases` count a `dst`/`src` use as an escape
+        // (`BulkMemoryUse::Escapes`). Only the translator's own cell decision
+        // (`translate_alloca`, `BulkMemoryUse::Tracked`) and
+        // `record_interior_pointer_escapes` treat it as a tracked position, because
+        // `translate_bulk_memory` writes the cell exactly or havocs it: a cell
+        // whose address reaches a MemCopy/MemSet stays precise across it in the
+        // diagnostic lane, and no admitted or promoted cell ever reaches one.
+        Inst::MemCopy { dst, src, bytes, .. } => {
+            uses.push(*dst);
+            uses.push(*src);
+            uses.push(*bytes);
+            false
+        }
+        Inst::MemSet { dst, byte, bytes } => {
+            uses.push(*dst);
+            uses.push(*byte);
+            uses.push(*bytes);
             false
         }
         Inst::Alloca { count, .. } | Inst::HeapAlloc { count, .. } => {
@@ -5117,17 +8754,32 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
             }
             false
         }
-        Inst::Call { args, .. } => {
+        Inst::Call { args, .. } | Inst::CallCannotUnwind { args, .. } => {
             uses.extend(args.iter().copied());
             false
         }
-        Inst::CallIndirect { callee, args, .. } => {
+        Inst::CallIndirect { callee, args, .. }
+        | Inst::CallIndirectCannotUnwind { callee, args, .. } => {
             uses.push(*callee);
             uses.extend(args.iter().copied());
             false
         }
         Inst::Return { values } => {
             uses.extend(values.iter().copied());
+            false
+        }
+        Inst::MakeAggregate { fields, .. } | Inst::MakeClosure { captures: fields, .. } => {
+            uses.extend(fields.iter().copied());
+            false
+        }
+        // v50 `[value; n]` reads exactly ONE operand, once, whatever `n` is (the
+        // lane count lives in the type). A pointer in `value` is thereby copied
+        // into an aggregate value: every alias analysis that consumes this list
+        // treats a use by an instruction it does not model positionally as an
+        // escape, which is the right answer for a pointer that now lives in `n`
+        // lanes.
+        Inst::ArraySplat { value, .. } => {
+            uses.push(*value);
             false
         }
         Inst::ExtractField { aggregate, .. } => {
@@ -5150,7 +8802,9 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
             uses.push(*value);
             false
         }
-        Inst::Assume { cond } | Inst::Assert { cond } => {
+        // An Assert's v52 `kind` operands are read only on failure, a terminal
+        // panic outcome, so the check itself reads only `cond`.
+        Inst::Assume { cond } | Inst::Assert { cond, kind: _, site: _ } => {
             uses.push(*cond);
             false
         }
@@ -5192,13 +8846,153 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
         | Inst::Unreachable
         | Inst::Fence { .. }
         | Inst::OpenFrame { .. } => false,
-        // Unknown / opaque (e.g. `DialectOp`, or any future variant): we cannot
-        // enumerate its reads, so report it conservatively.
-        _ => true,
+        // Opaque: we cannot (or do not) enumerate its reads, so report it
+        // conservatively. Listed rather than `_` so a FUTURE variant is a compile
+        // error here instead of silently inheriting a classification.
+        Inst::DialectOp(_)
+        | Inst::CoroSuspend { .. }
+        | Inst::Invoke { .. }
+        | Inst::AssertInvoke { .. }
+        | Inst::DropInvoke { .. }
+        | Inst::InvokeIndirect { .. }
+        | Inst::LandingPad { .. }
+        | Inst::Resume { .. } => true,
+        // trust-ir v67-v69 tensor region (`crate::tensor_region`): refused by
+        // name wherever it is translated, and absent from every module this
+        // lowering admits. Reported conservatively (every in-scope value
+        // possibly read) rather than enumerated, so a caller that bypassed the
+        // module input keeps liveness a sound over-approximation.
+        Inst::TensorContract { .. }
+        | Inst::TensorMap { .. }
+        | Inst::TensorReduce { .. }
+        | Inst::TensorView { .. }
+        | Inst::TensorGather { .. }
+        | Inst::TensorScatter { .. } => true,
     }
 }
 
-/// Successor blocks of a terminator. An unrecognized terminator is reported via
+/// The declared type of every value `func` uses as the array or the index
+/// operand of an `ExtractElement`/`InsertElement`: a block parameter's declared
+/// type, or an instruction result's (`InstrNode::result_tys`). Two linear passes
+/// over the function. A value with no declared type here (a result the
+/// instruction does not type) is simply absent.
+fn element_operand_tys(func: &Function, module: &Module) -> BTreeMap<ValueId, Ty> {
+    let mut wanted: BTreeSet<ValueId> = BTreeSet::new();
+    for node in func.blocks.iter().flat_map(|block| block.body.iter()) {
+        if let Inst::ExtractElement { array, index, .. }
+        | Inst::InsertElement { array, index, .. } = &node.inst
+        {
+            wanted.insert(*array);
+            wanted.insert(*index);
+        }
+    }
+    let mut tys = BTreeMap::new();
+    if wanted.is_empty() {
+        return tys;
+    }
+    for block in &func.blocks {
+        for (value, ty) in &block.params {
+            if wanted.contains(value) {
+                tys.insert(*value, ty.clone());
+            }
+        }
+        for node in &block.body {
+            if node.results.iter().any(|result| wanted.contains(result)) {
+                for (result, ty) in node.results.iter().zip(node.result_tys(module)) {
+                    if wanted.contains(result) {
+                        tys.insert(*result, ty);
+                    }
+                }
+            }
+        }
+    }
+    tys
+}
+
+/// The blocks of `func` in which array CONTENT is modeled with SMT arrays
+/// (`ChcFuncTranslator::smt_arrays`): every block that no cycle of the CFG reaches
+/// — a block ON a cycle reaches itself. The native CHC engine at the pinned ay
+/// revision answers Inconclusive for an array term in any clause reachable from a
+/// loop, while it decides array terms in an acyclic problem and in the acyclic
+/// part before a loop; so the blocks before every loop (all of them, in an acyclic
+/// function) model array content and every block a loop reaches carries its
+/// arrays shape-only. The set is closed under predecessors: a block whose
+/// predecessor is reachable from a cycle is itself.
+///
+/// A terminator whose successors are not statically known may lead anywhere, a
+/// cycle included, so such a function models no array content at all (the empty
+/// set). Linear in the CFG: an iterative three-colour DFS finds the back edges —
+/// every cycle has one, and its target lies on the cycle — and one forward sweep
+/// from their targets marks everything a cycle reaches. A malformed body that
+/// repeats a block id is one node (it shares one relation).
+fn array_content_blocks(func: &Function) -> BTreeSet<BlockId> {
+    let mut slot_of: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for block in &func.blocks {
+        let next = slot_of.len();
+        slot_of.entry(block.id).or_insert(next);
+    }
+    let nodes = slot_of.len();
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); nodes];
+    for block in &func.blocks {
+        let Some(terminator) = block.body.last() else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        if liveness_terminator_successors(&terminator.inst, &mut targets) {
+            return BTreeSet::new();
+        }
+        let from = slot_of[&block.id];
+        for target in targets {
+            let Some(&to) = slot_of.get(&target) else {
+                return BTreeSet::new();
+            };
+            successors[from].push(to);
+        }
+    }
+    // 0 = unvisited, 1 = on the DFS stack, 2 = finished.
+    let mut colour = vec![0u8; nodes];
+    let mut reached_from_cycle = vec![false; nodes];
+    let mut frontier: Vec<usize> = Vec::new();
+    for root in 0..nodes {
+        if colour[root] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        colour[root] = 1;
+        while let Some((node, next)) = stack.last_mut() {
+            let node = *node;
+            if let Some(&successor) = successors[node].get(*next) {
+                *next += 1;
+                match colour[successor] {
+                    0 => {
+                        colour[successor] = 1;
+                        stack.push((successor, 0));
+                    }
+                    // A back edge: its target is on a cycle.
+                    1 if !reached_from_cycle[successor] => {
+                        reached_from_cycle[successor] = true;
+                        frontier.push(successor);
+                    }
+                    _ => {}
+                }
+            } else {
+                colour[node] = 2;
+                stack.pop();
+            }
+        }
+    }
+    while let Some(node) = frontier.pop() {
+        for &successor in &successors[node] {
+            if !reached_from_cycle[successor] {
+                reached_from_cycle[successor] = true;
+                frontier.push(successor);
+            }
+        }
+    }
+    slot_of.into_iter().filter(|(_, slot)| !reached_from_cycle[*slot]).map(|(id, _)| id).collect()
+}
+
+/// Successors blocks of a terminator. An unrecognized terminator is reported via
 /// the boolean flag so liveness can stay conservative.
 fn collect_terminator_successors(inst: &Inst, successors: &mut Vec<BlockId>) -> bool {
     match inst {
@@ -5223,22 +9017,229 @@ fn collect_terminator_successors(inst: &Inst, successors: &mut Vec<BlockId>) -> 
     }
 }
 
-fn sanitize_name(name: &str) -> String {
-    name.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect()
+/// The blocks a TERMINATOR can transfer control to, for relation liveness only.
+/// Returns `true` for a terminator it does not know.
+///
+/// Callers pass terminators only (`Inst::is_terminator`): an ordinary
+/// instruction hands control to the next instruction of its own block, never to
+/// another block. Asking `collect_terminator_successors` about every instruction
+/// was the liveness bug: its `_ => true` arm made every block holding an
+/// ordinary instruction read every carried value.
+///
+/// This is a separate function, not a widening of `collect_terminator_successors`,
+/// because that one also feeds `promoted_cell_is_definitely_initialized`, a
+/// proof-admission predicate that deliberately refuses the terminators listed
+/// here; liveness only sizes relations and must not move that decision.
+fn liveness_terminator_successors(inst: &Inst, successors: &mut Vec<BlockId>) -> bool {
+    match inst {
+        // The translation lowers `Invoke` to an unconditional fail-closed error
+        // and emits no transition out of it, so these edges only widen liveness;
+        // they are listed because they ARE the instruction's edges.
+        Inst::Invoke { normal_dest, unwind_dest, .. } => {
+            successors.push(*normal_dest);
+            successors.push(*unwind_dest);
+            false
+        }
+        // Leave the function (`Resume` unwinds to the caller, `CoroSuspend`
+        // returns to the resumer).
+        Inst::Resume { .. } | Inst::CoroSuspend { .. } => false,
+        other => collect_terminator_successors(other, successors),
+    }
 }
 
-/// Map a callee method name to the MODULAR `BinOp` a wrapping arithmetic intrinsic
-/// computes, matching on the final `::` path segment (`core::num::<impl u64>::
-/// wrapping_add` → `Add`). Mirrors the compiler MIR path's
-/// `inline_wrapping_arith_expr`; the caller (`translate_call`) additionally checks
-/// the callee's signature shape before modeling the call as this BV op.
-fn wrapping_arith_binop(callee_name: &str) -> Option<BinOp> {
-    match callee_name.rsplit("::").next()? {
-        "wrapping_add" => Some(BinOp::Add),
-        "wrapping_sub" => Some(BinOp::Sub),
-        "wrapping_mul" => Some(BinOp::Mul),
-        _ => None,
+/// Live-in sets of the relation-carried values `carried`, keyed by block. See
+/// `ChcFuncTranslator::compute_live_params` for the equations and the soundness
+/// argument.
+///
+/// Uses are every SSA operand of every instruction (trust-ir's canonical
+/// exhaustive walk, so no instruction is ever "not enumerable"); successors come
+/// only from terminators. The fixpoint is computed by delta propagation: each
+/// `(block, value)` pair enters a live-in set at most once and is then offered to
+/// each predecessor once, so the work is `Σ_b |live_in(b)| · |preds(b)|` set
+/// operations — proportional to the relation columns it produces, never to
+/// blocks × carried values, and independent of how many rounds a round-robin
+/// sweep would need.
+fn carried_live_in(
+    func: &Function,
+    carried: &BTreeSet<u32>,
+    def_block: &BTreeMap<u32, BlockId>,
+    work: &mut ChcTranslationWork,
+) -> BTreeMap<BlockId, BTreeSet<u32>> {
+    if carried.is_empty() {
+        return BTreeMap::new();
     }
+    // One slot per distinct block id (a malformed body that repeats an id shares
+    // one relation, so its blocks share one slot; the union is conservative).
+    let mut slot_of: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for block in &func.blocks {
+        let next = slot_of.len();
+        slot_of.entry(block.id).or_insert(next);
+    }
+    let slots = slot_of.len();
+
+    // own[B]: B's block params and the carried values B defines.
+    let mut own: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); slots];
+    for (id, block) in def_block {
+        if carried.contains(id)
+            && let Some(&slot) = slot_of.get(block)
+        {
+            own[slot].insert(*id);
+        }
+    }
+    for block in &func.blocks {
+        own[slot_of[&block.id]].extend(block.params.iter().map(|(value, _)| value.index()));
+    }
+
+    let mut seeds: Vec<Vec<u32>> = vec![Vec::new(); slots];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); slots];
+    for block in &func.blocks {
+        let slot = slot_of[&block.id];
+        let mut conservative = false;
+        let mut targets = Vec::new();
+        for node in &block.body {
+            node.inst.visit_value_operands(|value| {
+                let id = value.index();
+                if carried.contains(&id) && !own[slot].contains(&id) {
+                    seeds[slot].push(id);
+                }
+            });
+            if node.inst.is_terminator() {
+                conservative |= liveness_terminator_successors(&node.inst, &mut targets);
+            }
+        }
+        if conservative {
+            // An unknown terminator may hand control anywhere: assume it reads
+            // every carried value it does not itself define.
+            seeds[slot].extend(carried.iter().filter(|id| !own[slot].contains(id)));
+        }
+        // A target outside the function is malformed control flow, which the
+        // translation turns into a fail-closed error rule, not a transition.
+        succs[slot].extend(targets.iter().filter_map(|target| slot_of.get(target)));
+    }
+
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); slots];
+    for (slot, targets) in succs.iter_mut().enumerate() {
+        targets.sort_unstable();
+        targets.dedup();
+        for &target in targets.iter() {
+            preds[target].push(slot);
+        }
+    }
+
+    let mut live: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); slots];
+    let mut pending: std::collections::VecDeque<(usize, Vec<u32>)> =
+        std::collections::VecDeque::new();
+    for (slot, seed) in seeds.into_iter().enumerate() {
+        let delta: Vec<u32> = seed.into_iter().filter(|id| live[slot].insert(*id)).collect();
+        if !delta.is_empty() {
+            work.live_in_insertions += delta.len() as u64;
+            pending.push_back((slot, delta));
+        }
+    }
+    while let Some((slot, delta)) = pending.pop_front() {
+        for &pred in &preds[slot] {
+            work.live_in_edge_visits += delta.len() as u64;
+            let added: Vec<u32> = delta
+                .iter()
+                .copied()
+                .filter(|id| !own[pred].contains(id) && live[pred].insert(*id))
+                .collect();
+            if !added.is_empty() {
+                work.live_in_insertions += added.len() as u64;
+                pending.push_back((pred, added));
+            }
+        }
+    }
+
+    slot_of.into_iter().map(|(block, slot)| (block, std::mem::take(&mut live[slot]))).collect()
+}
+
+/// The liveness analysis this crate shipped before `carried_live_in`, kept
+/// VERBATIM (modulo being a free function) as the differential oracle of the
+/// verdict-parity tests. It asks every instruction for terminator successors, so
+/// any block holding an ordinary instruction is "conservative" and reads every
+/// carried value. Never compiled into production builds.
+#[cfg(any(test, feature = "legacy-liveness-oracle"))]
+fn legacy_carried_live_in(
+    func: &Function,
+    param_ids: &BTreeSet<u32>,
+    def_block: &BTreeMap<u32, BlockId>,
+) -> BTreeMap<BlockId, BTreeSet<u32>> {
+    if param_ids.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut direct_uses: BTreeMap<BlockId, BTreeSet<u32>> = BTreeMap::new();
+    let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+    let mut block_defs: BTreeMap<BlockId, BTreeSet<u32>> = BTreeMap::new();
+    for (&id, &blk) in def_block {
+        if param_ids.contains(&id) {
+            block_defs.entry(blk).or_default().insert(id);
+        }
+    }
+
+    for block in &func.blocks {
+        let mut own: BTreeSet<u32> = block.params.iter().map(|(v, _)| v.index()).collect();
+        if let Some(defs) = block_defs.get(&block.id) {
+            own.extend(defs.iter().copied());
+        }
+
+        let mut raw_uses: Vec<ValueId> = Vec::new();
+        let mut succs: Vec<BlockId> = Vec::new();
+        let mut conservative = false;
+        for node in &block.body {
+            conservative |= collect_inst_value_uses(&node.inst, &mut raw_uses);
+            conservative |= collect_terminator_successors(&node.inst, &mut succs);
+        }
+
+        let mut uses: BTreeSet<u32> = if conservative {
+            param_ids.clone()
+        } else {
+            raw_uses.into_iter().map(|v| v.index()).filter(|id| param_ids.contains(id)).collect()
+        };
+        for d in &own {
+            uses.remove(d);
+        }
+
+        direct_uses.insert(block.id, uses);
+        successors.insert(block.id, succs);
+    }
+
+    let mut live: BTreeMap<BlockId, BTreeSet<u32>> =
+        func.blocks.iter().map(|b| (b.id, BTreeSet::new())).collect();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            let mut next = direct_uses.get(&block.id).cloned().unwrap_or_default();
+            let mut own: BTreeSet<u32> = block.params.iter().map(|(v, _)| v.index()).collect();
+            if let Some(defs) = block_defs.get(&block.id) {
+                own.extend(defs.iter().copied());
+            }
+            for succ in successors.get(&block.id).into_iter().flatten() {
+                if let Some(succ_live) = live.get(succ) {
+                    for id in succ_live {
+                        if !own.contains(id) {
+                            next.insert(*id);
+                        }
+                    }
+                }
+            }
+            if let Some(current) = live.get_mut(&block.id)
+                && *current != next
+            {
+                *current = next;
+                changed = true;
+            }
+        }
+    }
+
+    live
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect()
 }
 
 /// Trust: host target thin-pointer width in bits. trust-ir `Ty::bit_width()`
@@ -5257,22 +9258,109 @@ fn is_scalar_field_ty(ty: &Ty) -> bool {
     ty.bit_width_with(HOST_POINTER_BITS).is_some()
 }
 
-/// Trust (#46): free version of `aggregate_field_tys` (so the recursive block-
-/// relation declaration can borrow `&Module` + `&mut vc` as disjoint fields while a
-/// `&self.func` block iteration is live). A struct/tuple is trackable when every
-/// field is a scalar OR itself a trackable (possibly nested) aggregate.
-fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
-    // Bound the TOTAL flattened scalar-leaf count before declaring this aggregate
-    // trackable. `aggregate_leaf_count_within` subsumes the old field-by-field
-    // trackability check (it returns `None` unless every leaf bottoms out in a
-    // scalar) AND caps the leaf count at `MAX_AGGREGATE_LEAVES`, so a trackable-but-
-    // huge nested array (`bd37bce4a`) can no longer explode the block-relation
-    // signature into millions of CHC variables. Over budget ⇒ `None` ⇒ every caller
-    // that gates expansion on this function (`declare_relation_binding_rec`,
-    // `resolve_field_binding`, `fresh_call_summary_value`, the pad/newtype helpers)
+/// How the CHC value model carries a value of a TRACKABLE composite type.
+#[derive(Debug, Clone)]
+enum CompositeShape {
+    /// A struct, tuple, closure, `()` or EMPTY array: one binding per field.
+    Fields(Vec<Ty>),
+    /// A non-empty fixed-size array `[elem; len]`: one SMT array per scalar leaf
+    /// of `elem` (`ArrayValue`). Nothing about it is sized by `len`.
+    Array { elem: Ty, len: u64 },
+}
+
+/// The composite shape of `ty`, or `None` when `ty` is not a trackable composite
+/// (a scalar, an enum, a fat pointer, or a composite with a non-trackable leaf or
+/// over `MAX_AGGREGATE_LEAVES` leaves).
+///
+/// Trust (#46): a free function (so the recursive block-relation declaration can
+/// borrow `&Module` + `&mut vc` as disjoint fields while a `&self.func` block
+/// iteration is live). A struct/tuple is trackable when every field is a scalar OR
+/// itself a trackable composite; a non-empty array when its element is.
+fn composite_shape_of(module: &Module, ty: &Ty) -> Option<CompositeShape> {
+    // `aggregate_leaf_count_within` returns `None` unless every leaf bottoms out in
+    // a scalar, and bounds the struct-DAG leaf count (see `MAX_AGGREGATE_LEAVES`).
+    // An array counts as its element's leaves ONCE, so no length enters it. Over
+    // budget ⇒ `None` ⇒ every caller that gates expansion on this function
     // uniformly treats the value as a single opaque scalar (fail closed).
     aggregate_leaf_count_within(module, ty, MAX_AGGREGATE_LEAVES)?;
-    immediate_aggregate_field_tys(module, ty)
+    if let Some((elem, len)) = nonempty_array_elem(module, ty) {
+        return Some(CompositeShape::Array { elem, len });
+    }
+    immediate_aggregate_field_tys(module, ty).map(CompositeShape::Fields)
+}
+
+/// The field types of a trackable struct/tuple/closure/unit/EMPTY-array `ty`.
+/// `None` for a scalar, a non-trackable composite and a NON-EMPTY array — an
+/// array's lanes are not fields (`composite_shape_of`, `ArrayValue`).
+fn aggregate_field_tys_of(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
+    match composite_shape_of(module, ty)? {
+        CompositeShape::Fields(fields) => Some(fields),
+        CompositeShape::Array { .. } => None,
+    }
+}
+
+/// `true` iff the value model tracks `ty` as a composite (fields or SMT arrays).
+fn is_composite_value_ty(module: &Module, ty: &Ty) -> bool {
+    composite_shape_of(module, ty).is_some()
+}
+
+/// `(element type, length)` of a NON-EMPTY `Ty::Array`, with no trackability
+/// check. An empty array `[T; 0]` has no lane and is the zero-field aggregate.
+fn nonempty_array_elem(module: &Module, ty: &Ty) -> Option<(Ty, u64)> {
+    let Ty::Array(elem, len) = ty else {
+        return None;
+    };
+    if *len == 0 {
+        return None;
+    }
+    Some((module.types.get(elem.as_usize())?.clone(), *len))
+}
+
+/// Does `actual` inhabit `expected` exactly (Bool, bit-vector WIDTH, array index
+/// and element sorts)? `Sort` equality alone is not relied on, because AY's
+/// equality historically did not always distinguish bit-vector widths.
+fn sort_matches(actual: &ay_bindings::Sort, expected: &ay_bindings::Sort) -> bool {
+    if expected.is_bool() {
+        return actual.is_bool();
+    }
+    if let Some(width) = expected.bitvec_width() {
+        return actual.bitvec_width() == Some(width);
+    }
+    match (actual.array_sort(), expected.array_sort()) {
+        (Some(actual), Some(expected)) => {
+            sort_matches(&actual.index_sort, &expected.index_sort)
+                && sort_matches(&actual.element_sort, &expected.element_sort)
+        }
+        _ => false,
+    }
+}
+
+/// Does `binding` have exactly the shape and leaf sorts a value of `ty` gets,
+/// with every scalar leaf lifted through `depth` enclosing arrays? This is the
+/// bar an element must clear before it is spliced into an `ArrayValue`, so a
+/// mis-sorted term can never reach a relation column.
+fn binding_matches_ty_at(module: &Module, binding: &ValueBinding, ty: &Ty, depth: u32) -> bool {
+    match (binding, composite_shape_of(module, ty)) {
+        (ValueBinding::Scalar(expr), None) => {
+            is_scalar_field_ty(ty) && sort_matches(expr.sort(), &lifted_sort(ty_to_sort(ty), depth))
+        }
+        (ValueBinding::Aggregate(aggregate), Some(CompositeShape::Fields(fields))) => {
+            aggregate.fields.len() == fields.len()
+                && aggregate
+                    .fields
+                    .iter()
+                    .zip(&fields)
+                    .all(|(field, field_ty)| binding_matches_ty_at(module, field, field_ty, depth))
+        }
+        (ValueBinding::Array(array), Some(CompositeShape::Array { elem, len })) => {
+            array.len == len
+                && array
+                    .lanes
+                    .as_ref()
+                    .is_none_or(|lanes| binding_matches_ty_at(module, lanes, &elem, depth + 1))
+        }
+        _ => false,
+    }
 }
 
 /// Proof-authority admission class for a single-cell (`count: None`) stack `Alloca`,
@@ -5326,7 +9414,7 @@ pub fn classify_aggregate_stack_cell(module: &Module, ty: &Ty) -> StackCellAdmis
     if !is_cell_shape {
         return StackCellAdmission::NotAggregate;
     }
-    if aggregate_field_tys_of(module, ty).is_some() {
+    if is_composite_value_ty(module, ty) {
         StackCellAdmission::RequiresNonEscape
     } else {
         StackCellAdmission::OpaqueSafe
@@ -5351,7 +9439,7 @@ pub fn classify_aggregate_stack_cell(module: &Module, ty: &Ty) -> StackCellAdmis
 /// `Record`, and any opaque/over-budget aggregate that `classify_aggregate_stack_cell`
 /// reports as `NotAggregate` (a non-cell shape) or `OpaqueSafe`.
 pub fn stack_cell_is_translator_opaque(module: &Module, ty: &Ty) -> bool {
-    !is_precise_stack_scalar_ty(ty) && aggregate_field_tys_of(module, ty).is_none()
+    !is_precise_stack_scalar_ty(ty) && !is_composite_value_ty(module, ty)
 }
 
 /// The cell types mem2reg promotion may thread through the block relations: EXACTLY
@@ -5375,11 +9463,19 @@ pub fn stack_cell_is_translator_opaque(module: &Module, ty: &Ty) -> bool {
 ///   would let a merge forward one variant's payload onto a path carrying another.
 /// - `Ty::FatPtr` / floats / `Char` / `Set` / `Seq` / `Record` — not aggregates and not
 ///   `is_precise_stack_scalar_ty`; the translator havocs these cells.
-/// - an aggregate with a non-trackable leaf, an array longer than 256, or any type over
-///   `MAX_AGGREGATE_LEAVES` — `aggregate_leaf_count_within` declines, so the translator
-///   would model the cell opaquely and there is no binding to thread.
+/// - a composite with a non-trackable leaf, or any type over `MAX_AGGREGATE_LEAVES`
+///   (a struct DAG; an array counts its element once) — `aggregate_leaf_count_within`
+///   declines, so the translator would model the cell opaquely and there is no binding
+///   to thread.
+///
+/// An array cell of ANY length is promotable here: its binding is one SMT-array column
+/// per element leaf (`ArrayValue`), so nothing about it is sized by the length. The
+/// proof-authority lanes that consult this predicate (lane 2,
+/// `promoted_cell_alloca_reject`; lane 4, `borrowed_block_local_cell_is_admissible`)
+/// admit such a cell on the same argument as any other promoted or borrowed cell,
+/// whatever its length (decision TMC-2, `docs/DECISION_QUEUE.md`).
 fn promotable_cell_ty(module: &Module, ty: &Ty) -> bool {
-    is_precise_stack_scalar_ty(ty) || aggregate_field_tys_of(module, ty).is_some()
+    is_precise_stack_scalar_ty(ty) || is_composite_value_ty(module, ty)
 }
 
 /// `true` iff `alloca_result` is used ONLY as the `ptr` operand of `Load`/`Store` —
@@ -5404,7 +9500,8 @@ fn promotable_cell_ty(module: &Module, ty: &Ty) -> bool {
 /// step 2 disqualifies exactly that mismatch (lines ~799-814); this pair reproduces the
 /// full disqualification.
 /// How an alloca's address — and every pointer DERIVED from it by `GEP`/`Borrow`/
-/// `BorrowMut` — is used across the function.
+/// `BorrowMut`, or by a thin-pointer `Copy` ([`transparent_pointer_alias`]) — is used
+/// across the function.
 ///
 /// This is the provenance-aware refinement of [`stack_alloca_pointer_is_non_escaping`],
 /// which is deliberately left BYTE-IDENTICAL: the driver's proof-authority gate
@@ -5471,8 +9568,55 @@ fn promote_cell_borrows() -> bool {
     *ON.get_or_init(|| std::env::var_os("TRUST_PROMOTE_CELL_BORROWS").is_some())
 }
 
+/// The pointer value `inst` binds its single result to UNCHANGED, when `inst` is a
+/// transparent alias of one: `ptr` for `Borrow`/`BorrowMut`, `operand` for a `Copy`
+/// at a THIN pointer type (`Ptr`, `Ref`, `RefMut`, `PtrConst`, `PtrMut`).
+///
+/// WHY `Copy` IS HERE. A Rust producer spells every reference it creates as the
+/// place's address value or a `Copy` of it, never as a permission instruction
+/// (trust-ir `docs/SPEC_RATIFICATIONS.md`, "A Rust reference carries no permission
+/// instruction"): the MIR bridge's thin `&place` / `&mut place` is a `Copy` at `Ptr`
+/// carrying its `SharedBorrow` / `UniqueBorrow` claim, as its fat reborrow already
+/// was. The translator gives both spellings the same value (the operand's resolved
+/// address), so every analysis that follows a borrow as an alias must follow the
+/// `Copy` the same way, or a Copy-spelled reference costs the precision a
+/// Borrow-spelled one had. The claim is not consulted: it has no operational
+/// meaning, and an unclaimed thin-pointer `Copy` (`&raw const place`) is the same
+/// alias.
+///
+/// THE SOUNDNESS CONDITION, stated rather than assumed: an analysis that admits an
+/// alias through this predicate tracks the alias RESULT's own uses exactly as it
+/// tracks the referent's. A call argument, a store of the alias as a VALUE, a block
+/// argument, a `Select` operand or any use the analysis does not enumerate is an
+/// escape of the referent. `copy_alias_into_a_call_invalidates_the_cell` is the
+/// dual that fails if a caller breaks this.
+///
+/// No permission transition is implied: a `Copy` never touches the permission
+/// machine (trust-ir Lean `stepInst_copy_preserves_memory_and_permissions`), so
+/// the borrowed-cell lane joins a `Copy` to its alias set without one.
+///
+/// A `Copy` at a FAT pointer type carries metadata a thin address does not, and a
+/// `Copy` at any other type is not a pointer: both answer `None`, so every caller
+/// keeps its fail-closed default for them.
+pub(crate) fn transparent_pointer_alias(inst: &Inst) -> Option<ValueId> {
+    match inst {
+        Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => Some(*ptr),
+        Inst::Copy { ty, operand } if is_transparent_alias_pointer_ty(ty) => Some(*operand),
+        _ => None,
+    }
+}
+
+/// The thin pointer types at which a `Copy` is a [`transparent_pointer_alias`]. A
+/// reference-counted `Rc` is a thin word too, but no Rust producer spells a
+/// reference at it, so it keeps its historical (escape) reading here.
+fn is_transparent_alias_pointer_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Ptr | Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_))
+}
+
 /// Whether `inst` is a TRANSPARENT BORROW of promotion candidate `cell` which the
 /// translator models exactly and whose derived pointers all stay inside the model.
+/// A thin-pointer `Copy` of the cell is the same borrow in the Rust producers'
+/// spelling ([`transparent_pointer_alias`]).
 ///
 /// SPLIT OUT FROM THE STEP-2 ARM ON PURPOSE. [`promote_cell_borrows`] is a
 /// process-global `OnceLock`, so a test cannot toggle the flag in-process; a
@@ -5482,10 +9626,8 @@ fn promote_cell_borrows() -> bool {
 ///
 /// The escape classification is the load-bearing half — see the call site.
 fn borrow_use_is_transparently_promotable(func: &Function, inst: &Inst, cell: ValueId) -> bool {
-    matches!(
-        inst,
-        Inst::Borrow { ptr } | Inst::BorrowMut { ptr } if ptr.index() == cell.index()
-    ) && stack_alloca_escape_classification(func, cell) != StackCellEscape::Unbounded
+    transparent_pointer_alias(inst).is_some_and(|referent| referent.index() == cell.index())
+        && stack_alloca_escape_classification(func, cell) != StackCellEscape::Unbounded
 }
 
 /// Classify how `alloca_result` and its derived interior pointers escape.
@@ -5511,7 +9653,7 @@ fn borrow_use_is_transparently_promotable(func: &Function, inst: &Inst, cell: Va
 /// Anything not positively recognized is [`StackCellEscape::Unbounded`]: this fails
 /// closed, matching the conservative-`true` contract of `collect_inst_value_uses`. Note
 /// the failure mode for an UNMODELLED DERIVATION is also closed rather than open: if some
-/// instruction outside the {GEP, Borrow, BorrowMut} closure produces a new pointer from
+/// instruction outside the {GEP, Borrow, BorrowMut, thin-pointer Copy} closure produces a new pointer from
 /// one of ours, that instruction still USES a derived pointer, so it lands on the `_` arm
 /// and the whole cell becomes `Unbounded`. A derivation we do not understand costs
 /// precision, never soundness.
@@ -5527,9 +9669,32 @@ pub(crate) fn stack_alloca_escape_classification(
     func: &Function,
     alloca_result: ValueId,
 ) -> StackCellEscape {
-    // Fixpoint over GEP/Borrow derivations. The IR is SSA, but a derivation may be
-    // written before the block that defines its base is visited, so iterate to
-    // stability rather than assuming a single ordered pass suffices.
+    stack_alloca_escape_classification_with(func, alloca_result, BulkMemoryUse::Escapes)
+}
+
+/// How [`stack_alloca_escape_classification_with`] counts a cell address in the
+/// `dst`/`src` position of a bulk `MemCopy`/`MemSet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkMemoryUse {
+    /// An escape (`Unbounded`): the classification the proof-authority gate and
+    /// the promotion analysis use, unchanged.
+    Escapes,
+    /// A tracked access, like a `Load`/`Store` `ptr`: the CHC translator's own
+    /// cell decision, whose bulk arm writes the cell exactly or havocs it.
+    Tracked,
+}
+
+/// [`stack_alloca_escape_classification`], choosing how a bulk-memory pointer
+/// operand counts. Its byte count and fill byte are values in either mode.
+pub(crate) fn stack_alloca_escape_classification_with(
+    func: &Function,
+    alloca_result: ValueId,
+    bulk: BulkMemoryUse,
+) -> StackCellEscape {
+    // Fixpoint over GEP/Borrow derivations (a thin-pointer `Copy` is a borrow in the
+    // Rust producers' spelling: `transparent_pointer_alias`). The IR is SSA, but a
+    // derivation may be written before the block that defines its base is visited,
+    // so iterate to stability rather than assuming a single ordered pass suffices.
     let mut derived: BTreeSet<ValueId> = BTreeSet::new();
     derived.insert(alloca_result);
     loop {
@@ -5538,8 +9703,10 @@ pub(crate) fn stack_alloca_escape_classification(
             for node in &block.body {
                 let base = match &node.inst {
                     Inst::GEP { base, .. } => *base,
-                    Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => *ptr,
-                    _ => continue,
+                    inst => match transparent_pointer_alias(inst) {
+                        Some(referent) => referent,
+                        None => continue,
+                    },
                 };
                 if !derived.contains(&base) {
                     continue;
@@ -5582,6 +9749,11 @@ pub(crate) fn stack_alloca_escape_classification(
                 | Inst::Borrow { .. }
                 | Inst::BorrowMut { .. }
                 | Inst::EndBorrow { .. } => {}
+                // A thin-pointer `Copy` is a derivation exactly like a borrow: its
+                // result joined `derived` above, so its own uses are classified by
+                // this same loop. A `Copy` at any other type is not an alias and
+                // falls to the fail-closed `_` arm.
+                inst @ Inst::Copy { .. } if transparent_pointer_alias(inst).is_some() => {}
                 // `ptr` is tracked; a derived pointer in the VALUE position puts the
                 // address INTO memory, where no invalidation point exists.
                 Inst::Store { value, .. } | Inst::AtomicStore { value, .. } => {
@@ -5593,6 +9765,18 @@ pub(crate) fn stack_alloca_escape_classification(
                 // pointer use we model.
                 Inst::GEP { indices, .. } => {
                     if indices.iter().any(|i| derived.contains(i)) {
+                        return StackCellEscape::Unbounded;
+                    }
+                }
+                // `dst`/`src` are read and written THROUGH, like a `Load`/`Store`
+                // `ptr`; a derived pointer as the byte count or fill byte is a value.
+                Inst::MemCopy { bytes, .. } if bulk == BulkMemoryUse::Tracked => {
+                    if derived.contains(bytes) {
+                        return StackCellEscape::Unbounded;
+                    }
+                }
+                Inst::MemSet { byte, bytes, .. } if bulk == BulkMemoryUse::Tracked => {
+                    if derived.contains(byte) || derived.contains(bytes) {
                         return StackCellEscape::Unbounded;
                     }
                 }
@@ -5664,6 +9848,49 @@ pub fn stack_alloca_pointer_is_non_escaping(func: &Function, alloca_result: Valu
 /// mismatched-type Load alone is sound (it havocs), but is rejected here too to mirror
 /// step 2 exactly — harmless, since the admissible whole-aggregate return slot reads and
 /// writes a single consistent type.
+/// Is `slot`'s address used ONLY as the `ptr` operand of a non-volatile
+/// `Load`/`Store` in `func`? — the admission gate for the call-summary
+/// interpreter's path-local stack cells.
+///
+/// This is STRICTLY STRONGER than [`StackCellEscape::Contained`], which also
+/// admits `GEP`/`Borrow`/`BorrowMut` derivations because `translate_block` carries
+/// a whole interior-pointer provenance model for them. The summary interpreter
+/// carries none: it keys a cell by the alloca's own SSA id, so a write through a
+/// DERIVED pointer would be invisible to it and the following read would return
+/// the pre-store value — a fabricated fact, i.e. a false proof. Refusing every
+/// derivation is what makes the id-keyed model exact rather than optimistic.
+///
+/// Fail-closed in both directions: an instruction whose operands
+/// `collect_inst_value_uses` cannot statically enumerate is treated as possibly
+/// taking the address, and a `Store` that carries the address as its *value*
+/// (rather than its `ptr`) is a leak like any other.
+fn call_summary_slot_is_directly_addressed(func: &Function, slot: ValueId) -> bool {
+    for block in &func.blocks {
+        for node in &block.body {
+            // The defining `Alloca` mentions the slot only as its own result.
+            if matches!(&node.inst, Inst::Alloca { .. }) && node.results.contains(&slot) {
+                continue;
+            }
+            let addressed_only_as_access_ptr = match &node.inst {
+                Inst::Load { ptr, volatile: false, .. } => *ptr == slot,
+                Inst::Store { ptr, value, volatile: false, .. } => *ptr == slot && *value != slot,
+                _ => false,
+            };
+            if addressed_only_as_access_ptr {
+                continue;
+            }
+            let mut uses = Vec::new();
+            // `true` means this instruction's operands are NOT statically
+            // enumerable, so it may read anything in scope — including the slot
+            // address. Refuse the slot rather than guess.
+            if collect_inst_value_uses(&node.inst, &mut uses) || uses.contains(&slot) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn stack_alloca_cell_accesses_match_type(
     func: &Function,
     alloca_result: ValueId,
@@ -5805,13 +10032,9 @@ fn compute_promotable_cells_of(
                                 // and the threaded value has no structure to keep in step —
                                 // `promotion_widens_only_on_trackable_aggregate_cells` pins
                                 // exactly that, and caught this arm admitting an `i64`.
-                                let projectable_aggregate = candidate_ty
-                                    .get(&used.index())
-                                    .is_some_and(|ty| {
-                                        matches!(
-                                            ty,
-                                            Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _)
-                                        )
+                                let projectable_aggregate =
+                                    candidate_ty.get(&used.index()).is_some_and(|ty| {
+                                        matches!(ty, Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _))
                                     });
                                 let def_block_local_projection = promote_def_block_projections()
                                     && projectable_aggregate
@@ -6018,7 +10241,6 @@ fn promoted_cell_alloca_reject(
             module, function, result, ty,
         )));
     }
-
     // No unmodeled access qualifier anywhere on this cell.
     for block in &function.blocks {
         for node in &block.body {
@@ -6137,7 +10359,6 @@ fn promoted_cell_alloca_is_admissible_reference(
     if !promoted.iter().any(|(cell, cell_ty)| cell.index() == result && cell_ty == ty) {
         return false;
     }
-
     for block in &function.blocks {
         for node in &block.body {
             match &node.inst {
@@ -6435,30 +10656,64 @@ fn promoted_cell_block_transfer(block: &Block, cell: u32, mut state: bool) -> (b
 pub enum BlockLocalAllocaReject {
     /// The pointee is neither a precise stack scalar nor a (possibly opaque)
     /// aggregate — e.g. a fat pointer or a bare `Ty::Ptr`.
-    PointeeNotScalarOrAggregate { ty: String },
+    PointeeNotScalarOrAggregate {
+        ty: String,
+    },
     /// No `Alloca { count: None, align: None, ty: <exactly this ty> }` in the
     /// function defines this value.
     NoExactDefiningAlloca,
     /// A `Load` through the cell pointer outside the defining block. This is
     /// the clause a cross-block escape analysis would have to replace.
-    LoadInOtherBlock { block: u32, definition_block: u32 },
+    LoadInOtherBlock {
+        block: u32,
+        definition_block: u32,
+    },
     /// A `Load` in the defining block not preceded there by a `Store`.
-    LoadBeforeStore { block: u32 },
-    LoadVolatile { block: u32 },
-    LoadAligned { block: u32 },
-    LoadTypeMismatch { block: u32, access_ty: String, cell_ty: String },
-    StoreInOtherBlock { block: u32, definition_block: u32 },
-    StoreVolatile { block: u32 },
-    StoreAligned { block: u32 },
-    StoreTypeMismatch { block: u32, access_ty: String, cell_ty: String },
+    LoadBeforeStore {
+        block: u32,
+    },
+    LoadVolatile {
+        block: u32,
+    },
+    LoadAligned {
+        block: u32,
+    },
+    LoadTypeMismatch {
+        block: u32,
+        access_ty: String,
+        cell_ty: String,
+    },
+    StoreInOtherBlock {
+        block: u32,
+        definition_block: u32,
+    },
+    StoreVolatile {
+        block: u32,
+    },
+    StoreAligned {
+        block: u32,
+    },
+    StoreTypeMismatch {
+        block: u32,
+        access_ty: String,
+        cell_ty: String,
+    },
     /// The cell POINTER itself is the stored value — it escaped into memory.
-    PointerStoredAsValue { block: u32 },
+    PointerStoredAsValue {
+        block: u32,
+    },
     /// An instruction whose operands `collect_inst_value_uses` does not
     /// enumerate appears anywhere in the function; it could read any pointer.
-    OpaqueInstruction { block: u32, inst: String },
+    OpaqueInstruction {
+        block: u32,
+        inst: String,
+    },
     /// The cell pointer is an operand of some instruction other than a direct
     /// `Load`/`Store` through it (a `GEP` base, a `Call` argument, a `Borrow`).
-    PointerUsedByInstruction { block: u32, inst: String },
+    PointerUsedByInstruction {
+        block: u32,
+        inst: String,
+    },
 }
 
 impl BlockLocalAllocaReject {
@@ -6532,11 +10787,21 @@ pub enum PromotionBlocker {
     /// `array`/`closure`/`unit` cell no longer lands here. What still does:
     /// `enum` (no per-variant leaf model), fat pointers, floats, `char`, and any
     /// aggregate with a non-trackable leaf or over `MAX_AGGREGATE_LEAVES`.
-    PointeeNotPreciseScalar { ty: String },
-    AccessTypeMismatch { access: &'static str, access_ty: String, cell_ty: String },
+    PointeeNotPreciseScalar {
+        ty: String,
+    },
+    AccessTypeMismatch {
+        access: &'static str,
+        access_ty: String,
+        cell_ty: String,
+    },
     PointerStoredAsValue,
-    OpaqueInstruction { inst: String },
-    PointerUsedByInstruction { inst: String },
+    OpaqueInstruction {
+        inst: String,
+    },
+    PointerUsedByInstruction {
+        inst: String,
+    },
     /// The mirror found no blocker although the authority says not promoted —
     /// report it rather than guessing.
     Unclassified,
@@ -6629,17 +10894,16 @@ impl std::fmt::Display for SingleCellAllocaRejection {
 /// cannot drift as `Inst` grows variants. Reject path only.
 fn inst_variant_name(inst: &Inst) -> String {
     let rendered = format!("{inst:?}");
-    let end = rendered
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .unwrap_or(rendered.len());
+    let end =
+        rendered.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rendered.len());
     rendered[..end].to_string()
 }
 
 /// Whether proof-grade native ingestion may admit a metadata-less, single-cell
 /// `Alloca` without importing source authority.
 ///
-/// This deliberately mirrors the CHC translator's tracked-versus-opaque split,
-/// which has TWO exact lanes. The first (below) is the per-block `stack_cells`
+/// This deliberately mirrors the CHC translator's tracked-versus-opaque split.
+/// The first lane (below) is the per-block `stack_cells`
 /// lane: a precise scalar or trackable aggregate is admitted when its pointer is
 /// used exclusively in its defining block as the direct operand of same-type,
 /// non-volatile loads and stores with no caller-asserted alignment, and every
@@ -6657,6 +10921,13 @@ fn inst_variant_name(inst: &Inst) -> String {
 /// exactly ACROSS blocks. Neither lane subsumes the other: the block-local one also
 /// covers cells the translator models OPAQUELY (enums, fat pointers, over-budget
 /// aggregates — never promoted), the promoted one also covers cross-block cells.
+/// A third lane admits direct opaque fat-pointer slots across blocks after
+/// MUST initialization analysis; each load remains fresh havoc. A fourth lane
+/// admits initialized whole-cell Borrow/BorrowMut aliases whose
+/// complete use set remains within the defining block; it independently checks
+/// initialization, access types and permission transitions for every alias.
+/// The caller must first validate the full module's SSA definitions, dominance,
+/// types and CFG, as the native proof-authority gate does.
 pub fn single_cell_alloca_is_admissible(
     module: &Module,
     function: &Function,
@@ -6667,12 +10938,12 @@ pub fn single_cell_alloca_is_admissible(
 }
 
 /// The reason form of [`single_cell_alloca_is_admissible`]: `None` iff the cell
-/// is admitted, otherwise BOTH lanes' first blocking condition.
+/// is admitted, otherwise the direct and promoted lanes' first blocking condition.
 ///
 /// This is the sole implementation — the boolean above is defined as
 /// `.is_none()` — so a verdict cannot differ between the measured and unmeasured
-/// paths. The `?` keeps the original `||` short-circuit exactly: lane 2 runs only
-/// when lane 1 declined.
+/// paths. Each later lane runs only after the earlier lanes declined; the
+/// borrowed-cell lane adds no diagnostic authority to the rejection reasons.
 pub fn single_cell_alloca_rejection(
     module: &Module,
     function: &Function,
@@ -6681,7 +10952,452 @@ pub fn single_cell_alloca_rejection(
 ) -> Option<SingleCellAllocaRejection> {
     let block_local = block_local_alloca_reject(function, alloca_result, ty)?;
     let promoted = promoted_cell_alloca_reject(module, function, alloca_result, ty)?;
+    if opaque_fat_pointer_cell_is_admissible(module, function, alloca_result, ty) {
+        return None;
+    }
+    if borrowed_block_local_cell_is_admissible(module, function, alloca_result, ty) {
+        return None;
+    }
     Some(SingleCellAllocaRejection { block_local, promoted })
+}
+
+/// A directly addressed fat-pointer slot needs no value promotion: the CHC
+/// translator retains its owned-stack identity across blocks and every opaque
+/// load is fresh havoc. Access safety still requires a real allocation, exact
+/// whole-cell access types and definite initialization on every CFG path.
+/// No address derivation, escape, volatile access or alignment claim is admitted.
+fn opaque_fat_pointer_cell_is_admissible(
+    module: &Module,
+    function: &Function,
+    cell: ValueId,
+    ty: &Ty,
+) -> bool {
+    if !matches!(ty, Ty::FatPtr(_)) || !stack_cell_is_translator_opaque(module, ty) {
+        return false;
+    }
+    let mut defined = false;
+    for block in &function.blocks {
+        for node in &block.body {
+            if node.results.contains(&cell) {
+                if defined
+                    || !matches!(&node.inst, Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty)
+                {
+                    return false;
+                }
+                defined = true;
+            }
+            let mut uses = Vec::new();
+            if collect_inst_value_uses(&node.inst, &mut uses) {
+                return false;
+            }
+            if !uses.contains(&cell) {
+                continue;
+            }
+            match &node.inst {
+                Inst::Load { ty: access_ty, ptr, volatile: false, align: None }
+                    if *ptr == cell && access_ty == ty => {}
+                Inst::Store { ty: access_ty, ptr, value, volatile: false, align: None }
+                    if *ptr == cell && access_ty == ty && *value != cell => {}
+                _ => return false,
+            }
+        }
+    }
+    defined && promoted_cell_is_definitely_initialized(function, cell.index())
+}
+
+/// Initialized whole-cell borrows that stay within the defining block. This
+/// lane uses the translator's provenance-aware whole-cell loads and stores; it
+/// does not rely on root-id-only definite initialization or alias promotion.
+/// Every borrow follows a real exact-type store, and every derived address is
+/// used only for another borrow or an unqualified exact-type load/store.
+/// Permission transitions are checked independently of value initialization:
+/// shared borrows may be repeated but forbid later writes, while a mutable
+/// borrow is unique and cannot be reborrowed in this lane. EndBorrow is excluded.
+/// A thin-pointer `Copy` of an alias (the Rust producers' spelling of a
+/// reference, [`transparent_pointer_alias`]) is an alias with no permission
+/// transition. Calls, GEPs, pointer escape and cross-block uses remain outside
+/// this lane.
+fn borrowed_block_local_cell_is_admissible(
+    module: &Module,
+    function: &Function,
+    cell: ValueId,
+    ty: &Ty,
+) -> bool {
+    // An array cell of any length is tracked in constant size (`promotable_cell_ty`),
+    // so its length never decides this lane (decision TMC-2).
+    if !promotable_cell_ty(module, ty) {
+        return false;
+    }
+    let mut definitions = function.blocks.iter().filter(|block| {
+        block.body.iter().any(|node| {
+            node.results.contains(&cell)
+                && matches!(&node.inst, Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty)
+        })
+    });
+    let Some(definition) = definitions.next() else {
+        return false;
+    };
+    if definitions.next().is_some() {
+        return false;
+    }
+
+    enum Permission {
+        Owned,
+        Shared,
+        Mutable,
+    }
+    let mut aliases = BTreeSet::from([cell]);
+    let mut defined = false;
+    let mut initialized = false;
+    let mut permission = Permission::Owned;
+    for node in &definition.body {
+        if node.results.contains(&cell) {
+            if defined
+                || !matches!(&node.inst, Inst::Alloca { ty: cell_ty, count: None, align: None } if cell_ty == ty)
+            {
+                return false;
+            }
+            defined = true;
+            continue;
+        }
+        let mut uses = Vec::new();
+        if collect_inst_value_uses(&node.inst, &mut uses) {
+            return false;
+        }
+        if !uses.iter().any(|value| aliases.contains(value)) {
+            continue;
+        }
+        if !defined {
+            return false;
+        }
+        match &node.inst {
+            Inst::Borrow { ptr } | Inst::BorrowMut { ptr }
+                if aliases.contains(ptr) && initialized && node.results.len() == 1 =>
+            {
+                // TrustIR's permission semantics permit Owned -> Mutable and
+                // Owned/Shared -> Shared only. Value aliasing alone cannot
+                // justify a second mutable borrow, or a shared reborrow of it.
+                if matches!(node.inst, Inst::BorrowMut { .. }) {
+                    if !matches!(permission, Permission::Owned) {
+                        return false;
+                    }
+                    permission = Permission::Mutable;
+                } else {
+                    if matches!(permission, Permission::Mutable) {
+                        return false;
+                    }
+                    permission = Permission::Shared;
+                }
+                if !aliases.insert(node.results[0]) {
+                    return false;
+                }
+            }
+            // A thin-pointer `Copy` of an alias is the Rust producers' spelling of a
+            // reference (`transparent_pointer_alias`). It joins the alias set with NO
+            // permission transition: a `Copy` never touches the permission machine,
+            // so it neither takes nor conflicts with a borrow. The cell stays exactly
+            // modeled because every alias use is still one of this lane's three
+            // forms, all in this block; the soundness dual is
+            // `copy_alias_into_a_call_invalidates_the_cell`.
+            inst @ Inst::Copy { operand, .. }
+                if transparent_pointer_alias(inst).is_some()
+                    && aliases.contains(operand)
+                    && initialized
+                    && node.results.len() == 1 =>
+            {
+                if !aliases.insert(node.results[0]) {
+                    return false;
+                }
+            }
+            Inst::Load { ty: access_ty, ptr, volatile: false, align: None }
+                if aliases.contains(ptr) && access_ty == ty && initialized => {}
+            Inst::Store { ty: access_ty, ptr, value, volatile: false, align: None }
+                if aliases.contains(ptr)
+                    && access_ty == ty
+                    && !aliases.contains(value)
+                    && !matches!(permission, Permission::Shared) =>
+            {
+                initialized = true;
+            }
+            _ => return false,
+        }
+    }
+    // Scan after collecting the whole local alias set, so block storage order
+    // cannot hide an alias use in an earlier-listed successor or predecessor.
+    for block in &function.blocks {
+        if block.id == definition.id {
+            continue;
+        }
+        for node in &block.body {
+            let mut uses = Vec::new();
+            if collect_inst_value_uses(&node.inst, &mut uses)
+                || uses.iter().any(|value| aliases.contains(value))
+            {
+                return false;
+            }
+        }
+    }
+    // The lane is for a cell reached through at least one ALIAS (a borrow, or a
+    // Copy-spelled reference). Before Copy-spelled references this read "not
+    // `Owned`", which is the same condition while every alias was a borrow.
+    defined && aliases.len() > 1
+}
+
+/// Whether a borrow operand belongs to an initialized, block-local whole-cell
+/// alias family that the CHC translator models exactly. Native proof admission
+/// uses this same structural check for the Borrow/BorrowMut instruction as for
+/// its Alloca; no public validity annotation or rollout flag supplies a fact.
+pub fn initialized_local_borrow_is_admissible(
+    module: &Module,
+    function: &Function,
+    operand: ValueId,
+) -> bool {
+    let mut current = operand;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        let mut definitions = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.body)
+            .filter(|node| node.results.contains(&current));
+        let Some(definition) = definitions.next() else {
+            return false;
+        };
+        if definitions.next().is_some() {
+            return false;
+        }
+        match &definition.inst {
+            Inst::Alloca { ty, .. } => {
+                return borrowed_block_local_cell_is_admissible(module, function, current, ty);
+            }
+            // A borrow, or a Copy-spelled reference (`transparent_pointer_alias`).
+            inst => match transparent_pointer_alias(inst) {
+                Some(referent) => current = referent,
+                None => return false,
+            },
+        }
+    }
+    false
+}
+
+/// Why the native proof-authority gate refuses one `ExtractElement`, or a `Call` that
+/// would fold one into its caller (decision TMC-1, `docs/DECISION_QUEUE.md`).
+/// Produced only by [`ProofGradeElementReads::rejection`] and
+/// [`ProofGradeElementReads::call_rejection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractElementReject {
+    /// The array operand has no declared type in its function (no block parameter or
+    /// typed instruction result defines it), so the read has no length to state its
+    /// bounds obligation with.
+    UntypedArray,
+    /// The array operand's declared type is not a non-empty fixed-size array whose
+    /// element the SMT-array model tracks: a SIMD vector or a sequence (the translator
+    /// reads either as a fresh value, not a `select` of modeled lanes), an empty
+    /// array, or an array whose element is not trackable (`composite_shape_of`, which
+    /// still bounds an element's leaf count by `MAX_AGGREGATE_LEAVES` and its nesting
+    /// by `AGGREGATE_LEAF_WALK_DEPTH` until the datatype-sort work retires them).
+    NotAnSmtArray { ty: Ty },
+    /// The result type is not exactly the array's element type. trust-ir's validator
+    /// lets a refinement stand on either side (`decided_by_the_consumption_rule`), but
+    /// the translator reads such a mismatch as a fresh value, not a `select`.
+    ElementTypeMismatch { element: Ty, result: Ty },
+    /// The index operand's declared type is not an integer type, so which lane its
+    /// bits name is not known (the translator's `UnmodeledElementIndex`).
+    UnmodeledIndex,
+    /// The read is in a block that a cycle of the CFG reaches, where the translator
+    /// carries every array SHAPE-ONLY (its length, not its lanes; see `ArrayValue`):
+    /// the read would be a fresh value, not a `select` of the modeled lanes.
+    ShapeOnlyArray,
+    /// A `Call`, in a block a cycle of the CFG reaches, of a callee whose summarized
+    /// body reads an array element (`ElementReadingFunctions`). The caller folds the
+    /// callee's body into the call's block (`try_direct_call_summary`), where it
+    /// carries every array shape-only, so the callee's read would be a fresh value,
+    /// not a `select` of modeled lanes: the `ShapeOnlyArray` refusal, at the call
+    /// site that places the read there.
+    ShapeOnlyArrayInCallee { callee: String },
+}
+
+impl ExtractElementReject {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::UntypedArray => "untyped_array",
+            Self::NotAnSmtArray { .. } => "not_an_smt_array",
+            Self::ElementTypeMismatch { .. } => "element_type_mismatch",
+            Self::UnmodeledIndex => "unmodeled_index",
+            Self::ShapeOnlyArray => "shape_only_array",
+            Self::ShapeOnlyArrayInCallee { .. } => "shape_only_array_in_callee",
+        }
+    }
+}
+
+impl std::fmt::Display for ExtractElementReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnSmtArray { ty } => write!(f, "{}(ty={ty})", self.kind()),
+            Self::ElementTypeMismatch { element, result } => {
+                write!(f, "{}(element={element}, result={result})", self.kind())
+            }
+            Self::ShapeOnlyArrayInCallee { callee } => {
+                write!(f, "{}(callee=`{callee}`)", self.kind())
+            }
+            other => write!(f, "{}", other.kind()),
+        }
+    }
+}
+
+/// The functions of a module whose SUMMARIZED body can read an array element
+/// (decision TMC-1): every function with an `ExtractElement`, and every function
+/// that reaches one through direct `Call` edges — the edges
+/// `try_direct_call_summary` follows when it folds a nested callee into the same
+/// call site. Built once per module: one pass over every instruction to collect the
+/// readers and the reverse call edges, then one worklist sweep up those edges, so
+/// the cost is linear in the module's size (log-factor maps) whatever the shape of
+/// its call graph, cycles included.
+#[derive(Debug, Clone)]
+pub struct ElementReadingFunctions {
+    reading: BTreeSet<FuncId>,
+}
+
+impl ElementReadingFunctions {
+    pub fn new(module: &Module) -> Self {
+        let mut reading: BTreeSet<FuncId> = BTreeSet::new();
+        let mut callers: BTreeMap<FuncId, Vec<FuncId>> = BTreeMap::new();
+        for function in &module.functions {
+            for node in function.blocks.iter().flat_map(|block| block.body.iter()) {
+                match &node.inst {
+                    Inst::ExtractElement { .. } => {
+                        reading.insert(function.id);
+                    }
+                    Inst::Call { callee, .. } => {
+                        callers.entry(*callee).or_default().push(function.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut frontier: Vec<FuncId> = reading.iter().copied().collect();
+        while let Some(callee) = frontier.pop() {
+            for caller in callers.get(&callee).into_iter().flatten() {
+                if reading.insert(*caller) {
+                    frontier.push(*caller);
+                }
+            }
+        }
+        Self { reading }
+    }
+
+    /// Whether `function`'s summarized body can read an array element.
+    pub fn reads(&self, function: FuncId) -> bool {
+        self.reading.contains(&function)
+    }
+}
+
+/// The native proof-authority gate's view of the array element READS of one
+/// function (decision TMC-1): the translator's own `element_operand_tys` and
+/// `array_content_blocks`, each one linear pass over the function, computed once
+/// per function, and each distinct array type's shape decided once — so gating
+/// every read of a function is linear in its size, never a re-walk per read.
+///
+/// An `ExtractElement { ty, array, index }` in block `block` is admitted exactly
+/// when
+///
+/// 1. `array`'s DECLARED type is a non-empty fixed-size array the value model
+///    tracks (`composite_shape_of` is `CompositeShape::Array`);
+/// 2. `ty` is exactly that array's element type;
+/// 3. `index`'s declared type is an integer type; and
+/// 4. `block` is one where array content is modeled: no cycle of the CFG reaches
+///    it (`array_content_blocks`).
+///
+/// Those are the reads `ChcFuncTranslator::translate_extract_element` models as
+/// the exact `select(lanes, index)` — the lanes of the operand's binding in the
+/// block or, for an operand with none, fresh lanes of its declared type recorded
+/// so every read of it agrees — under the access's OWN in-bounds obligation
+/// (`discharge_element_bounds`): with memory checks on, as the proof-grade lane
+/// requires, an error rule where the index is out of bounds as its declared
+/// signedness reads it (`array_lane_access`, trust-ir `runtime_index`), after which
+/// the block's path continues only in bounds. The same read inside a callee that a
+/// caller summarizes carries the same obligation and reads the same `select`
+/// (`try_direct_call_summary`'s `ExtractElement` arm) wherever the call's block
+/// models array content; a call in a block a cycle reaches, of a callee that reads
+/// an element, is refused at the call ([`Self::call_rejection`]). Every other read
+/// fails closed at the gate: a vector or sequence read is a fresh value, an index
+/// of unknown signedness is `UnmodeledElementIndex`, and a read in a block a cycle
+/// reaches is a fresh value of a shape-only array.
+///
+/// The caller must first validate the full module, as the gate does.
+#[derive(Debug, Clone)]
+pub struct ProofGradeElementReads<'m> {
+    module: &'m Module,
+    operand_tys: BTreeMap<ValueId, Ty>,
+    content_blocks: BTreeSet<BlockId>,
+    /// Each array operand type's element type when it is an SMT-modeled array, else
+    /// `None`; filled on the type's first read, so `composite_shape_of` runs once
+    /// per distinct type, never once per read.
+    element_tys: std::collections::HashMap<Ty, Option<Ty>>,
+}
+
+impl<'m> ProofGradeElementReads<'m> {
+    /// The view of `function`'s element reads, from the translator's own analyses.
+    pub fn new(module: &'m Module, function: &Function) -> Self {
+        Self {
+            module,
+            operand_tys: element_operand_tys(function, module),
+            content_blocks: array_content_blocks(function),
+            element_tys: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Why the gate refuses `ExtractElement { ty: result_ty, array, index }` in
+    /// `block`, or `None` when it is admitted (see the type's documentation).
+    pub fn rejection(
+        &mut self,
+        block: BlockId,
+        result_ty: &Ty,
+        array: ValueId,
+        index: ValueId,
+    ) -> Option<ExtractElementReject> {
+        let Some(array_ty) = self.operand_tys.get(&array) else {
+            return Some(ExtractElementReject::UntypedArray);
+        };
+        let module = self.module;
+        let element = self.element_tys.entry(array_ty.clone()).or_insert_with(|| {
+            match composite_shape_of(module, array_ty) {
+                Some(CompositeShape::Array { elem, .. }) => Some(elem),
+                _ => None,
+            }
+        });
+        let Some(element) = element else {
+            return Some(ExtractElementReject::NotAnSmtArray { ty: array_ty.clone() });
+        };
+        if element != result_ty {
+            return Some(ExtractElementReject::ElementTypeMismatch {
+                element: element.clone(),
+                result: result_ty.clone(),
+            });
+        }
+        if !self.operand_tys.get(&index).is_some_and(Ty::is_integer) {
+            return Some(ExtractElementReject::UnmodeledIndex);
+        }
+        if !self.content_blocks.contains(&block) {
+            return Some(ExtractElementReject::ShapeOnlyArray);
+        }
+        None
+    }
+
+    /// Why the gate refuses a `Call` of `callee` in `block`, or `None` when it is
+    /// admitted as far as element reads go: refused exactly when `block` is one a
+    /// cycle of the CFG reaches and `callee`'s summarized body reads an array
+    /// element (`readers`), since the summary would read it where this function
+    /// carries arrays shape-only ([`ExtractElementReject::ShapeOnlyArrayInCallee`]).
+    pub fn call_rejection(
+        &self,
+        block: BlockId,
+        callee: &Function,
+        readers: &ElementReadingFunctions,
+    ) -> Option<ExtractElementReject> {
+        (!self.content_blocks.contains(&block) && readers.reads(callee.id))
+            .then(|| ExtractElementReject::ShapeOnlyArrayInCallee { callee: callee.name.clone() })
+    }
 }
 
 /// Lane 1 of [`single_cell_alloca_is_admissible`]: the per-block `stack_cells`
@@ -6701,7 +11417,13 @@ fn block_local_alloca_reject(
         ty,
         Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(_, _) | Ty::Unit | Ty::Closure(_) | Ty::Enum(_)
     );
-    if !is_precise_stack_scalar_ty(ty) && !aggregate {
+    // A fat pointer is also a fixed-size value that can occupy one stack slot.
+    // Its value stays opaque in the translator: every load is fresh havoc,
+    // never a fabricated data/metadata pair. Admission only establishes the
+    // slot's access safety; the exact-type, initialization, same-block and
+    // non-escape checks below remain mandatory. Pointee accesses and metadata
+    // operations retain their independent native proof-authority gates.
+    if !is_precise_stack_scalar_ty(ty) && !aggregate && !matches!(ty, Ty::FatPtr(_)) {
         return Some(BlockLocalAllocaReject::PointeeNotScalarOrAggregate { ty: ty.to_string() });
     }
 
@@ -6753,8 +11475,7 @@ fn block_local_alloca_reject(
     //
     // Read once per process, not per alloca.
     static WIDEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let widen = *WIDEN
-        .get_or_init(|| std::env::var_os("TRUST_ALLOCA_ESCAPE_GATE_WIDEN").is_some());
+    let widen = *WIDEN.get_or_init(|| std::env::var_os("TRUST_ALLOCA_ESCAPE_GATE_WIDEN").is_some());
     let escape = if widen {
         stack_alloca_escape_classification(function, alloca_result)
     } else {
@@ -6985,13 +11706,21 @@ fn immediate_aggregate_field_tys(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
         // aggregate and `r?` fails closed. An empty tuple already takes the
         // `Ty::Tuple` arm; `Ty::Unit` is the distinct variant.
         Ty::Unit => Some(Vec::new()),
-        // A fixed-size array `[T; N]` is modeled as an N-field aggregate of the
-        // element type, so it is trackable as a call-summary value (param/return)
-        // and an `ExtractElement` at a constant index projects a consistent field.
-        // Capped per-dimension; larger arrays fail closed.
-        Ty::Array(elem_id, len) if *len <= 256 => {
-            Some(vec![module.types.get(elem_id.as_usize())?.clone(); *len as usize])
-        }
+        // An EMPTY array has no lane and no data: the zero-field aggregate, like
+        // `()`. A non-empty array is NOT a field aggregate — its lanes are SMT
+        // arrays over the element's leaves (`CompositeShape::Array`), so nothing
+        // here is ever sized by its length.
+        Ty::Array(_, 0) => Some(Vec::new()),
+        // A first-class closure is an aggregate of its CAPTURES, in capture order
+        // (the `func` slot is not a field). This mirrors the interpreter
+        // (`InterpretValueKind::Closure { captures }`) and the module validator's
+        // `validate_field_access` closure arm EXACTLY, so `ExtractField`/
+        // `InsertField` on a closure env project a consistent capture symbol
+        // instead of poisoning the function's shared ERROR relation. Captures that
+        // are themselves non-trackable make the enclosing `aggregate_leaf_count_within`
+        // check fall back to opaque/fail-closed — sound, just not proved.
+        Ty::Closure(id) => Some(module.closure_type(*id)?.captures.clone()),
+        Ty::Enum(_) => dataless_enum::tag_type(module, ty).map(|tag| vec![tag]),
         _ => None,
     }
 }
@@ -7003,23 +11732,188 @@ fn immediate_aggregate_field_tys(module: &Module, ty: &Ty) -> Option<Vec<Ty>> {
 /// the running total passes `budget`, so an over-budget type costs `O(budget)` rather
 /// than `O(leaves)` and is never materialized.
 fn aggregate_leaf_count_within(module: &Module, ty: &Ty, budget: usize) -> Option<usize> {
+    aggregate_leaf_count_within_depth(module, ty, budget, AGGREGATE_LEAF_WALK_DEPTH)
+}
+
+/// Depth guard for [`aggregate_leaf_count_within`]. The leaf BUDGET alone cannot
+/// terminate the walk on a CYCLIC type table (a struct whose field chain reaches
+/// itself): in a pure cycle no scalar leaf is ever reached, so `total` never
+/// advances and the budget short-circuit never fires — measured as an unbounded
+/// `aggregate_leaf_count_within` recursion (SIGBUS stack overflow) on ny-cert's
+/// recursive arena types. Exceeding the depth answers `None` — "not a trackable
+/// aggregate" — which every caller already treats as the fail-closed
+/// opaque/havoc path; a missed promotion, never a wrong one. The cap is far
+/// above any genuine trackable nesting (the budget bounds real leaf counts long
+/// before 64 levels).
+const AGGREGATE_LEAF_WALK_DEPTH: u32 = 64;
+
+fn aggregate_leaf_count_within_depth(
+    module: &Module,
+    ty: &Ty,
+    budget: usize,
+    depth: u32,
+) -> Option<usize> {
+    // This slice admits only top-level register enum carriers. A one-field
+    // addition must not silently enable enums nested in tuples/structs/arrays.
+    if matches!(ty, Ty::Enum(_)) && depth != AGGREGATE_LEAF_WALK_DEPTH {
+        return None;
+    }
+    let depth = depth.checked_sub(1)?;
+    // Mirror `declare_relation_binding_rec`'s precedence: a part that is itself a
+    // trackable (within-budget) composite is expanded; otherwise it is one scalar
+    // leaf — but only if it is a valid scalar, else the parent is not trackable.
+    let part_leaves =
+        |part: &Ty| match aggregate_leaf_count_within_depth(module, part, budget, depth) {
+            Some(count) => Some(count),
+            None if is_scalar_field_ty(part) => Some(1),
+            None => None,
+        };
+    // A non-empty array is ONE SMT array per leaf of its element: the element's
+    // leaf count, counted once, whatever the length.
+    if let Some((elem, _len)) = nonempty_array_elem(module, ty) {
+        return part_leaves(&elem).filter(|leaves| *leaves <= budget);
+    }
     let fields = immediate_aggregate_field_tys(module, ty)?;
     let mut total = 0usize;
     for field in &fields {
-        // Mirror `declare_relation_binding_rec`'s precedence: a field that is itself a
-        // trackable (within-budget) aggregate is expanded; otherwise it is one scalar
-        // leaf — but only if it is a valid scalar, else the parent is not trackable.
-        let leaves = match aggregate_leaf_count_within(module, field, budget) {
-            Some(count) => count,
-            None if is_scalar_field_ty(field) => 1,
-            None => return None,
-        };
-        total = total.saturating_add(leaves);
+        total = total.saturating_add(part_leaves(field)?);
         if total > budget {
             return None;
         }
     }
     Some(total)
+}
+
+/// `true` iff some rule of `vc` asserts SMT equality or disequality between two
+/// ARRAY-sorted terms — the hypothesis the junk-lane invariant on `ArrayValue`
+/// forbids, because two arrays that agree on `[0, len)` may still differ on
+/// their junk lanes. Linear in the rule DAGs: a shared subterm is visited once.
+#[cfg(test)]
+pub(crate) fn vc_equates_array_terms(vc: &ChcVc) -> bool {
+    vc_equates_array_terms_beyond(vc, &BTreeSet::new(), &BTreeSet::new())
+}
+
+/// `vc_equates_array_terms` of a translation, admitting its large-block column
+/// definitions (`LargeBlockMap::columns`).
+#[cfg(test)]
+pub(crate) fn output_equates_array_terms(output: &ChcTranslationOutput) -> bool {
+    let columns = output.large_block.as_ref().map(|map| map.columns.clone()).unwrap_or_default();
+    vc_equates_array_terms_beyond(&output.vc, &BTreeSet::new(), &columns)
+}
+
+/// `vc_equates_array_terms`, admitting the DEFINITIONAL lane equalities of a flat
+/// array literal (`define_array_lanes`): `select(L, k) = e` where `L` is one of
+/// `definitional` (a fresh lane variable) and `k` a constant — each `(L, k)`
+/// defined at most once, which is what makes it definitional; a second one is
+/// reported. Also admits `c = t` with `c` one of `columns`, a large-block
+/// definitional variable (`LargeBlockMap::columns`): a fresh variable the
+/// encoding defines by ONE unconditional equality — a second equality with the
+/// same variable on its left would be a hypothesis on two array terms, and is
+/// reported. Walks every term of every rule: body constraints, the body
+/// relation's arguments and the head's arguments.
+pub(crate) fn vc_equates_array_terms_beyond(
+    vc: &ChcVc,
+    definitional: &BTreeSet<String>,
+    columns: &BTreeSet<String>,
+) -> bool {
+    let mut seen: BTreeSet<*const ay_bindings::ExprValue> = BTreeSet::new();
+    let mut defined: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut defined_columns: BTreeSet<&str> = BTreeSet::new();
+    let mut stack: Vec<&Expr> = Vec::new();
+    for rule in &vc.rules {
+        stack.extend(rule.body.constraints.iter());
+        if let Some(app) = &rule.body.relation {
+            stack.extend(app.args.iter());
+        }
+        stack.extend(rule.head.args.iter());
+    }
+    while let Some(expr) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.value())) {
+            continue;
+        }
+        match expr.value() {
+            ay_bindings::ExprValue::Eq(left, right)
+                if left.sort().is_array()
+                    && matches!(left.value(), ay_bindings::ExprValue::Var { name } if columns.contains(name)) =>
+            {
+                // A large-block definition: once per variable; walk only the
+                // defining term.
+                if let ay_bindings::ExprValue::Var { name } = left.value()
+                    && !defined_columns.insert(name.as_ref())
+                {
+                    return true;
+                }
+                stack.push(right);
+                continue;
+            }
+            ay_bindings::ExprValue::Eq(left, _) if left.sort().is_array() => {
+                let lane = match left.value() {
+                    ay_bindings::ExprValue::Select { array, index } => {
+                        match (array.value(), index.value()) {
+                            (
+                                ay_bindings::ExprValue::Var { name },
+                                ay_bindings::ExprValue::BitVecConst { value, .. },
+                            ) if definitional.contains(name) => {
+                                Some((name.clone(), value.to_string()))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(lane) = lane else {
+                    return true;
+                };
+                if !defined.insert(lane) {
+                    return true;
+                }
+            }
+            ay_bindings::ExprValue::Distinct(terms)
+                if terms.iter().any(|term| term.sort().is_array()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        stack.extend(expr.children());
+    }
+    false
+}
+
+/// `binding` with the part at constant lane `path` replaced by `new`: a field of
+/// an aggregate, or — through an array — a `select` of the lane, updated in
+/// place, `store`d back. A shape-only array absorbs the write, as
+/// `ArrayValue::store` does (its content is unconstrained anyway; the caller has
+/// checked the path against the cell's TYPE). `None` when the path does not fit
+/// the shape. Each level copies only the parts it keeps, so the cost is the
+/// binding's size plus the path's length, not their product.
+fn update_binding_lane(
+    binding: &ValueBinding,
+    path: &[usize],
+    new: ValueBinding,
+) -> Option<ValueBinding> {
+    let Some((&first, rest)) = path.split_first() else {
+        return Some(new);
+    };
+    match binding {
+        ValueBinding::Aggregate(aggregate) => {
+            let child = aggregate.fields.get(first)?;
+            let updated = update_binding_lane(child, rest, new)?;
+            let mut fields = Vec::with_capacity(aggregate.fields.len());
+            let mut updated = Some(updated);
+            for (index, field) in aggregate.fields.iter().enumerate() {
+                fields.push(if index == first { updated.take()? } else { field.clone() });
+            }
+            Some(ValueBinding::Aggregate(AggregateValue { fields }))
+        }
+        ValueBinding::Array(array) if array.lanes.is_none() => Some(binding.clone()),
+        ValueBinding::Array(array) => {
+            let lane = Expr::bitvec_const(u64::try_from(first).ok()?, 64);
+            let updated = update_binding_lane(&array.select(&lane)?, rest, new)?;
+            Some(ValueBinding::Array(array.store(&lane, &updated)?))
+        }
+        ValueBinding::Scalar(_) => None,
+    }
 }
 
 /// Trust (#46): declare the CHC block-relation formal arguments and the matching
@@ -7032,23 +11926,62 @@ fn declare_relation_binding_rec(
     vc: &mut ChcVc,
     prefix: &str,
     ty: &Ty,
+    smt_arrays: bool,
     arg_sorts: &mut Vec<ay_bindings::Sort>,
 ) -> ValueBinding {
-    if let Some(field_tys) = aggregate_field_tys_of(module, ty) {
-        let mut fields = Vec::with_capacity(field_tys.len());
-        for (field_index, field_ty) in field_tys.iter().enumerate() {
-            fields.push(declare_relation_binding_rec(
+    declare_relation_binding_lifted(module, vc, prefix, ty, 0, smt_arrays, arg_sorts)
+}
+
+/// `declare_relation_binding_rec` for a value nested inside `depth` arrays: every
+/// scalar leaf is declared at its sort lifted through those arrays, so a
+/// `[e; n]` column is one `(Array BV64 S)` variable per leaf of `e` — never one
+/// per lane. With `smt_arrays` off (a block a cycle of the CFG reaches) an array
+/// is shape-only and declares no column at all.
+fn declare_relation_binding_lifted(
+    module: &Module,
+    vc: &mut ChcVc,
+    prefix: &str,
+    ty: &Ty,
+    depth: u32,
+    smt_arrays: bool,
+    arg_sorts: &mut Vec<ay_bindings::Sort>,
+) -> ValueBinding {
+    match composite_shape_of(module, ty) {
+        Some(CompositeShape::Fields(field_tys)) => {
+            let mut fields = Vec::with_capacity(field_tys.len());
+            for (field_index, field_ty) in field_tys.iter().enumerate() {
+                fields.push(declare_relation_binding_lifted(
+                    module,
+                    vc,
+                    &format!("{prefix}_field{field_index}"),
+                    field_ty,
+                    depth,
+                    smt_arrays,
+                    arg_sorts,
+                ));
+            }
+            ValueBinding::Aggregate(AggregateValue { fields })
+        }
+        Some(CompositeShape::Array { len, .. }) if !smt_arrays => {
+            ValueBinding::Array(ArrayValue::shape_only(len))
+        }
+        Some(CompositeShape::Array { elem, len }) => ValueBinding::Array(ArrayValue {
+            len,
+            lanes: Some(Box::new(declare_relation_binding_lifted(
                 module,
                 vc,
-                &format!("{prefix}_field{field_index}"),
-                field_ty,
+                &format!("{prefix}_lanes"),
+                &elem,
+                depth + 1,
+                smt_arrays,
                 arg_sorts,
-            ));
+            ))),
+        }),
+        None => {
+            let sort = lifted_sort(ty_to_sort(ty), depth);
+            arg_sorts.push(sort.clone());
+            ValueBinding::Scalar(vc.declare_var(prefix.to_string(), sort))
         }
-        ValueBinding::Aggregate(AggregateValue { fields })
-    } else {
-        arg_sorts.push(ty_to_sort(ty));
-        ValueBinding::Scalar(vc.declare_var(prefix.to_string(), ty_to_sort(ty)))
     }
 }
 
@@ -7070,6 +12003,79 @@ fn normalize_expr_to_exact_ty(expr: &Expr, ty: &Ty) -> Option<Expr> {
     (normalized.sort().bitvec_width() == Some(expected_width)).then_some(normalized)
 }
 
+/// Trust (2026-09-14): the ALLOW-LIST fence of `try_self_call_inductive_hypothesis`
+/// (c). Every instruction kind not listed — including any variant added to
+/// `Inst` later — refuses. Every `Store` must write through a pointer derived
+/// from this function's own `Alloca`s (through `GEP`/`Copy`/pointer-to-pointer
+/// casts), so a deeper activation of the same body cannot clobber this
+/// activation's tracked cells: with pointer-free parameters it holds no pointer
+/// INTO this frame, and with no forged, global, fat or heap pointer it can write
+/// nowhere but its own frame.
+fn self_call_body_is_frame_local(func: &Function) -> bool {
+    let mut frame_ptrs: BTreeSet<ValueId> = BTreeSet::new();
+    // Fixpoint over pointer derivations (SSA, but a derivation may precede the
+    // block that defines its base in emission order).
+    loop {
+        let before = frame_ptrs.len();
+        for block in &func.blocks {
+            for node in &block.body {
+                let Some(result) = node.results.first().copied() else { continue };
+                let derived = match &node.inst {
+                    Inst::Alloca { .. } => true,
+                    Inst::GEP { base, .. } => frame_ptrs.contains(base),
+                    Inst::Copy { operand, .. } => frame_ptrs.contains(operand),
+                    Inst::Cast { op: CastOp::PtrToPtr | CastOp::Bitcast, operand, .. } => {
+                        frame_ptrs.contains(operand)
+                    }
+                    _ => false,
+                };
+                if derived {
+                    frame_ptrs.insert(result);
+                }
+            }
+        }
+        if frame_ptrs.len() == before {
+            break;
+        }
+    }
+    func.blocks.iter().flat_map(|b| b.body.iter()).all(|node| match &node.inst {
+        Inst::Store { ptr, .. } => frame_ptrs.contains(ptr),
+        Inst::Cast { op, .. } => !matches!(op, CastOp::IntToPtr),
+        // Complete field construction is pure, like InsertField below. This
+        // effect fence grants no operand-definedness or value-model fact;
+        // the ordinary constructor/actual-transport guards still check those.
+        Inst::MakeAggregate { ty: Ty::Struct(_) | Ty::Tuple(_), variant: None, .. } => true,
+        Inst::BinOp { .. }
+        | Inst::UnOp { .. }
+        | Inst::Overflow { .. }
+        | Inst::ICmp { .. }
+        | Inst::FCmp { .. }
+        | Inst::Load { .. }
+        | Inst::Alloca { .. }
+        | Inst::GEP { .. }
+        | Inst::Br { .. }
+        | Inst::CondBr { .. }
+        | Inst::Switch { .. }
+        | Inst::Call { .. }
+        | Inst::Return { .. }
+        | Inst::ExtractField { .. }
+        | Inst::InsertField { .. }
+        | Inst::ExtractElement { .. }
+        | Inst::InsertElement { .. }
+        // v50 `[value; n]`: a pure value construction, no memory write.
+        | Inst::ArraySplat { .. }
+        | Inst::Const { .. }
+        | Inst::NullPtr
+        | Inst::Undef { .. }
+        | Inst::Assume { .. }
+        | Inst::Assert { .. }
+        | Inst::Unreachable
+        | Inst::Copy { .. }
+        | Inst::Select { .. } => true,
+        _ => false,
+    })
+}
+
 fn is_call_summary_scalar_ty(ty: &Ty) -> bool {
     // A pointer is modeled opaquely (it is never dereferenced precisely in the
     // summary — a `ValidBorrow` Load havocs the loaded value), so a reference
@@ -7078,35 +12084,91 @@ fn is_call_summary_scalar_ty(ty: &Ty) -> bool {
 }
 
 fn call_summary_value(
-    values: &BTreeMap<ValueId, ValueBinding>,
+    values: &BTreeMap<ValueId, CallSummaryBinding>,
     value: ValueId,
     ty: &Ty,
-) -> Option<ValueBinding> {
+) -> Option<CallSummaryBinding> {
+    if let CallSummaryBinding::Uninit(actual) = values.get(&value)? {
+        return (actual == ty).then(|| CallSummaryBinding::Uninit(actual.clone()));
+    }
+    if let Ty::FatPtr(kind) = ty {
+        return match values.get(&value)? {
+            CallSummaryBinding::OpaqueFatPtr(actual) if actual == kind => {
+                Some(CallSummaryBinding::OpaqueFatPtr(*kind))
+            }
+            _ => None,
+        };
+    }
     if is_call_summary_scalar_ty(ty) {
-        return Some(ValueBinding::Scalar(call_summary_scalar(values, value)?));
+        return Some(CallSummaryBinding::Scalar(call_summary_scalar(values, value)?));
+    }
+    // A non-empty array carries its SMT-array lanes; every other composite its
+    // fields. The binding VARIANT must match the declared type, so a wrongly-shaped
+    // term never enters the callee model.
+    if is_nonempty_array_ty(ty) {
+        return match values.get(&value)? {
+            CallSummaryBinding::Array(array) => Some(CallSummaryBinding::Array(array.clone())),
+            _ => None,
+        };
     }
 
-    Some(ValueBinding::Aggregate(call_summary_aggregate(values, value)?))
+    Some(CallSummaryBinding::Aggregate(call_summary_aggregate(values, value)?))
 }
 
-fn call_summary_scalar(values: &BTreeMap<ValueId, ValueBinding>, value: ValueId) -> Option<Expr> {
+/// `true` for `[T; n]` with `n >= 1` — the types whose value is SMT-array lanes
+/// rather than fields.
+fn is_nonempty_array_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Array(_, len) if *len > 0)
+}
+
+fn call_summary_binding_matches_type(ty: &Ty, binding: &CallSummaryBinding) -> bool {
+    match binding {
+        CallSummaryBinding::Uninit(actual) => actual == ty,
+        CallSummaryBinding::OpaqueFatPtr(kind) => {
+            matches!(ty, Ty::FatPtr(actual) if actual == kind)
+        }
+        CallSummaryBinding::Scalar(_) => is_call_summary_scalar_ty(ty),
+        CallSummaryBinding::Aggregate(_) => {
+            !is_call_summary_scalar_ty(ty)
+                && !matches!(ty, Ty::FatPtr(_))
+                && !is_nonempty_array_ty(ty)
+        }
+        CallSummaryBinding::Array(array) => {
+            matches!(ty, Ty::Array(_, len) if *len == array.len && *len > 0)
+        }
+    }
+}
+
+fn call_summary_scalar(
+    values: &BTreeMap<ValueId, CallSummaryBinding>,
+    value: ValueId,
+) -> Option<Expr> {
     match values.get(&value)? {
-        ValueBinding::Scalar(expr) => Some(expr.clone()),
-        ValueBinding::Aggregate(_) => None,
+        CallSummaryBinding::Scalar(expr) => Some(expr.clone()),
+        CallSummaryBinding::Aggregate(_)
+        | CallSummaryBinding::Uninit(_)
+        | CallSummaryBinding::OpaqueFatPtr(_)
+        | CallSummaryBinding::Array(_) => None,
     }
 }
 
 fn call_summary_aggregate(
-    values: &BTreeMap<ValueId, ValueBinding>,
+    values: &BTreeMap<ValueId, CallSummaryBinding>,
     value: ValueId,
-) -> Option<AggregateValue> {
+) -> Option<CallSummaryAggregate> {
     match values.get(&value)? {
-        ValueBinding::Scalar(_) => None,
-        ValueBinding::Aggregate(aggregate) => Some(aggregate.clone()),
+        CallSummaryBinding::Scalar(_)
+        | CallSummaryBinding::Uninit(_)
+        | CallSummaryBinding::OpaqueFatPtr(_)
+        | CallSummaryBinding::Array(_) => None,
+        CallSummaryBinding::Aggregate(aggregate) => Some(aggregate.clone()),
     }
 }
 
-fn call_summary_bool(values: &BTreeMap<ValueId, ValueBinding>, value: ValueId) -> Option<Expr> {
+fn call_summary_bool(
+    values: &BTreeMap<ValueId, CallSummaryBinding>,
+    value: ValueId,
+) -> Option<Expr> {
     let expr = call_summary_scalar(values, value)?;
     expr.sort().is_bool().then_some(expr)
 }
@@ -7132,7 +12194,7 @@ fn call_summary_guarded_condition(path_conditions: &[Expr], condition: Expr) -> 
 fn combine_call_summary_returns(
     return_paths: &[CallSummaryReturn],
     return_count: usize,
-) -> Option<Vec<ValueBinding>> {
+) -> Option<Vec<CallSummaryBinding>> {
     if return_paths.is_empty() {
         return None;
     }
@@ -7155,11 +12217,25 @@ fn combine_call_summary_returns(
 
 fn combine_call_summary_binding(
     guard: Expr,
-    then_value: &ValueBinding,
-    else_value: ValueBinding,
-) -> Option<ValueBinding> {
+    then_value: &CallSummaryBinding,
+    else_value: CallSummaryBinding,
+) -> Option<CallSummaryBinding> {
     match (then_value, else_value) {
-        (ValueBinding::Scalar(then_expr), ValueBinding::Scalar(else_expr)) => {
+        (CallSummaryBinding::Uninit(then_ty), CallSummaryBinding::Uninit(else_ty))
+            if *then_ty == else_ty =>
+        {
+            Some(CallSummaryBinding::Uninit(else_ty))
+        }
+        (
+            CallSummaryBinding::OpaqueFatPtr(then_kind),
+            CallSummaryBinding::OpaqueFatPtr(else_kind),
+        ) if *then_kind == else_kind => {
+            // Both concrete results inhabit this fat-pointer kind. Forget their
+            // identity and the selection; no content or equality fact is needed
+            // to transport an opaque value through the caller.
+            Some(CallSummaryBinding::OpaqueFatPtr(else_kind))
+        }
+        (CallSummaryBinding::Scalar(then_expr), CallSummaryBinding::Scalar(else_expr)) => {
             // Fail closed (never `ite`-panic / ICE) when the two return paths carry
             // INCOMPATIBLE sorts — a malformed trust-ir lowering can give one path an
             // `i64`-typed constant and another an `i128` value (the transport lowering
@@ -7172,11 +12248,12 @@ fn combine_call_summary_binding(
             // pair reach `Expr::ite`, whose internal `.expect("… matching branch sorts")`
             // then ICE'd. `try_ite(...).ok()?` is the authoritative, panic-proof guard;
             // declining (havoc) is the sound conservative fallback.
-            Expr::try_ite(guard, then_expr.clone(), else_expr).ok().map(ValueBinding::Scalar)
+            Expr::try_ite(guard, then_expr.clone(), else_expr).ok().map(CallSummaryBinding::Scalar)
         }
-        (ValueBinding::Aggregate(then_aggregate), ValueBinding::Aggregate(else_aggregate))
-            if then_aggregate.fields.len() == else_aggregate.fields.len() =>
-        {
+        (
+            CallSummaryBinding::Aggregate(then_aggregate),
+            CallSummaryBinding::Aggregate(else_aggregate),
+        ) if then_aggregate.fields.len() == else_aggregate.fields.len() => {
             // Trust (#46): recurse so nested-aggregate fields are merged field-by-
             // field (not `ite`'d as if they were scalars).
             let mut fields = Vec::with_capacity(then_aggregate.fields.len());
@@ -7184,167 +12261,33 @@ fn combine_call_summary_binding(
             {
                 fields.push(combine_call_summary_binding(guard.clone(), then_field, else_field)?);
             }
-            Some(ValueBinding::Aggregate(AggregateValue { fields }))
+            Some(CallSummaryBinding::Aggregate(CallSummaryAggregate { fields }))
+        }
+        // Two paths' arrays merge lane-for-lane: `ite` on each SMT-array leaf (a
+        // whole-array `ite`, never an equality between arrays).
+        (CallSummaryBinding::Array(then_array), CallSummaryBinding::Array(else_array))
+            if then_array.len == else_array.len =>
+        {
+            let lanes = match (&then_array.lanes, else_array.lanes) {
+                (Some(then_lanes), Some(else_lanes)) => {
+                    Some(Box::new(combine_call_summary_binding(guard, then_lanes, *else_lanes)?))
+                }
+                (None, None) => None,
+                _ => return None,
+            };
+            Some(CallSummaryBinding::Array(CallSummaryArray { len: then_array.len, lanes }))
         }
         _ => None,
     }
 }
 
 fn bind_call_summary_result(
-    values: &mut BTreeMap<ValueId, ValueBinding>,
+    values: &mut BTreeMap<ValueId, CallSummaryBinding>,
     node: &InstrNode,
-    binding: ValueBinding,
+    binding: CallSummaryBinding,
 ) -> Option<()> {
     values.insert(*node.results.first()?, binding);
     Some(())
-}
-
-#[cfg(test)]
-mod narrowing_reachability_tests {
-    use super::*;
-    use trust_ir::value::FuncTyId;
-
-    fn block(id: u32, terminator: Inst) -> Block {
-        let mut block = Block::new(BlockId::new(id));
-        block.body.push(InstrNode::new(terminator));
-        block
-    }
-
-    fn function(entry: u32, blocks: Vec<Block>) -> Function {
-        let mut function = Function::new(
-            FuncId::new(0),
-            "cfg_reachability",
-            FuncTyId::new(0),
-            BlockId::new(entry),
-        );
-        function.blocks = blocks;
-        function
-    }
-
-    fn return_block(id: u32) -> Block {
-        block(id, Inst::Return { values: Vec::new() })
-    }
-
-    #[test]
-    fn invalid_source_and_target_are_unknown() {
-        let function = function(0, vec![return_block(0)]);
-        let missing = BlockId::new(99);
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, missing, BlockId::new(0)),
-            CfgReachability::Unknown
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), missing),
-            CfgReachability::Unknown
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, missing, missing),
-            CfgReachability::Unknown,
-            "from == to is not reachable authority when the block does not exist"
-        );
-    }
-
-    #[test]
-    fn dangling_successor_is_unknown() {
-        let function = function(
-            0,
-            vec![
-                block(0, Inst::Br { target: BlockId::new(99), args: Vec::new() }),
-                return_block(1),
-            ],
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Unknown
-        );
-    }
-
-    #[test]
-    fn missing_or_unsupported_terminator_is_unknown() {
-        let empty = function(0, vec![Block::new(BlockId::new(0)), return_block(1)]);
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&empty, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Unknown
-        );
-
-        let unterminated = function(
-            0,
-            vec![block(0, Inst::Const { ty: Ty::Bool, value: Constant::Int(1) }), return_block(1)],
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&unterminated, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Unknown
-        );
-    }
-
-    #[test]
-    fn terminator_before_the_end_is_unknown() {
-        let mut malformed = block(0, Inst::Br { target: BlockId::new(1), args: Vec::new() });
-        malformed.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
-        let function = function(0, vec![malformed, return_block(1)]);
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Unknown
-        );
-    }
-
-    #[test]
-    fn duplicate_block_identity_is_unknown() {
-        let function = function(0, vec![return_block(0), return_block(0), return_block(1)]);
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Unknown
-        );
-    }
-
-    #[test]
-    fn cycles_terminate_and_can_still_prove_unreachable() {
-        let function = function(
-            0,
-            vec![
-                block(0, Inst::Br { target: BlockId::new(1), args: Vec::new() }),
-                block(1, Inst::Br { target: BlockId::new(0), args: Vec::new() }),
-                return_block(2),
-            ],
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(1)),
-            CfgReachability::Reachable
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(2)),
-            CfgReachability::ProvenUnreachable
-        );
-    }
-
-    #[test]
-    fn complete_diamond_proves_sibling_unreachable() {
-        let function = function(
-            0,
-            vec![
-                block(
-                    0,
-                    Inst::CondBr {
-                        cond: ValueId::new(0),
-                        then_target: BlockId::new(1),
-                        then_args: Vec::new(),
-                        else_target: BlockId::new(2),
-                        else_args: Vec::new(),
-                    },
-                ),
-                return_block(1),
-                return_block(2),
-            ],
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(0), BlockId::new(2)),
-            CfgReachability::Reachable
-        );
-        assert_eq!(
-            ChcFuncTranslator::cfg_reaches(&function, BlockId::new(1), BlockId::new(2)),
-            CfgReachability::ProvenUnreachable
-        );
-    }
 }
 
 // `is_eq_comparable_ty` / `is_ordered_scalar_ty` moved to `crate::translate`
@@ -7397,8 +12340,7 @@ pub fn proof_grade_cast_is_admissible(
     src_ty: &Ty,
     dst_ty: &Ty,
 ) -> bool {
-    let newtype_path_of =
-        |ty: &Ty| pointer_newtype_field_path(ty, module, POINTER_NEWTYPE_FUEL);
+    let newtype_path_of = |ty: &Ty| pointer_newtype_field_path(ty, module, POINTER_NEWTYPE_FUEL);
     let is_newtype_struct =
         |ty: &Ty| !is_thin_pointer_ty(ty) && newtype_path_of(ty).is_some_and(|p| !p.is_empty());
     match op {
@@ -7457,9 +12399,7 @@ pub fn proof_grade_cast_is_admissible(
                 || int_unpack
                 || int_identity
         }
-        CastOp::PtrToInt => {
-            is_thin_pointer_ty(src_ty) && is_pointer_width_unsigned_ty(dst_ty)
-        }
+        CastOp::PtrToInt => is_thin_pointer_ty(src_ty) && is_pointer_width_unsigned_ty(dst_ty),
         _ => false,
     }
 }
@@ -7517,15 +12457,51 @@ fn ty_is_definitely_non_zst(module: &Module, ty: &Ty, fuel: u32) -> bool {
 ///   `trust_types::total_call_summaries::total_summary_len_bound` already draws).
 /// * `FatPtr(Slice(elem))` — bounded ONLY when `elem` is provably non-ZST; a `&[()]`
 ///   length may legally reach `usize::MAX`.
-/// * anything else — a `dyn Trait` vtable pointer, an element the module's type table
-///   cannot resolve, or a non-fat `ptr_ty` spelling — is NOT bounded (fail-closed).
+/// * `FatPtr(ContainerLen)` — the metadata IS a length (of the DST at the container's
+///   tail), but the kind carries no element type, so non-ZST-ness cannot be decided:
+///   NOT bounded.
+/// * `FatPtr(TraitObject | ContainerVtable)` — the metadata is an opaque VTABLE WORD,
+///   not a length at all (`fat_ptr_metadata_is_vtable_word`): nothing to bound.
+/// * anything else — an element the module's type table cannot resolve, or a non-fat
+///   `ptr_ty` spelling — is NOT bounded (fail-closed).
+///
+/// The fat-pointer kinds are matched EXHAUSTIVELY so a kind added to trust-ir later
+/// must decide its bound here rather than inheriting `false` silently.
 fn fat_ptr_metadata_len_is_isize_bounded(module: &Module, ptr_ty: &Ty) -> bool {
-    match ptr_ty {
-        Ty::FatPtr(FatPtrKind::Str) => true,
-        Ty::FatPtr(FatPtrKind::Slice(elem)) => module
+    let Ty::FatPtr(kind) = ptr_ty else {
+        return false;
+    };
+    // No wildcard inside: a sixth kind is a compile error here, not a silent `false`.
+    match kind {
+        FatPtrKind::Str => true,
+        FatPtrKind::Slice(elem) => module
             .ty(*elem)
             .is_some_and(|elem| ty_is_definitely_non_zst(module, elem, NON_ZST_FUEL)),
-        _ => false,
+        FatPtrKind::ContainerLen | FatPtrKind::TraitObject { .. } | FatPtrKind::ContainerVtable => {
+            false
+        }
+    }
+}
+
+/// Whether the metadata word of a fat pointer of type `ptr_ty` is an OPAQUE VTABLE
+/// WORD rather than a length.
+///
+/// This is trust-ir's own classification (`FatPtrKind` docs and
+/// `PointerMetadataShape::metadata_ty`): `TraitObject` and its v40 `dyn`-tail
+/// container sibling `ContainerVtable` carry a vtable pointer; `Slice`, `Str` and
+/// `ContainerLen` carry an unsigned length. It is decided by what the metadata
+/// MEANS, never by the `metadata_ty` a producer spelled, because a vtable word read
+/// as a length is a type confusion — the translator must never mint a `slice_len`
+/// symbol for one, and must never push a length bound on one. Exhaustive on purpose:
+/// a kind added later must be placed in a bucket here, not fall into one.
+fn fat_ptr_metadata_is_vtable_word(ptr_ty: &Ty) -> bool {
+    let Ty::FatPtr(kind) = ptr_ty else {
+        return false;
+    };
+    // No wildcard inside: a sixth kind must be placed here, not fall into a bucket.
+    match kind {
+        FatPtrKind::TraitObject { .. } | FatPtrKind::ContainerVtable => true,
+        FatPtrKind::Slice(_) | FatPtrKind::Str | FatPtrKind::ContainerLen => false,
     }
 }
 
@@ -7593,13 +12569,20 @@ fn unsupported_value_reason(inst: &Inst) -> TrustIrChcUnsupportedReason {
 fn unsupported_unit_reason(inst: &Inst) -> TrustIrChcUnsupportedReason {
     match inst {
         Inst::Switch { .. } => TrustIrChcUnsupportedReason::Switch,
-        Inst::CallIndirect { .. } => TrustIrChcUnsupportedReason::IndirectCall,
+        Inst::CallIndirect { .. } | Inst::InvokeIndirect { .. } => {
+            TrustIrChcUnsupportedReason::IndirectCall
+        }
+        Inst::CallCannotUnwind { .. } | Inst::CallIndirectCannotUnwind { .. } => {
+            TrustIrChcUnsupportedReason::NoUnwindCallBoundary
+        }
+        Inst::AssertInvoke { .. } => TrustIrChcUnsupportedReason::UnwindingCheck,
         Inst::Fence { .. } => TrustIrChcUnsupportedReason::Fence,
         Inst::EndBorrow { .. } => TrustIrChcUnsupportedReason::EndBorrow,
         Inst::Retain { .. } | Inst::Release { .. } => {
             TrustIrChcUnsupportedReason::ReferenceCounting
         }
         Inst::Dealloc { .. } => TrustIrChcUnsupportedReason::HeapDeallocation,
+        Inst::Drop { .. } | Inst::DropInvoke { .. } => TrustIrChcUnsupportedReason::DropGlue,
         Inst::CloseFrame { .. } => TrustIrChcUnsupportedReason::BindingFrameClose,
         Inst::DialectOp(_) => TrustIrChcUnsupportedReason::DialectOperation,
         _ => TrustIrChcUnsupportedReason::MalformedControlFlow,
@@ -7608,75 +12591,970 @@ fn unsupported_unit_reason(inst: &Inst) -> TrustIrChcUnsupportedReason {
 
 #[cfg(test)]
 mod aggregate_leaf_budget_tests {
-    //! Regression guard for the nested-array aggregate OOM introduced in `bd37bce4a`
-    //! ("model array ExtractElement"). A trackable-but-deeply-nested fixed-size array
-    //! was flattened into one CHC leaf per scalar with NO total-leaf cap (only a
-    //! per-dimension `len <= 256` guard), so a value like `[[[u8; 256]; 256]; 256]`
-    //! declared `256^3 ~= 16.7M` permanently-live CHC variables (`declare_var` per leaf,
-    //! re-cloned at every relation application), exhausting RAM + swap — a kernel
-    //! watchdog OOM panic. `MAX_AGGREGATE_LEAVES` now bounds the flattened leaf count;
-    //! an over-budget aggregate is reported non-trackable and falls back to a single
-    //! opaque scalar (fail closed — spurious-unverified, never a false proof).
+    //! The leaf accounting behind every trackability decision.
     //!
-    //! NOTE: this could not be executed in-session — the pinned `nightly-2025-12-03`
-    //! toolchain ICEs while compiling `serde_derive v1.0.228`, which blocks every build
-    //! of this crate. Re-run once that toolchain blocker is cleared.
+    //! History: the N-field array model (`bd37bce4a`) flattened `[[[u8; 256]; 256];
+    //! 256]` into `256^3 ~= 16.7M` permanently-live CHC variables and OOM'd the host;
+    //! `MAX_AGGREGATE_LEAVES` was added to bound it, next to a per-dimension
+    //! `len <= 256` cap. Arrays are now SMT arrays — one per element leaf — so an
+    //! array counts its element's leaves ONCE and no length enters the count (the
+    //! 256 cap is gone). `MAX_AGGREGATE_LEAVES` stays for what is still exponential
+    //! in the type text: struct DAGs, pinned below by a struct-DAG witness.
     use super::*;
+    use trust_ir::{FieldDef, StructDef, StructId};
     use trust_ir_build::ModuleBuilder;
 
-    /// `[[u8; 128]; 128]` = 16_384 leaves, over `MAX_AGGREGATE_LEAVES` (4096): the
-    /// aggregate must be reported NON-trackable so it collapses to one opaque scalar
-    /// rather than exploding the block-relation signature into 16_384 CHC variables.
-    /// Pre-fix this returned `Some(..)` (and the full expansion is what OOM'd).
-    #[test]
-    fn nested_array_over_leaf_budget_is_not_trackable() {
-        let mut mb = ModuleBuilder::new("agg_leaf_budget_over");
-        let u8_ty = mb.add_type(Ty::U8);
-        let row_ty = mb.add_type(Ty::Array(u8_ty, 128)); // [u8; 128]
-        let module = mb.build();
-        let matrix = Ty::Array(row_ty, 128); // [[u8; 128]; 128] = 16_384 leaves
+    // Intentionally independent of the production constant: relaxing the
+    // production limit must make the one-over-bound regression test fail.
+    const EXPECTED_AGGREGATE_LEAF_WALK_DEPTH: u32 = 64;
 
-        assert!(
-            aggregate_field_tys_of(&module, &matrix).is_none(),
-            "a 16_384-leaf nested array must fail closed via the leaf-count budget, \
-             not expand into 16_384 permanently-declared CHC variables"
-        );
+    fn nested_singleton_tuple(depth: u32) -> Ty {
+        (0..depth).fold(Ty::U8, |inner, _| Ty::Tuple(vec![inner]))
     }
 
-    /// A small nested array (`[[u8; 8]; 8]` = 64 leaves) is within budget: it must
-    /// stay trackable and still expand into its immediate rows — the guard must not
-    /// over-restrict ordinary small aggregates.
     #[test]
-    fn small_nested_array_within_budget_stays_trackable() {
-        let mut mb = ModuleBuilder::new("agg_leaf_budget_under");
-        let u8_ty = mb.add_type(Ty::U8);
-        let row_ty = mb.add_type(Ty::Array(u8_ty, 8)); // [u8; 8]
-        let module = mb.build();
-        let matrix = Ty::Array(row_ty, 8); // [[u8; 8]; 8] = 64 leaves
-
-        let fields = aggregate_field_tys_of(&module, &matrix)
-            .expect("a 64-leaf nested array stays trackable");
-        assert_eq!(fields.len(), 8, "the outer array expands into its 8 immediate rows");
-    }
-
-    /// The flattened-leaf counter is inclusive at the cap and short-circuits without
-    /// materializing the leaves: `[[u8; 64]; 64]` = exactly 4096 leaves stays trackable.
-    #[test]
-    fn leaf_budget_boundary_is_inclusive() {
-        let mut mb = ModuleBuilder::new("agg_leaf_budget_boundary");
-        let u8_ty = mb.add_type(Ty::U8);
-        let row_ty = mb.add_type(Ty::Array(u8_ty, 64)); // [u8; 64]
-        let module = mb.build();
-        let at_cap = Ty::Array(row_ty, 64); // [[u8; 64]; 64] = 4096 == MAX_AGGREGATE_LEAVES
+    fn recursive_struct_type_is_not_trackable() {
+        let mut mb = ModuleBuilder::new("agg_leaf_recursive_struct");
+        let recursive_id = StructId::new(0);
+        mb.add_struct(StructDef {
+            id: recursive_id,
+            name: "Recursive".to_owned(),
+            fields: vec![FieldDef {
+                name: "next".to_owned(),
+                ty: Ty::Struct(recursive_id),
+                offset: None,
+            }],
+            size: None,
+            align: None,
+            repr: Default::default(),
+            origin: None,
+        });
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
+        let recursive = Ty::Struct(recursive_id);
 
         assert_eq!(
-            aggregate_leaf_count_within(&module, &at_cap, MAX_AGGREGATE_LEAVES),
-            Some(MAX_AGGREGATE_LEAVES),
-            "a 4096-leaf aggregate sits exactly at the inclusive cap (the guard rejects only `> cap`)"
+            aggregate_leaf_count_within(&module, &recursive, MAX_AGGREGATE_LEAVES),
+            None,
+            "a cyclic aggregate table must exhaust the descent budget and fail closed"
         );
         assert!(
-            aggregate_field_tys_of(&module, &at_cap).is_some(),
-            "an at-cap aggregate is still trackable"
+            aggregate_field_tys_of(&module, &recursive).is_none(),
+            "a cyclic aggregate must not be admitted as trackable"
+        );
+    }
+
+    #[test]
+    fn ordinary_finite_nested_aggregate_retains_leaf_count() {
+        let nested = Ty::Tuple(vec![Ty::Tuple(vec![Ty::U8, Ty::Tuple(vec![Ty::Bool, Ty::Unit])])]);
+        let module = ModuleBuilder::new("agg_leaf_finite_nested")
+            .build()
+            .expect("ModuleBuilder::build: test fixture");
+
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &nested, MAX_AGGREGATE_LEAVES),
+            Some(2),
+            "finite nested aggregates retain their scalar-leaf accounting"
+        );
+        assert!(aggregate_field_tys_of(&module, &nested).is_some());
+    }
+
+    #[test]
+    fn aggregate_walk_exact_depth_boundary_is_trackable() {
+        let module = ModuleBuilder::new("agg_leaf_depth_boundary")
+            .build()
+            .expect("ModuleBuilder::build: test fixture");
+        let at_depth_limit = nested_singleton_tuple(EXPECTED_AGGREGATE_LEAF_WALK_DEPTH);
+
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &at_depth_limit, MAX_AGGREGATE_LEAVES),
+            Some(1),
+            "exactly the configured number of aggregate descents remains trackable"
+        );
+    }
+
+    #[test]
+    fn aggregate_walk_one_over_depth_boundary_fails_closed() {
+        let module = ModuleBuilder::new("agg_leaf_depth_over")
+            .build()
+            .expect("ModuleBuilder::build: test fixture");
+        let over_depth_limit = nested_singleton_tuple(EXPECTED_AGGREGATE_LEAF_WALK_DEPTH + 1);
+
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &over_depth_limit, MAX_AGGREGATE_LEAVES),
+            None,
+            "the depth guard is charged on descent and rejects the first aggregate beyond it"
+        );
+    }
+
+    /// An array is ONE SMT array per leaf of its element, so its leaf count is its
+    /// element's, whatever its length: `[u8; n]` is one leaf at every `n`, and the
+    /// nested `[[u8; n]; n]` that used to flatten into `n^2` leaves (16_384 at
+    /// `n = 128`, the shape that OOM'd before `MAX_AGGREGATE_LEAVES`) is one leaf of
+    /// sort `(Array BV64 (Array BV64 BV8))`. Lengths are compared small and huge;
+    /// nothing here allocates anything of size `n`.
+    #[test]
+    fn an_array_counts_its_element_leaves_once_whatever_its_length() {
+        let mut mb = ModuleBuilder::new("agg_leaf_array_once");
+        let u8_ty = mb.add_type(Ty::U8);
+        let row_2 = mb.add_type(Ty::Array(u8_ty, 2));
+        let row_128 = mb.add_type(Ty::Array(u8_ty, 128));
+        let row_huge = mb.add_type(Ty::Array(u8_ty, u64::MAX));
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
+
+        for (label, ty) in [
+            ("[u8; 2]", Ty::Array(u8_ty, 2)),
+            ("[u8; 257]", Ty::Array(u8_ty, 257)),
+            ("[u8; u64::MAX]", Ty::Array(u8_ty, u64::MAX)),
+            ("[[u8; 2]; 2]", Ty::Array(row_2, 2)),
+            ("[[u8; 128]; 128]", Ty::Array(row_128, 128)),
+            ("[[u8; u64::MAX]; u64::MAX]", Ty::Array(row_huge, u64::MAX)),
+        ] {
+            assert_eq!(
+                aggregate_leaf_count_within(&module, &ty, MAX_AGGREGATE_LEAVES),
+                Some(1),
+                "{label}: one leaf, whatever the length"
+            );
+            assert!(
+                matches!(composite_shape_of(&module, &ty), Some(CompositeShape::Array { .. })),
+                "{label}: trackable as SMT-array lanes"
+            );
+            assert!(
+                aggregate_field_tys_of(&module, &ty).is_none(),
+                "{label}: an array's lanes are never a field list"
+            );
+        }
+        // A struct element contributes its own field leaves, once.
+        let mut pairs = ModuleBuilder::new("agg_leaf_array_of_pairs");
+        let pair_id = pairs.add_type(Ty::Tuple(vec![Ty::U32, Ty::Bool]));
+        let pairs = pairs.build().expect("ModuleBuilder::build: test fixture");
+        for len in [2, 3, u64::MAX] {
+            assert_eq!(
+                aggregate_leaf_count_within(&pairs, &Ty::Array(pair_id, len), MAX_AGGREGATE_LEAVES),
+                Some(2),
+                "[(u32, bool); {len}] has the element's two leaves"
+            );
+        }
+        // The empty array is the zero-field aggregate: no lane, no leaf.
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &Ty::Array(u8_ty, 0), MAX_AGGREGATE_LEAVES),
+            Some(0)
+        );
+        assert_eq!(aggregate_field_tys_of(&module, &Ty::Array(u8_ty, 0)), Some(Vec::new()));
+    }
+
+    /// `k` nested two-field structs flatten to `2^k` leaves — exponential in the
+    /// type text, because every struct field is its own CHC column. That is what
+    /// `MAX_AGGREGATE_LEAVES` still bounds after arrays stopped counting by length
+    /// (it retires only with a datatype-sort model for ALL aggregates): a DAG of
+    /// 13 doublings is 8192 leaves, past the cap, so it is NOT trackable and
+    /// collapses to one opaque scalar instead of 8192 relation columns.
+    #[test]
+    fn a_struct_dag_over_the_leaf_budget_is_not_trackable() {
+        let module = ModuleBuilder::new("agg_leaf_struct_dag")
+            .build()
+            .expect("ModuleBuilder::build: test fixture");
+        let dag = |doublings: u32| {
+            (0..doublings).fold(Ty::U8, |inner, _| Ty::Tuple(vec![inner.clone(), inner]))
+        };
+        // 2^12 == 4096 == MAX_AGGREGATE_LEAVES: exactly at the inclusive cap.
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &dag(12), MAX_AGGREGATE_LEAVES),
+            Some(MAX_AGGREGATE_LEAVES),
+            "a 4096-leaf struct DAG sits exactly at the inclusive cap"
+        );
+        assert!(aggregate_field_tys_of(&module, &dag(12)).is_some());
+        // One more doubling is 8192 leaves: over the cap, fail closed.
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &dag(13), MAX_AGGREGATE_LEAVES),
+            None,
+            "an 8192-leaf struct DAG must fail closed via the leaf-count budget"
+        );
+        assert!(aggregate_field_tys_of(&module, &dag(13)).is_none());
+        assert!(stack_cell_is_translator_opaque(&module, &dag(13)));
+    }
+
+    /// An array of an over-budget struct DAG is over budget too: the element's
+    /// leaves are what the lanes carry, once.
+    #[test]
+    fn an_array_of_an_over_budget_struct_dag_is_not_trackable() {
+        let mut mb = ModuleBuilder::new("agg_leaf_array_of_dag");
+        let dag = (0..13).fold(Ty::U8, |inner, _| Ty::Tuple(vec![inner.clone(), inner]));
+        let dag_id = mb.add_type(dag);
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &Ty::Array(dag_id, 2), MAX_AGGREGATE_LEAVES),
+            None
+        );
+        assert!(composite_shape_of(&module, &Ty::Array(dag_id, 2)).is_none());
+    }
+
+    /// A WIDTHLESS leaf keeps its whole enclosing aggregate non-trackable, and
+    /// `Ty::Sequence` is the widthless leaf the call-summary lane keeps reaching
+    /// for. This test exists because that reach is tempting and WRONG here.
+    ///
+    /// `aggregate_leaf_count_within` looks like call-summary machinery. It is not:
+    /// it is the single trackability oracle behind `aggregate_field_tys_of`, and
+    /// `classify_aggregate_stack_cell`'s doc comment names that sharing as the
+    /// property that keeps the translator's tracked-vs-opaque alloca split from
+    /// drifting. So admitting a widthless leaf here as "one opaque leaf" — which
+    /// reads as a local relaxation of a summary budget — silently does three
+    /// things at once:
+    ///
+    ///   1. `declare_relation_binding_rec` expands the aggregate into per-leaf CHC
+    ///      relation arguments and must produce a SORT for a leaf that has no bit
+    ///      width;
+    ///   2. `classify_aggregate_stack_cell` flips the enclosing stack cell from
+    ///      `OpaqueSafe` to `RequiresNonEscape` — i.e. from havoc-on-load to
+    ///      TRACKED — for a leaf into which no value is ever actually stored,
+    ///      which is the stale-read false proof the load arms are written to avoid;
+    ///   3. only then, incidentally, does the call summary get further.
+    ///
+    /// Measured 2026-09-18: a probe adding `None if matches!(field, Ty::Sequence(_))
+    /// => 1` to the leaf walk passed all 267 tests in this crate. Nothing pinned
+    /// (1) or (2). This test is that pin — it asserts the refusal at the oracle AND
+    /// at the stack-cell classifier, so the same relaxation cannot pass silently
+    /// again. Widening the call-summary lane to carry sequences is a separate,
+    /// legitimate change: it belongs in the summary's own binding and constructor
+    /// (the `OpaqueFatPtr` precedent), never in this shared walk.
+    #[test]
+    fn sequence_bearing_aggregate_is_not_trackable_and_its_stack_cell_stays_opaque() {
+        let mut mb = ModuleBuilder::new("agg_leaf_sequence_field");
+        let u8_ty = mb.add_type(Ty::U8);
+        let seq_id = mb.add_type(Ty::Sequence(u8_ty));
+        let bearing_id = StructId::new(0);
+        mb.add_struct(StructDef {
+            id: bearing_id,
+            name: "SequenceBearing".to_owned(),
+            fields: vec![
+                FieldDef { name: "len".to_owned(), ty: Ty::U64, offset: None },
+                FieldDef { name: "items".to_owned(), ty: Ty::Sequence(u8_ty), offset: None },
+            ],
+            size: None,
+            align: None,
+            repr: Default::default(),
+            origin: None,
+        });
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
+        let bearing = Ty::Struct(bearing_id);
+        let _ = seq_id;
+
+        // The premise the walk actually rests on: a sequence has no bit width, so
+        // it is not a scalar leaf. If this ever becomes true, the rest of this
+        // test is measuring something else.
+        assert!(
+            !is_scalar_field_ty(&Ty::Sequence(u8_ty)),
+            "a sequence must not be a scalar leaf — it carries no bit width"
+        );
+
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &bearing, MAX_AGGREGATE_LEAVES),
+            None,
+            "one widthless leaf makes the whole enclosing aggregate non-trackable"
+        );
+        assert!(
+            aggregate_field_tys_of(&module, &bearing).is_none(),
+            "a sequence-bearing aggregate must not be admitted as trackable"
+        );
+        assert!(
+            matches!(
+                classify_aggregate_stack_cell(&module, &bearing),
+                StackCellAdmission::OpaqueSafe
+            ),
+            "a sequence-bearing stack cell must stay OPAQUE: tracking it would \
+             answer a load from a cell whose sequence leaf never received a value"
+        );
+
+        // A tuple reaches the same refusal by the same route — the property is the
+        // widthless leaf, not the struct table.
+        let tuple_bearing = Ty::Tuple(vec![Ty::U64, Ty::Sequence(u8_ty)]);
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &tuple_bearing, MAX_AGGREGATE_LEAVES),
+            None,
+            "the refusal follows the widthless leaf, not the aggregate's spelling"
+        );
+
+        // Positive control: the SAME shape with the sequence field replaced by an
+        // ordinary scalar is trackable, so the refusals above are attributable to
+        // the sequence leaf and not to some unrelated property of this module.
+        let control = Ty::Tuple(vec![Ty::U64, Ty::U8]);
+        assert_eq!(
+            aggregate_leaf_count_within(&module, &control, MAX_AGGREGATE_LEAVES),
+            Some(2),
+            "positive control: the same shape with a scalar in place of the sequence is trackable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod whole_cell_borrow_load_tests {
+    use super::*;
+    use trust_ir_build::ModuleBuilder;
+    use trust_mc_core::chc_const_prop::eval::try_eval_to_bool;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Read {
+        Shared,
+        Mutable,
+        Reborrow,
+        AfterWrite,
+        AfterCall,
+        WrongType,
+    }
+
+    /// How the fixture spells each reference it takes: the permission instructions,
+    /// or the Rust producers' spelling, a `Copy` of the address at `Ptr`
+    /// (`transparent_pointer_alias`). The bridge's `Copy` also carries a
+    /// `SharedBorrow`/`UniqueBorrow` claim; the translator never reads a claim, so
+    /// the fixture leaves it off.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Spelling {
+        Borrow,
+        Copy,
+    }
+
+    fn fixture(aggregate: bool, read: Read) -> (Module, FuncId, ValueId, Ty) {
+        fixture_spelled(aggregate, read, Spelling::Borrow)
+    }
+
+    /// One reference to `of`, spelled as `spelling` says.
+    fn reference(
+        fb: &mut trust_ir_build::FunctionBuilder<'_>,
+        spelling: Spelling,
+        of: ValueId,
+        mutable: bool,
+    ) -> ValueId {
+        match (spelling, mutable) {
+            (Spelling::Borrow, false) => fb.borrow(of),
+            (Spelling::Borrow, true) => fb.borrow_mut(of),
+            (Spelling::Copy, _) => fb.copy(Ty::Ptr, of),
+        }
+    }
+
+    fn fixture_spelled(
+        aggregate: bool,
+        read: Read,
+        spelling: Spelling,
+    ) -> (Module, FuncId, ValueId, Ty) {
+        let mut mb = ModuleBuilder::new("whole_cell_borrow_load");
+        let sink_ty = mb.add_func_type(vec![Ty::Ptr], vec![]);
+        let sink_id = mb.peek_next_func_id().expect("peek_next_func_id: test fixture");
+        {
+            let mut sink = mb.function("sink", sink_ty);
+            let entry = sink.create_block();
+            sink.switch_to_block(entry);
+            sink.set_entry(entry);
+            sink.add_block_param(entry, Ty::Ptr);
+            sink.ret(vec![]);
+            sink.build();
+        }
+        let fn_ty = mb.add_func_type(vec![], vec![]);
+        let function = mb.peek_next_func_id().expect("peek_next_func_id: test fixture");
+        let mut fb = mb.function("read_borrowed_cell", fn_ty);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let seven = fb.const_value(Ty::U32, Constant::Int(7));
+        let cell_ty = if aggregate { Ty::Tuple(vec![Ty::U32, Ty::Bool]) } else { Ty::U32 };
+        let initial = if aggregate {
+            let empty =
+                fb.const_value(cell_ty.clone(), Constant::Aggregate(vec![Constant::Uninit; 2]));
+            let with_number = fb.insert_field(cell_ty.clone(), empty, 0, seven);
+            let yes = fb.const_value(Ty::Bool, Constant::Bool(true));
+            fb.insert_field(cell_ty.clone(), with_number, 1, yes)
+        } else {
+            seven
+        };
+        let slot = fb.alloca(cell_ty.clone());
+        fb.store(cell_ty.clone(), slot, initial);
+        let alias =
+            reference(&mut fb, spelling, slot, !matches!(read, Read::Shared | Read::Reborrow));
+        let alias = if matches!(read, Read::Reborrow) {
+            reference(&mut fb, spelling, alias, false)
+        } else {
+            alias
+        };
+        if matches!(read, Read::AfterWrite) {
+            let zero = fb.const_value(Ty::U32, Constant::Int(0));
+            let replacement =
+                if aggregate { fb.insert_field(cell_ty.clone(), initial, 0, zero) } else { zero };
+            fb.store(cell_ty.clone(), alias, replacement);
+        }
+        if matches!(read, Read::AfterCall) {
+            fb.call_void(sink_id, vec![alias]);
+        }
+        let access_ty = if matches!(read, Read::WrongType) { Ty::U64 } else { cell_ty.clone() };
+        let loaded = fb.load(access_ty.clone(), alias);
+        let (number, expected, number_ty) = if matches!(read, Read::WrongType) {
+            (loaded, fb.const_value(Ty::U64, Constant::Int(7)), Ty::U64)
+        } else if aggregate {
+            (fb.extract_field(Ty::U32, loaded, 0), seven, Ty::U32)
+        } else {
+            (loaded, seven, Ty::U32)
+        };
+        let equals_initial = fb.icmp(ICmpOp::Eq, number_ty, number, expected);
+        fb.assert(equals_initial);
+        fb.ret(vec![]);
+        fb.build();
+        (mb.build().expect("ModuleBuilder::build: test fixture"), function, slot, cell_ty)
+    }
+
+    #[test]
+    fn original_aggregate_undef_borrow_fixtures_are_runtime_ub_and_refused() {
+        for read in [Read::Shared, Read::Reborrow, Read::Mutable, Read::AfterWrite, Read::AfterCall]
+        {
+            for spelling in [Spelling::Borrow, Spelling::Copy] {
+                let (mut module, function, _, ty) = fixture_spelled(true, read, spelling);
+                let source =
+                    module.functions.iter_mut().find(|source| source.id == function).unwrap();
+                let seed = source
+                    .blocks
+                    .iter_mut()
+                    .flat_map(|block| &mut block.body)
+                    .find(|node| {
+                        matches!(&node.inst, Inst::Const { ty: seed_ty,
+                        value: Constant::Aggregate(fields) } if seed_ty == &ty
+                            && fields.iter().all(|field| matches!(field, Constant::Uninit)))
+                    })
+                    .unwrap();
+                // Restore the exact original Undef instruction, retaining every
+                // other original definition/use/SSA id and its actual UB.
+                seed.inst = Inst::Undef { ty };
+                let error = trust_ir::interpret::Interpreter::with_module(&module)
+                    .execute_func(function, [])
+                    .unwrap_err();
+                assert_eq!(error.code, trust_ir::interpret::InterpretErrorCode::UndefinedBehavior);
+                let output = translate_function(
+                    module.function_by_id(function).unwrap(),
+                    &module,
+                    &TranslateOptions::default(),
+                );
+                assert!(output.diagnostics.iter().any(|diagnostic| diagnostic.reason
+                    == TrustIrChcUnsupportedReason::OperandConsumption));
+                assert!(super::smt_array_tests::error_reachable(&output));
+            }
+        }
+    }
+
+    #[test]
+    fn original_interior_field_undef_is_runtime_ub_and_refused() {
+        for spelling in [Spelling::Borrow, Spelling::Copy] {
+            let (mut module, function) = interior_field_fixture(spelling);
+            let source = module.functions.iter_mut().find(|source| source.id == function).unwrap();
+            let seed = source
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.body)
+                .find(|node| {
+                    matches!(&node.inst, Inst::Const {
+                    value: Constant::Aggregate(fields), .. }
+                    if fields.iter().all(|field| matches!(field, Constant::Uninit)))
+                })
+                .unwrap();
+            let Inst::Const { ty, .. } = &seed.inst else { unreachable!() };
+            seed.inst = Inst::Undef { ty: ty.clone() };
+            assert_eq!(
+                trust_ir::interpret::Interpreter::with_module(&module)
+                    .execute_func(function, [])
+                    .unwrap_err()
+                    .code,
+                trust_ir::interpret::InterpretErrorCode::UndefinedBehavior
+            );
+            let output = translate_function(
+                module.function_by_id(function).unwrap(),
+                &module,
+                &TranslateOptions::default(),
+            );
+            assert!(
+                output.diagnostics.iter().any(|diagnostic| diagnostic.reason
+                    == TrustIrChcUnsupportedReason::OperandConsumption)
+            );
+        }
+    }
+
+    fn probe(aggregate: bool, read: Read) -> ChcTranslationOutput {
+        probe_spelled(aggregate, read, Spelling::Borrow)
+    }
+
+    fn probe_spelled(aggregate: bool, read: Read, spelling: Spelling) -> ChcTranslationOutput {
+        let (module, function, _, _) = fixture_spelled(aggregate, read, spelling);
+        trust_ir_function_to_chc_translation_output(&module, function, &TranslateOptions::default())
+            .expect("whole-cell alias fixture translates")
+    }
+
+    // Every fixture has one source assertion in one straight-line block. Inspect
+    // its error condition directly, without treating a rendered solver verdict
+    // or saved report as proof authority.
+    fn assertion_error(output: &ChcTranslationOutput) -> Option<bool> {
+        let errors: Vec<_> =
+            output.vc.rules.iter().filter(|rule| rule.head.name.as_str() == ERROR_REL).collect();
+        assert_eq!(errors.len(), 1, "one assertion error, no unsupported memory edge");
+        let mut result = Some(true);
+        for condition in &errors[0].body.constraints {
+            match try_eval_to_bool(condition) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => result = None,
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn whole_cell_borrow_load_preserves_scalar_and_aggregate_values() {
+        for aggregate in [false, true] {
+            for read in [Read::Shared, Read::Mutable, Read::Reborrow] {
+                let output = probe(aggregate, read);
+                assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+                assert_eq!(assertion_error(&output), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn whole_cell_borrow_load_observes_the_latest_alias_write() {
+        for aggregate in [false, true] {
+            let output = probe(aggregate, Read::AfterWrite);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            assert_eq!(assertion_error(&output), Some(true), "the written zero must refute == 7");
+        }
+    }
+
+    #[test]
+    fn whole_cell_borrow_load_does_not_resurrect_a_call_invalidated_value() {
+        for aggregate in [false, true] {
+            let output = probe(aggregate, Read::AfterCall);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            assert_eq!(assertion_error(&output), None, "a call-escaping cell stays havoced");
+        }
+    }
+
+    #[test]
+    fn whole_cell_borrow_load_rejects_a_mismatched_access_type() {
+        for aggregate in [false, true] {
+            let output = probe(aggregate, Read::WrongType);
+            assert!(
+                output.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.reason
+                        == TrustIrChcUnsupportedReason::MemoryAccessWithoutPreciseModel
+                }),
+                "a U64 load cannot import the stored U32 or tuple value"
+            );
+        }
+    }
+
+    #[test]
+    fn initialized_local_borrows_reach_the_structural_alloca_lane() {
+        for aggregate in [false, true] {
+            for read in [Read::Shared, Read::Mutable, Read::Reborrow, Read::AfterWrite] {
+                let (module, function, cell, ty) = fixture(aggregate, read);
+                let function = module.function_by_id(function).unwrap();
+                assert!(borrowed_block_local_cell_is_admissible(&module, function, cell, &ty));
+                assert!(single_cell_alloca_is_admissible(&module, function, cell, &ty));
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_alloca_lane_rejects_call_escape_and_type_mismatch() {
+        for aggregate in [false, true] {
+            for read in [Read::AfterCall, Read::WrongType] {
+                let (module, function, cell, ty) = fixture(aggregate, read);
+                let function = module.function_by_id(function).unwrap();
+                assert!(!borrowed_block_local_cell_is_admissible(&module, function, cell, &ty));
+                assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty));
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_alloca_lane_rejects_permission_conflicts() {
+        for hazard in [
+            "mutable_after_mutable",
+            "shared_after_mutable",
+            "mutable_after_shared",
+            "shared_write_alias",
+            "shared_write_root",
+        ] {
+            let read =
+                if hazard.starts_with("shared_write") { Read::AfterWrite } else { Read::Mutable };
+            let (mut module, function, cell, ty) = fixture(false, read);
+            let body =
+                &mut module.functions.iter_mut().find(|f| f.id == function).unwrap().blocks[0].body;
+            let borrow_index =
+                body.iter().position(|node| matches!(node.inst, Inst::BorrowMut { .. })).unwrap();
+            let alias = body[borrow_index].results[0];
+            if matches!(hazard, "mutable_after_shared" | "shared_write_alias" | "shared_write_root")
+            {
+                body[borrow_index].inst = Inst::Borrow { ptr: cell };
+            }
+            if hazard.ends_with("after_mutable") || hazard == "mutable_after_shared" {
+                let inst = if hazard == "shared_after_mutable" {
+                    Inst::Borrow { ptr: alias }
+                } else {
+                    Inst::BorrowMut { ptr: alias }
+                };
+                body.insert(borrow_index + 1, InstrNode::new(inst).with_result(ValueId::new(1000)));
+            }
+            if hazard == "shared_write_root" {
+                for node in &mut body[borrow_index + 1..] {
+                    if let Inst::Store { ptr, .. } = &mut node.inst {
+                        *ptr = cell;
+                    }
+                }
+            }
+            let function = module.function_by_id(function).unwrap();
+            assert!(
+                !borrowed_block_local_cell_is_admissible(&module, function, cell, &ty),
+                "{hazard}"
+            );
+            assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty), "{hazard}");
+        }
+    }
+
+    #[test]
+    fn borrowed_alloca_lane_rejects_uninitialized_or_qualified_accesses() {
+        for hazard in
+            ["uninitialized", "volatile", "aligned", "store_type", "extent", "alloca_align"]
+        {
+            let (mut module, function, cell, ty) = fixture(false, Read::Mutable);
+            let body =
+                &mut module.functions.iter_mut().find(|f| f.id == function).unwrap().blocks[0].body;
+            match hazard {
+                "uninitialized" => body.retain(|node| !matches!(node.inst, Inst::Store { .. })),
+                "volatile" | "aligned" => {
+                    for node in body {
+                        if let Inst::Load { volatile, align, .. } = &mut node.inst {
+                            if hazard == "volatile" {
+                                *volatile = true;
+                            } else {
+                                *align = Some(4);
+                            }
+                        }
+                    }
+                }
+                "store_type" => {
+                    for node in body {
+                        if let Inst::Store { ty, .. } = &mut node.inst {
+                            *ty = Ty::U64;
+                        }
+                    }
+                }
+                "extent" | "alloca_align" => {
+                    for node in body {
+                        if let Inst::Alloca { count, align, .. } = &mut node.inst {
+                            if hazard == "extent" {
+                                *count = Some(ValueId::new(0));
+                            } else {
+                                *align = Some(4);
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let function = module.function_by_id(function).unwrap();
+            assert!(
+                !borrowed_block_local_cell_is_admissible(&module, function, cell, &ty),
+                "{hazard}"
+            );
+            assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty), "{hazard}");
+        }
+    }
+
+    #[test]
+    fn borrowed_alloca_lane_rejects_alias_escape_and_cross_block_loads() {
+        for cross_block in [false, true] {
+            let (mut module, function, cell, ty) = fixture(false, Read::Mutable);
+            let func = module.functions.iter_mut().find(|f| f.id == function).unwrap();
+            let alias = func.blocks[0]
+                .body
+                .iter()
+                .find_map(|node| {
+                    matches!(node.inst, Inst::BorrowMut { .. }).then(|| node.results[0])
+                })
+                .unwrap();
+            if cross_block {
+                let load_index = func.blocks[0]
+                    .body
+                    .iter()
+                    .position(|node| matches!(node.inst, Inst::Load { .. }))
+                    .unwrap();
+                let mut successor = Block::new(BlockId::new(1));
+                successor.body = func.blocks[0].body.split_off(load_index);
+                func.blocks[0]
+                    .body
+                    .push(InstrNode::new(Inst::Br { target: successor.id, args: vec![] }));
+                // The successor is deliberately listed first: admission must not
+                // depend on seeing the definition block before its alias use.
+                func.blocks.insert(0, successor);
+            } else {
+                let body = &mut func.blocks[0].body;
+                let holder = ValueId::new(1000);
+                body.insert(
+                    body.len() - 1,
+                    InstrNode::new(Inst::Alloca { ty: Ty::Ptr, count: None, align: None })
+                        .with_result(holder),
+                );
+                body.insert(
+                    body.len() - 1,
+                    InstrNode::new(Inst::Store {
+                        ty: Ty::Ptr,
+                        ptr: holder,
+                        value: alias,
+                        volatile: false,
+                        align: None,
+                    }),
+                );
+            }
+            let function = module.function_by_id(function).unwrap();
+            assert!(!borrowed_block_local_cell_is_admissible(&module, function, cell, &ty));
+            assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty));
+        }
+    }
+
+    // ---- Copy-spelled references (`transparent_pointer_alias`) ----
+    //
+    // A Rust producer spells `&place` / `&mut place` as a `Copy` of the address, not
+    // as a permission instruction (trust-ir SPEC "A Rust reference carries no
+    // permission instruction"). These pin that the translator and the borrowed-cell
+    // lane give that spelling the borrow's exact model, and that its soundness
+    // guards (escape, call invalidation) hold for it too.
+
+    /// A cell of `(u32, bool)` holding `(7, true)`; `&mut cell.0 = 0` through a
+    /// reference to the field's GEP; then the cell is loaded and `cell.0 == 0`
+    /// asserted. The interior-field store shape the provenance lanes follow.
+    fn interior_field_fixture(spelling: Spelling) -> (Module, FuncId) {
+        let mut mb = ModuleBuilder::new("interior_field_reference_store");
+        // A declared layout, so the field GEP names exactly one lane (an
+        // undeclared tuple layout drops the store to "unknown offset").
+        let struct_id = mb.add_struct(trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "interior_field::S".to_string(),
+            fields: vec![
+                trust_ir::FieldDef { name: "a".into(), ty: Ty::U32, offset: Some(0) },
+                trust_ir::FieldDef { name: "b".into(), ty: Ty::Bool, offset: Some(4) },
+            ],
+            size: Some(8),
+            align: Some(4),
+            repr: trust_ir::StructRepr::Rust,
+            origin: None,
+        });
+        let fn_ty = mb.add_func_type(vec![], vec![]);
+        let function = mb.peek_next_func_id().expect("peek_next_func_id: test fixture");
+        let mut fb = mb.function("write_through_field_reference", fn_ty);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let cell_ty = Ty::Struct(struct_id);
+        let seven = fb.const_value(Ty::U32, Constant::Int(7));
+        let yes = fb.const_value(Ty::Bool, Constant::Bool(true));
+        let empty = fb.const_value(cell_ty.clone(), Constant::Aggregate(vec![Constant::Uninit; 2]));
+        let with_number = fb.insert_field(cell_ty.clone(), empty, 0, seven);
+        let initial = fb.insert_field(cell_ty.clone(), with_number, 1, yes);
+        let slot = fb.alloca(cell_ty.clone());
+        fb.store(cell_ty.clone(), slot, initial);
+        let index = fb.iconst(Ty::U64, 0);
+        let field = fb.gep(Ty::U32, slot, vec![index]);
+        let field_ref = reference(&mut fb, spelling, field, true);
+        let zero = fb.const_value(Ty::U32, Constant::Int(0));
+        fb.store(Ty::U32, field_ref, zero);
+        let loaded = fb.load(cell_ty.clone(), slot);
+        let number = fb.extract_field(Ty::U32, loaded, 0);
+        let written = fb.icmp(ICmpOp::Eq, Ty::U32, number, zero);
+        fb.assert(written);
+        fb.ret(vec![]);
+        fb.build();
+        (mb.build().expect("ModuleBuilder::build: test fixture"), function)
+    }
+
+    /// M-a. Every permission-legal whole-cell shape, and the interior-field store,
+    /// translates to the same verdict whether its references are borrows or
+    /// Copy-spelled. Fails before `transparent_pointer_alias` reaches the translator
+    /// and the lanes: the Copy rows lose the referent's provenance, are classed as
+    /// escapes, and come back havoced (`None`) where the borrow rows are exact.
+    #[test]
+    fn copy_and_borrow_references_translate_identically() {
+        for aggregate in [false, true] {
+            for read in
+                [Read::Shared, Read::Mutable, Read::Reborrow, Read::AfterWrite, Read::AfterCall]
+            {
+                let borrow = probe_spelled(aggregate, read, Spelling::Borrow);
+                let copy = probe_spelled(aggregate, read, Spelling::Copy);
+                assert!(copy.diagnostics.is_empty(), "{:?}", copy.diagnostics);
+                assert_eq!(
+                    assertion_error(&copy),
+                    assertion_error(&borrow),
+                    "aggregate={aggregate} read={read:?}"
+                );
+                let (bm, bf, bcell, bty) = fixture_spelled(aggregate, read, Spelling::Borrow);
+                let (cm, cf, ccell, cty) = fixture_spelled(aggregate, read, Spelling::Copy);
+                let (bfunc, cfunc) =
+                    (bm.function_by_id(bf).unwrap(), cm.function_by_id(cf).unwrap());
+                assert_eq!(
+                    single_cell_alloca_is_admissible(&cm, cfunc, ccell, &cty),
+                    single_cell_alloca_is_admissible(&bm, bfunc, bcell, &bty),
+                    "aggregate={aggregate} read={read:?}"
+                );
+            }
+        }
+        let outputs = [Spelling::Borrow, Spelling::Copy].map(|spelling| {
+            let (module, function) = interior_field_fixture(spelling);
+            trust_ir_function_to_chc_translation_output(
+                &module,
+                function,
+                &TranslateOptions::default(),
+            )
+            .expect("interior-field fixture translates")
+        });
+        for output in &outputs {
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        }
+        assert_eq!(assertion_error(&outputs[1]), assertion_error(&outputs[0]));
+        assert_eq!(
+            assertion_error(&outputs[1]),
+            Some(false),
+            "the write through the Copy-spelled field reference reaches the cell's lane"
+        );
+    }
+
+    /// The M-b subject, `let mut x = 5; { let r = &mut x; *r = 6; } let s = &x; *s`:
+    /// block-local and call-free, its two references spelled as `spelling` says.
+    fn reborrow_after_mutable_fixture(spelling: Spelling) -> (Module, FuncId, ValueId) {
+        let mut mb = ModuleBuilder::new("shared_after_mutable_reference");
+        let fn_ty = mb.add_func_type(vec![], vec![]);
+        let function = mb.peek_next_func_id().expect("peek_next_func_id: test fixture");
+        let mut fb = mb.function("read_after_scoped_mutable_reference", fn_ty);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.set_entry(entry);
+        let slot = fb.alloca(Ty::U32);
+        let five = fb.const_value(Ty::U32, Constant::Int(5));
+        fb.store(Ty::U32, slot, five);
+        let r = reference(&mut fb, spelling, slot, true);
+        let six = fb.const_value(Ty::U32, Constant::Int(6));
+        fb.store(Ty::U32, r, six);
+        let s = reference(&mut fb, spelling, slot, false);
+        let read = fb.load(Ty::U32, s);
+        let is_six = fb.icmp(ICmpOp::Eq, Ty::U32, read, six);
+        fb.assert(is_six);
+        fb.ret(vec![]);
+        fb.build();
+        (mb.build().expect("ModuleBuilder::build: test fixture"), function, slot)
+    }
+
+    /// M-b. A Copy-spelled reference is not held to the permission machine: the
+    /// scoped `&mut` followed by a `&` of the same local is admitted by the gate's
+    /// Alloca predicate and proved. Its Borrow-spelled twin (a `BorrowMut` that is
+    /// never ended, then a `Borrow`) is refused by the borrowed-cell lane's
+    /// permission check, which is the machine's own reading of that spelling.
+    #[test]
+    fn copy_reference_is_not_held_to_the_permission_machine() {
+        let (module, function, cell) = reborrow_after_mutable_fixture(Spelling::Copy);
+        let func = module.function_by_id(function).unwrap();
+        assert!(borrowed_block_local_cell_is_admissible(&module, func, cell, &Ty::U32));
+        assert!(single_cell_alloca_is_admissible(&module, func, cell, &Ty::U32));
+        let output = trust_ir_function_to_chc_translation_output(
+            &module,
+            function,
+            &TranslateOptions::default(),
+        )
+        .expect("Copy-spelled fixture translates");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(assertion_error(&output), Some(false), "`*s == 6` is proved");
+
+        let (module, function, cell) = reborrow_after_mutable_fixture(Spelling::Borrow);
+        let func = module.function_by_id(function).unwrap();
+        assert!(!borrowed_block_local_cell_is_admissible(&module, func, cell, &Ty::U32));
+        assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::U32));
+    }
+
+    /// M-c, the soundness dual of `transparent_pointer_alias`: a Copy-spelled `&mut`
+    /// of the cell handed to an opaque call. The call may write through it, so the
+    /// cell's old value must not be proved afterwards, and the lane must refuse the
+    /// cell. Passes before M1 (a `Copy` operand was an escape); fails if the alias
+    /// predicate ever lets the Copy RESULT's call use stop counting as an escape.
+    #[test]
+    fn copy_alias_into_a_call_invalidates_the_cell() {
+        for aggregate in [false, true] {
+            let output = probe_spelled(aggregate, Read::AfterCall, Spelling::Copy);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            assert_eq!(assertion_error(&output), None, "a call-escaping cell stays havoced");
+            let (module, function, cell, ty) =
+                fixture_spelled(aggregate, Read::AfterCall, Spelling::Copy);
+            let function = module.function_by_id(function).unwrap();
+            assert!(!borrowed_block_local_cell_is_admissible(&module, function, cell, &ty));
+            assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty));
+            assert_eq!(
+                stack_alloca_escape_classification(function, cell),
+                StackCellEscape::IntoCallsOnly
+            );
+        }
+    }
+
+    /// A Copy-spelled alias written into memory as a VALUE is the escape the
+    /// borrowed lane refuses for a borrow (`..._rejects_alias_escape_...` above).
+    #[test]
+    fn copy_alias_stored_as_a_value_is_refused_by_the_lane() {
+        let (mut module, function, cell, ty) =
+            fixture_spelled(false, Read::Mutable, Spelling::Copy);
+        let func = module.functions.iter_mut().find(|f| f.id == function).unwrap();
+        let alias = func.blocks[0]
+            .body
+            .iter()
+            .find_map(|node| matches!(node.inst, Inst::Copy { .. }).then(|| node.results[0]))
+            .unwrap();
+        let body = &mut func.blocks[0].body;
+        let holder = ValueId::new(1000);
+        body.insert(
+            body.len() - 1,
+            InstrNode::new(Inst::Alloca { ty: Ty::Ptr, count: None, align: None })
+                .with_result(holder),
+        );
+        body.insert(
+            body.len() - 1,
+            InstrNode::new(Inst::Store {
+                ty: Ty::Ptr,
+                ptr: holder,
+                value: alias,
+                volatile: false,
+                align: None,
+            }),
+        );
+        let function = module.function_by_id(function).unwrap();
+        assert!(!borrowed_block_local_cell_is_admissible(&module, function, cell, &ty));
+        assert!(!single_cell_alloca_is_admissible(&module, function, cell, &ty));
+        assert_eq!(stack_alloca_escape_classification(function, cell), StackCellEscape::Unbounded);
+    }
+
+    /// The alias predicate itself: a borrow's operand, and a `Copy`'s operand at
+    /// exactly the five thin reference/pointer types; never a `Copy` at a fat
+    /// pointer, a reference-counted word or a non-pointer type.
+    #[test]
+    fn transparent_pointer_alias_is_exactly_the_borrows_and_thin_pointer_copies() {
+        let p = ValueId::new(3);
+        assert_eq!(transparent_pointer_alias(&Inst::Borrow { ptr: p }), Some(p));
+        assert_eq!(transparent_pointer_alias(&Inst::BorrowMut { ptr: p }), Some(p));
+        for ty in [
+            Ty::Ptr,
+            Ty::Ref(Box::new(Ty::U8)),
+            Ty::RefMut(Box::new(Ty::U8)),
+            Ty::PtrConst(Box::new(Ty::U8)),
+            Ty::PtrMut(Box::new(Ty::U8)),
+        ] {
+            assert_eq!(transparent_pointer_alias(&Inst::Copy { ty, operand: p }), Some(p));
+        }
+        for ty in [Ty::FatPtr(FatPtrKind::Str), Ty::Rc(Box::new(Ty::U8)), Ty::U64, Ty::Usize] {
+            assert_eq!(transparent_pointer_alias(&Inst::Copy { ty, operand: p }), None);
+        }
+        assert_eq!(transparent_pointer_alias(&Inst::EndBorrow { borrow_ptr: p }), None);
+        assert_eq!(
+            transparent_pointer_alias(&Inst::Load {
+                ty: Ty::Ptr,
+                ptr: p,
+                volatile: false,
+                align: None
+            }),
+            None
         );
     }
 }
@@ -7739,7 +13617,7 @@ mod mem2reg_tests {
         fb.ret(vec![]);
         fb.build();
 
-        (mb.build(), acc, entry, header, body, exit)
+        (mb.build().expect("ModuleBuilder::build: test fixture"), acc, entry, header, body, exit)
     }
 
     #[test]
@@ -7832,7 +13710,7 @@ mod mem2reg_tests {
         fb.ret(vec![]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let func = &module.functions[0];
         let options = TranslateOptions::default();
         let translator = ChcFuncTranslator::new(func, &module, &options);
@@ -7911,7 +13789,7 @@ mod mem2reg_tests {
         fb.ret(vec![k]);
         fb.build();
 
-        (mb.build(), cell, join)
+        (mb.build().expect("ModuleBuilder::build: test fixture"), cell, join)
     }
 
     /// THE gap this lane closes: the cross-block clamp/join cell is modeled
@@ -8015,7 +13893,7 @@ mod mem2reg_tests {
         fb.ret(vec![k]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let func = &module.functions[0];
         let options = TranslateOptions::default();
         let translator = ChcFuncTranslator::new(func, &module, &options);
@@ -8064,7 +13942,7 @@ mod mem2reg_tests {
         fb.ret(vec![]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let func = &module.functions[0];
         assert!(!promoted_cell_is_definitely_initialized(func, cell.index()));
         assert!(!single_cell_alloca_is_admissible(&module, func, cell, &Ty::I64));
@@ -8105,9 +13983,23 @@ mod mem2reg_tests {
     /// STORE in each arm, a whole-cell LOAD in the join. Returns
     /// `(module, cell, cell ty, join block)`.
     fn build_aggregate_clamp_join(shape: AggregateJoinShape) -> (Module, ValueId, Ty, BlockId) {
+        build_aggregate_clamp_join_input(shape, false)
+    }
+
+    fn build_aggregate_clamp_join_input(
+        shape: AggregateJoinShape,
+        initialized: bool,
+    ) -> (Module, ValueId, Ty, BlockId) {
         let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
         let mut mb = ModuleBuilder::new("mem2reg_aggregate_join");
-        let ft = mb.add_func_type(vec![Ty::Bool, pair.clone()], vec![pair.clone()]);
+        let ft = mb.add_func_type(
+            if initialized {
+                vec![Ty::Bool, Ty::U64, Ty::U64]
+            } else {
+                vec![Ty::Bool, pair.clone()]
+            },
+            vec![pair.clone()],
+        );
         let mut fb = mb.function("pair_join", ft);
 
         let entry = fb.create_block();
@@ -8118,7 +14010,13 @@ mod mem2reg_tests {
 
         fb.switch_to_block(entry);
         let cond = fb.add_block_param(entry, Ty::Bool);
-        let p = fb.add_block_param(entry, pair.clone());
+        let p = if initialized {
+            let x = fb.add_block_param(entry, Ty::U64);
+            let y = fb.add_block_param(entry, Ty::U64);
+            fb.make_aggregate(pair.clone(), vec![x, y])
+        } else {
+            fb.add_block_param(entry, pair.clone())
+        };
         let cell = fb.alloca(pair.clone());
         fb.condbr(cond, then_block, vec![], else_block, vec![]);
 
@@ -8154,7 +14052,7 @@ mod mem2reg_tests {
         fb.ret(vec![k]);
         fb.build();
 
-        (mb.build(), cell, pair, join)
+        (mb.build().expect("ModuleBuilder::build: test fixture"), cell, pair, join)
     }
 
     fn relation_arity(output: &ChcTranslationOutput, block: BlockId) -> usize {
@@ -8192,15 +14090,91 @@ mod mem2reg_tests {
         );
         assert!(single_cell_alloca_is_admissible(&module, func, cell, &pair));
 
-        let output = translate_function(func, &module, &options);
+        let output = translate_function_per_block(func, &module, &options);
         assert!(output.diagnostics.is_empty(), "the promoted aggregate lowers with no diagnostics");
 
         let (aliased_module, ..) = build_aggregate_clamp_join(AggregateJoinShape::Aliased);
-        let aliased = translate_function(&aliased_module.functions[0], &aliased_module, &options);
+        let aliased =
+            translate_function_per_block(&aliased_module.functions[0], &aliased_module, &options);
         assert_eq!(
             relation_arity(&output, join) - relation_arity(&aliased, join),
             2,
             "promotion adds exactly one relation leaf per flattened tuple field"
+        );
+    }
+
+    #[test]
+    fn original_cross_block_partial_transport_does_not_initialize_fields() {
+        use trust_ir::interpret::{
+            InterpretErrorCode, InterpretValue, InterpretValueKind, Interpreter,
+        };
+        let (mut module, _, pair, _) =
+            build_aggregate_clamp_join_input(AggregateJoinShape::Clean, false);
+        for condition in [false, true] {
+            let input = InterpretValue {
+                ty: pair.clone(),
+                kind: InterpretValueKind::Aggregate(vec![
+                    InterpretValue::int(Ty::U64, 7).unwrap(),
+                    InterpretValue { ty: Ty::U64, kind: InterpretValueKind::Uninit },
+                ]),
+            };
+            let condition =
+                InterpretValue { ty: Ty::Bool, kind: InterpretValueKind::Bool(condition) };
+            let result = Interpreter::with_module(&module)
+                .execute_func(FuncId::new(0), [condition, input])
+                .unwrap();
+            assert!(matches!(&result.returns[0].kind, InterpretValueKind::Aggregate(fields)
+                if matches!(fields[1].kind, InterpretValueKind::Uninit)));
+        }
+        let output = translate_function_per_block(
+            &module.functions[0],
+            &module,
+            &TranslateOptions::default(),
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let mut signature = module.func_types[module.functions[0].ty.as_usize()].clone();
+        signature.params.clear();
+        signature.returns.clear();
+        let ty = trust_ir::FuncTyId::new(module.func_types.len() as u32);
+        module.func_types.push(signature);
+        let mut caller =
+            Function::new(FuncId::new(1), "consume_unwritten_field", ty, BlockId::new(0));
+        let mut entry = Block::new(BlockId::new(0));
+        entry.body = vec![
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                .with_result(ValueId::new(0)),
+            InstrNode::new(Inst::Const {
+                ty: pair.clone(),
+                value: Constant::Aggregate(vec![Constant::Int(7), Constant::Uninit]),
+            })
+            .with_result(ValueId::new(1)),
+            InstrNode::new(Inst::Call {
+                callee: FuncId::new(0),
+                args: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::U64,
+                aggregate: ValueId::new(2),
+                field: 1,
+            })
+            .with_result(ValueId::new(3)),
+            InstrNode::new(Inst::Return { values: vec![] }),
+        ];
+        caller.blocks.push(entry);
+        module.functions.push(caller);
+        assert_eq!(
+            Interpreter::with_module(&module).execute_func(FuncId::new(1), []).unwrap_err().code,
+            InterpretErrorCode::UndefinedBehavior
+        );
+        let output =
+            translate_function(&module.functions[1], &module, &TranslateOptions::default());
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason
+                    == TrustIrChcUnsupportedReason::OperandConsumption)
         );
     }
 
@@ -8217,11 +14191,18 @@ mod mem2reg_tests {
     #[test]
     fn a_nested_aggregate_cell_threads_one_relation_leaf_per_scalar_leaf() {
         let inner = Ty::Tuple(vec![Ty::U64, Ty::Bool]);
-        let outer = Ty::Tuple(vec![Ty::U64, inner, Ty::Unit]);
+        let outer = Ty::Tuple(vec![Ty::U64, inner.clone(), Ty::Unit]);
 
-        let build = |alias: bool| {
+        let build = |alias: bool, initialized: bool| {
             let mut mb = ModuleBuilder::new("mem2reg_nested_join");
-            let ft = mb.add_func_type(vec![Ty::Bool, outer.clone()], vec![outer.clone()]);
+            let ft = mb.add_func_type(
+                if initialized {
+                    vec![Ty::Bool, Ty::U64, Ty::U64, Ty::Bool]
+                } else {
+                    vec![Ty::Bool, outer.clone()]
+                },
+                vec![outer.clone()],
+            );
             let mut fb = mb.function("nested_join", ft);
             let entry = fb.create_block();
             let then_block = fb.create_block();
@@ -8231,7 +14212,16 @@ mod mem2reg_tests {
 
             fb.switch_to_block(entry);
             let cond = fb.add_block_param(entry, Ty::Bool);
-            let p = fb.add_block_param(entry, outer.clone());
+            let p = if initialized {
+                let x = fb.add_block_param(entry, Ty::U64);
+                let y = fb.add_block_param(entry, Ty::U64);
+                let flag = fb.add_block_param(entry, Ty::Bool);
+                let nested = fb.make_aggregate(inner.clone(), vec![y, flag]);
+                let unit = fb.const_value(Ty::Unit, Constant::PhantomData);
+                fb.make_aggregate(outer.clone(), vec![x, nested, unit])
+            } else {
+                fb.add_block_param(entry, outer.clone())
+            };
             let cell = fb.alloca(outer.clone());
             fb.condbr(cond, then_block, vec![], else_block, vec![]);
 
@@ -8253,16 +14243,48 @@ mod mem2reg_tests {
             let k = fb.load(outer.clone(), cell);
             fb.ret(vec![k]);
             fb.build();
-            (mb.build(), cell, join)
+            (mb.build().expect("ModuleBuilder::build: test fixture"), cell, join)
         };
 
-        let (module, cell, join) = build(false);
-        let (aliased_module, ..) = build(true);
+        let (original, _, _) = build(false, false);
+        {
+            use trust_ir::interpret::{InterpretValue, InterpretValueKind, Interpreter};
+            let value = InterpretValue {
+                ty: outer.clone(),
+                kind: InterpretValueKind::Aggregate(vec![
+                    InterpretValue::int(Ty::U64, 7).unwrap(),
+                    InterpretValue {
+                        ty: inner.clone(),
+                        kind: InterpretValueKind::Aggregate(vec![
+                            InterpretValue { ty: Ty::U64, kind: InterpretValueKind::Uninit },
+                            InterpretValue { ty: Ty::Bool, kind: InterpretValueKind::Bool(true) },
+                        ]),
+                    },
+                    InterpretValue { ty: Ty::Unit, kind: InterpretValueKind::Unit },
+                ]),
+            };
+            let condition = InterpretValue { ty: Ty::Bool, kind: InterpretValueKind::Bool(true) };
+            let result = Interpreter::with_module(&original)
+                .execute_func(FuncId::new(0), [condition, value])
+                .unwrap();
+            assert!(matches!(&result.returns[0].kind, InterpretValueKind::Aggregate(fields)
+                if matches!(&fields[1].kind, InterpretValueKind::Aggregate(inner)
+                    if matches!(inner[0].kind, InterpretValueKind::Uninit))));
+            let output = translate_function_per_block(
+                &original.functions[0],
+                &original,
+                &TranslateOptions::default(),
+            );
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        }
+        let (module, cell, join) = build(false, false);
+        let (aliased_module, ..) = build(true, false);
         let options = TranslateOptions::default();
 
         assert!(single_cell_alloca_is_admissible(&module, &module.functions[0], cell, &outer));
-        let output = translate_function(&module.functions[0], &module, &options);
-        let aliased = translate_function(&aliased_module.functions[0], &aliased_module, &options);
+        let output = translate_function_per_block(&module.functions[0], &module, &options);
+        let aliased =
+            translate_function_per_block(&aliased_module.functions[0], &aliased_module, &options);
         assert!(output.diagnostics.is_empty());
         assert_eq!(
             relation_arity(&output, join) - relation_arity(&aliased, join),
@@ -8280,7 +14302,7 @@ mod mem2reg_tests {
     fn each_join_edge_carries_its_own_predecessors_aggregate_leaves() {
         let (module, .., join) = build_aggregate_clamp_join(AggregateJoinShape::Clean);
         let options = TranslateOptions::default();
-        let output = translate_function(&module.functions[0], &module, &options);
+        let output = translate_function_per_block(&module.functions[0], &module, &options);
 
         let name = block_relation_name(join);
         let heads: Vec<&Vec<Expr>> = output
@@ -8342,7 +14364,11 @@ mod mem2reg_tests {
             let func = &module.functions[0];
             let rejection = single_cell_alloca_rejection(&module, func, cell, &pair)
                 .unwrap_or_else(|| panic!("{shape:?} must stay fail-closed"));
-            assert_eq!(rejection.promoted.kind(), expected, "{shape:?} refused for the wrong reason");
+            assert_eq!(
+                rejection.promoted.kind(),
+                expected,
+                "{shape:?} refused for the wrong reason"
+            );
         }
     }
 
@@ -8371,7 +14397,7 @@ mod mem2reg_tests {
         fb.ret(vec![value]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let admitted =
             single_cell_alloca_rejection(&module, &module.functions[0], cell, &pair).is_none();
         assert_eq!(
@@ -8403,6 +14429,16 @@ mod mem2reg_tests {
     }
 
     fn build_borrowed_cross_block(shape: BorrowShape) -> (Module, ValueId, Ty) {
+        build_referenced_cross_block(shape, false)
+    }
+
+    /// [`build_borrowed_cross_block`], with the reference spelled either as the
+    /// `BorrowMut` permission instruction or (`copy_spelled`) as the Rust producers'
+    /// `Copy` of the address at `Ptr` (`transparent_pointer_alias`).
+    fn build_referenced_cross_block(
+        shape: BorrowShape,
+        copy_spelled: bool,
+    ) -> (Module, ValueId, Ty) {
         let cell_ty = if shape == BorrowShape::ScalarTransparent {
             Ty::U64
         } else {
@@ -8422,7 +14458,8 @@ mod mem2reg_tests {
         let seed = fb.add_block_param(entry, cell_ty.clone());
         let cell = fb.alloca(cell_ty.clone());
         fb.store(cell_ty.clone(), cell, seed); // definite initialization in the def block
-        let borrowed = fb.borrow_mut(cell); // THE BORROW
+        // THE BORROW
+        let borrowed = if copy_spelled { fb.copy(Ty::Ptr, cell) } else { fb.borrow_mut(cell) };
         if shape == BorrowShape::StoredAsValue {
             let sink = fb.alloca(Ty::Ptr);
             fb.store(Ty::Ptr, sink, borrowed); // the ADDRESS goes into memory
@@ -8440,7 +14477,7 @@ mod mem2reg_tests {
         fb.ret(vec![out]);
         fb.build();
 
-        (mb.build(), cell, cell_ty)
+        (mb.build().expect("ModuleBuilder::build: test fixture"), cell, cell_ty)
     }
 
     /// Run the real step-2 predicate on the fixture's borrow. Called directly
@@ -8452,10 +14489,8 @@ mod mem2reg_tests {
             .iter()
             .flat_map(|block| block.body.iter())
             .find(|node| {
-                matches!(
-                    &node.inst,
-                    Inst::Borrow { ptr } | Inst::BorrowMut { ptr } if ptr.index() == cell.index()
-                )
+                transparent_pointer_alias(&node.inst)
+                    .is_some_and(|referent| referent.index() == cell.index())
             })
             .map(|node| borrow_use_is_transparently_promotable(func, &node.inst, cell))
             .expect("the fixture borrows the cell")
@@ -8484,6 +14519,49 @@ mod mem2reg_tests {
         );
     }
 
+    /// The tripwire above, with the reference spelled as the Rust producers spell
+    /// it: a thin-pointer `Copy` of the cell. The `Copy` joins the derivation
+    /// closure exactly as the borrow did, so its RESULT written into memory is the
+    /// same escape. If this goes green, a Copy-spelled reference is the unsound
+    /// hole the borrow arm's escape guard exists to close.
+    #[test]
+    fn a_copy_reference_stored_as_a_value_is_still_refused() {
+        let (module, cell, ty) = build_referenced_cross_block(BorrowShape::StoredAsValue, true);
+        assert!(
+            !borrow_is_transparently_promotable(&module, cell),
+            "a Copy-spelled reference whose RESULT is written into memory must never be promotable",
+        );
+        assert_eq!(
+            stack_alloca_escape_classification(&module.functions[0], cell),
+            StackCellEscape::Unbounded,
+            "and it must be refused for the ESCAPE reason, not incidentally",
+        );
+        assert!(single_cell_alloca_rejection(&module, &module.functions[0], cell, &ty).is_some());
+    }
+
+    /// The Copy-spelled twin of the positive half below: a thin-pointer `Copy` of
+    /// the cell is the same transparent derivation, so the classification and the
+    /// promotion predicate answer exactly as they do for the borrow.
+    #[test]
+    fn a_copy_reference_classifies_exactly_like_the_borrow() {
+        for shape in
+            [BorrowShape::Transparent, BorrowShape::ScalarTransparent, BorrowShape::StoredAsValue]
+        {
+            let (borrow_module, borrow_cell, _) = build_referenced_cross_block(shape, false);
+            let (copy_module, copy_cell, _) = build_referenced_cross_block(shape, true);
+            assert_eq!(
+                stack_alloca_escape_classification(&copy_module.functions[0], copy_cell),
+                stack_alloca_escape_classification(&borrow_module.functions[0], borrow_cell),
+                "{shape:?}"
+            );
+            assert_eq!(
+                borrow_is_transparently_promotable(&copy_module, copy_cell),
+                borrow_is_transparently_promotable(&borrow_module, borrow_cell),
+                "{shape:?}"
+            );
+        }
+    }
+
     /// The positive half: the transparent cross-block borrow the arm exists to
     /// admit, on both an aggregate and a scalar cell.
     #[test]
@@ -8509,11 +14587,9 @@ mod mem2reg_tests {
     /// accommodate the flag.
     #[test]
     fn the_borrow_arm_is_default_off_and_bucket_preserving() {
-        for shape in [
-            BorrowShape::Transparent,
-            BorrowShape::ScalarTransparent,
-            BorrowShape::StoredAsValue,
-        ] {
+        for shape in
+            [BorrowShape::Transparent, BorrowShape::ScalarTransparent, BorrowShape::StoredAsValue]
+        {
             let (module, cell, ty) = build_borrowed_cross_block(shape);
             let func = &module.functions[0];
             let rejection = single_cell_alloca_rejection(&module, func, cell, &ty)
@@ -8573,7 +14649,7 @@ mod mem2reg_tests {
         callee.ret(vec![]);
         callee.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         assert_eq!(
             stack_alloca_escape_classification(&module.functions[0], cell),
             StackCellEscape::IntoCallsOnly
@@ -8684,11 +14760,7 @@ mod alloca_reject_taxonomy_tests {
             EnumId::new(0),
             "Choice",
             vec![
-                EnumVariant {
-                    name: "A".to_string(),
-                    fields: Vec::new(),
-                    field_names: Vec::new(),
-                },
+                EnumVariant { name: "A".to_string(), fields: Vec::new(), field_names: Vec::new() },
                 EnumVariant {
                     name: "B".to_string(),
                     fields: vec![Ty::I64],
@@ -8728,13 +14800,8 @@ mod alloca_reject_taxonomy_tests {
     }
 
     fn load(result: u32, ptr: u32, ty: Ty) -> InstrNode {
-        InstrNode::new(Inst::Load {
-            ty,
-            ptr: ValueId::new(ptr),
-            volatile: false,
-            align: None,
-        })
-        .with_result(ValueId::new(result))
+        InstrNode::new(Inst::Load { ty, ptr: ValueId::new(ptr), volatile: false, align: None })
+            .with_result(ValueId::new(result))
     }
 
     fn ret() -> InstrNode {
@@ -8754,19 +14821,29 @@ mod alloca_reject_taxonomy_tests {
         // Admitted control: block-local scalar, store then load.
         all.push((
             "admissible_block_local",
-            func(0, vec![block(0, vec![alloca(0, i64_.clone()), store(0, 1, i64_.clone()),
-                load(2, 0, i64_.clone()), ret()])]),
+            func(
+                0,
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, i64_.clone()),
+                        store(0, 1, i64_.clone()),
+                        load(2, 0, i64_.clone()),
+                        ret(),
+                    ],
+                )],
+            ),
             cell,
             i64_.clone(),
         ));
 
-        // Lane 1: the pointee is neither a precise scalar nor an aggregate.
-        let fat = Ty::FatPtr(FatPtrKind::Slice(TyId::new(0)));
+        // Lane 1: floats still have no admitted stack-cell lane. Fat-pointer
+        // cells have separate access-safety and opaque-value regression tests.
         all.push((
             "pointee_not_scalar_or_aggregate",
-            func(0, vec![block(0, vec![alloca(0, fat.clone()), ret()])]),
+            func(0, vec![block(0, vec![alloca(0, Ty::F32), ret()])]),
             cell,
-            fat,
+            Ty::F32,
         ));
 
         // No `Alloca { count: None, align: None, ty }` defines the cell: here the
@@ -8935,12 +15012,7 @@ mod alloca_reject_taxonomy_tests {
                 0,
                 vec![block(
                     0,
-                    vec![
-                        alloca(0, i64_.clone()),
-                        alloca(3, Ty::Ptr),
-                        store(3, 0, Ty::Ptr),
-                        ret(),
-                    ],
+                    vec![alloca(0, i64_.clone()), alloca(3, Ty::Ptr), store(3, 0, Ty::Ptr), ret()],
                 )],
             ),
             cell,
@@ -9007,10 +15079,7 @@ mod alloca_reject_taxonomy_tests {
                 0,
                 vec![
                     block(0, vec![alloca(0, Ty::Tuple(vec![Ty::I64, Ty::I64])), br(1)]),
-                    block(
-                        1,
-                        vec![store(0, 1, Ty::Tuple(vec![Ty::I64, Ty::I64])), ret()],
-                    ),
+                    block(1, vec![store(0, 1, Ty::Tuple(vec![Ty::I64, Ty::I64])), ret()]),
                 ],
             ),
             cell,
@@ -9284,8 +15353,14 @@ mod alloca_reject_taxonomy_tests {
 
     #[test]
     fn an_array_or_aligned_alloca_is_declined_by_both_lanes() {
-        assert_eq!(reason_for("array_alloca_count_some").block_local.kind(), "no_exact_defining_alloca");
-        assert_eq!(reason_for("array_alloca_count_some").promoted.kind(), "no_exact_defining_alloca");
+        assert_eq!(
+            reason_for("array_alloca_count_some").block_local.kind(),
+            "no_exact_defining_alloca"
+        );
+        assert_eq!(
+            reason_for("array_alloca_count_some").promoted.kind(),
+            "no_exact_defining_alloca"
+        );
         assert_eq!(reason_for("aligned_alloca").block_local.kind(), "no_exact_defining_alloca");
         assert_eq!(reason_for("aligned_alloca").promoted.kind(), "no_exact_defining_alloca");
     }
@@ -9295,7 +15370,8 @@ mod alloca_reject_taxonomy_tests {
         // The gate log histogram is built by grepping `reason=<lane1>/<lane2>`, so
         // a bucket name must never contain a separator that breaks the split.
         for (_, function, cell, ty) in fixtures() {
-            if let Some(reason) = single_cell_alloca_rejection(&taxonomy_module(), &function, cell, &ty)
+            if let Some(reason) =
+                single_cell_alloca_rejection(&taxonomy_module(), &function, cell, &ty)
             {
                 let kind = reason.kind();
                 assert_eq!(kind.matches('/').count(), 1, "exactly one lane separator: {kind}");
@@ -9376,7 +15452,8 @@ mod alloca_reject_taxonomy_tests {
         ];
         for (label, function, cell, ty) in fixtures() {
             for probe_ty in std::iter::once(ty.clone()).chain(probes.iter().cloned()) {
-                let now = promoted_cell_alloca_reject(&module, &function, cell, &probe_ty).is_none();
+                let now =
+                    promoted_cell_alloca_reject(&module, &function, cell, &probe_ty).is_none();
                 let before =
                     promoted_cell_alloca_is_admissible_scalar_reference(&function, cell, &probe_ty);
                 if now == before {
@@ -9390,6 +15467,147 @@ mod alloca_reject_taxonomy_tests {
                      trackable aggregate"
                 );
             }
+        }
+    }
+}
+
+/// trust-ir v40 `FatPtrKind::ContainerVtable`: every place this translator classifies
+/// a fat-pointer KIND must place the new kind by what its metadata MEANS.
+#[cfg(test)]
+mod fat_ptr_kind_classification_tests {
+    use super::{
+        fat_ptr_metadata_is_vtable_word, fat_ptr_metadata_len_is_isize_bounded, ty_carrier,
+    };
+    use trust_ir::Module;
+    use trust_ir::ty::{FatPtrKind, Ty};
+    use trust_ir::value::TyId;
+
+    fn every_kind() -> [FatPtrKind; 5] {
+        [
+            FatPtrKind::Slice(TyId::new(0)),
+            FatPtrKind::Str,
+            FatPtrKind::TraitObject { trait_id: 0 },
+            FatPtrKind::ContainerLen,
+            FatPtrKind::ContainerVtable,
+        ]
+    }
+
+    /// The census names the v40 kind by ITS OWN label. Folding it into
+    /// `TraitObject`'s (or an `Other` bucket) would be the attribution failure
+    /// the exhaustive match exists to prevent.
+    #[test]
+    fn census_carrier_names_container_vtable_as_its_own_class() {
+        assert_eq!(ty_carrier(&Ty::FatPtr(FatPtrKind::ContainerVtable)), "FatPtr_ContainerVtable");
+        let labels: std::collections::BTreeSet<String> =
+            every_kind().iter().map(|kind| ty_carrier(&Ty::FatPtr(*kind))).collect();
+        assert_eq!(labels.len(), every_kind().len(), "two fat-pointer kinds share a census label");
+    }
+
+    /// Metadata meaning: `ContainerVtable` follows `TraitObject` (a vtable word),
+    /// never `Slice`/`Str`/`ContainerLen` (a length) — trust-ir's own rule.
+    #[test]
+    fn container_vtable_metadata_is_a_vtable_word_not_a_length() {
+        for kind in every_kind() {
+            let is_vtable =
+                matches!(kind, FatPtrKind::TraitObject { .. } | FatPtrKind::ContainerVtable);
+            assert_eq!(fat_ptr_metadata_is_vtable_word(&Ty::FatPtr(kind)), is_vtable, "{kind:?}");
+        }
+        assert!(!fat_ptr_metadata_is_vtable_word(&Ty::Ptr), "a thin pointer has no metadata word");
+    }
+
+    /// No `len <= isize::MAX` bound may ever be pushed for a vtable-word kind, and
+    /// `ContainerLen` (a length with no element type) stays unbounded too.
+    #[test]
+    fn no_isize_length_bound_for_vtable_word_or_container_len_kinds() {
+        let module = Module::new("classification");
+        for kind in [
+            FatPtrKind::ContainerVtable,
+            FatPtrKind::TraitObject { trait_id: 0 },
+            FatPtrKind::ContainerLen,
+        ] {
+            assert!(!fat_ptr_metadata_len_is_isize_bounded(&module, &Ty::FatPtr(kind)), "{kind:?}");
+        }
+        assert!(fat_ptr_metadata_len_is_isize_bounded(&module, &Ty::FatPtr(FatPtrKind::Str)));
+    }
+}
+
+#[cfg(test)]
+mod make_aggregate_operand_tests {
+    use super::*;
+
+    #[test]
+    fn make_closure_uses_preserve_capture_order_and_duplicates() {
+        for captures in [vec![], vec![ValueId::new(7), ValueId::new(2), ValueId::new(7)]] {
+            let inst = Inst::MakeClosure {
+                ty: trust_ir::value::ClosureTyId::new(0),
+                func: FuncId::new(42),
+                captures: captures.clone(),
+            };
+            let mut uses = vec![ValueId::new(99)];
+            assert!(!collect_inst_value_uses(&inst, &mut uses));
+            let mut expected = vec![ValueId::new(99)];
+            expected.extend(captures);
+            assert_eq!(uses, expected);
+        }
+    }
+
+    #[test]
+    fn make_closure_pointer_capture_is_an_unbounded_cell_escape() {
+        let mut function = Function::new(
+            FuncId::new(0),
+            "capture_escape",
+            trust_ir::value::FuncTyId::new(0),
+            BlockId::new(0),
+        );
+        let mut block = trust_ir::Block::new(BlockId::new(0));
+        block.body.push(
+            InstrNode::new(Inst::Alloca { ty: Ty::I64, count: None, align: None })
+                .with_result(ValueId::new(7)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::MakeClosure {
+                ty: trust_ir::value::ClosureTyId::new(0),
+                func: FuncId::new(42),
+                captures: vec![ValueId::new(7)],
+            })
+            .with_result(ValueId::new(8)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+        function.blocks.push(block);
+        assert_eq!(
+            stack_alloca_escape_classification(&function, ValueId::new(7)),
+            StackCellEscape::Unbounded
+        );
+    }
+
+    #[test]
+    fn make_aggregate_uses_preserve_lane_order_and_duplicates() {
+        for fields in [vec![], vec![ValueId::new(7), ValueId::new(2), ValueId::new(7)]] {
+            let inst = Inst::MakeAggregate {
+                ty: Ty::Tuple(vec![]),
+                variant: None,
+                fields: fields.clone(),
+            };
+            let mut uses = vec![ValueId::new(99)];
+            assert!(!collect_inst_value_uses(&inst, &mut uses));
+            let mut expected = vec![ValueId::new(99)];
+            expected.extend(fields);
+            assert_eq!(uses, expected);
+        }
+    }
+
+    /// v50 `[value; n]` reads its one operand exactly once, at every length:
+    /// the lane count is in the type, never in the operand list.
+    #[test]
+    fn array_splat_uses_its_one_operand_once_at_any_length() {
+        for len in [1, 256, u64::MAX] {
+            let inst = Inst::ArraySplat {
+                ty: Ty::Array(trust_ir::TyId::new(0), len),
+                value: ValueId::new(7),
+            };
+            let mut uses = vec![ValueId::new(99)];
+            assert!(!collect_inst_value_uses(&inst, &mut uses), "len {len}");
+            assert_eq!(uses, vec![ValueId::new(99), ValueId::new(7)], "len {len}");
         }
     }
 }

@@ -20,8 +20,6 @@ use super::chc_debug_enabled;
 use super::chc_fresh_name;
 use super::codegen_ctx::RefTarget;
 use super::codegen_ctx::types::ChcConfig;
-use super::declare_pending_var;
-use super::push_pending_var_decl;
 
 // Re-export sibling modules from chc that stmt files access via
 // `super::module::item` paths.
@@ -30,6 +28,7 @@ use super::codegen_call_coerce;
 use super::codegen_call_vec;
 use super::codegen_ctx;
 use super::codegen_decl_flatten;
+use super::codegen_expr_flat_struct_path;
 use super::codegen_expr_heap;
 use super::codegen_expr_signedness;
 use super::codegen_rules;
@@ -70,13 +69,19 @@ pub(super) mod codegen_stmt_mirror;
 pub(super) mod codegen_stmt_output;
 pub(super) mod codegen_stmt_projection;
 pub(super) mod codegen_stmt_store;
+pub(in crate::codegen_ay::chc) use codegen_stmt_assign_simple_collection::ty_holds_collection;
 pub(in crate::codegen_ay::chc) use codegen_stmt_store::deref_mem::ProvDef;
 pub(super) mod codegen_stmt_store_ref;
+mod native_box_model_selection;
 pub(super) mod stmt_accumulator;
 
 mod codegen_stmt_aggregate;
 mod codegen_stmt_aggregate_closure;
 mod codegen_stmt_aggregate_discr;
+#[cfg(test)]
+pub(in crate::codegen_ay::chc) use codegen_stmt_aggregate_discr::{
+    DISCR_UNRESOLVED_DIRECT_PLACE, DISCR_UNRESOLVED_REFERENT,
+};
 mod codegen_stmt_aggregate_discr_adt;
 mod codegen_stmt_aggregate_discr_literal_opt;
 mod codegen_stmt_aggregate_wrapper;
@@ -97,22 +102,32 @@ mod codegen_stmt_flatten_constrain;
 pub(super) mod codegen_stmt_flatten_copy;
 mod codegen_stmt_flatten_dt_ite;
 mod codegen_stmt_flatten_enum_bv;
+mod codegen_stmt_payload_value_fact;
+mod codegen_stmt_payload_value_liveness;
 mod codegen_stmt_ptr_metadata;
 mod codegen_stmt_ptr_metadata_copy_trace;
 mod codegen_stmt_ptr_metadata_mir_trace;
 mod codegen_stmt_ptr_metadata_mir_trace_util;
 mod codegen_stmt_rvalue;
 mod codegen_stmt_rvalue_binop;
+mod codegen_stmt_value_ref_payload;
+// `Rvalue::ShallowInitBox` does not exist in Trust MIR; its only caller is nightly-only.
+#[cfg(not(trust_toolchain))]
 mod codegen_stmt_rvalue_box;
 mod codegen_stmt_rvalue_len;
 mod codegen_stmt_rvalue_offset;
+mod codegen_stmt_rvalue_offset_const_access;
+mod codegen_stmt_rvalue_offset_const_object;
 mod codegen_stmt_rvalue_pun_scan;
 mod codegen_stmt_rvalue_ref;
+pub(crate) mod codegen_stmt_slice_len_write;
 pub(crate) mod codegen_stmt_slice_metadata;
 mod codegen_stmt_store_array;
 mod codegen_stmt_store_ref_array;
 mod codegen_stmt_store_ref_array_compound;
 mod codegen_stmt_store_ref_collection;
+pub(crate) mod codegen_stmt_transmute_layout;
+pub(crate) mod codegen_stmt_union_bits;
 pub(super) mod codegen_stmt_vtable_tracking;
 
 // Re-export inter-stmt items used by stmt files via `super::`.

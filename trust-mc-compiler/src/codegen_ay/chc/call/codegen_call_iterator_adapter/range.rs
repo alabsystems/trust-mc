@@ -7,9 +7,12 @@
 
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
-use rustc_public::mir::Operand;
-use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+use rustc_public::mir::{
+    Body, CastKind, Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+};
+use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind};
 use std::collections::HashSet;
+use tracing::debug;
 
 use crate::codegen_ay::types::{CtorFieldExt, SignExtension, coerce_bitvec_width_safe};
 
@@ -88,21 +91,58 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Determine whether a Range local's element type should use signed BV comparison.
-    fn range_local_element_signedness(&self, iter_local: Option<usize>) -> Option<bool> {
+    ///
+    /// The local may be the `&mut Range<T>` receiver itself rather than the range: a
+    /// receiver whose points-at edge was not recorded still names `T` in its type, so the
+    /// signedness is read through the reference instead of taking the fallback. Element
+    /// signedness is a fact about the static pointee type, so peeling is exact whatever the
+    /// reference points at; without it every `for i in a..b` over a signed range took the
+    /// arithmetic signedness fallback (expected/loop-backedge/test.rs: signedness_fallback=12).
+    pub(in crate::codegen_ay::chc) fn range_local_element_signedness(
+        &self,
+        iter_local: Option<usize>,
+    ) -> Option<bool> {
         let local_idx = iter_local?;
         let local_decl = self.body.locals().get(local_idx)?;
-        match local_decl.ty.kind() {
-            TyKind::RigidTy(RigidTy::Adt(def, args)) if def.trimmed_name() == "Range" => {
-                match args.0.first() {
-                    Some(GenericArgKind::Type(elem_ty)) => super::super::ty_signedness(*elem_ty),
-                    _ => None, // external enum: GenericArgKind
-                }
-            }
-            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.trimmed_name() == "IndexRange" => {
-                Some(false)
-            }
-            _ => None, // external enum: TyKind
+        range_ty_element_signedness(local_decl.ty)
+    }
+
+    /// The local `advance_range_iterator_expr` should advance for a `spec_next` receiver.
+    ///
+    /// `iterator_receiver_expr_and_local` answers the pointee when `ref_targets` holds an
+    /// edge for the receiver, and the receiver itself otherwise. Loop unrolling repeats
+    /// `_9 = &mut _7` once per copy of the loop body, so Pass1 records no edge for `_9`
+    /// (several producers) and none reaches its copy `_24 = copy _9 as &mut Range<u64>`;
+    /// RangeSpecNext then had neither a datatype nor a flattened local and failed closed on
+    /// every unrolled step. When the receiver is not already a datatype, and every
+    /// producer along its copy/cast/reborrow chain names ONE flattened `Range` local, that
+    /// local is the iterator on every path and is advanced in place. Anything else keeps
+    /// the receiver, and the existing fail-closed rule.
+    pub(in crate::codegen_ay::chc) fn range_receiver_local(
+        &self,
+        iter_expr: &Expr,
+        iter_local: Option<usize>,
+    ) -> Option<usize> {
+        let local = iter_local?;
+        if iter_expr.sort().is_datatype() || self.flatten.flattened_tuple_locals.contains(&local)
+        {
+            return Some(local);
         }
+        let Some(target) = unanimous_borrowed_local(self.body, local) else {
+            return Some(local);
+        };
+        let target_is_range = self.body.locals().get(target).is_some_and(|decl| {
+            matches!(decl.ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _))
+                if matches!(def.trimmed_name().as_str(), "Range" | "IndexRange"))
+        });
+        if target_is_range
+            && self.flatten.flattened_tuple_locals.contains(&target)
+            && self.flattened_field_count(target) >= 2
+        {
+            debug!(receiver = local, target, "RangeSpecNext: receiver resolved to its unanimous flattened Range pointee");
+            return Some(target);
+        }
+        Some(local)
     }
 
     /// Advance a range iterator (`Range<T>::next`) for both datatype and flattened paths.
@@ -406,3 +446,103 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 }
 use super::super::stubs_option_helpers::OptionHelpers;
+
+/// Element signedness of `Range<T>` / `IndexRange`, seen through any `&` / `*` layers.
+fn range_ty_element_signedness(ty: Ty) -> Option<bool> {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+            range_ty_element_signedness(inner)
+        }
+        TyKind::RigidTy(RigidTy::Adt(def, args)) if def.trimmed_name() == "Range" => {
+            match args.0.first() {
+                Some(GenericArgKind::Type(elem_ty)) => super::super::ty_signedness(*elem_ty),
+                _ => None, // external enum: GenericArgKind
+            }
+        }
+        TyKind::RigidTy(RigidTy::Adt(def, _)) if def.trimmed_name() == "IndexRange" => Some(false),
+        _ => None, // external enum: TyKind
+    }
+}
+
+/// The one local a pointer-typed `start` local points at on EVERY path, by MIR alone.
+///
+/// Walks every whole-local producer of `start` and of each local it is copied, cast
+/// (`PtrToPtr`) or reborrowed (`&mut (*x)`) from, and succeeds only when every chain ends in
+/// a borrow `&mut L` / `&raw mut L` of the SAME unprojected local `L`. A borrow with no
+/// projection names the same storage whichever producer ran, so repeated identical
+/// producers (loop unrolling) agree; `if b { &mut r1 } else { &mut r2 }` does not.
+///
+/// Fails closed (`None`) on: a producer that is a call, an argument or otherwise unassigned
+/// local (no producer vouches for it), a partial write to a chain local, a borrow of a chain
+/// local itself (it could be rewritten through that borrow), a projected borrow, any other
+/// rvalue, and chains longer than a small bound.
+pub(in crate::codegen_ay::chc) fn unanimous_borrowed_local(body: &Body, start: usize) -> Option<usize> {
+    const MAX_CHAIN_LOCALS: usize = 16;
+    let mut pending = vec![start];
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut target: Option<usize> = None;
+    while let Some(local) = pending.pop() {
+        if !visited.insert(local) {
+            continue;
+        }
+        if visited.len() > MAX_CHAIN_LOCALS {
+            return None;
+        }
+        let written_by_call = body.blocks.iter().any(|block| {
+            matches!(&block.terminator.kind, TerminatorKind::Call { destination, .. }
+                if destination.local == local)
+        });
+        if written_by_call {
+            return None;
+        }
+        let mut producers = 0usize;
+        for stmt in body.blocks.iter().flat_map(|block| &block.statements) {
+            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                continue;
+            };
+            // The chain local's own address escaping lets a write through that borrow
+            // replace the pointer on some path this walk never sees.
+            if let Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) = rhs
+                && place.local == local
+                && !matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            {
+                return None;
+            }
+            if lhs.local != local {
+                continue;
+            }
+            match lhs.projection.first() {
+                // A write THROUGH the pointer, not to it.
+                Some(ProjectionElem::Deref) => continue,
+                Some(_) => return None,
+                None => {}
+            }
+            producers += 1;
+            match rhs {
+                Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                    match place.projection.as_slice() {
+                        [] => {
+                            if *target.get_or_insert(place.local) != place.local {
+                                return None;
+                            }
+                        }
+                        [ProjectionElem::Deref] => pending.push(place.local),
+                        _ => return None,
+                    }
+                }
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+                | Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(src) | Operand::Move(src), _)
+                    if src.projection.is_empty() =>
+                {
+                    pending.push(src.local);
+                }
+                _ => return None,
+            }
+        }
+        if producers == 0 {
+            return None;
+        }
+    }
+    target
+}
+

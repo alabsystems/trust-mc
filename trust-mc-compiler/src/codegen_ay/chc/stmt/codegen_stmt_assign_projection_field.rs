@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 
 use super::codegen_call_coerce::coerce_eq_constraint;
-use super::codegen_decl_flatten::{compute_nested_flat_slot, compute_nested_flat_span};
+use super::codegen_decl_flatten::compute_nested_flat_slot;
 use super::codegen_stmt_projection::constant_index_offset;
 use super::codegen_types::CodegenTypes;
 use super::stmt_accumulator::StmtAccumulator;
@@ -63,24 +63,90 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Pattern: (*ref).field[i] = rhs — the Deref means the base local is a
         // reference; resolve through ref_targets to find the actual struct local,
         // then use [Field, Index] on that target.
-        let (effective_prefix, store_local) =
+        let (effective_prefix, store_local, ref_target_projs) =
             if matches!(field_prefix.first(), Some(ProjectionElem::Deref)) {
                 if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx) {
-                    (&field_prefix[1..], ref_target.local)
+                    (&field_prefix[1..], ref_target.local, ref_target.projections.clone())
                 } else {
                     return false;
                 }
             } else {
-                (field_prefix, local_idx)
+                (field_prefix, local_idx, Vec::new())
             };
 
         // Collect field projections from the (possibly Deref-stripped) prefix.
-        let field_projs = collect_field_projections(
+        let mut field_projs = collect_field_projections(
             effective_prefix,
             UnknownProjectionPolicy::ReturnEmpty(&self.diagnostics),
         );
         if field_projs.is_empty() {
             return false;
+        }
+
+        // The lhs fields after the Deref are relative to the REFERENT, which is
+        // `ref_target.projections` inside `store_local`. Applying them to
+        // `store_local` itself wrote another field: with `let r = &mut o.inner;
+        // r.arr[1] = v`, `arr` was taken as `o`'s own field and the store landed
+        // on `o.pre` (a false proof of `o.inner.arr[1] == 0` and a Genuine
+        // counterexample for its safe twin).
+        let composed = !ref_target_projs.is_empty();
+        if composed {
+            if ref_target_projs
+                .iter()
+                .any(|p| !matches!(p, ProjectionElem::Field(..) | ProjectionElem::Downcast(_)))
+            {
+                return false;
+            }
+            let mut full =
+                collect_field_projections(&ref_target_projs, UnknownProjectionPolicy::Skip);
+            full.append(&mut field_projs);
+            field_projs = full;
+            // An enum payload in the composed path: the enum-layout handlers
+            // after this one resolve a Downcast ref_target.
+            if field_projs.iter().any(|fp| fp.cons_idx.is_some()) {
+                return false;
+            }
+        }
+
+        // A nested path into a flattened owner (`o.inner.arr[i]`, or a composed
+        // one): the array's slot is placed exactly or the owner fails closed.
+        // The root-expression path below reads slot 0 as if it were the whole
+        // owner, and the handlers after this one wrote slot 0 as the array
+        // (`let r = &mut o; r.inner.arr[i] = v` stored into `o.pre`).
+        if self.flatten.flattened_tuple_locals.contains(&store_local)
+            && field_projs.len() > 1
+            && field_projs.iter().all(|fp| fp.cons_idx.is_none())
+        {
+            return match self.faithful_nested_flat_slot(store_local, &field_projs) {
+                Ok(fld) => {
+                    if self.store_into_flattened_array_slot(
+                        store_local,
+                        fld,
+                        index_proj,
+                        rhs_expr,
+                        acc,
+                    ) {
+                        true
+                    } else {
+                        warn!(store_local, fld, "CHC: nested Field+Index store not encodable");
+                        self.havoc_local_fail_closed(
+                            store_local,
+                            "flat_field_index_store_unresolved",
+                            acc,
+                        );
+                        true
+                    }
+                }
+                Err(why) => {
+                    warn!(store_local, why, "CHC: nested Field+Index store has no faithful slot");
+                    self.havoc_local_fail_closed(
+                        store_local,
+                        "flat_field_index_store_unresolved",
+                        acc,
+                    );
+                    true
+                }
+            };
         }
 
         if self.flatten.flattened_tuple_locals.contains(&store_local) && field_projs.len() == 1 {
@@ -104,74 +170,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let n_fields = self.flattened_field_count(store_local);
                     if n_fields == 1 { 0 } else { 1 }
                 }
-            } else if let Some(local_decl) = self.body.locals().get(store_local)
-                && let Some(sort) = Self::translate_ty(local_decl.ty)
-                && let Some(leaf_slot) = compute_nested_flat_slot(&sort, &[fp.field_idx])
-            {
-                leaf_slot
             } else {
-                fp.field_idx
+                // The field's leaf slot through the checked path (C5b); there
+                // is no raw-index fallback, which named another leaf's slot
+                // whenever the sort walk disagreed with the type.
+                match self.flat_slot_for(store_local, std::slice::from_ref(fp)) {
+                    Ok(slot) => slot,
+                    Err(why) => {
+                        warn!(store_local, why, "CHC: Field+Index store has no faithful slot");
+                        self.havoc_local_fail_closed(
+                            store_local,
+                            "flat_field_index_store_unresolved",
+                            acc,
+                        );
+                        return true;
+                    }
+                }
             };
 
-            let field_count = self.flattened_field_count(store_local);
-            if fld >= field_count {
-                return false;
-            }
-
-            let Some(array_expr) = self.flattened_local_field_expr(store_local, fld, acc.modified)
-            else {
-                return false;
-            };
-            if !array_expr.sort().is_array() {
-                debug!(
-                    store_local,
-                    fld, "handle_field_index_store: flattened field slot is not an Array sort"
-                );
-                return false;
-            }
-
-            let index_expr = match index_proj {
-                ProjectionElem::Index(index_local) => {
-                    let Some(raw) = self.resolve_local_expr(*index_local, acc.modified) else {
-                        return false;
-                    };
-                    coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
-                }
-                ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                    // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
-                    let Some(actual_index) = constant_index_offset(*offset, *min_length, *from_end)
-                    else {
-                        return false;
-                    };
-                    Expr::bitvec_const(actual_index as u128, POINTER_WIDTH)
-                }
-                _ => return false,
-            };
-            let value_to_store =
-                Self::coerce_store_value(array_expr.sort(), rhs_expr, false, &self.diagnostics);
-            let new_array = array_expr.store(index_expr, value_to_store);
-
-            let mut values = Vec::with_capacity(field_count);
-            for field_idx in 0..field_count {
-                if field_idx == fld {
-                    values.push(Some(new_array.clone()));
-                } else {
-                    values.push(self.flattened_local_field_expr(
-                        store_local,
-                        field_idx,
-                        acc.modified,
-                    ));
-                }
-            }
-
-            if self.constrain_flattened_fields(store_local, &values, acc) {
-                debug!(
-                    store_local,
-                    fld, "CHC: emitted flattened Field+Index store directly on array slot"
-                );
-                return true;
-            }
-            return false;
+            return self.store_into_flattened_array_slot(
+                store_local,
+                fld,
+                index_proj,
+                rhs_expr,
+                acc,
+            );
         }
 
         // Get current root expression for non-flattened locals.
@@ -267,6 +290,92 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// The flattened slot of the Field-only path `projs` on `local`, placed
+    /// the way read case C places it (`faithful_flat_field_path`, then
+    /// `compute_nested_flat_slot`), or why it cannot be placed faithfully.
+    pub(in crate::codegen_ay::chc) fn faithful_nested_flat_slot(
+        &self,
+        local: usize,
+        projs: &[FieldProjection],
+    ) -> Result<usize, &'static str> {
+        if projs.iter().any(|fp| fp.cons_idx.is_some()) {
+            return Err("enum_downcast_in_path");
+        }
+        let projs = self.faithful_flat_field_path(local, projs)?;
+        let local_ty = self.body.locals().get(local).ok_or("local_missing")?.ty;
+        let sort = Self::translate_ty(local_ty).ok_or("root_sort_unavailable")?;
+        let indices: Vec<usize> = projs.iter().map(|fp| fp.field_idx).collect();
+        compute_nested_flat_slot(&sort, &indices).ok_or("slot_unresolved")
+    }
+
+    /// `slot[index] = rhs` on the array-sorted flattened slot `fld` of
+    /// `store_local`, keeping every other slot. False when the slot is not an
+    /// array or the index cannot be resolved; nothing is emitted then.
+    fn store_into_flattened_array_slot(
+        &mut self,
+        store_local: usize,
+        fld: usize,
+        index_proj: &ProjectionElem,
+        rhs_expr: Expr,
+        acc: &mut StmtAccumulator<'_>,
+    ) -> bool {
+        let field_count = self.flattened_field_count(store_local);
+        if fld >= field_count {
+            return false;
+        }
+
+        let Some(array_expr) = self.flattened_local_field_expr(store_local, fld, acc.modified)
+        else {
+            return false;
+        };
+        if !array_expr.sort().is_array() {
+            debug!(
+                store_local,
+                fld, "handle_field_index_store: flattened field slot is not an Array sort"
+            );
+            return false;
+        }
+
+        let index_expr = match index_proj {
+            ProjectionElem::Index(index_local) => {
+                let Some(raw) = self.resolve_local_expr(*index_local, acc.modified) else {
+                    return false;
+                };
+                coerce_bitvec_width_safe(raw, POINTER_WIDTH, SignExtension::ZeroExtend)
+            }
+            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+                // #from_end needs the slice's runtime length -> fail closed (projection_path.rs)
+                let Some(actual_index) = constant_index_offset(*offset, *min_length, *from_end)
+                else {
+                    return false;
+                };
+                Expr::bitvec_const(actual_index as u128, POINTER_WIDTH)
+            }
+            _ => return false,
+        };
+        let value_to_store =
+            Self::coerce_store_value(array_expr.sort(), rhs_expr, false, &self.diagnostics);
+        let new_array = array_expr.store(index_expr, value_to_store);
+
+        let mut values = Vec::with_capacity(field_count);
+        for field_idx in 0..field_count {
+            if field_idx == fld {
+                values.push(Some(new_array.clone()));
+            } else {
+                values.push(self.flattened_local_field_expr(store_local, field_idx, acc.modified));
+            }
+        }
+
+        if self.constrain_flattened_fields(store_local, &values, acc) {
+            debug!(
+                store_local,
+                fld, "CHC: emitted flattened Field+Index store directly on array slot"
+            );
+            return true;
+        }
+        false
+    }
+
     /// Encode a flattened tuple/enum field projection assignment.
     ///
     /// Computes the target slot from the field projection metadata, then
@@ -306,23 +415,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         }
 
-        if let Some(local_decl) = self.body.locals().get(local_idx)
-            && let Some(sort) = Self::translate_ty(local_decl.ty)
-            && let Some((leaf_slot, leaf_count)) = compute_nested_flat_span(&sort, &[fp.field_idx])
-        {
-            // Part of #3814: top-level non-leaf fields on recursively flattened
-            // locals (for example `LinearExpr.constant: Rational`) must rewrite
-            // the entire leaf span, not just the first slot.
-            if leaf_count == 1 {
-                self.encode_flattened_field_slot(rhs_expr, local_idx, leaf_slot, acc);
-            } else {
-                self.encode_flattened_field_span(rhs_expr, local_idx, leaf_slot, leaf_count, acc);
+        // The field's slot span through the checked path (C5b): a step
+        // `translate_ty` collapses (`UnsafeCell<T>.0`) is the whole local.
+        match self.flat_span_for(local_idx, std::slice::from_ref(fp)) {
+            Ok((leaf_slot, leaf_count)) => {
+                // Part of #3814: top-level non-leaf fields on recursively
+                // flattened locals (for example `LinearExpr.constant:
+                // Rational`) must rewrite the entire leaf span, not just the
+                // first slot.
+                if leaf_count == 1 {
+                    self.encode_flattened_field_slot(rhs_expr, local_idx, leaf_slot, acc);
+                } else {
+                    self.encode_flattened_field_span(
+                        rhs_expr, local_idx, leaf_slot, leaf_count, acc,
+                    );
+                }
             }
-            return;
+            Err(why) => {
+                // There is no raw-index fallback: it named another leaf's slot
+                // whenever the sort walk disagreed with the type.
+                warn!(local_idx, why, "CHC: flattened field store has no faithful slot");
+                self.havoc_local_fail_closed(local_idx, "flat_field_store_unresolved", acc);
+            }
         }
-
-        // Sort lookup unavailable; direct mapping (flat tuple).
-        self.encode_flattened_field_slot(rhs_expr, local_idx, fp.field_idx, acc);
     }
 
     /// Encode a nested field projection assignment on a recursively flattened local.

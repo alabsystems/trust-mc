@@ -99,6 +99,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -131,6 +133,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -165,6 +169,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;

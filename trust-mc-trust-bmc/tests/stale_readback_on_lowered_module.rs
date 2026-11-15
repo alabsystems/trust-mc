@@ -31,9 +31,15 @@ use trust_ir::Module;
 use trust_ir::value::FuncId;
 use trust_mc_core::chc::ChcVc;
 use trust_mc_core::chc_const_prop::eval::try_eval_to_bool;
-use trust_mc_trust_bmc::{TranslateOptions, trust_ir_function_to_chc_translation_output};
+use trust_mc_trust_bmc::{
+    TranslateOptions, trust_ir_function_to_chc_translation_output,
+    trust_ir_function_to_chc_translation_output_per_block,
+};
 
 const BUNDLE: &str = include_str!("fixtures/stale_struct_native_bundle.json");
+
+#[path = "support/initialized_construction.rs"]
+mod initialized_construction;
 
 fn lowered_module() -> Module {
     let bundle: serde_json::Value =
@@ -117,14 +123,17 @@ fn the_lowered_module_still_stores_through_an_interior_pointer() {
 /// obligation must NOT be discharged.
 #[test]
 fn the_divide_by_zero_in_the_lowered_module_is_not_falsely_proved() {
-    let module = lowered_module();
+    // Keep every original store/read/assertion on an explicit complete
+    // construction twin. The archived Undef body is tested separately below.
+    let module = initialized_construction::complete_construction_twin(&lowered_module());
     let func = module
         .functions
         .iter()
         .position(|f| f.name.contains("stale_struct"))
         .expect("the dumped module defines stale_struct");
 
-    let out = trust_ir_function_to_chc_translation_output(
+    // Per block, so each error rule's constraints are its own and fold alone.
+    let out = trust_ir_function_to_chc_translation_output_per_block(
         &module,
         FuncId::new(func as u32),
         &TranslateOptions::default(),
@@ -142,4 +151,58 @@ fn the_divide_by_zero_in_the_lowered_module_is_not_falsely_proved() {
         "the through-borrow store is modeled exactly, so nothing should fail closed: {:?}",
         out.diagnostics
     );
+
+    // The production encoding is one large-block query built from the same block
+    // translations: one of its error sites, `site ⇒ (prefix ∧ condition)`, carries
+    // the same condition, which folds to `true`.
+    let production = trust_ir_function_to_chc_translation_output(
+        &module,
+        FuncId::new(func as u32),
+        &TranslateOptions::default(),
+    )
+    .expect("stale_struct translates");
+    let map = production.large_block.as_ref().expect("stale_struct is acyclic: one query");
+    let sites: std::collections::BTreeSet<&str> =
+        map.sites.iter().map(|site| site.var.as_str()).collect();
+    let mut true_sites = 0;
+    for rule in production.vc.rules.iter().filter(|rule| rule.head.name.as_str() == "error") {
+        for constraint in rule.body.constraints.iter() {
+            let ay_bindings::ExprValue::Implies(site, body) = constraint.value() else { continue };
+            let ay_bindings::ExprValue::Var { name } = site.value() else { continue };
+            if !sites.contains(name.as_str()) {
+                continue;
+            }
+            let ay_bindings::ExprValue::And(parts) = body.value() else { continue };
+            if parts.last().and_then(try_eval_to_bool) == Some(true) {
+                true_sites += 1;
+            }
+        }
+    }
+    assert!(true_sites >= 1, "FALSE PROVE in the large-block query of `stale_struct`");
+}
+
+#[test]
+fn original_stale_struct_capture_is_ub_before_the_write_regression() {
+    use trust_ir::interpret::{InterpretErrorCode, InterpretValue, Interpreter};
+    let original = lowered_module();
+    let function =
+        original.functions.iter().find(|function| function.name.contains("stale_struct")).unwrap();
+    let error = Interpreter::with_module(&original)
+        .execute_func(function.id, [InterpretValue::int(trust_ir::Ty::U32, 7).unwrap()])
+        .expect_err("the archived non-scalar Undef is UB at its definition");
+    assert_eq!(error.code, InterpretErrorCode::UndefinedBehavior);
+    let output = trust_ir_function_to_chc_translation_output(
+        &original,
+        function.id,
+        &TranslateOptions::default(),
+    )
+    .unwrap();
+    assert!(output.diagnostics.iter().any(|diagnostic| diagnostic.reason
+        == trust_mc_trust_bmc::TrustIrChcUnsupportedReason::OperandConsumption));
+
+    let initialized = initialized_construction::complete_construction_twin(&original);
+    let error = Interpreter::with_module(&initialized)
+        .execute_func(function.id, [InterpretValue::int(trust_ir::Ty::U32, 7).unwrap()])
+        .expect_err("the initialized program reaches its real divide-by-zero check");
+    assert_eq!(error.code, InterpretErrorCode::Panic, "{error:?}");
 }

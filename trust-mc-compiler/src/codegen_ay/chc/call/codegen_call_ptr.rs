@@ -140,10 +140,29 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
             // Used by map_addr → with_addr → wrapping_byte_offset chain.
             StubKind::PtrWithMetadataOf => {
                 let dest_local: usize = cx.destination.local;
+                // `self.with_metadata_of(meta)`: the DATA word of `self`, the
+                // METADATA of `meta`. For a thin destination that is `self`
+                // unchanged. For a wide destination (`*const [T]`, `*const
+                // str`, `*const dyn Trait`) returning `self` alone zero-padded
+                // the metadata, and `PtrMetadata` of the result read the
+                // padding as a length of 0 — the same fabrication the byte-step
+                // stubs had. The metadata now comes from `meta` through the
+                // known-metadata resolver, or a counted havoc.
                 let first_arg = cx
                     .args
                     .first()
-                    .and_then(|arg| self.translate_operand_with_modified(arg, cx.modified_locals));
+                    .and_then(|arg| self.translate_operand_with_modified(arg, cx.modified_locals))
+                    .map(|self_ptr| {
+                        let data = crate::codegen_ay::ptr_repr::PtrRepr::classify(&self_ptr)
+                            .map(|repr| repr.into_data().into_expr())
+                            .unwrap_or(self_ptr);
+                        match cx.args.get(1) {
+                            Some(meta_arg) => {
+                                self.wide_byte_step_result(meta_arg, data, cx.modified_locals)
+                            }
+                            None => data,
+                        }
+                    });
                 // Part of #3561: consolidated resolve→coerce→emit via helper.
                 try_emit_precise_call_result(
                     self,
@@ -189,9 +208,27 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
                         _ => None,
                     }) {
                         if let Some(target_local) = self.resolve_ptr_write_target_local(ptr_local) {
-                            if let Some(value_expr) = self
+                            // The written type may differ from the local's: a
+                            // narrower write splices bytes in, a wider one is out
+                            // of the local's bounds or spliced across it, exactly
+                            // as a store through `*p` (`ref_store_reinterpretation`).
+                            // The writeback took the value as the local's whole
+                            // value, so `(p as *mut u64).write(1)` into a `u32`
+                            // was a clean proof where Kani reports a pointer
+                            // outside object bounds (first review of the sixth
+                            // round: `r1g.rs` `g12_bug_wide_store_symbolic_ptr_field`).
+                            let value_expr = self
                                 .translate_operand_with_modified(&cx.args[1], cx.modified_locals)
-                            {
+                                .and_then(|value| {
+                                    self.ptr_write_writeback_value(
+                                        ptr_local,
+                                        target_local,
+                                        value,
+                                        cx.modified_locals,
+                                        &mut writeback_locals,
+                                    )
+                                });
+                            if let Some(value_expr) = value_expr {
                                 if let Some((_, out_var)) = self.resolve_destination(target_local) {
                                     let out_sort = out_var.sort().clone();
                                     if let Some(eq) = self.make_coerced_eq_constraint(
@@ -329,9 +366,24 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
         // Keep the destination threaded so the generated constraints do not
         // reintroduce it as an unconstrained free variable.
         self.ensure_local_live_at_block(dest_local, cx.target);
-        if let Some(result_expr) =
-            self.translate_pointer_utility_call(cx.stub, cx.args, cx.modified_locals)
-        {
+        // `ptr::null()` and `without_provenance` invalidate the result's
+        // `obj_valid` lane through `heap_state.pending_updates` and mark that
+        // lane modified. This is a call terminator: the block's statement
+        // encoding drained `pending_updates` before it ran, so nothing else
+        // delivers the update to THIS rule. Left pending, the head carried an
+        // unbound `obj_valid__out` (a havoc of every allocation's validity, with
+        // no approximation recorded) and the update leaked into whichever rule
+        // drained next. Take exactly the updates this translation produced. The
+        // fallback paths below drop them with the rest of the translation: the
+        // lane stays unbound there, under the fallback reason they record.
+        let pending_before = self.heap_state.pending_updates.len();
+        let translated = self.translate_pointer_utility_call(cx.stub, cx.args, cx.modified_locals);
+        let mut heap_updates: Vec<Expr> =
+            self.heap_state.pending_updates.drain(pending_before..).collect();
+        // `addr` / `with_addr` read an address (heap/stack_address.rs); the
+        // layout facts that reading relies on belong to this rule too.
+        heap_updates.extend(self.take_address_assumptions());
+        if let Some(result_expr) = translated {
             let forwarded_nonnull = matches!(cx.stub, StubKind::NonNullAsPtr);
             let src_local = cx.args.first().and_then(|arg| match arg {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
@@ -396,7 +448,7 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
                                 forwarded_ref_target = true;
                             }
 
-                            if let Some(obj_id) = self.known_alloc_ids.get(&src_local).copied() {
+                            if let Some(obj_id) = self.trace_deref_store_alloc_id(src_local) {
                                 self.known_alloc_ids.insert(dest_local, obj_id);
                             } else {
                                 self.known_alloc_ids.remove(&dest_local);
@@ -411,7 +463,7 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
                         // translate_operand is correct; only ref_target linkage
                         // was lost at the field boundary.
                         if !forwarded_ref_target {
-                            if let Some(obj_id) = ChcCtx::try_extract_obj_id(&result_expr)
+                            if let Some(obj_id) = ChcCtx::try_extract_base_obj_id(&result_expr)
                                 && let Some(owning_local) =
                                     self.heap_state.local_idx_for_obj_id(obj_id)
                             {
@@ -448,7 +500,11 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
                         cx.target,
                         &new_output_args,
                         cx.stmt_constraints,
-                        nonzero_guard.into_iter().chain(char_validity_guard).chain([eq]),
+                        nonzero_guard
+                            .into_iter()
+                            .chain(char_validity_guard)
+                            .chain([eq])
+                            .chain(heap_updates),
                     );
                 } else {
                     warn!(
@@ -676,4 +732,45 @@ impl<'tcx, 'body> CallPtr for ChcCtx<'tcx, 'body> {
         );
     }
     // Pointer identity/passthrough ops extracted to codegen_call_ptr_identity.rs per #3199.
+}
+
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The value a `ptr.write(value)` writes back into the stack local
+    /// `target_local` its pointer resolves to, reinterpreted as a store through
+    /// `*ptr` is (`ref_store_reinterpretation`). `None` when nothing is written
+    /// back: an out-of-bounds write (recorded as a violation of the block) or
+    /// a reinterpretation the lane does not model (the local is left
+    /// unconstrained in `writeback_locals`, failing closed).
+    fn ptr_write_writeback_value(
+        &mut self,
+        ptr_local: usize,
+        target_local: usize,
+        value: Expr,
+        modified_locals: &std::collections::HashSet<usize>,
+        writeback_locals: &mut Vec<usize>,
+    ) -> Option<Expr> {
+        use crate::codegen_ay::chc::stmt::codegen_stmt_store::{
+            OUT_OF_BOUNDS_MESSAGE, RefStoreReinterpretation,
+        };
+        let lhs = rustc_public::mir::Place {
+            local: ptr_local,
+            projection: vec![rustc_public::mir::ProjectionElem::Deref],
+        };
+        let target = RefTarget::with_projections(target_local, Vec::new());
+        match self.ref_store_reinterpretation(&target, &lhs, &value, ptr_local, modified_locals) {
+            RefStoreReinterpretation::SameType => Some(value),
+            RefStoreReinterpretation::Converted(converted)
+            | RefStoreReinterpretation::ConvertedLocal(converted) => Some(converted),
+            RefStoreReinterpretation::OutOfBounds => {
+                self.record_block_violation(Expr::bool_const(true), OUT_OF_BOUNDS_MESSAGE);
+                None
+            }
+            RefStoreReinterpretation::Unmodeled(why) => {
+                warn!(ptr_local, target_local, why, "CHC: ptr.write writeback not modeled");
+                self.record_sound_fallback_reason("ptr_write_writeback_unmodeled");
+                writeback_locals.push(target_local);
+                None
+            }
+        }
+    }
 }

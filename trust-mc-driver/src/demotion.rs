@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use trust_mc_metadata::HarnessMetadata;
 
+use crate::chc_claim_policy::{proof_qualifying_fallback_count, qualifies_proof_unchanged};
 use crate::unsoundness_counts::CrateUnsoundnessCounts;
 use crate::util::warning;
 use crate::verification_result::{
@@ -287,14 +288,12 @@ pub(crate) fn apply_sound_fallback_fail_close(
     harness: &HarnessMetadata,
     counts: &CrateUnsoundnessCounts,
 ) {
-    let havoc_key = trust_mc_metadata::UnsoundnessCategory::ChcSoundHavocDrop.json_key();
     let approx = sound_approx_categories_fail_closed(counts, &harness.pretty_name);
-    result.sound_fallback_count =
-        approx.iter().filter(|(cat, _)| cat.as_str() != havoc_key).map(|(_, count)| count).sum();
+    result.sound_fallback_count = proof_qualifying_fallback_count(&approx);
     if result.status == VerificationStatus::Success && result.sound_fallback_count > 0 {
         let categories: Vec<String> = approx
             .iter()
-            .filter(|(cat, _)| cat.as_str() != havoc_key)
+            .filter(|(cat, _)| !qualifies_proof_unchanged(cat.as_str()))
             .map(|(cat, count)| format!("{cat}={count}"))
             .collect();
         result.status = VerificationStatus::Failure;

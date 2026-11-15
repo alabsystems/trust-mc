@@ -1,2 +1,3 @@
-0 of 0 failed
-VERIFICATION:- SUCCESSFUL
+[AY:VACUOUS:no-checks]
+[AY:PROOF_QUALIFIERS:no_checks=compiler_certified_obligation_free]
+VERIFICATION:- SUCCESSFUL (no checks — compiler-certified obligation-free)

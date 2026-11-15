@@ -105,6 +105,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         } else {
             let name = self.ctx.fresh_name("hashmap_len");
             let len = self.ctx.declare_var(&name, ptr_sort());
+            self.ctx.bmc_sound_havoc("hashmap_len");
             self.hashmap_len_symbols.insert(map_base.into(), len.clone());
             len
         }
@@ -180,6 +181,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // indicate no key exists. Return symbolic boolean for over-approximation.
             warn!("option_is_some: expected datatype, returning symbolic bool");
             let name = self.ctx.fresh_name("option_is_some_fallback");
+            self.ctx.bmc_sound_havoc("option_is_some_fallback");
             self.ctx.declare_var(&name, bool_sort())
         }
     }

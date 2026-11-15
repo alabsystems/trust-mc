@@ -12,7 +12,10 @@
 //! - `infer_adt_sort` - General ADT (enum/struct) sort inference
 
 use crate::codegen_ay::names::{self, enum_sort, struct_sort};
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::types::{bool_sort, bv8_sort, flatten_dt_array_element, int_sort, ptr_sort};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_public::CrateDef;
 use rustc_public::ty::{AdtDef, AdtKind, GenericArgKind, GenericArgs};
@@ -314,7 +317,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // from "modelled as a scalar".
         let mut payload = None;
         for (idx, f) in def.variants().first()?.fields().iter().enumerate() {
-            if Self::layout_is_zst(f.ty_with_args(&args)) {
+            if Self::layout_is_zst(mono_ty::field_ty(f, &args)?) {
                 continue;
             }
             if payload.is_some() {
@@ -412,8 +415,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let some_variant = &variants[some_idx];
 
                 if let Some(field) = some_variant.fields().first() {
-                    let field_ty = field.ty();
-                    let concrete_ty = Self::resolve_generic_ty(field_ty, &args);
+                    let concrete_ty = mono_ty::field_ty(field, &args);
 
                     if let Some(concrete_ty) = concrete_ty {
                         // #824 value-semantics: a Some payload that is a reference
@@ -480,14 +482,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let mut fields = Vec::with_capacity(variant.fields().len());
 
             for field in variant.fields() {
-                // Use rustc's real generic substitution. `resolve_generic_ty`
-                // only substitutes a TOP-LEVEL `Param`, so a field whose type
-                // NESTS a generic param — e.g. ArrayVec's `buf: [MaybeUninit<T>; N]`
-                // — kept `T` unresolved, making `infer_sort_from_ty` fail and the
-                // whole struct fall back to a default `bv32`. `ty_with_args`
-                // substitutes recursively (matching the CHC path), so the field
-                // becomes the concrete `[MaybeUninit<u32>; 4]` → `Array(bv64,bv32)`.
-                let concrete_ty = field.ty_with_args(&args);
+                // Rule A (`shared::mono_ty::field_ty`): the field's type at the
+                // ADT's own arguments, so a field that NESTS a generic param —
+                // ArrayVec's `buf: [MaybeUninit<T>; N]` — is the concrete
+                // `[MaybeUninit<u32>; 4]` → `Array(bv64,bv32)`, and one that does
+                // not instantiate refuses the sort instead of panicking.
+                let concrete_ty = mono_ty::field_ty(&field, &args)?;
                 let sort = Self::infer_sort_from_ty(concrete_ty)?;
                 fields.push((names::adt_struct_field_name(&field.name), sort));
             }
@@ -503,8 +503,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             for variant in &variants {
                 let mut fields = Vec::with_capacity(variant.fields().len());
                 for (idx, field) in variant.fields().iter().enumerate() {
-                    let field_ty = field.ty();
-                    let concrete_ty = Self::resolve_generic_ty(field_ty, &args)?;
+                    let concrete_ty = mono_ty::field_ty(field, &args)?;
                     let sort = Self::infer_sort_from_ty(concrete_ty)?;
                     fields.push((names::variant_field_name(&variant.name(), idx), sort));
                 }

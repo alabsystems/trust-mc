@@ -165,6 +165,8 @@ pub(super) const STRING_STUBS: &[StubKind] = &[
     StubKind::StringIsAscii,
     StubKind::StringAsStr,
     StubKind::StringIntoBoxedStr,
+    StubKind::StringFromUtf8, // String::from_utf8(Vec<u8>) -> Result<String, FromUtf8Error>
+    StubKind::StringIntoBytes, // String::into_bytes(self) -> Vec<u8>
     StubKind::CowToString,
     StubKind::DisplayToString,
     StubKind::FmtFormat,
@@ -246,6 +248,12 @@ pub(super) const OPTION_RESULT_STUBS: &[StubKind] = &[
     StubKind::OptionExpect,
     StubKind::ResultUnwrap,
     StubKind::ResultExpect,
+    // Result::unwrap_err / expect_err. Was missing from this table, so the
+    // registry matched ResultUnwrapErr and the dispatcher then fell through to
+    // the unsupported "Call terminator" fallback without ever reaching
+    // `codegen_result_unwrap_err` (stub_dispatch_option_result.rs) — measured
+    // on `Err(3u8).expect_err("x") == 3`: fallback=1, spurious CTREX.
+    StubKind::ResultUnwrapErr,
     StubKind::OptionUnwrapOrElse,
     StubKind::ResultUnwrapOrElse,
     StubKind::OptionAndThen,

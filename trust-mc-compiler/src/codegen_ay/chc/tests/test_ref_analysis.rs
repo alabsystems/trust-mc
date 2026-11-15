@@ -318,7 +318,7 @@ fn test_ref_analysis_transitive_deref_ref_target_propagation() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() == 1
                     && matches!(place.projection[0], ProjectionElem::Deref)
@@ -364,7 +364,7 @@ fn test_ref_analysis_deref_field_copy_ref_target_propagation() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() >= 2
                     && matches!(place.projection[0], ProjectionElem::Deref)
@@ -429,7 +429,7 @@ fn test_ref_analysis_copy_move_deref_field_source_resolution() {
             for stmt in &block.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.len() >= 2
                     && matches!(place.projection[0], ProjectionElem::Deref)
@@ -550,7 +550,7 @@ fn test_ref_analysis_tuple_field_copy_discriminant_ref_target_propagation() {
                     }
                     StatementKind::Assign(
                         lhs,
-                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                     ) if place.projection.len() == 1
                         && matches!(place.projection[0], ProjectionElem::Field(_, _))
                         && tuple_locals.contains(&place.local) =>
@@ -576,10 +576,27 @@ fn test_ref_analysis_tuple_field_copy_discriminant_ref_target_propagation() {
                     && tuple_field_copy_locals.contains(&place.local)
                 {
                     let ref_local = place.local;
-                    assert!(
-                        chc_ctx.ref_resolution.ref_targets.contains_key(&ref_local),
-                        "tuple-field Copy/Move local _{ref_local} should be tracked in ref_targets"
-                    );
+                    // The probe selects `refs.0` or `refs.1` on two paths, so this local has
+                    // several producers. Since 5423d7296 the ref_targets pre-pass records no
+                    // path-insensitive points-at edge for such a local: either edge alone would
+                    // be wrong on the other path (that edge produced a false proof).
+                    let producers = body
+                        .blocks
+                        .iter()
+                        .flat_map(|b| b.statements.iter())
+                        .filter(|st| matches!(&st.kind, StatementKind::Assign(lhs, _) if lhs.local == ref_local))
+                        .count();
+                    if producers > 1 {
+                        assert!(
+                            !chc_ctx.ref_resolution.ref_targets.contains_key(&ref_local),
+                            "multi-producer local _{ref_local} must not get a path-insensitive ref target"
+                        );
+                    } else {
+                        assert!(
+                            chc_ctx.ref_resolution.ref_targets.contains_key(&ref_local),
+                            "tuple-field Copy/Move local _{ref_local} should be tracked in ref_targets"
+                        );
+                    }
 
                     let discr = chc_ctx.translate_discriminant(place, &HashSet::new());
                     assert!(

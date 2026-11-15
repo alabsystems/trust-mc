@@ -21,12 +21,27 @@ fn assert_zero_fallback_count(fn_name: &str) {
     );
 }
 
+/// At most one closure-call bail-out: the `any_where` closure the walker does
+/// not inline. Its havoc records `nested_call_overapprox` and, because the
+/// closure calls `Vec::len` (whose std body the obligation-free walk cannot
+/// certify: `assert_unchecked`'s `Assume`, a `Cap` transmute), Rule D's
+/// lost effect too (`LostEffect::NestedCallFallback`, design
+/// trust-mc-reds-final §4.1): two fail-closed records, one event.
 fn assert_translation_drop_budget(fn_name: &str) {
     let translation_drops = take_translation_drop_by_fn();
+    let site_reasons =
+        crate::codegen_ay::chc::codegen_ctx::take_translation_drop_site_reasons_by_fn();
     let drop_count = translation_drops.get(fn_name).copied().unwrap_or(0);
+    let lost = crate::codegen_ay::chc::call::inline_walk_guard::LostEffect::NestedCallFallback;
+    let lost_count = site_reasons
+        .get(fn_name)
+        .and_then(|reasons| reasons.get(lost.reason()).copied())
+        .unwrap_or(0);
     assert!(
-        drop_count <= 1,
-        "{fn_name} should have at most 1 translation drop (closure call bail-out), got {drop_count}, map={translation_drops:?}"
+        lost_count <= 1 && drop_count <= 1 + lost_count,
+        "{fn_name} should have at most 1 translation drop (closure call bail-out) plus its \
+         Rule D record, got {drop_count} ({lost_count} Rule D), map={translation_drops:?}, \
+         site_reasons={site_reasons:?}"
     );
 }
 

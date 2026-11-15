@@ -12,119 +12,153 @@
 //! is in `operand_scalar_enum.rs`.
 
 use super::{
-    Allocation, CrateDef, Expr, GlobalAlloc, IndexedVal, IntoOption, LayoutOf, RigidTy, SortInner,
-    StatementCodegen, TyKind,
+    CrateDef, Expr, IndexedVal, IntoOption, LayoutOf, RigidTy, SortInner, StatementCodegen, TyKind,
 };
 use crate::codegen_ay::names::{self, struct_sort};
+use crate::codegen_ay::shared::const_pointer::{ConstPtr, ConstRead, Slot};
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::types::{
     POINTER_WIDTH, int_ty_to_bitvec_width, ptr_sort, uint_ty_to_bitvec_width,
 };
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::ty::GenericArgKind;
 use tracing::{debug, warn};
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
-    /// Extract a scalar value (bool/int/uint) from an allocation.
+    /// Decode the constant VALUE of type `ty` held by `bytes` (a constant's
+    /// own bytes, `const_pointer::const_bytes`, or a window of a target).
     ///
-    /// REQUIRES: alloc contains valid bytes for the given type
+    /// Every byte access goes through the slot clause (`shared::const_pointer`):
+    /// a pointer-typed slot is the address of its relocation's target plus the
+    /// offset its bytes carry ([`Self::const_ptr_value`]), never those bytes as
+    /// an integer; an uninitialized byte or a partial pointer declines. A
+    /// top-level reference is not decoded here (`codegen_const_ref` reads its
+    /// pointee), but a reference INSIDE a value is a pointer slot like any
+    /// other.
+    ///
     /// ENSURES: On Some, result.sort() matches width/signedness of ty
-    /// ENSURES: On None, allocation could not be interpreted as scalar
-    pub(super) fn codegen_scalar_from_alloc(
+    /// ENSURES: On None, the bytes could not be interpreted (caller leaves the
+    /// value unconstrained)
+    pub(super) fn codegen_scalar_from_bytes(
         &self,
-        alloc: &Allocation,
+        bytes: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
         match ty.kind() {
-            TyKind::RigidTy(RigidTy::Bool) => {
-                Some(Expr::bool_const(alloc.read_bool().into_option()?))
-            }
+            TyKind::RigidTy(RigidTy::Bool) => Some(Expr::bool_const(bytes.read_bool_at(0)?)),
             TyKind::RigidTy(RigidTy::Int(int_ty)) => {
                 let width = int_ty_to_bitvec_width(int_ty);
-                let value = alloc.read_int().into_option()?;
-                // Mask to the correct width for SMT bitvector
-                let value_u128 = if width >= 128 {
-                    value as u128
-                } else {
-                    (value as u128) & ((1u128 << width) - 1)
-                };
-                Some(Expr::bitvec_const(value_u128, width))
+                let value = bytes.read_uint_at(0, (width / 8) as usize)?;
+                Some(Expr::bitvec_const(value, width))
             }
             TyKind::RigidTy(RigidTy::Uint(uint_ty)) => {
                 let width = uint_ty_to_bitvec_width(uint_ty);
-                let value = alloc.read_uint().into_option()?;
-                // Mask to the correct width for SMT bitvector
-                let value_u128 = if width >= 128 { value } else { value & ((1u128 << width) - 1) };
-                Some(Expr::bitvec_const(value_u128, width))
+                let value = bytes.read_uint_at(0, (width / 8) as usize)?;
+                Some(Expr::bitvec_const(value, width))
             }
             TyKind::RigidTy(RigidTy::Char) => {
-                // Rust char is a 32-bit Unicode scalar value (0x0000 to 0xD7FF or 0xE000 to 0x10FFFF)
-                let value = alloc.read_uint().into_option()?;
-                // Mask to 32 bits - char is always 4 bytes in Rust
-                let value_u128 = value & 0xFFFFFFFF;
-                Some(Expr::bitvec_const(value_u128, 32))
+                // A Rust char is a 32-bit Unicode scalar value.
+                let value = bytes.read_uint_at(0, 4)?;
+                Some(Expr::bitvec_const(value, 32))
             }
             // Part of #3094: Float constants modeled as bitvectors.
             TyKind::RigidTy(RigidTy::Float(float_ty)) => {
-                Self::float_scalar_to_expr(alloc, float_ty)
+                Self::float_scalar_to_expr(bytes, float_ty)
             }
-            // Raw pointer constants (#1039) - NonNull::dangling() and similar const-evaluated pointers
-            // Read as usize (pointer-width bitvector)
-            TyKind::RigidTy(RigidTy::RawPtr(..)) => self.codegen_raw_ptr_from_alloc(alloc),
+            // Raw pointer constants (#1039): `NonNull::dangling()`, `&raw const S`.
+            // Only a THIN pointer has the pointer sort; a fat one's sort is a
+            // datatype this reader does not build.
+            TyKind::RigidTy(RigidTy::RawPtr(..))
+                if Self::infer_sort_from_ty(ty).as_ref() == Some(&ptr_sort()) =>
+            {
+                self.const_pointer_slot(bytes, 0)
+            }
             TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
-                self.codegen_adt_from_alloc(alloc, ty, adt_def, args)
+                self.codegen_adt_from_alloc(bytes, ty, adt_def, args)
             }
             TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) => {
-                self.codegen_array_wrapper_from_alloc(alloc, elem_ty, len_const)
+                self.codegen_array_wrapper_from_alloc(bytes, elem_ty, len_const)
             }
-            TyKind::RigidTy(RigidTy::FnPtr(..)) => {
-                let value = alloc.read_uint().into_option()?;
-                let value_u128 = value & ((1u128 << POINTER_WIDTH) - 1);
-                debug!("codegen_scalar_from_alloc: FnPtr value={:#x}", value_u128);
-                Some(Expr::bitvec_const(value_u128, POINTER_WIDTH))
-            }
+            // A function pointer is its function's identity (a relocation to
+            // a function at offset 0), or plain data (null is not a fn value,
+            // but a const-eval'd integer is kept as it was).
+            TyKind::RigidTy(RigidTy::FnPtr(..)) => self.const_pointer_slot(bytes, 0),
             TyKind::RigidTy(RigidTy::Tuple(tys)) if tys.len() > 1 => {
-                self.codegen_tuple_from_alloc(alloc, ty, &tys)
+                self.codegen_tuple_from_alloc(bytes, ty, &tys)
             }
             TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                self.codegen_closure_from_alloc(alloc, ty, def, args)
+                self.codegen_closure_from_alloc(bytes, ty, def, args)
             }
             _ => None, // external enum: TyKind
         }
     }
 
-    /// Read a raw pointer constant from an allocation.
-    fn codegen_raw_ptr_from_alloc(&self, alloc: &Allocation) -> Option<Expr> {
-        let value = alloc.read_uint().into_option()?;
-        let value_u128 = value & ((1u128 << POINTER_WIDTH) - 1);
-        // Part of #3094: Raw pointer constants to statics have provenance
-        // but offset 0. read_uint() returns just the offset, ignoring
-        // provenance, so `&raw const STATIC_VAR` produces bitvec(0) — NULL.
-        // This triggers false null-check violations in place_deref.rs.
-        // When provenance points to a real allocation (Static or Memory),
-        // use a non-zero page-aligned sentinel address instead of the raw
-        // offset. The BMC path identifies memory locations by variable name,
-        // not address, so the specific non-zero value is immaterial.
-        if value_u128 == 0 && !alloc.provenance.ptrs.is_empty() {
-            let (_, prov) = &alloc.provenance.ptrs[0];
-            let alloc_id = prov.0;
-            let has_real_provenance = matches!(
-                GlobalAlloc::from(alloc_id),
-                GlobalAlloc::Static(_) | GlobalAlloc::Memory(_)
-            );
-            if has_real_provenance {
-                tracing::debug!(
-                    "codegen_scalar_from_alloc: RawPtr offset=0 with provenance, sentinel=0x1000"
-                );
-                return Some(Expr::bitvec_const(0x1000u128, POINTER_WIDTH));
-            }
+    /// The pointer-width value stored at `at` under the slot clause.
+    ///
+    /// Plain data (an address const-eval produced without provenance: null,
+    /// `NonNull::dangling()`) is that integer. A relocation is the pointer it
+    /// records ([`Self::const_ptr_value`]). An uninitialized word, a partial
+    /// pointer, or a target this lane never named declines.
+    pub(super) fn const_pointer_slot(&self, bytes: &dyn ConstRead, at: usize) -> Option<Expr> {
+        match bytes.read_slot(at, POINTER_WIDTH) {
+            Slot::Data(value) => Some(Expr::bitvec_const(value, POINTER_WIDTH)),
+            Slot::Pointer(ptr) => self.const_ptr_value(&ptr),
+            Slot::Uninit | Slot::PartialPointer | Slot::OutOfBounds => None,
         }
-        tracing::debug!("codegen_scalar_from_alloc: RawPtr value={:#x}", value_u128);
-        Some(Expr::bitvec_const(value_u128, POINTER_WIDTH))
+    }
+
+    /// The value of a constant pointer in this lane: `base(T) + k`, `base(T)`
+    /// being the ONE address symbol `global_alloc_addrs` holds for its target
+    /// (materialized when the body was entered, `global_alloc.rs`), or a
+    /// function's identity (`fn_ptr_identity`, the value a reification of
+    /// the same instance gets) when it names one at offset 0. `None` for a
+    /// vtable, a target the body never materialized, or a function pointer
+    /// at a nonzero offset: the caller leaves the value unconstrained.
+    ///
+    /// Before this, a pointer inside a constant VALUE (`[&raw const P.0, &raw
+    /// const P.1]`, a struct's raw-pointer field) decoded to the offset its
+    /// bytes carry, so `PTRS[0].is_null()` PROVED
+    /// (tools/soundness-duals/const_pointer_value_slots_dual.rs).
+    pub(super) fn const_ptr_value(&self, ptr: &ConstPtr) -> Option<Expr> {
+        if let Some(instance) = ptr.function() {
+            let id = crate::codegen_ay::fn_ptr_identity::fn_ptr_identity_of_instance(&instance);
+            return Some(Expr::bitvec_const(u128::from(id), POINTER_WIDTH));
+        }
+        let key = ptr.key()?;
+        let Some(base) = self.ctx.global_alloc_addrs.get(&key) else {
+            debug!(?key, "constant pointer into an allocation this body never named: declined");
+            return None;
+        };
+        ptr.address(base, POINTER_WIDTH)
+    }
+
+    /// A `width`-bit bitvector slot at `at`: plain data, or (pointer width
+    /// only) a stored pointer's value. Anything else declines.
+    fn read_bv_slot(&self, bytes: &dyn ConstRead, at: usize, width: u32) -> Option<Expr> {
+        if width == POINTER_WIDTH {
+            return self.const_pointer_slot(bytes, at);
+        }
+        let value = bytes.read_uint_at(at, (width / 8) as usize)?;
+        Some(Expr::bitvec_const(value, width))
+    }
+
+    /// A `TypeId` at `at`: its 128-bit hash. Rustc stores it as pointers into
+    /// a type-id segment whose OFFSETS are the hash words (`ConstPtr::offset`,
+    /// the pointer's k); older layouts store plain data.
+    fn type_id_value(bytes: &dyn ConstRead, at: usize) -> Option<u128> {
+        if let (Some(lo), Some(hi)) =
+            (bytes.stored_pointer(at), bytes.stored_pointer(at + POINTER_WIDTH as usize / 8))
+        {
+            return Some(u128::from(lo.offset()) | (u128::from(hi.offset()) << 64));
+        }
+        bytes.read_uint_at(at, 16)
     }
 
     /// Extract an ADT (struct/enum) constant from an allocation.
     fn codegen_adt_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         adt_def: rustc_public::ty::AdtDef,
         args: rustc_public::ty::GenericArgs,
@@ -143,37 +177,28 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return self.codegen_alignment_from_alloc(alloc, adt_def, args);
         }
 
-        // #1039: Handle NonNull<T> - single field wrapper around raw pointer
+        // #1039: Handle NonNull<T> - single field wrapper around raw pointer.
+        // Its word is a pointer slot: `NonNull::from(&S)` is S's address, not
+        // the offset its bytes carry.
         if base_name == "NonNull" {
-            let value = alloc.read_uint().into_option()?;
-            let value_u128 = value & ((1u128 << POINTER_WIDTH) - 1);
-            tracing::debug!("codegen_scalar_from_alloc: NonNull value={:#x}", value_u128);
-            return Some(Expr::bitvec_const(value_u128, POINTER_WIDTH));
+            return self.const_pointer_slot(alloc, 0);
         }
 
         // Part of #3367: TypeId is a wrapper around u128 (internal type identity).
         // Extract the raw 128-bit value so Transmute(TypeId → u128) is identity
         // and Any::downcast_ref type equality checks resolve concretely.
         if base_name == "TypeId" {
-            let value = alloc.read_uint().into_option().unwrap_or_else(|| {
-                // Part of #1739: TypeId allocations may carry provenance markers
-                // that cause read_uint() to fail. Read raw bytes directly.
-                let mut v: u128 = 0;
-                for (i, byte) in alloc.bytes.iter().take(16).enumerate() {
-                    if let Some(b) = byte {
-                        v |= (*b as u128) << (i * 8);
-                    }
-                }
-                tracing::debug!("codegen_scalar_from_alloc: TypeId read_uint failed, raw bytes fallback value={:#x}", v);
-                v
-            });
+            let value = Self::type_id_value(alloc, 0)?;
             tracing::debug!("codegen_scalar_from_alloc: TypeId value={:#x}", value);
             return Some(Expr::bitvec_const(value, 128));
         }
 
         let variants = adt_def.variants();
-        // Check if this is a unit enum (all variants have no fields)
-        let is_unit_enum = variants.iter().all(|v| v.fields().is_empty());
+        // Check if this is a unit enum (all variants have no fields). Only an ENUM: a unit
+        // struct (`struct Mild;`) also has a single fieldless variant, and asking rustc for its
+        // discriminant ICEs (`assertion failed: self.is_enum()`), e.g. for `&Mild as &dyn Tick`.
+        let is_unit_enum = adt_def.kind() == rustc_public::ty::AdtKind::Enum
+            && variants.iter().all(|v| v.fields().is_empty());
         if is_unit_enum {
             return self.codegen_unit_enum_from_alloc(alloc, adt_def, &variants);
         }
@@ -193,7 +218,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // codegen_scalar_from_alloc sees TyKind::Adt. Extract elements from the allocation
         // bytes and build an SMT Array constant directly.
         if variants.len() == 1 && variants[0].fields().len() == 1 {
-            let field_ty = variants[0].fields()[0].ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
             if let TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) = field_ty.kind() {
                 if let Some(result) =
                     self.codegen_array_wrapper_from_alloc(alloc, elem_ty, len_const)
@@ -228,7 +253,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// fell through to `codegen_assign`'s unconstrained fallback (#4530).
     fn codegen_array_wrapper_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         elem_ty: rustc_public::ty::Ty,
         len_const: rustc_public::ty::TyConst,
     ) -> Option<Expr> {
@@ -242,47 +267,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         // Verify allocation has enough bytes
-        if alloc.bytes.len() < len * elem_bytes {
+        if alloc.len() < len.checked_mul(elem_bytes)? {
             return None;
         }
 
-        // Build per-element reader + default value for the ElemSort.
+        // Each element is read at its own offset through the per-field reader
+        // (`read_field_from_alloc`): the slot clause throughout, so a pointer
+        // element is its target's address and a compound element (a const
+        // `[[E; N]; M]` lookup table, a struct element) recurses over its own
+        // window with its relocations kept (`sub_window`). Without the
+        // recursion such a table fell through to codegen_assign's
+        // unconstrained-array fallback; without the window a pointer element
+        // decoded to the offset its bytes carry.
         let read_elem = |i: usize| -> Option<Expr> {
-            let offset = i * elem_bytes;
-            let bytes = alloc.bytes.get(offset..offset + elem_bytes)?;
-            if elem_sort.is_bool() {
-                // Rust represents bool as a single byte: 0 → false, 1 → true.
-                // MIR rejects any other bit pattern, so we treat non-zero as
-                // true without diagnosing invalid allocations here.
-                let raw = bytes.first()?.unwrap_or(0);
-                Some(Expr::bool_const(raw != 0))
-            } else if let Some(width) = elem_sort.bitvec_width() {
-                let read_bytes = ((width as usize) / 8).min(elem_bytes);
-                let mut value: u128 = 0;
-                for (j, byte) in bytes.iter().take(read_bytes).enumerate() {
-                    if let Some(b) = byte {
-                        value |= (*b as u128) << (j * 8);
-                    }
-                }
-                Some(Expr::bitvec_const(value, width))
-            } else {
-                // Compound element (nested array / fieldless-enum-as-array / struct):
-                // recurse via a sub-allocation over this element's bytes, reusing the
-                // per-type codegen. Without this, a const `[[E; N]; M]` lookup table
-                // (e.g. aterm's `OriginTag` join table — array OF arrays of fieldless
-                // enums) returned None, the caller fell through to codegen_assign's
-                // unconstrained-array fallback, and every downstream `discriminant`
-                // read was unconstrained (INCONCLUSIVE). The recursion is well-typed:
-                // `infer_sort_from_ty([T; N]) == Sort::array(ptr_sort(), sort(T))`,
-                // exactly what this fn builds.
-                let sub_alloc = Allocation {
-                    bytes: bytes.to_vec(),
-                    provenance: rustc_public::ty::ProvenanceMap { ptrs: vec![] },
-                    align: alloc.align,
-                    mutability: alloc.mutability,
-                };
-                self.codegen_scalar_from_alloc(&sub_alloc, elem_ty)
-            }
+            self.read_field_from_alloc(alloc, elem_ty, &elem_sort, i * elem_bytes)
         };
 
         // Default seed for the const-array. Every in-bounds index is overwritten by
@@ -330,30 +328,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Extract a Layout constant from an allocation (#1524).
     /// Layout struct: { size: usize, align: Alignment }
-    fn codegen_layout_from_alloc(&self, alloc: &Allocation) -> Option<Expr> {
-        // Read raw bytes: first 8 bytes = size, next 8 bytes = alignment
-        let size_value = if alloc.bytes.len() >= 8 {
-            let mut size_bytes = [0u8; 8];
-            for (i, b) in alloc.bytes.iter().take(8).enumerate() {
-                size_bytes[i] = b.unwrap_or(0);
-            }
-            u64::from_le_bytes(size_bytes) as u128
-        } else {
-            // Fallback: use read_uint for smaller allocations
-            alloc.read_uint().into_option()? & ((1u128 << POINTER_WIDTH) - 1)
-        };
-
-        // Read alignment from bytes 8-16 (or default to size alignment)
-        let align_value = if alloc.bytes.len() >= 16 {
-            let mut align_bytes = [0u8; 8];
-            for (i, b) in alloc.bytes.iter().skip(8).take(8).enumerate() {
-                align_bytes[i] = b.unwrap_or(0);
-            }
-            u64::from_le_bytes(align_bytes) as u128
-        } else {
-            // Default alignment: use size as hint, minimum 1
-            if size_value == 0 { 1 } else { size_value.min(8) }
-        };
+    fn codegen_layout_from_alloc(&self, alloc: &dyn ConstRead) -> Option<Expr> {
+        // `Layout { size: usize, align: Alignment }`: two data words.
+        let size_value = alloc.read_uint_at(0, 8)?;
+        let align_value = alloc.read_uint_at(8, 8)?;
 
         debug!("codegen_scalar_from_alloc: Layout size={} align={}", size_value, align_value);
 
@@ -374,7 +352,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Types: std::ptr::Alignment, core::ptr::Alignment
     fn codegen_alignment_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         adt_def: rustc_public::ty::AdtDef,
         args: rustc_public::ty::GenericArgs,
     ) -> Option<Expr> {
@@ -385,7 +363,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             && let Some(field) = cons.fields.first()
         {
             // Read the allocation value with proper width
-            let value = alloc.read_uint().into_option()?;
+            let value = alloc.read_uint_at(0, alloc.len())?;
             let field_width = field.sort.bitvec_width().unwrap_or(POINTER_WIDTH);
             let value_u128 =
                 if field_width >= 128 { value } else { value & ((1u128 << field_width) - 1) };
@@ -412,7 +390,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Extract a multi-field tuple constant from an allocation.
     fn codegen_tuple_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         tys: &[rustc_public::ty::Ty],
     ) -> Option<Expr> {
@@ -446,7 +424,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ZST closures -> Bool(true) per CHC convention. Capturing -> Datatype.
     pub(super) fn codegen_closure_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         def: rustc_public::ty::ClosureDef,
         args: rustc_public::ty::GenericArgs,
@@ -514,42 +492,49 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             .unwrap_or_default()
     }
 
-    /// Read a single field value from allocation bytes at a given offset.
+    /// Read the value of type `field_ty` (sort `field_sort`) stored at
+    /// `offset` in `alloc`, under the slot clause: a fieldless enum is its
+    /// discriminant decoded from its own tag bytes, a bitvector slot is data
+    /// or (pointer width) a stored pointer's value, a `bool` is a 0/1 byte,
+    /// and a compound value recurses over its own window (`sub_window`, which
+    /// rebases the relocations inside it). An uninitialized byte declines:
+    /// it is not 0.
     pub(super) fn read_field_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         field_ty: rustc_public::ty::Ty,
         field_sort: &ay_bindings::Sort,
         offset: usize,
     ) -> Option<Expr> {
+        if let Some(bv_width) = field_sort.bitvec_width()
+            && crate::codegen_ay::chc::expr::codegen_expr_constant_payload::ty_is_fieldless_enum(
+                field_ty,
+            )
+        {
+            // A fieldless enum field is its discriminant at the sort's width,
+            // decoded from its own tag bytes (one byte for `Ordering`).
+            let value =
+                crate::codegen_ay::chc::expr::codegen_expr_constant_payload::fieldless_enum_const_bits(
+                    field_ty, alloc, offset, bv_width,
+                )?;
+            return Some(Expr::bitvec_const(value, bv_width));
+        }
+        if let TyKind::RigidTy(RigidTy::Adt(def, _)) = field_ty.kind()
+            && def.trimmed_name() == "TypeId"
+            && field_sort.bitvec_width() == Some(128)
+        {
+            return Some(Expr::bitvec_const(Self::type_id_value(alloc, offset)?, 128));
+        }
         if let Some(bv_width) = field_sort.bitvec_width() {
-            // BitVec field: read raw bytes at offset
-            let field_size = (bv_width as usize) / 8;
-            let bytes = alloc.bytes.get(offset..offset + field_size)?;
-            let mut value: u128 = 0;
-            for (i, byte) in bytes.iter().enumerate() {
-                if let Some(b) = byte {
-                    value |= (*b as u128) << (i * 8);
-                }
-            }
-            Some(Expr::bitvec_const(value, bv_width))
+            self.read_bv_slot(alloc, offset, bv_width)
         } else if field_sort.is_bool() {
-            // Bool field: read 1 byte at offset
-            let byte = alloc.bytes.get(offset)?;
-            let val = byte.unwrap_or(0);
-            Some(Expr::bool_const(val != 0))
+            Some(Expr::bool_const(alloc.read_bool_at(offset)?))
         } else {
-            // Compound sort (Datatype, Array, etc.): attempt recursive extraction
-            // by constructing a sub-allocation from the field's bytes.
+            // Compound sort (Datatype, Array, etc.): recurse over the field's
+            // own window, its relocations kept.
             let field_size = LayoutOf::new(field_ty).size_of()?;
-            let bytes = alloc.bytes.get(offset..offset + field_size)?;
-            let sub_alloc = Allocation {
-                bytes: bytes.to_vec(),
-                provenance: rustc_public::ty::ProvenanceMap { ptrs: vec![] },
-                align: alloc.align,
-                mutability: alloc.mutability,
-            };
-            self.codegen_scalar_from_alloc(&sub_alloc, field_ty)
+            let window = alloc.sub_window(offset, field_size)?;
+            self.codegen_scalar_from_bytes(&window, field_ty)
         }
     }
 }

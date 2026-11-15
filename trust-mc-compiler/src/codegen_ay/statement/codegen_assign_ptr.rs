@@ -6,10 +6,10 @@
 // Extracted from codegen_assign.rs (#2246): raw pointer deref, Box unwrap,
 // and array index assignment handlers.
 
-use super::{IntoOption, StatementCodegen};
-use crate::codegen_ay::types::POINTER_WIDTH;
+use super::{IndexedVal, IntoOption, StatementCodegen};
+use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 use crate::kani_middle::abi::LayoutOf;
-use ay_bindings::Expr;
+use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, trace, warn};
@@ -38,11 +38,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Emit pointer validity checks for raw pointer dereference (#430, #508).
         self.emit_raw_ptr_deref_checks(lhs);
-
-        // FC-06 (BMC): a raw-pointer store (including `static mut` writes)
-        // inside a modifies frame with an empty declared footprint is an
-        // assigns violation (see `statement::modifies_frame`).
-        self.bmc_modifies_check_raw_store(lhs);
 
         // Handle projections after Deref (e.g., (*ptr).field = value)
         if lhs.projection.len() > 1 {
@@ -105,7 +100,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ptr_expr
         };
         debug!("codegen_assign: raw ptr deref + field, offset={}, storing to memory", total_offset);
-        self.ctx.store_memory_bytes(addr, value_expr.clone());
+        self.store_memory_bytes_on_path(addr, value_expr.clone(), "raw pointer field store");
 
         // #1039: Update heap_pointees for struct field mutations through Box.
         let ptr_base = self.root_ssa_base_name(ptr_place);
@@ -118,14 +113,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if let Some(old_struct) = self.heap_pointees.get(source_box.as_ref()).cloned() {
                 warn!("#1039: found old_struct in heap_pointees, sort={:?}", old_struct.sort());
                 if let Some(new_struct) =
-                    self.update_struct_field(&old_struct, &field_indices, value_expr)
+                    self.update_struct_field(&old_struct, &field_indices, value_expr.clone())
                 {
                     warn!(
                         "#1039: struct field mutation SUCCESS, updating heap_pointees[{}] and [{}]",
                         source_box, ptr_base
                     );
                     self.heap_pointees.insert(source_box, new_struct.clone());
-                    self.heap_pointees.insert(std::sync::Arc::from(ptr_base), new_struct);
+                    self.heap_pointees.insert(std::sync::Arc::from(ptr_base.as_str()), new_struct);
                 } else {
                     warn!("#1039: update_struct_field returned None");
                 }
@@ -135,7 +130,64 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         } else {
             warn!("#1039: ptr_base {} NOT found in ptr_source_map", ptr_base);
         }
+        // The byte store above and the `heap_pointees` / `ptr_source_map`
+        // write-backs both key on the POINTER. A raw pointer taken of a STACK
+        // place reaches none of them, so `let p: *mut S = &mut a[0];
+        // (*p).y = 9; assert!(a[0].y == 0)` was VERIFICATION:- SUCCESSFUL with
+        // `[AY:PROOF_QUALIFIERS:clean]` — the store landed nowhere a read of
+        // `a` resolves to (fourth adversarial review of m3/soundness-fixes-2,
+        // 2026-09-14, defect M1/D2; pre-existing on main). The `&mut` deref
+        // path writes the field back through the projection walk; this one now
+        // does the same, or fails closed.
+        self.write_back_field_to_stack_pointee(&ptr_base, &field_indices, &value_expr, lhs);
         true
+    }
+
+    /// Write `(*ptr).f0.f1… = value` back into the STACK place `ptr` addresses.
+    ///
+    /// The field's derived name (`{pointee}_field_{f0}_field_{f1}`) is the name
+    /// the projection walk owns, so updating that register and handing it to
+    /// `try_propagate_deref_write_to_parent_datatype` undoes the fields — and,
+    /// for a pointer of an array ELEMENT's field, the element too. Anything this
+    /// cannot place exactly records a fail-closed reason: a silently dropped
+    /// field store is the false proof this exists to close.
+    fn write_back_field_to_stack_pointee(
+        &mut self,
+        ptr_base: &str,
+        field_indices: &[usize],
+        value_expr: &Expr,
+        lhs: &Place,
+    ) {
+        let Some(pointee_base) = self.resolved_stack_pointee_base(ptr_base) else {
+            // No stack pointee is recorded: the pointer addresses memory the
+            // byte store above already covers (a heap object, a parameter).
+            return;
+        };
+        if field_indices.is_empty() {
+            return;
+        }
+        let mut derived = pointee_base.to_string();
+        for idx in field_indices {
+            derived.push_str(&format!("_field_{idx}"));
+        }
+        // The field register must be able to HOLD the stored value. A mismatch
+        // (a flattened payload word, a narrower view) is not a write-back this
+        // path can make exactly.
+        if let Some(current) = self.env_lookup(&derived).cloned()
+            && current.sort() != value_expr.sort()
+        {
+            self.ctx.unsupported_with_fallback(
+                "raw_ptr_field_store_pointee_sort_mismatch",
+                format!("{derived}: {:?} != {:?}", current.sort(), value_expr.sort()),
+            );
+            return;
+        }
+        debug!("codegen_assign: raw ptr field store writes back to {derived}");
+        let field_name = self.ssa_name_from_base(&derived, true);
+        let field_var = self.ctx.declare_var(&field_name, value_expr.sort().clone());
+        self.assert_ssa_def(field_var.clone(), value_expr.clone(), &derived);
+        self.env_update(derived.clone(), field_var.clone());
+        self.try_propagate_deref_write_to_parent_datatype(&derived, &field_var, lhs);
     }
 
     /// Handle simple `*ptr = value` — raw pointer deref without field projections.
@@ -144,7 +196,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             && let Some(value_expr) = self.codegen_rvalue(rhs)
         {
             debug!("codegen_assign: raw ptr deref, storing to memory, ptr_place={:?}", ptr_place);
-            self.ctx.store_memory_bytes(ptr_expr, value_expr.clone());
+            // A store on one path keeps main's path-guarded lane; a store on every
+            // path of a known pointee type replaces only its object's bytes.
+            match ptr_place.ty(self.body.locals()).into_option().map(|t| t.kind()) {
+                Some(TyKind::RigidTy(RigidTy::RawPtr(pointee, _)))
+                    if self.store_path_condition().is_none() =>
+                {
+                    self.store_typed_value_to_memory(ptr_expr, value_expr.clone(), pointee)
+                }
+                _ => self.store_memory_bytes_on_path(
+                    ptr_expr,
+                    value_expr.clone(),
+                    "raw pointer store",
+                ),
+            }
 
             // #1210: Track heap value for symbolic deref resolution.
             let ptr_base: std::sync::Arc<str> =
@@ -174,7 +239,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // of a statement native Rust panics on — because reads of `x` still
             // resolved to its pre-store SSA value. `ref_pointees` is where the
             // pointer-to-local relationship lives, and nothing consulted it.
-            self.write_back_to_stack_pointee(&ptr_base, &value_expr);
+            self.write_back_to_stack_pointee(&ptr_base, &value_expr, ptr_place, rhs);
         }
     }
 
@@ -185,23 +250,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// differently-sorted value would trade one wrong answer for another. When
     /// the sorts disagree the byte-level memory store still stands, so this
     /// only declines to ALSO update the scalar view.
-    fn write_back_to_stack_pointee(
-        &mut self,
-        ptr_base: &std::sync::Arc<str>,
-        value_expr: &Expr,
-    ) {
-        let Some(mut pointee_base) = self.ref_pointees.get(ptr_base.as_ref()).cloned() else {
-            return;
-        };
-        // Follow the chain to the REAL local. `let p: *mut u8 = &mut x` lowers
-        // to two steps — `_3 = &mut x` then `_2 = &raw mut (*_3)` — and records
-        //
-        //     ref_pointees[local_3] = local_1          (x itself)
-        //     ref_pointees[local_2] = local_3_deref    (a synthetic)
-        //
-        // so one lookup from the raw pointer lands on `local_3_deref`, which no
-        // read of `x` resolves to. Strip the `_deref` marker and look through
-        // again until it settles on a base the environment actually holds.
+    /// The storage a pointer's `ref_pointees` entry finally names.
+    ///
+    /// Follow the chain to the REAL local. `let p: *mut u8 = &mut x` lowers
+    /// to two steps — `_3 = &mut x` then `_2 = &raw mut (*_3)` — and records
+    ///
+    ///     ref_pointees[local_3] = local_1          (x itself)
+    ///     ref_pointees[local_2] = local_3_deref    (a synthetic)
+    ///
+    /// so one lookup from the raw pointer lands on `local_3_deref`, which no
+    /// read of `x` resolves to. Strip the `_deref` marker and look through
+    /// again until it settles on a base the environment actually holds.
+    pub(super) fn resolved_stack_pointee_base(
+        &self,
+        ptr_base: &str,
+    ) -> Option<std::sync::Arc<str>> {
+        let mut pointee_base = self.ref_pointees.get(ptr_base).cloned()?;
         for _ in 0..MAX_POINTEE_CHAIN {
             let Some(stem) = pointee_base.as_ref().strip_suffix("_deref") else {
                 break;
@@ -211,6 +275,49 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             };
             pointee_base = next;
         }
+        Some(pointee_base)
+    }
+
+    /// Move an element-qualified pointee's OWN register to the stored value.
+    ///
+    /// `a_idx_by_L`, `a_idx_by_L_field_0` and friends are names the READ side
+    /// resolves directly (`codegen_place` tries the full projected name first),
+    /// so a store through a raw pointer of such a slot has to update that
+    /// register as well as the array the walk writes back into. A sort the
+    /// register cannot hold is not a write-back this path can make exactly: the
+    /// register is havocked and a fail-closed reason recorded, never left at
+    /// the pre-store value.
+    fn place_element_slot_register(&mut self, pointee_base: &str, value_expr: &Expr) {
+        let current_sort = self.env_lookup(pointee_base).map(|e| e.sort().clone());
+        match current_sort {
+            Some(sort) if sort != *value_expr.sort() => {
+                self.ctx.unsupported_with_fallback(
+                    "raw_ptr_store_element_slot_sort_mismatch",
+                    format!("{pointee_base}: {:?} != {:?}", sort, value_expr.sort()),
+                );
+                let fresh_name = self.ssa_name_from_base(pointee_base, true);
+                let fresh = self.ctx.declare_var(&fresh_name, sort);
+                self.env_update(pointee_base.to_owned(), fresh);
+            }
+            _ => {
+                let slot_name = self.ssa_name_from_base(pointee_base, true);
+                let slot_var = self.ctx.declare_var(&slot_name, value_expr.sort().clone());
+                self.assert_ssa_def(slot_var.clone(), value_expr.clone(), pointee_base);
+                self.env_update(pointee_base.to_owned(), slot_var);
+            }
+        }
+    }
+
+    pub(super) fn write_back_to_stack_pointee(
+        &mut self,
+        ptr_base: &std::sync::Arc<str>,
+        value_expr: &Expr,
+        ptr_place: &Place,
+        rhs: &Rvalue,
+    ) {
+        let Some(pointee_base) = self.resolved_stack_pointee_base(ptr_base.as_ref()) else {
+            return;
+        };
         // An element-qualified pointee (`<array>_idx_by_<local>`, written by
         // the as_ptr/offset provenance) names ONE SLOT of an array, not a
         // scalar local. Overwriting the whole local with a single element's
@@ -220,10 +327,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if pointee_base.contains("_idx_by_") {
             let fn_name = self.ctx.current_fn_name().to_string();
             debug!("codegen_assign: raw ptr store -> indexed array write {}", pointee_base);
+            // The pointee's OWN register is a name a READ resolves: `codegen_place`
+            // looks the full projected name (`a_idx_by_L_field_0`) up in the
+            // environment BEFORE it walks the array, and `&raw mut a[i].x`
+            // recorded the pre-store value under exactly that name. Every other
+            // branch of this function updates that register first; this one did
+            // not, so the array was updated exactly and the read still answered
+            // with the value the borrow was taken at:
+            // `let p: *mut u8 = &raw mut a[i].x; *p = 9; assert!(a[i].x == 0)`
+            // was VERIFICATION:- SUCCESSFUL with [AY:PROOF_QUALIFIERS:clean] and
+            // its safe twin FAILED [AY:CTREX_CAT:Genuine] (fifth adversarial
+            // review of m3/soundness-fixes-2, 2026-09-14, defect R1 — a
+            // regression of the D1 commit, which stopped
+            // `try_propagate_indexed_ref_write_to_array` from recording the
+            // coercion fallback that used to demote this shape). The element
+            // slot is placed under the array by the walk below; here the slot's
+            // own register moves with it, or the store fails closed.
+            self.place_element_slot_register(&pointee_base, value_expr);
             self.try_propagate_indexed_ref_write_to_array(
                 &fn_name,
                 pointee_base.as_ref(),
                 value_expr.clone(),
+            );
+            // The projection walk owns every derived name (`_idx_by_`,
+            // `_cidx_`, `_field_`) and undoes them innermost first; the call
+            // above is now only the stub-pointee fallback.
+            self.try_propagate_deref_write_to_parent_datatype(
+                pointee_base.as_ref(),
+                value_expr,
+                ptr_place,
             );
             return;
         }
@@ -242,17 +374,43 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let new_name = self.ssa_name_from_base(pointee_base.as_ref(), true);
             let new_var = self.ctx.declare_var(&new_name, stored.sort().clone());
             self.assert_ssa_def(new_var.clone(), stored, pointee_base.as_ref());
-            self.env_update(std::sync::Arc::clone(&pointee_base), new_var);
+            self.env_update(std::sync::Arc::clone(&pointee_base), new_var.clone());
+            self.try_propagate_deref_write_to_parent_datatype(
+                pointee_base.as_ref(),
+                &new_var,
+                ptr_place,
+            );
             return;
         }
-        if let Some(current) = self.env_lookup(pointee_base.as_ref())
+        if let Some(current) = self.env_lookup(pointee_base.as_ref()).cloned()
             && current.sort() != value_expr.sort()
         {
+            // The local holds the pointee in another representation (a flattened
+            // payload word against a datatype value, a narrower cast view). The
+            // store still happened: leaving the local at its old value made the
+            // old value provable. It is left unconstrained instead, with its
+            // flattened components, and the harness is marked.
             debug!(
-                "codegen_assign: raw ptr store to {} skipped — sort {:?} != {:?}",
+                "codegen_assign: raw ptr store to {} — sort {:?} != {:?}, pointee havocked",
                 pointee_base,
                 current.sort(),
                 value_expr.sort()
+            );
+            self.ctx.unsupported_with_fallback(
+                "raw_ptr_store_pointee_sort_mismatch",
+                format!("{pointee_base}: {:?} != {:?}", current.sort(), value_expr.sort()),
+            );
+            let fresh_name = self.ssa_name_from_base(pointee_base.as_ref(), true);
+            let fresh = self.ctx.declare_var(&fresh_name, current.sort().clone());
+            self.env_update(std::sync::Arc::clone(&pointee_base), fresh.clone());
+            self.store_flattened_components(pointee_base.as_ref(), Vec::new());
+            // The havocked field reaches its enclosing datatype register too, as
+            // every exact write-back below does: otherwise the next `&(*r).N`
+            // re-derives the field from the stale parent.
+            self.try_propagate_deref_write_to_parent_datatype(
+                pointee_base.as_ref(),
+                &fresh,
+                ptr_place,
             );
             return;
         }
@@ -260,7 +418,27 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let pointee_name = self.ssa_name_from_base(pointee_base.as_ref(), true);
         let pointee_var = self.ctx.declare_var(&pointee_name, value_expr.sort().clone());
         self.assert_ssa_def(pointee_var.clone(), value_expr.clone(), pointee_base.as_ref());
-        self.env_update(std::sync::Arc::clone(&pointee_base), pointee_var);
+        let bindings_before = self.ref_pointees.generation();
+        self.env_update(std::sync::Arc::clone(&pointee_base), pointee_var.clone());
+        // The stored value's flattened components travel with it.
+        self.store_flattened_components_through_ref(pointee_base.as_ref(), rhs);
+        // The local now holds a value written through a raw pointer; bindings
+        // recorded for its previous value are stale (see the `&mut` deref store).
+        self.ref_pointees.poison_stale_since(&pointee_base, bindings_before);
+        // Keep the enclosing datatype register in step with a FIELD write,
+        // exactly as the `&mut` deref-store path does
+        // (`try_codegen_assign_ref_deref`). Without it the flattened field
+        // register (`<obj>_field_N`) holds the new value while `<obj>` still
+        // holds the old one, and the next borrow of that field
+        // (`&(*r).N`, which re-derives `<obj>_field_N` from `<obj>`) silently
+        // restores the pre-store value. `dual_uc_ensures.rs::harness_for_modify`
+        // (`*im.x.get() += 2` under `requires x < 100`, `ensures x < 101`) read
+        // the stale value in its postcondition and verified SUCCESSFUL.
+        self.try_propagate_deref_write_to_parent_datatype(
+            pointee_base.as_ref(),
+            &pointee_var,
+            ptr_place,
+        );
     }
 
     /// Handle Box unwrap assignment patterns (#1039).
@@ -309,7 +487,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // ptr_source_map from the outer Box local to the inner Box's local.
                 // This enables deref chains to find the inner Box's heap_pointees
                 // content when resolving multi-level Box dereferences.
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rhs {
+                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rhs {
                     let src_root = self.root_ssa_base_name(src);
                     if src_root != box_base && self.heap_pointees.contains_key(src_root.as_str()) {
                         debug!(
@@ -376,6 +554,223 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             warn!("#1039: update_struct_field returned None");
             false
         }
+    }
+
+    /// `g[i][j] = v`, `g[K][j] = v`, `a[i].buf[k] = v`: a store into a place on a
+    /// LOCAL that nests an element index inside another index or a field, which
+    /// neither `try_codegen_assign_array_index` (one `Index`) nor the datatype
+    /// field handlers (fields after one index, one trailing index under fields)
+    /// cover. The generic path bound a register named for the projection while
+    /// the local never changed: `let mut g = [[0u8; 2]; 2]; g[1][0] = 9;
+    /// assert!(g[1][0] == 0)` verified SUCCESSFUL and the safe twin FAILED with a
+    /// Genuine counterexample (main 31793ccc3). The local's value is rebuilt from
+    /// the leaf outwards (`update_projected_value`); anything that cannot be
+    /// rebuilt records `unsupported_with_fallback` and fails closed. Returns
+    /// `true` when the store was handled (exactly or fail-closed).
+    pub(super) fn try_codegen_assign_nested_place(&mut self, lhs: &Place, rhs: &Rvalue) -> bool {
+        if lhs.projection.len() < 2
+            || lhs.projection.iter().any(|p| matches!(p, ProjectionElem::Deref))
+        {
+            return false;
+        }
+        let indexes = lhs
+            .projection
+            .iter()
+            .filter(|p| {
+                matches!(p, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+            })
+            .count();
+        if indexes == 0 {
+            return false;
+        }
+        let location = || format!("{lhs:?}");
+        let base_place = Place { local: lhs.local, projection: vec![] };
+        let Some(root) = self.codegen_place(&base_place) else {
+            self.ctx
+                .unsupported_with_fallback("nested place store: local has no value", location());
+            return true;
+        };
+        let Some(rhs_expr) = self.codegen_rvalue(rhs) else {
+            self.ctx
+                .unsupported_with_fallback("nested place store: value did not codegen", location());
+            return true;
+        };
+        let signed = lhs
+            .ty(self.body.locals())
+            .into_option()
+            .and_then(crate::codegen_ay::shared::ty_signedness_shallow)
+            .unwrap_or(false);
+        let Some(new_root) =
+            self.update_projected_value(&root, &lhs.projection, &rhs_expr, lhs, signed)
+        else {
+            self.ctx.unsupported_with_fallback("nested place store: place not rebuilt", location());
+            return true;
+        };
+        let base_name = self.ssa_base_name(&base_place);
+        // A materialized byte image of the local (its address was taken) would be
+        // stale after this store; nothing may rest on it.
+        if self.addr_symbols.contains_key(base_name.as_str()) {
+            self.ctx.unsupported_with_fallback(
+                "nested place store: address-taken local not mirrored",
+                location(),
+            );
+        }
+        let new_name = self.ssa_name(&base_place, true);
+        let new_var = self.ctx.declare_var(&new_name, new_root.sort().clone());
+        self.assert_ssa_def(new_var.clone(), new_root, &base_name);
+        self.env_update(base_name.clone(), new_var);
+        self.repeat_array_values.remove(base_name.as_str());
+        debug!("nested place store: {} rebuilt from the leaf", new_name);
+        true
+    }
+
+    /// `value` with the sub-place `projs` denotes replaced by `leaf`: an `Index` /
+    /// `ConstantIndex` becomes `store(array, i, ..)` (over the element array of a
+    /// slice / Vec datatype when `value` is one), a `Field` (after an optional
+    /// `Downcast`) a rebuilt constructor. The leaf is coerced to the slot's sort
+    /// with the BMC store coercions. `None` when a projection does not fit the
+    /// value's sort, an index has no value, or the leaf cannot be coerced — the
+    /// caller fails closed, never stores a fresh symbol.
+    pub(in crate::codegen_ay::statement) fn update_projected_value(
+        &mut self,
+        value: &Expr,
+        projs: &[ProjectionElem],
+        leaf: &Expr,
+        lhs: &Place,
+        leaf_signed: bool,
+    ) -> Option<Expr> {
+        let mut variant: Option<usize> = None;
+        let mut at = 0;
+        while let Some(ProjectionElem::Downcast(v)) = projs.get(at) {
+            variant = Some(v.to_index());
+            at += 1;
+        }
+        let Some(proj) = projs.get(at) else {
+            return self.coerce_leaf_to_slot(value.sort(), leaf, leaf_signed);
+        };
+        match proj {
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                // The element storage: the value itself, or `fld_data` / `fld_buf`
+                // of a slice / Vec datatype.
+                let data_field = if value.sort().is_array() {
+                    None
+                } else {
+                    let dt = value.sort().datatype_sort()?;
+                    if dt.constructors.len() != 1 {
+                        return None;
+                    }
+                    let (field_idx, field) =
+                        dt.constructors[0].fields.iter().enumerate().find(|(_, f)| {
+                            matches!(&*f.name, "fld_data" | "fld_buf") && f.sort.is_array()
+                        })?;
+                    Some((
+                        dt.name.to_string(),
+                        field_idx,
+                        field.name.to_string(),
+                        field.sort.clone(),
+                    ))
+                };
+                let array = match &data_field {
+                    None => value.clone(),
+                    Some((dt_name, _, field_name, field_sort)) => {
+                        value.clone().field_select(dt_name, field_name, field_sort.clone())
+                    }
+                };
+                let arr_sort = array.sort().array_sort()?;
+                let index_width = arr_sort.index_sort.bitvec_width().unwrap_or(POINTER_WIDTH);
+                let idx = self.projection_index_value(proj, index_width)?;
+                let elem = array.clone().select(idx.clone());
+                let new_elem =
+                    self.update_projected_value(&elem, &projs[at + 1..], leaf, lhs, leaf_signed)?;
+                let new_array = array.store(idx, new_elem);
+                match data_field {
+                    None => Some(new_array),
+                    Some((_, field_idx, _, _)) => Self::datatype_field_update(
+                        value, field_idx, None, new_array, lhs, self.ctx,
+                    ),
+                }
+            }
+            ProjectionElem::Field(field_idx, _) => {
+                let sort = value.sort().clone();
+                let dt = sort.datatype_sort()?;
+                let cons_idx = if dt.constructors.len() > 1 { variant? } else { 0 };
+                let cons = dt.constructors.get(cons_idx)?;
+                // `datatype_field_update` maps field 0 of the `Some` arm of an
+                // option-like struct onto its second field; read the same slot.
+                let is_option_like_struct = dt.constructors.len() == 1
+                    && cons.fields.len() == 2
+                    && cons.fields[0].name == "is_some";
+                let slot = if is_option_like_struct && variant == Some(1) && *field_idx == 0 {
+                    1
+                } else {
+                    *field_idx
+                };
+                let field = cons.fields.get(slot)?;
+                let current =
+                    value.clone().field_select(&*dt.name, &*field.name, field.sort.clone());
+                let new_field = self.update_projected_value(
+                    &current,
+                    &projs[at + 1..],
+                    leaf,
+                    lhs,
+                    leaf_signed,
+                )?;
+                Self::datatype_field_update(value, *field_idx, variant, new_field, lhs, self.ctx)
+            }
+            _ => None, // external enum: ProjectionElem (Deref, Subslice, OpaqueCast, ...)
+        }
+    }
+
+    /// The index of an `Index` / `ConstantIndex` projection as a bitvector of
+    /// `width` bits: the index local's value, or the constant offset. `None` for an
+    /// index counted from the end (a runtime length this layer has no value for)
+    /// or an index local with no value.
+    pub(super) fn projection_index_value(
+        &mut self,
+        proj: &ProjectionElem,
+        width: u32,
+    ) -> Option<Expr> {
+        let idx = match proj {
+            ProjectionElem::Index(idx_local) => {
+                let idx_name =
+                    crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), *idx_local);
+                self.env_lookup(&idx_name).cloned().or_else(|| {
+                    let idx_ssa = self.ssa_name_from_base(&idx_name, false);
+                    self.ctx.lookup_var(&idx_ssa).cloned()
+                })?
+            }
+            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+                let offset = super::constant_index_offset(*offset, *min_length, *from_end)?;
+                Expr::bitvec_const(offset as u128, width)
+            }
+            _ => return None, // external enum: ProjectionElem
+        };
+        match idx.sort().bitvec_width() {
+            Some(w) if w == width => Some(idx),
+            Some(w) if w < width => Some(idx.zero_extend(width - w)),
+            Some(_) => Some(idx.extract(width - 1, 0)),
+            None => None,
+        }
+    }
+
+    /// `leaf` coerced to `slot_sort` with the BMC store coercions (Vec / String
+    /// element images, bitvector widths, `Bool` <-> `BV1`); `None` when the sorts
+    /// still differ.
+    fn coerce_leaf_to_slot(&self, slot_sort: &Sort, leaf: &Expr, signed: bool) -> Option<Expr> {
+        if leaf.sort() == slot_sort {
+            return Some(leaf.clone());
+        }
+        let slot_array = Sort::array(ptr_sort(), slot_sort.clone());
+        let coerced =
+            crate::codegen_ay::store_coercion::coerce_vec_string_store_value(&slot_array, leaf)
+                .or_else(|| {
+                    crate::codegen_ay::store_coercion::coerce_store_value_bmc(
+                        &slot_array,
+                        leaf,
+                        signed,
+                    )
+                })?;
+        (coerced.sort() == slot_sort).then_some(coerced)
     }
 
     /// Handle array index assignment: `arr[i] = value` uses SMT store.

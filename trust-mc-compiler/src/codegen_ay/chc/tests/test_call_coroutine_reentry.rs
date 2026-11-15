@@ -379,7 +379,7 @@ fn try_assert_yield_only_resume_arg_call(
         "precise coroutine dispatch should constrain the receiver output var {receiver_out_name}; smt={smt}"
     );
     assert!(
-        smt.contains("Yielded_CoroutineState"),
+        spells_variant_ctor(&smt, "Yielded", COROUTINE_STATE, ""),
         "yield-only repeated resume(Box<_>) should constrain the CoroutineState result to Yielded(...); smt={smt}"
     );
     true
@@ -467,19 +467,21 @@ fn assert_inline_pin_reentry_result(
 ) {
     let receiver_name = chc_ctx.state_var_mgr.state_vars[receiver_state_idx].0.clone();
     let receiver_out_name = chc_ctx.state_var_mgr.output_state_vars[receiver_state_idx].0.clone();
-    let before_fallback = chc_ctx.sound_fallback_count();
+    let before = bookings(chc_ctx);
     let before_rules = chc_ctx.vc.rules.len();
 
     assert!(
         chc_ctx.try_dispatch_call_coroutine(dcx),
         "inline Pin::new repeated-resume call should be handled by coroutine dispatch"
     );
-    assert_eq!(
-        chc_ctx.sound_fallback_count(),
-        before_fallback,
-        "inline Pin::new repeated-resume call should stay on the precise inline/write-back path instead of falling back; local6_decl={:?}; bb0_statements={:?}; call_summaries={call_summaries:?}",
-        diagnostics.local6_decl,
-        diagnostics.bb0_statements
+    // The resume is not walked: its payloads are booked havocs (Rule E).
+    assert_precise_up_to_attributed_havocs(
+        chc_ctx,
+        &before,
+        &format!(
+            "inline Pin::new repeated-resume call should stay on the precise inline/write-back path instead of falling back; local6_decl={:?}; bb0_statements={:?}; call_summaries={call_summaries:?}",
+            diagnostics.local6_decl, diagnostics.bb0_statements
+        ),
     );
     assert!(
         chc_ctx.vc.rules.len() > before_rules,

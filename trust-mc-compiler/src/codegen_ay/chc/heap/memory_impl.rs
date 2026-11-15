@@ -9,6 +9,7 @@
 //! memory_impl_type_keys.rs respectively. Region array load/store helpers are
 //! in memory_impl_region.rs per #3053.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,9 +19,10 @@ use tracing::{debug, warn};
 
 use super::codegen_ctx::diagnostics::CellCounter;
 use super::codegen_types::CodegenTypes;
+use super::heap_state::ConstantCellLoad;
 use super::memory_impl_region::ptr_array_sort;
 use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
-use super::{ChcCtx, UNDEF_COUNTER, declare_pending_var, dyn_coercion};
+use super::{ChcCtx, UNDEF_COUNTER, dyn_coercion};
 use crate::codegen_ay::chc::call::canonical_zst_expr_for_sort;
 use crate::codegen_ay::chc::call::codegen_call_kani_model_dst::is_zst_ty;
 use crate::codegen_ay::provenance::{Loc, Val};
@@ -150,6 +152,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         addr: Expr,
         pointee_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
+        self.load_from_memory_view(addr, pointee_ty, true)
+    }
+
+    /// Read an array element through its typed view. Indexed writes maintain
+    /// this view even when their symbolic address cannot update a region
+    /// shortcut; the normal access checks and view ledger still apply.
+    pub(in crate::codegen_ay::chc) fn load_array_element_from_memory(
+        &mut self,
+        addr: Loc,
+        pointee_ty: rustc_public::ty::Ty,
+    ) -> Option<Val> {
+        self.load_from_memory_view(addr.into_expr(), pointee_ty, false).map(Val::of_value)
+    }
+
+    fn load_from_memory_view(
+        &mut self,
+        addr: Expr,
+        pointee_ty: rustc_public::ty::Ty,
+        use_region: bool,
+    ) -> Option<Expr> {
         let pointee_ty = self.resolve_body_ty(pointee_ty);
         // BigInt uses value semantics - the address IS the value (#545 audit)
         if Self::type_name_contains_bigint(&pointee_ty) {
@@ -159,6 +181,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
             return Some(addr);
         }
+        // F1 (call/inline_walk_guard.rs): a heap read inside an inline walk
+        // after a write since the outermost walk mark fails closed.
+        self.note_inline_walk_memory_read();
 
         // Part of #2875: Coerce Int addresses to BV before pointer arithmetic.
         let addr = if addr.sort().is_int() { addr.int2bv(POINTER_WIDTH) } else { addr };
@@ -207,9 +232,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3608: Compile-time store-to-load forwarding.
         if let Some((fwd_obj_id, fwd_offset)) = Self::try_extract_constant_addr(&addr) {
             let fwd_key = ((fwd_obj_id as u64) << 32) | (fwd_offset as u64);
-            if let Some((store_bb, forwarded_value, _store_type_key)) =
+            if let Some((store_bb, forwarded_value, store_type_key)) =
                 self.heap_state.store_forward_map.get(&fwd_key).cloned()
                 && store_bb == self.current_encode_bb
+                // The map is keyed by address alone. A store of ANOTHER type at
+                // the same address is this load's value only when both are bit
+                // patterns the byte reassembly below can tile. A datatype load
+                // is not one: its term is the compact flatten encoding, not the
+                // memory layout. A field-decomposed `Option<u8>` stores its tag
+                // byte at the Option's own address, and forwarding that `u8`
+                // into an `Option<u8>` load decoded the tag as the whole Option
+                // (`Some(tag)`), which folded `o == Some(4)` to false for an
+                // Option read through `&o` in the block that borrowed it.
+                && (*store_type_key == *type_key
+                    || pointee_sort.as_ref().is_some_and(|sort| sort.is_bitvec()))
+                // An array load is forwarded only a whole array of its own
+                // sort. A `[T; N]` store decomposes into per-element stores
+                // that record the ELEMENT at the array's base address under
+                // the array's type key, and handing that element to a
+                // whole-array load built an array holding element 0 and
+                // zeros: `let c = Cell::new([0u8; 2]); c.set(v);
+                // assert!(c.get()[1] == 0)` verified SUCCESSFUL (the store and
+                // the `&c` mirror both wrote the base address in the get's
+                // block). The reconstruction below reads every element.
+                && !pointee_sort.as_ref().is_some_and(|sort| {
+                    sort.is_array() && forwarded_value.sort() != sort
+                })
             {
                 debug!(
                     obj_id = fwd_obj_id,
@@ -272,7 +320,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // through to the multi-element reconstruction path below.
         let needs_array_reconstruction =
             pointee_sort.as_ref().is_some_and(|ps| ps.is_array()) && !elem_sort.is_array();
-        if !needs_array_reconstruction {
+        if use_region && !needs_array_reconstruction {
             if let Some(result) = self.try_load_from_region(
                 &addr,
                 &elem_sort,
@@ -288,6 +336,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // all N elements from consecutive addresses and reconstruct the full array.
         if let Some(ref ps) = pointee_sort
             && ps.is_array()
+            // The loaded lanes are stored into an Array(index, element); a lane sort
+            // that differs from the element sort (e.g. a nested byte array) would build
+            // an ill-sorted store, which ay rejects. Take the type-array path instead.
+            && ps.array_sort().is_some_and(|arr| arr.element_sort == elem_sort)
             && let Some(array_len) = self.get_array_length(pointee_ty)
             && array_len > 0
             && let Some(elem_size) =
@@ -340,8 +392,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 type_key,
                 UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
-            let fresh = declare_pending_var(sym_name, elem_sort);
-            self.record_sound_fallback_reason("spawn_type_array_load_stub");
+            let booked = self.record_sound_fallback_reason("spawn_type_array_load_stub");
+            let fresh = Havoc::booked(booked, sym_name, elem_sort);
             return Some(Self::coerce_loaded_value_for_pointee(fresh, pointee_sort));
         }
 
@@ -352,9 +404,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let arr_sort = ptr_array_sort(declared_elem_sort.clone());
             self.push_late_state_var_pair(Arc::clone(&arr_name), &arr_out_name, arr_sort);
         }
+        let read_addr = addr.clone();
 
         // Read through the CURRENT (possibly fragment-mid-renamed) input name.
         let (cur_in_name, _, _) = self.current_array_state_names(&arr_name, &arr_out_name);
+
+        // Rule C's backstop: a constant-address read, judged against every
+        // store once the translation is done (`memory_cell_backstop.rs`).
+        if let Some((obj_id, offset)) = Self::try_extract_constant_addr(&addr) {
+            self.heap_state.constant_cell_loads.push(ConstantCellLoad {
+                addr: (u64::from(obj_id) << 32) | u64::from(offset),
+                type_key: Arc::from(type_key),
+                array: Arc::clone(&cur_in_name),
+            });
+        }
 
         let arr_sort = ptr_array_sort(declared_elem_sort.clone());
         let (arr_expr, use_arr_name): (Expr, Cow<'_, str>) =
@@ -364,6 +427,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 (Expr::var(&*cur_in_name, arr_sort), Cow::Borrowed(type_key))
             };
         let result = arr_expr.select(addr);
+        self.note_view_read(&read_addr, type_key, &declared_elem_sort, Some(&result));
 
         debug!(
             type_key = %type_key,
@@ -382,8 +446,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// This keeps subsequent same-block loads off the stale input array and
     /// makes the eventual output universally quantified instead of identity-copied.
     #[allow(dead_code)]
+    ///
+    /// The fresh arrays stand on the caller's booking of the dropped store
+    /// (`booked`, Rule E).
     pub(in crate::codegen_ay::chc) fn overapproximate_memory_store_target(
         &mut self,
+        booked: crate::codegen_ay::chc::codegen_ctx::Booked,
         pointee_ty: rustc_public::ty::Ty,
         addr: Option<&Expr>,
     ) {
@@ -406,7 +474,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 let region_key = crate::codegen_ay::names::region_key(obj_id);
                 let arr_sort = ptr_array_sort(elem_sort.clone());
-                let fresh = declare_pending_var(sym_name, arr_sort);
+                let fresh = Havoc::booked(booked, sym_name, arr_sort);
                 self.heap_state.accumulate_store(&region_key, eff_out, fresh);
                 self.heap_state.mark_array_modified(&region_key);
                 self.heap_state.mark_type_array_written(&eff_in, self.current_encode_bb);
@@ -420,7 +488,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 );
                 let region_key = crate::codegen_ay::names::region_key(obj_id);
                 let arr_sort = ptr_array_sort(region_sort);
-                let fresh = declare_pending_var(sym_name, arr_sort);
+                let fresh = Havoc::booked(booked, sym_name, arr_sort);
                 self.heap_state.accumulate_store(&region_key, region_out, fresh);
                 self.heap_state.mark_array_modified(&region_key);
                 self.heap_state.mark_type_array_written(&region_in, self.current_encode_bb);
@@ -431,6 +499,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let type_key = self.type_key_for_body_ty(pointee_ty);
+        // The whole array is replaced by a fresh one: for the object `addr`
+        // names, every cell of this key is rewritten by one store.
+        self.note_view_havoc(addr, &type_key);
+        if let Some(addr) = addr {
+            self.note_view_havoc(Some(addr), super::heap_view_ledger::REGION_VIEW_KEY);
+        }
         let (arr_name, arr_out_name, declared_elem_sort, is_new) =
             self.heap_state.get_or_create_type_array(&type_key, elem_sort, &self.fn_name);
         self.heap_state.mark_type_array_written(&arr_name, self.current_encode_bb);
@@ -438,13 +512,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let arr_sort = ptr_array_sort(declared_elem_sort.clone());
             self.push_late_state_var_pair(Arc::clone(&arr_name), &arr_out_name, arr_sort);
         }
+        // The type key is spelled through the same bound as the array name:
+        // AY charges every variable occurrence's name bytes problem-wide.
         let sym_name = format!(
             "__store_drop_mem_{}_{}",
-            type_key,
+            crate::codegen_ay::names::bounded_type_key_segment(&type_key),
             UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let arr_sort = ptr_array_sort(declared_elem_sort);
-        let fresh = declare_pending_var(sym_name, arr_sort);
+        let fresh = Havoc::booked(booked, sym_name, arr_sort);
         let (_, cur_out_name, state_idx) = self.current_array_state_names(&arr_name, &arr_out_name);
         self.heap_state.accumulate_store(&type_key, cur_out_name, fresh);
         self.heap_state.mark_array_modified(&type_key);
@@ -501,6 +577,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         value: Expr,
         pointee_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
+        if !self.native_drop_store_has_authority() {
+            self.refuse_native_drop_memory("native_drop_memory_store_without_ssa");
+        }
         let pointee_ty = self.resolve_body_ty(pointee_ty);
         let signed = ty_signedness_shallow(pointee_ty).unwrap_or(false);
         // Part of #2875: Coerce Int addresses to BV before pointer arithmetic.
@@ -538,6 +617,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
+        self.note_native_dyn_memory_write(&addr);
+
         if !self.suppress_heap_store_checks {
             let checks = self.heap_access_checks(addr.clone(), pointee_ty);
             if !checks.is_empty() {
@@ -560,18 +641,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // replaced by an unconstrained symbolic in coerce_store_value (data lost).
         // Instead, extract each element via AY select and store at consecutive
         // byte addresses. The load side (#4086 reconstruction) rebuilds the array.
+        // A `repr(transparent)` wrapper of an array (`Cell<[T; N]>`, the `&c`
+        // mirror of a Cell local) has the array's layout and type key, so it
+        // decomposes exactly like the array: stored whole, the array value
+        // was coerced into ONE element-sorted cell and its other elements
+        // were never written.
+        let array_ty = unwrap_layout_transparent_ty(pointee_ty);
         let is_plain_array = matches!(
-            pointee_ty.kind(),
+            array_ty.kind(),
             rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Array(..))
         );
         if is_plain_array
             && value.sort().is_array()
             && !elem_sort.is_array()
-            && let Some(array_len) = self.get_array_length(pointee_ty)
+            && let Some(array_len) = self.get_array_length(array_ty)
             && array_len > 0
             && array_len <= 64
             && let Some(elem_size) =
-                self.get_array_element_ty(pointee_ty).and_then(|et| self.get_type_size(et))
+                self.get_array_element_ty(array_ty).and_then(|et| self.get_type_size(et))
             && elem_size > 0
         {
             // The per-element cells above live under the ARRAY's type key
@@ -584,11 +671,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // key too, but ONLY for an object nothing can write through a
             // pointer — see `array_elem_mirror_key_if_write_free`.
             let elem_type_key = self
-                .array_elem_mirror_key_if_write_free(&addr, pointee_ty)
+                .array_elem_mirror_key_if_write_free(&addr, array_ty)
                 .filter(|k| **k != *type_key);
+            let array_elem_ty = self.get_array_element_ty(array_ty);
             for i in 0..array_len {
                 let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
                 let elem_val = value.clone().select(idx);
+                let elem_val = match array_elem_ty {
+                    Some(elem_ty) => self.enum_bits_at_cell_width(elem_val, elem_ty, &elem_sort),
+                    None => elem_val,
+                };
                 let elem_addr = if i == 0 {
                     addr.clone()
                 } else {
@@ -615,11 +707,81 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
+        let value = self.enum_bits_at_cell_width(value, pointee_ty, &elem_sort);
+
         // Part of #1443: Try region array first (always falls through to type store).
         self.try_store_to_region(&addr, &value, &elem_sort, signed);
 
         // Fallback: type-indexed array store.
         self.store_to_type_array(addr, value, &type_key, elem_sort, signed)
+    }
+
+    /// A multi-constructor enum held as a flat bitvector of one width, re-encoded
+    /// at the memory cell's width.
+    ///
+    /// The flat enum encoding is width-parametric (`flatten_datatype_to_bitvec`:
+    /// the tag in the TOP bits, the payload right-aligned, padding between), so
+    /// the same value has a different bit pattern at every width. An array of
+    /// enums keeps its elements at their compact width (`[Option<u8>; 2]`: nine
+    /// bits, tag at bit 8), the enum's memory cell is wider (`mem_Option_u8`:
+    /// sixteen bits, tag at bit 15), and the width coercion of the store
+    /// zero-extended: the stored tag landed at bit 8, every read of the element
+    /// through memory decoded `None`, and `opt_elem_refjoin_safe`
+    /// (review_r14_static_elem_refjoin.rs) FAILED certified Genuine. Rebuild
+    /// the enum from the narrow pattern and flatten it at the cell width; a shape
+    /// the pair cannot rebuild is a fresh cell value, booked as a layout
+    /// fallback, never the misplaced tag. Anything but an enum-typed bitvector
+    /// of another width passes through unchanged.
+    pub(in crate::codegen_ay::chc) fn enum_bits_at_cell_width(
+        &self,
+        value: Expr,
+        ty: rustc_public::ty::Ty,
+        cell_sort: &Sort,
+    ) -> Expr {
+        let (Some(width), Some(cell_width)) =
+            (value.sort().bitvec_width(), cell_sort.bitvec_width())
+        else {
+            return value;
+        };
+        if width == cell_width {
+            return value;
+        }
+        let ty = self.resolve_body_ty(ty);
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _)) = ty.kind()
+        else {
+            return value;
+        };
+        if def.kind() != rustc_public::ty::AdtKind::Enum {
+            return value;
+        }
+        let Some(dt_sort) = Self::translate_ty(ty) else { return value };
+        if dt_sort.datatype_sort().is_none_or(|dt| dt.constructors.len() < 2) {
+            return value;
+        }
+        let rebuilt = trust_mc_codegen_types::types::unflatten_bitvec_to_datatype(&value, &dt_sort)
+            .and_then(|dt_value| {
+                trust_mc_codegen_types::types::flatten_datatype_to_bitvec(&dt_value, cell_width)
+            });
+        match rebuilt {
+            Some(bits) => {
+                debug!(
+                    width,
+                    cell_width,
+                    ?ty,
+                    "CHC: enum bits re-encoded at the memory cell width"
+                );
+                bits
+            }
+            None => {
+                debug!(width, cell_width, ?ty, "CHC: enum bits not re-encodable; fresh cell value");
+                let booked = self.record_sound_fallback_reason("transmute_layout_fallback");
+                Havoc::booked(
+                    booked,
+                    crate::codegen_ay::chc::chc_fresh_name("__enum_cell_width_nondet"),
+                    cell_sort.clone(),
+                )
+            }
+        }
     }
 
     /// Type-indexed array store with coercion, forwarding, and alias mirroring.
@@ -657,7 +819,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `true` if any statement or call in this body writes through a `Deref`
     /// place — i.e. the typed memory array can hold a value the owning local's
     /// state var does not.
-    fn body_stores_through_deref(&self) -> bool {
+    pub(in crate::codegen_ay::chc) fn body_stores_through_deref(&self) -> bool {
         use rustc_public::mir::{Place, StatementKind, TerminatorKind};
         let place_has_deref = |p: &Place| {
             p.projection.iter().any(|e| matches!(e, rustc_public::mir::ProjectionElem::Deref))
@@ -673,9 +835,43 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         })
     }
 
+    /// Whether `local`'s register is the only place its value can change:
+    /// the local is never mutably borrowed, or no write can reach memory
+    /// around its register — this body stores through no `Deref` place
+    /// ([`Self::body_stores_through_deref`]) and passes no `&mut`/`*mut`
+    /// argument to a call (a callee could write through it). A read that
+    /// rebuilds the value from the register (a pointer-cast reinterpretation)
+    /// is then as exact as a plain read of the local.
+    pub(in crate::codegen_ay::chc) fn local_register_is_authoritative(&self, local: usize) -> bool {
+        use rustc_public::mir::TerminatorKind;
+        use rustc_public::ty::{RigidTy, TyKind};
+        if !self.local_is_mutably_borrowed(local) {
+            return true;
+        }
+        if self.body_stores_through_deref() {
+            return false;
+        }
+        let locals = self.body.locals();
+        !self.body.blocks.iter().any(|block| match &block.terminator.kind {
+            TerminatorKind::Call { args, .. } => args.iter().any(|arg| {
+                arg.ty(locals).map_or(true, |ty| {
+                    matches!(
+                        ty.kind(),
+                        TyKind::RigidTy(
+                            RigidTy::Ref(_, _, rustc_public::mir::Mutability::Mut)
+                                | RigidTy::RawPtr(_, rustc_public::mir::Mutability::Mut)
+                        )
+                    )
+                })
+            }),
+            TerminatorKind::InlineAsm { .. } => true,
+            _ => false,
+        })
+    }
+
     /// `true` if `local` is the base of a mutable borrow (`&mut _L`) or a
     /// mutable raw-address expression (`&raw mut _L`) anywhere in this body.
-    fn local_is_mutably_borrowed(&self, local: usize) -> bool {
+    pub(in crate::codegen_ay::chc) fn local_is_mutably_borrowed(&self, local: usize) -> bool {
         use rustc_public::mir::{BorrowKind, Mutability, Rvalue, StatementKind};
         self.body.blocks.iter().any(|block| {
             block.statements.iter().any(|stmt| {
@@ -707,6 +903,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.record_sound_fallback_reason("spawn_type_array_store_stub");
             return None;
         }
+        // A store at a static's address outside a routed static store reached
+        // the static's image and not its state (`decl::static_path`).
+        self.note_type_array_store(&addr, type_key);
+        // The heap view ledger groups this write with the other keys the same
+        // datum is written under (`heap_view_ledger.rs`).
+        let view_group = self.heap_state.view_ledger.group_for(&value);
 
         let (arr_name, arr_out_name, declared_elem_sort, is_new) =
             self.heap_state.get_or_create_type_array(type_key, elem_sort, &self.fn_name);
@@ -754,7 +956,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "CHC: coerced type-indexed store value via fresh symbolic (Part of #2244)"
             );
             self.record_aggregate_gap("memory_type_indexed_store_sort_mismatch");
-            declare_pending_var(sym_name, expected_elem_sort.clone())
+            Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE,
+                sym_name,
+                expected_elem_sort.clone(),
+            )
         } else {
             value
         };
@@ -775,6 +982,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.heap_state
                 .store_forward_map
                 .insert(fwd_key, (self.current_encode_bb, value.clone(), Arc::from(type_key)));
+            // Rule C's backstop: the cell this key wrote, in any block.
+            self.heap_state.constant_cell_stores.push((fwd_key, Arc::from(type_key)));
         } else {
             // Part of #3664: symbolic-address store invalidates all forwards.
             self.heap_state.invalidate_store_forwards();
@@ -788,13 +997,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.mark_state_var_modified(idx);
         }
 
-        self.mirror_pointer_wrapper_store_aliases(
-            &addr,
-            &value,
-            type_key,
-            &declared_elem_sort,
-            signed,
-        );
+        // The heap view ledger's record of this write. Main deleted the
+        // pointer-wrapper alias mirror (Box/NonNull/Unique share `ptr_T`), so
+        // the key written is the only view this store has.
+        self.note_view_write_in_group(&addr, type_key, &declared_elem_sort, view_group);
 
         debug!(
             type_key = %type_key,
@@ -924,4 +1130,26 @@ mod forwarded_width_tests {
             ForwardedWidth::TooNarrow
         ));
     }
+}
+
+/// `ty` with its `Cell`/`UnsafeCell` wrappers peeled: `repr(transparent)`, so
+/// the type whose layout a value of `ty` has. Unlike
+/// `unwrap_heap_transparent_ty` it keeps `RefCell`, `Mutex` and the guards,
+/// whose layout is not their payload's. (`ManuallyDrop`/`MaybeUninit` are
+/// transparent too but are left as they were: no Cell lane reaches them.)
+fn unwrap_layout_transparent_ty(mut ty: rustc_public::ty::Ty) -> rustc_public::ty::Ty {
+    use rustc_public::CrateDef;
+    use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+    for _ in 0..8 {
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else { return ty };
+        let name = def.name();
+        let canonical =
+            name.strip_prefix("core::").or_else(|| name.strip_prefix("std::")).unwrap_or_default();
+        if !matches!(canonical, "cell::Cell" | "cell::UnsafeCell") {
+            return ty;
+        }
+        let Some(GenericArgKind::Type(inner)) = args.0.first() else { return ty };
+        ty = *inner;
+    }
+    ty
 }

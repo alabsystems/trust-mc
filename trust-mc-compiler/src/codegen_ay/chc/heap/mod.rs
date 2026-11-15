@@ -10,14 +10,16 @@
 
 pub(super) use super::super::{names, types};
 pub(super) use super::{
-    ChcCtx, UNDEF_COUNTER, codegen_ctx, codegen_types, declare_pending_var, dyn_coercion,
-    record_type_sort_fallback,
+    ChcCtx, UNDEF_COUNTER, codegen_ctx, codegen_types, dyn_coercion, record_type_sort_fallback,
 };
 
 mod heap_regions;
 pub(in crate::codegen_ay::chc) mod heap_state;
 mod heap_state_alloc;
 pub(in crate::codegen_ay::chc) mod heap_store_chains;
+mod heap_unsize_alias;
+pub(in crate::codegen_ay::chc) mod heap_view_ledger;
+pub(in crate::codegen_ay::chc) mod memory_cell_backstop;
 mod memory_impl;
 mod memory_impl_addr;
 mod memory_impl_addr_normalize;
@@ -26,9 +28,10 @@ mod memory_impl_addr_normalize;
 // existing `super::super::heap::is_value_widened_into_address` imports still resolve.
 pub(in crate::codegen_ay::chc) use crate::codegen_ay::provenance::is_value_widened_into_address;
 mod memory_impl_addr_stack;
+pub(in crate::codegen_ay::chc) mod stack_address;
+mod vec_buffer_access;
 mod memory_impl_layout;
 mod memory_impl_layout_query;
-mod memory_impl_ptr_alias;
 mod memory_impl_region;
 mod memory_impl_type_keys;
 pub(in crate::codegen_ay::chc) mod memory_model;

@@ -4,6 +4,7 @@
 
 //! Extra-pointer-check helpers for RawVec/Layout dangling constructors.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 
 use crate::codegen_ay::names::{self, struct_sort};
@@ -13,7 +14,7 @@ use crate::codegen_ay::types::{POINTER_WIDTH, ptr_sort};
 use super::super::ChcCtx;
 use super::super::chc_call_context::ChcCallContext;
 use super::super::codegen_call_coerce::CallCoerce;
-use super::super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::super::codegen_ctx::globals::chc_fresh_name;
 use super::super::codegen_expr_heap;
 use super::super::codegen_rules::CodegenRules;
 
@@ -32,13 +33,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let Some(sort_name) = dest_var.sort().datatype_name() else {
             return false;
         };
-        if !sort_name.contains("RawVec") {
+        if !crate::codegen_ay::names::sort_name_mentions_rawvec(&sort_name[..]) {
             return false;
         }
 
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         // Freshly declared RawVec allocation base: an ADDRESS by construction.
-        let ptr = Loc::of_address(declare_pending_var(chc_fresh_name("rawvec_ptr"), ptr_sort()));
+        let ptr = Loc::of_address(Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_POINTER_VALUE,
+            chc_fresh_name("rawvec_ptr"),
+            ptr_sort(),
+        ));
         let rawvec_sort = struct_sort("RawVec", names::rawvec_fields());
         let rawvec = Expr::datatype_constructor(
             "RawVec",
@@ -52,7 +58,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let current_valid = self.current_obj_valid_array();
             let invalidated = current_valid.store(obj_id, Expr::bool_const(false));
             extra_constraints.push(codegen_expr_heap::obj_valid_out().eq(invalidated));
-            self.mark_heap_metadata_modified();
+            self.mark_obj_valid_modified();
         }
 
         let new_output_args = self.build_output_args(cx.modified_locals, &[dest_local]);
@@ -114,7 +120,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let current_valid = self.current_obj_valid_array();
             let invalidated = current_valid.store(obj_id, Expr::bool_const(false));
             extra_constraints.push(codegen_expr_heap::obj_valid_out().eq(invalidated));
-            self.mark_heap_metadata_modified();
+            self.mark_obj_valid_modified();
         }
 
         let new_output_args = self.build_output_args(cx.modified_locals, &[dest_local]);

@@ -5,6 +5,7 @@
 //! `trust-mc doctor` and `trust-mc version`: what verification needs, whether
 //! it is here, and the provenance of what is here.
 
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -12,8 +13,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use super::engine::{
-    self, Engine, candidates, engine_authority, engine_version, library_dirs, mark, resolve_engine,
-    solver_build_sha, solver_hint, solver_path, solver_version,
+    self, ALLOW_UNPINNED_ENV, AY_BIN_ENV, Engine, SolverPin, candidates, declared_ay_pin,
+    engine_authority, engine_version, library_dirs, mark, resolve_engine, solver_hint,
+    solver_override, solver_path, solver_pin, solver_version, unpinned_ay_fix,
 };
 use super::{BUILD_CMD, COMPILER, EXIT_NOT_READY, Fail, Front, VERSION};
 
@@ -96,11 +98,31 @@ pub(crate) fn version_command(rest: &[OsString]) -> Front<ExitCode> {
         }
     }
     match solver_path(resolve_engine().as_ref()) {
-        None => println!("solver:  `ay` not on PATH"),
+        None => match solver_override() {
+            Some(path) => {
+                println!("solver:  ${AY_BIN_ENV}={} is not an executable file", path.display())
+            }
+            None => println!("solver:  `ay` not on PATH"),
+        },
         Some(ay) => {
             println!("solver:  {}", ay.display());
-            if let Some(line) = solver_version(&ay) {
+            let version = solver_version(&ay);
+            if let Some(line) = &version {
                 println!("         {line}");
+            }
+            let pin = resolve_engine()
+                .and_then(|engine| engine_authority(&engine).ok())
+                .map(|authority| authority.ay_pin)
+                .or_else(declared_ay_pin);
+            if let Some(pin) = pin {
+                match solver_pin(version.as_deref(), &pin) {
+                    SolverPin::Matched => println!("         the pinned AY commit {}", short(&pin)),
+                    problem => println!(
+                        "         NOT the pinned AY commit {} ({}); the engine refuses it",
+                        short(&pin),
+                        problem.problem()
+                    ),
+                }
             }
         }
     }
@@ -182,7 +204,7 @@ fn examine(verbose: bool) -> Report {
                 warnings.push(format!(
                     "engine and front door versions differ ({v} vs {expected}); one of them is a\n  \
                      stale build. Rebuild the engine ({BUILD_CMD})\n  \
-                     or reinstall the front door (cargo install --path .)."
+                     or reinstall the front door (targo --unverified install --path .)."
                 ));
             }
         }
@@ -296,47 +318,87 @@ fn finish_solver(
     verbose: bool,
 ) {
     out.push_str("SMT solver (bounded runs shell out to it; CHC solves in-process)\n");
+
+    // The pin the binary must match: the engine's own when it attests one,
+    // otherwise the one this front door's workspace declares. Doctor has to be
+    // able to call a binary off-pin when the engine is missing or will not
+    // attest, because the engine refuses an off-pin `ay` either way.
+    let declared = declared_ay_pin();
+    let (pin, pin_source) = match authority {
+        Some(a) => (Some(a.ay_pin.clone()), "pinned by the engine"),
+        None => (declared.clone(), "pinned by this front door's Cargo.toml"),
+    };
+    if let (Some(a), Some(declared)) = (authority, &declared)
+        && a.ay_pin != *declared
+    {
+        warnings.push(format!(
+            "the engine pins AY {} but this front door's workspace pins {};\n  \
+             one of them is a stale build. The engine's pin decides which `ay` it accepts.",
+            short(&a.ay_pin),
+            short(declared)
+        ));
+    }
+
+    let override_path = solver_override();
     match solver_path(engine) {
         None => {
             *ready = false;
-            out.push_str("  [ ] ay  not on PATH\n");
-            fixes.push(format!("put the solver on PATH:\n    {}", solver_hint()));
+            match &override_path {
+                Some(path) => {
+                    out.push_str(&format!(
+                        "  [ ] ay  ${AY_BIN_ENV}={} is not an executable file\n",
+                        path.display()
+                    ));
+                    fixes.push(format!(
+                        "point {AY_BIN_ENV} at a built `ay` solver binary, or unset it to use \
+                         `ay` from PATH:\n    unset {AY_BIN_ENV}"
+                    ));
+                }
+                None => {
+                    out.push_str("  [ ] ay  not on PATH\n");
+                    fixes.push(format!("put the solver on PATH:\n    {}", solver_hint()));
+                }
+            }
         }
         Some(ay) => {
-            out.push_str(&format!("  [x] ay  {}\n", ay.display()));
+            let origin = if override_path.is_some() {
+                format!("from ${AY_BIN_ENV}")
+            } else {
+                "on PATH".into()
+            };
+            out.push_str(&format!("  [x] ay  {} ({origin})\n", ay.display()));
             if verbose {
                 out.push_str(&format!("      $ {} --version\n", ay.display()));
             }
-            match solver_version(&ay) {
-                None => out.push_str("  [!] ay does not answer --version\n"),
-                Some(version) => {
-                    out.push_str(&format!("      {version}\n"));
-                    if let Some(pin) = authority.map(|a| a.ay_pin.as_str()) {
-                        match solver_build_sha(&version) {
-                            Some(sha) if sha == pin => out.push_str(
-                                "  [x] the binary is the same AY commit the engine links\n",
-                            ),
-                            Some(sha) => {
-                                out.push_str(&format!(
-                                    "  [!] the binary is AY {} but the engine links {}\n",
-                                    short(&sha),
-                                    short(pin)
-                                ));
-                                warnings.push(format!(
-                                    "`ay` on PATH ({}) is not the commit the engine links ({});\n  \
-                                     bounded (BMC) verdicts come from that binary, so rebuild it at the\n  \
-                                     pinned commit: cd ../ay && git checkout {} && cargo build --release -p ay --features cli",
-                                    short(&sha),
-                                    short(pin),
-                                    pin
-                                ));
-                            }
-                            None => out.push_str(
-                                "  [!] the binary does not stamp its commit; cannot compare with the engine\n",
-                            ),
+            let version = solver_version(&ay);
+            if let Some(version) = &version {
+                out.push_str(&format!("      {version}\n"));
+            }
+            match &pin {
+                None => out.push_str(
+                    "  [!] cannot read the pinned AY revision; the engine still checks the binary\n",
+                ),
+                Some(pin) => match solver_pin(version.as_deref(), pin) {
+                    SolverPin::Matched => out.push_str(&format!(
+                        "  [x] the binary is the pinned AY commit {} ({pin_source})\n",
+                        short(pin)
+                    )),
+                    problem => {
+                        *ready = false;
+                        out.push_str(&format!(
+                            "  [ ] off-pin: {}\n      the pin is {pin} ({pin_source}); the engine \
+                             refuses an off-pin `ay`\n",
+                            problem.problem()
+                        ));
+                        if env::var_os(ALLOW_UNPINNED_ENV).is_some_and(|value| value == "1") {
+                            out.push_str(&format!(
+                                "      {ALLOW_UNPINNED_ENV}=1 is set: runs proceed, with every \
+                                 success reported as SUCCESSFUL (UNVALIDATED)\n"
+                            ));
                         }
+                        fixes.push(unpinned_ay_fix(pin));
                     }
-                }
+                },
             }
         }
     }
@@ -438,9 +500,19 @@ fn toolchain_fix(engine: &Engine) -> String {
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|text| pinned_channel(&text));
     match channel {
+        // The Trust seal ships the rustc_private closure; rustup cannot install
+        // it, and nothing links llvm-tools.
+        Some(channel) if channel == "trust" => format!(
+            "{COMPILER} cannot load its rustc (the Trust seal it links is gone or damaged);\n  \
+             check the Trust toolchain and rebuild:\n    \
+             aterm pkg doctor        (repair: aterm pkg repair)\n    \
+             {BUILD_CMD}"
+        ),
+        // STOCK-AS-ORACLE: a checkout pinned to a rustup
+        // channel -- the frozen Kani-comparison nightly -- reinstalls it there.
         Some(channel) => format!(
             "{COMPILER} cannot load its rustc; reinstall the pinned toolchain and rebuild:\n    \
-             rustup toolchain install {channel} --component rustc-dev rust-src llvm-tools\n    \
+             rustup toolchain install {channel} --component rustc-dev rust-src\n    \
              {BUILD_CMD}"
         ),
         None => format!(

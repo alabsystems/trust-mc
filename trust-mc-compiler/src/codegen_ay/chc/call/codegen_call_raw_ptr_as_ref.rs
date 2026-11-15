@@ -106,7 +106,7 @@ pub(super) fn try_dispatch_raw_ptr_as_ref(
         some_expr,
     );
 
-    let ptr_obj_id = ChcCtx::try_extract_obj_id(data_ptr.as_expr());
+    let ptr_obj_id = ChcCtx::try_extract_base_obj_id(data_ptr.as_expr());
     propagate_alloc_id(ctx, dest_local, src_local);
     propagate_ref_target(ctx, dest_local, src_local, ptr_obj_id);
     let vtable_constraint =

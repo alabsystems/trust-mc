@@ -40,6 +40,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let callee_path = self.resolve_callee_path(func)?;
         let method = callee_path.rsplit("::").next()?;
 
+        // The Euclidean stubs below are INTEGER bitvector division. `f32`/`f64`
+        // have methods of the same names (a float carries its IEEE bit pattern
+        // here, so the stub computed `bvurem` over the bits, and the false
+        // `x == 5.0 => x.rem_euclid(3.0) != 2.0` verified: TRUST-MC-FREM-2), and
+        // `num_traits::Euclid` passes `&Self`, whose operand is a pointer. Any
+        // operand that is not a by-value primitive integer is not claimed.
+        if matches!(method, "div_euclid" | "rem_euclid")
+            && !args.iter().take(2).all(|arg| {
+                arg.ty(self.body.locals())
+                    .is_ok_and(crate::codegen_ay::shared::is_primitive_integer_ty)
+            })
+        {
+            debug!(method, "euclid stub declined: an operand is not a primitive integer");
+            return None;
+        }
+
         match method {
             "wrapping_abs" if !args.is_empty() => {
                 self.codegen_wrapping_abs_bmc(&args[0], destination);

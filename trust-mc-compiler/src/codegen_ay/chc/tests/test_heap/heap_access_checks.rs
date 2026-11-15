@@ -302,7 +302,7 @@ fn test_heap_span_access_checks_symbolic_count_emits_bounds() {
 }
 
 #[test]
-fn test_heap_span_access_checks_skips_symbolic_provenance() {
+fn test_heap_span_access_checks_bounds_symbolic_provenance() {
     const SOURCE: &str = r#"
         #![allow(dead_code)]
 
@@ -319,14 +319,20 @@ fn test_heap_span_access_checks_skips_symbolic_provenance() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        // A raw symbolic pointer has unknown provenance: the allocation size
-        // is a caller contract we cannot invent, so no checks are emitted
-        // (historical skip; precision plan Step 5 owns this residual).
+        // A raw symbolic pointer: its object lane is the object's number, so
+        // the span is bounded by the size of the object that number names
+        // (`symbolic_lane_bounds`). The span used to get no check at all,
+        // and a copy past a Box through a wrapping step verified clean (review
+        // of fix/chc-lost-writes, lostwrite round 1, finding 4).
         let addr = Expr::var("p", Sort::bitvec(64));
         let elem_ty = rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8);
         let count = Expr::var("n", Sort::bitvec(64));
 
+        // Span-fits and no-wrap hold for any pointer; with no object the body
+        // takes the address of or allocates, no lane names a bounded object.
         let checks = chc_ctx.heap_span_access_checks(&addr, elem_ty, &count);
-        assert!(checks.is_empty(), "symbolic obj_id must keep the skip, got: {checks:?}");
+        assert_eq!(checks.len(), 2, "expected span-fits/no-wrap, got: {checks:?}");
+        let all = checks.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("bvuge"), "no-wrap check must be present: {all}");
     });
 }

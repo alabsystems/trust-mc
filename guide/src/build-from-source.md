@@ -7,23 +7,17 @@
 
 In general, the following dependencies are required to build trust-mc from source.
 
-> **NOTE**: These dependencies may be installed by running the scripts shown
-> below and don't need to be manually installed.
-
-1. Cargo installed via [rustup](https://rustup.rs/)
+1. The [Trust](https://github.com/alabsystems/trust) toolchain named in
+   `rust-toolchain.toml` (`channel = "trust"`): `targo`, `trustc`, `tippy`,
+   `trustfmt`. It ships the rustc internals trust-mc-compiler links.
 2. [AY](https://github.com/alabsystems/ay) (trust-mc's native verification backend)
 
 > **NOTE**: AY is trust-mc's default and only supported backend in current builds
 > (`--backend` accepts `auto` and `ay`). CBMC content in this repository is
 > retained as historical upstream reference, not as an active runtime backend.
 
-> **NOTE**: the `scripts/setup/` dependency installers referenced below are
-> inherited from upstream Kani and are **not present** in this repository.
-> Install rustup from <https://rustup.rs/>, link the toolchain named in
-> `rust-toolchain.toml`, and build the AY solver separately (see
-> [Installation](./install-guide.md)) so the `ay` binary is on your PATH.
-
-trust-mc has been tested in [Ubuntu](#install-dependencies-on-ubuntu) and [macOS](#install-dependencies-on-macos) platforms.
+> **NOTE**: install the Trust toolchain, then build the AY solver separately
+> (see [Installation](./install-guide.md)) so the `ay` binary is on your PATH.
 
 ### AY dependency strategy
 
@@ -35,7 +29,7 @@ rapid co-development when a sibling AY checkout is available.
 ```bash
 git clone https://github.com/alabsystems/trust-mc.git
 cd trust-mc
-cargo build  # uses pinned AY rev from Cargo.toml
+targo --unverified build  # uses pinned AY rev from Cargo.toml
 ```
 
 **Co-development setup (path deps):**
@@ -65,55 +59,29 @@ HEAD is not the declared authority.
 
 See `Cargo.toml` comments for full rationale.
 
-### Install dependencies on Ubuntu
-
-Support is available for Ubuntu 20.04, 22.04, and 24.04.
-The simplest way to install dependencies (especially if you're using a fresh VM)
-is following our CI scripts:
-
-```
-# git clone git@github.com:alabsystems/trust-mc.git
-git clone https://github.com/alabsystems/trust-mc.git
-cd trust-mc
- # For Ubuntu 20.04, use: `./scripts/setup/ubuntu-20.04/install_deps.sh`
-./scripts/setup/ubuntu/install_deps.sh
-# If you haven't already (or from https://rustup.rs/):
-./scripts/setup/install_rustup.sh
-source $HOME/.cargo/env
-```
-
-### Install dependencies on macOS
-
-Support is available for macOS 11. You need to have [Homebrew](https://brew.sh/) installed already.
-
-```
-# git clone git@github.com:alabsystems/trust-mc.git
-git clone https://github.com/alabsystems/trust-mc.git
-cd trust-mc
-./scripts/setup/macos/install_deps.sh
-# If you haven't already (or from https://rustup.rs/):
-./scripts/setup/install_rustup.sh
-source $HOME/.cargo/env
-```
-
 ## Build and test trust-mc
 
 Build the trust-mc package using:
 
 ```
-cargo build-dev -- --release
+targo --unverified build-dev --release
 ```
 to compile with optimizations turned on or using:
 ```
-cargo build-dev
+targo --unverified build-dev
 ```
-to compile in debug/development mode.
+to compile in debug/development mode. `build-dev` rebuilds std with
+trust-mc-compiler (`-Z build-std`); a Trust toolchain that ships no
+standard-library sources takes them from a trust checkout at the compiler's own
+commit: pass `--trust-checkout <trust checkout>` right after `build-dev`, before
+`--release` (or set `TRUST_MC_TRUST_CHECKOUT`) unless this checkout is
+`first-party/trust-mc` of one.
 
 There is no monolithic regression wrapper. Run the Rust units and the
 fail-closed AY corpus gates explicitly:
 
 ```
-cargo test --workspace --no-fail-fast
+targo --unverified test --workspace --no-fail-fast
 ./scripts/ay-compiletest.sh expected
 ./scripts/ay-soundness-gate.sh
 ```

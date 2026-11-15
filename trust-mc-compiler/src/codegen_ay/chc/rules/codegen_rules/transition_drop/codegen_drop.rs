@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
 use tracing::debug;
 
 use super::super::{CodegenRules, TransitionContext};
@@ -45,7 +48,7 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
     // Part of #4067: Mutex/RwLock drop is a no-op in single-threaded CHC verification.
     // The Mutex type is transparent (Mutex<T> → T), so its Drop impl just destroys
     // the platform mutex (pthread) which has no semantic effect. The drop shim body
-    // contains calls to <Mutex as Drop>::drop (prefix-abstracted, no body) and
+    // contains calls to <Mutex as Drop>::drop (abstracted, no body) and
     // pthread_* foreign functions — inlining fails or creates spurious error() rules.
     // Skip the entire drop as a plain goto to the successor block.
     if let Some(ty) = drop_ty {
@@ -77,7 +80,6 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
     if let Some(drop_ty) = drop_ty
         && !ty_trivially_no_drop_with_dyn_candidates(ctx, drop_ty)
     {
-        use rustc_public::mir::mono::Instance;
         use rustc_public::ty::{RigidTy, TyKind};
         if matches!(drop_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
             // Part of #3793: Try dyn drop dispatch before falling back.
@@ -85,10 +87,9 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
                 return;
             }
             drop_fallback_reason = Some(DropFallbackReason::DynDropUnsupported);
-        } else {
-            let drop_instance = Instance::resolve_drop_in_place(drop_ty);
+        } else if let Some(drop_instance) = mono_ty::drop_in_place(drop_ty) {
             if !drop_instance.is_empty_shim() {
-                let body_and_addr = drop_instance.body().map(|body| {
+                let body_and_addr = drop_instance.callee_body().map(|body| {
                     // The address lane is a `Loc`; the fallback lane is a fresh
                     // havoc var of genuinely unknown provenance (queue §4
                     // item 6), so the slot cannot be typed as an address and
@@ -97,7 +98,9 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
                         .translate_ref_to_address(place, tctx.modified_locals)
                         .map(crate::codegen_ay::provenance::Loc::into_expr)
                         .unwrap_or_else(|| {
-                            crate::codegen_ay::chc::declare_pending_var(
+                            Havoc::mint(
+                                ctx,
+                                sound_havoc::UNTRACKED_POINTER_VALUE,
                                 crate::codegen_ay::chc::chc_fresh_name("__drop_self"),
                                 ay_bindings::Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH),
                             )
@@ -107,7 +110,7 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
                 if let Some((body, self_expr)) = body_and_addr {
                     let params = [self_expr];
                     // Part of #4097: Register callee statics before inlining.
-                    ctx.register_callee_body_statics(&body);
+                    ctx.register_callee_body_consts(&body);
                     ctx.mark_inline_field_reads(&body, &params, tctx.bb_idx);
                     let mut caller_vtable_ids = std::collections::HashMap::new();
                     if let Some(vtable_id) = ctx.resolve_unique_wrapped_dyn_vtable_id(drop_ty) {
@@ -120,16 +123,25 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
                         );
                     }
                     if let Some(inline_result) =
-                        crate::codegen_ay::chc::call::inline_body::translate_inline_body(
-                            ctx,
-                            &body,
-                            &params,
-                            tctx.bb_idx,
-                            &caller_vtable_ids,
-                            Some(drop_instance),
-                            0,
-                        )
+                        crate::codegen_ay::chc::call::inline_body::walk_drop_body(ctx, |ctx| {
+                            crate::codegen_ay::chc::call::inline_body::translate_inline_body(
+                                ctx,
+                                &body,
+                                &params,
+                                tctx.bb_idx,
+                                &caller_vtable_ids,
+                                Some(drop_instance),
+                                0,
+                            )
+                        })
                     {
+                        // The walk's side-channel checks are real at this drop.
+                        ctx.emit_deferred_inline_checks_at(
+                            tctx.from_app,
+                            &tctx.shared_constraints[..],
+                            tctx.bb_idx,
+                            inline_result.deferred_checks.clone(),
+                        );
                         let inline_guard = extract_inline_assert_guard(&inline_result.value);
                         if let Some(guard) = &inline_guard {
                             ctx.emit_error_rule_for_condition_shared(
@@ -185,6 +197,10 @@ pub(in crate::codegen_ay::chc::rules::codegen_rules) fn codegen_drop(
                 debug!(bb_idx = tctx.bb_idx, "CHC: Drop → empty shim, skip");
                 return;
             }
+        } else {
+            // Rule A: the type still names a parameter, so its glue does not
+            // resolve; the drop is skipped and the fallback below records it.
+            drop_fallback_reason = Some(DropFallbackReason::DropGlueUnresolvedParams);
         }
     }
 
@@ -352,13 +368,14 @@ fn coroutine_drop_glue_trivially_no_drop(
     depth: usize,
 ) -> bool {
     use rustc_public::mir::TerminatorKind;
-    use rustc_public::mir::mono::Instance;
 
-    let drop_instance = Instance::resolve_drop_in_place(coroutine_ty);
+    let Some(drop_instance) = mono_ty::drop_in_place(coroutine_ty) else {
+        return false;
+    };
     if drop_instance.is_empty_shim() {
         return true;
     }
-    let Some(drop_body) = drop_instance.body() else {
+    let Some(drop_body) = drop_instance.callee_body() else {
         return false;
     };
 

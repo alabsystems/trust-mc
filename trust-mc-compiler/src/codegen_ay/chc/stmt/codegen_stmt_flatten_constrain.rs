@@ -8,7 +8,7 @@
 //! Provides `constrain_flattened_fields`, `constrain_flattened_pair`, and the core
 //! constraint replacement logic used by both block-level and call-handler paths.
 
-use ay_bindings::{Expr, Sort};
+use ay_bindings::{Expr, ExprValue, Sort};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
@@ -160,8 +160,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
-        let leaf_values = if let Some(values) =
-            self.build_enum_bv_destination_values(dest_local, &result_expr)
+        // A walked body that returned its by-value flattened argument's self
+        // placeholder unchanged returned that argument: its slots, when they
+        // have the destination's sorts.
+        let placeholder_slots = match result_expr.value() {
+            ExprValue::Var { name } => self.inline_placeholder_slots.get(name.as_str()).cloned(),
+            _ => None,
+        }
+        .filter(|slots| {
+            let vec_idx = self.try_state_idx_for_local(dest_local);
+            slots.len() == self.flattened_field_count(dest_local)
+                && vec_idx.is_some_and(|base| {
+                    slots.iter().enumerate().all(|(i, value)| {
+                        self.state_var_mgr
+                            .output_state_vars
+                            .get(base + i)
+                            .is_some_and(|(_, sort)| sort == value.sort())
+                    })
+                })
+        });
+        let leaf_values = if let Some(slots) = placeholder_slots {
+            slots.into_iter().map(Some).collect()
+        } else if let Some(values) = self.build_enum_bv_destination_values(dest_local, &result_expr)
         {
             values
         } else if let Some(values) =
@@ -199,6 +219,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     return Some(vec![(0, Expr::bool_const(true))]);
                 }
             }
+        } else if let Some(values) = self.string_slots_from_vec_value(dest_local, &result_expr) {
+            // `String { vec }`: the String model's slots are the vector's
+            // pointer, length and capacity (`codegen_expr_string_vec_view.rs`).
+            values
         } else {
             let mut leaf_values = Vec::new();
             super::codegen_stmt_flatten::collect_leaf_exprs(&result_expr, &mut leaf_values);
@@ -207,6 +231,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Part of #3768: graceful fallback instead of panic
         let vec_idx = self.try_state_idx_for_local(dest_local)?;
+
+        // The value's leaves must tile the destination's slots. Binding a
+        // shorter list slot by slot misaligns it and leaves every slot past it
+        // free, with nothing booked: a single-leaf read of a two-leaf tuple
+        // bound `t.0` and left `t.1` arbitrary, and `t.1 == b` failed with a
+        // counterexample certified Genuine (refcell_tuple_path_dual.rs,
+        // `safe_into_inner_second`, main 756f6eabf). Every slot is left free
+        // instead, booked fail-closed.
+        let field_count = self.flattened_field_count(dest_local);
+        if leaf_values.len() != field_count {
+            warn!(
+                fn_name = %self.fn_name,
+                dest_local,
+                leaf_count = leaf_values.len(),
+                field_count,
+                result_sort = ?result_expr.sort(),
+                "build_flattened_destination_constraints: value does not tile the destination, fail closed"
+            );
+            let _ = self.record_sound_fallback_reason("flatten_dest_leaf_count_mismatch");
+            return Some((0..field_count).map(|i| (i, Expr::bool_const(true))).collect());
+        }
+
         let mut constraints = Vec::new();
 
         for (i, val_opt) in leaf_values.iter().enumerate() {

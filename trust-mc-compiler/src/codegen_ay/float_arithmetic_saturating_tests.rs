@@ -28,7 +28,7 @@ fn assert_bv_expr_eq(expr: Expr, expected: Expr) {
     assert_eq!(actual, expected, "unexpected BV expression value for {expr}");
 }
 
-fn eval_bv_expr(expr: &Expr) -> (BigInt, u32) {
+pub(in crate::codegen_ay) fn eval_bv_expr(expr: &Expr) -> (BigInt, u32) {
     match eval_const_expr(expr) {
         ConstValue::Bv(value, width) => (value, width),
         other => panic!("expected BV expression, got {other:?} from {expr}"),

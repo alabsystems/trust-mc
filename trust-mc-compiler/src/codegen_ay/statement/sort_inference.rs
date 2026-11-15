@@ -13,7 +13,6 @@
 //! - `infer_tuple_sort` - Tuple sort inference
 //! - `slice_sort` - Fat pointer (slice) sort construction
 //! - `dyn_sort` - Fat pointer (trait object) sort construction (#1140)
-//! - `resolve_generic_ty` - Generic parameter resolution
 //! - `try_infer_sort_from_compound_ty` - Compound type inference
 //! - `tuple_sort_name` - Tuple sort naming
 //!
@@ -88,6 +87,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Part of #3159: Foreign types (extern type) like std::ptr::metadata::VTable.
             // Opaque unsized types that appear behind pointers; encode as pointer-width.
             TyKind::RigidTy(RigidTy::Foreign(_)) => Some(ptr_sort()),
+            // A function pointer is a code address: pointer width, the same
+            // representation `codegen_reify_fn_pointer` produces. Without a sort,
+            // `transmute::<fn(&T, ..), fn(NonNull<()>, ..)>` in core::fmt::rt
+            // `Argument::new_debug` (reached by `unwrap` on a Result whose error
+            // is Debug) left its destination unconstrained, and the proof was
+            // demoted (kani/Invariant/percentage.rs check_increase_safe).
+            TyKind::RigidTy(RigidTy::FnPtr(_)) => Some(ptr_sort()),
             _ => None, // external enum: TyKind
         }
     }
@@ -121,30 +127,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     pub(super) fn dyn_sort(trait_name: &str) -> Sort {
         let name = names::dyn_sort_name(trait_name);
         struct_sort(name, [("fld_ptr", ptr_sort()), ("fld_vtable", ptr_sort())])
-    }
-
-    /// Resolve a potentially generic type using generic arguments.
-    ///
-    /// If the type is a generic parameter (e.g., T), looks up the concrete type
-    /// in the provided generic args. Otherwise returns the type as-is.
-    pub(super) fn resolve_generic_ty(
-        ty: rustc_public::ty::Ty,
-        args: &GenericArgs,
-    ) -> Option<rustc_public::ty::Ty> {
-        match ty.kind() {
-            TyKind::Param(param_ty) => {
-                let idx = param_ty.index as usize;
-                if let Some(arg) = args.0.get(idx) {
-                    match arg {
-                        rustc_public::ty::GenericArgKind::Type(resolved_ty) => Some(*resolved_ty),
-                        _ => None, // external enum: GenericArgKind
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => Some(ty), // external enum: TyKind
-        }
     }
 
     /// Infer AY sort for tuple types from Rust type information.

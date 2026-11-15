@@ -82,7 +82,7 @@ impl<'tcx, 'body> CallDispatchMisc for ChcCtx<'tcx, 'body> {
         // Preserves original dispatch priority for overlapping predicates.
         // NonNull identity ops (AsNonNullPtr, New, Cast) MUST precede is_nonnull_extra
         // (catch-all) — Part of #3184, Part of #3136, Part of #3589.
-        let routes: [(Predicate, Handler<'tcx, 'body>); 12] = [
+        let routes: [(Predicate, Handler<'tcx, 'body>); 11] = [
             (StubKind::is_primitive_clone, Self::codegen_call_primitive_clone),
             (StubKind::is_rawvec, Self::codegen_call_rawvec),
             (StubKind::is_try_residual, Self::codegen_call_try_residual),
@@ -101,7 +101,6 @@ impl<'tcx, 'body> CallDispatchMisc for ChcCtx<'tcx, 'body> {
             (|s| matches!(s, StubKind::NonNullDangling), Self::codegen_call_nonnull_dangling),
             (StubKind::is_nonnull_extra, Self::codegen_call_unconstrained_stub),
             (StubKind::is_btreemap_internal, Self::codegen_call_unconstrained_stub),
-            (StubKind::is_iterator_adapter, Self::codegen_call_iterator_adapter),
         ];
         let handler =
             routes.into_iter().find_map(|(predicate, handler)| predicate(stub).then_some(handler));
@@ -130,6 +129,31 @@ impl<'tcx, 'body> CallDispatchMisc for ChcCtx<'tcx, 'body> {
         }
 
         // === Special-case branches: handlers needing extra params beyond ChcCallContext ===
+
+        // Iterator adapters, the route table's last entry until they took the
+        // call's callee operand (an `Iterator::sum` is classified from it).
+        if stub.is_iterator_adapter() {
+            if let Some(target) = target {
+                let cx = ChcCallContext {
+                    stub,
+                    args,
+                    destination,
+                    target: *target,
+                    from_app,
+                    stmt_constraints,
+                    modified_locals,
+                };
+                self.codegen_call_iterator_adapter(&cx, Some(func));
+            } else {
+                self.record_diverging_call_drop(
+                    func,
+                    Some(bb_idx),
+                    "misc::route_table",
+                    Some(stub),
+                );
+            }
+            return true;
+        }
 
         if stub.is_mem_intrinsic() {
             if let Some(target) = target {

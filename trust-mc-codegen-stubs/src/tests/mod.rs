@@ -15,6 +15,7 @@ mod registry_collections;
 mod registry_core;
 mod registry_iter_routes;
 mod registry_maps_numeric;
+mod stub_gaps;
 mod stubkind_predicates;
 mod suffix_common;
 mod suffix_intrinsics;

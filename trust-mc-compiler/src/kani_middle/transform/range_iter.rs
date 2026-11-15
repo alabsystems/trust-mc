@@ -18,6 +18,8 @@ use super::range_iter_transform::transform_range_loop;
 use crate::kani_middle::transform::TransformationType;
 use crate::kani_middle::transform::body::MutableBody;
 use crate::kani_queries::QueryDb;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -181,6 +183,8 @@ fn detect_range_into_iter(
             trace!("Skipping constant range operand for into_iter");
             return None;
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
 
     let target_bb = (*target)?;
@@ -330,7 +334,7 @@ fn find_range_for_loops(body: &Body) -> Vec<RangeForLoop> {
                 exit_bb,
                 body_bb,
                 option_local,
-                span: block.terminator.span,
+                span: mir_span!(block.terminator),
             });
         }
     }

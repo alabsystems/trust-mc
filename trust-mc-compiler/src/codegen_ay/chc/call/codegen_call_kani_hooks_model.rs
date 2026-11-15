@@ -9,6 +9,9 @@
 //! `Forall`/`Exists` (quantifier encoding), and validity-constraint
 //! helpers for unit-enum discriminants and `char` outputs.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue};
 use rustc_public::mir::Place;
 use rustc_public::ty::{AdtKind, RigidTy, TyKind};
@@ -276,7 +279,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if variants.len() != 1 {
                     return None;
                 }
-                variants[0].fields().iter().map(|f| f.ty_with_args(&args)).collect::<Vec<_>>()
+                variants[0]
+                    .fields()
+                    .iter()
+                    .map(|f| mono_ty::field_ty(f, &args))
+                    .collect::<Option<Vec<_>>>()?
             }
             TyKind::RigidTy(RigidTy::Tuple(elems)) => elems,
             _ => return None,

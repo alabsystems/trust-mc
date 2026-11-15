@@ -146,11 +146,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // handle. Resolve the reference args to their referent arrays and
         // route them through the shared finite-array equality helper.
         if let Some(path) = callee_path
-            && path.contains("SpecArrayEq")
-            && path.contains("spec_eq")
+            && let Some(is_ne) =
+                self.spec_array_comparison_for_operand(dcx.func, self.body.locals())
             && args.len() == 2
         {
-            if self.try_codegen_spec_array_eq(dcx, path, target, dest_local) {
+            let exact_without_elements = self.fixed_unit_array_eq_expr_from_args(args).is_some();
+            if (exact_without_elements
+                || self.spec_array_elements_are_faithful(dcx.func, self.body.locals()))
+                && self.try_codegen_spec_array_eq(dcx, path, is_ne, target, dest_local)
+            {
                 return;
             }
         }
@@ -265,10 +269,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// SpecArrayEq::spec_eq: resolve reference args and compare arrays (Part of #3875).
-    fn try_codegen_spec_array_eq(
+    pub(in crate::codegen_ay::chc) fn try_codegen_spec_array_eq(
         &mut self,
         dcx: &DispatchCallContext<'_>,
         callee_path: &str,
+        is_ne: bool,
         target: BasicBlockIdx,
         dest_local: usize,
     ) -> bool {
@@ -276,8 +281,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let bool_eq = if let Some(eq) = self.fixed_unit_array_eq_expr_from_args(dcx.args) {
             eq
         } else {
-            let lhs_expr = self.resolve_ref_or_const_referent(&dcx.args[0], modified_locals);
-            let rhs_expr = self.resolve_ref_or_const_referent(&dcx.args[1], modified_locals);
+            let lhs_expr = self
+                .resolve_ref_or_const_referent_tagged(&dcx.args[0], modified_locals)
+                .and_then(|referent| self.fixed_array_eq_referent_datum(&dcx.args[0], referent))
+                .or_else(|| {
+                    self.try_load_traced_fixed_array_referent(&dcx.args[0])
+                        .map(|value| value.into_expr())
+                });
+            let rhs_expr = self
+                .resolve_ref_or_const_referent_tagged(&dcx.args[1], modified_locals)
+                .and_then(|referent| self.fixed_array_eq_referent_datum(&dcx.args[1], referent))
+                .or_else(|| {
+                    self.try_load_traced_fixed_array_referent(&dcx.args[1])
+                        .map(|value| value.into_expr())
+                });
+            // Element loads at a call terminator must emit their bounds and
+            // liveness obligations on this edge, including a declined result.
+            super::super::ptr_receiver_mem::drain_pending_checks(self, dcx, target);
             let (Some(lhs), Some(rhs)) = (lhs_expr, rhs_expr) else { return false };
             let len =
                 recover_spec_array_eq_len(Some(callee_path), dcx.args.first(), self.body.locals());
@@ -286,6 +306,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             bool_eq
         };
+        let bool_eq = if is_ne { bool_eq.not() } else { bool_eq };
         let Some((_, dest_var)) = self.resolve_destination(dest_local) else { return false };
         let out_sort = dest_var.sort();
         let converted = if out_sort.is_bool() {

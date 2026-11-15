@@ -17,14 +17,16 @@
 //! definition of custom coercions for smart pointers can be found in the
 //! [RFC 982 DST Coercion](https://rust-lang.github.io/rfcs/0982-dst-coercion.html).
 
-use rustc_hir::lang_items::LangItem;
+use crate::rustc_compat::LangItem;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_middle::traits::{ImplSource, ImplSourceUserDefinedData};
 use rustc_middle::ty::TraitRef;
 use rustc_middle::ty::adjustment::CustomCoerceUnsized;
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
 use rustc_public::Symbol;
 use rustc_public::rustc_internal;
-use rustc_public::ty::{RigidTy, Ty as TyStable, TyKind};
+use rustc_public::ty::{Pattern, RigidTy, Ty as TyStable, TyKind};
 use rustc_span::DUMMY_SP;
 use tracing::trace;
 
@@ -64,6 +66,10 @@ use tracing::trace;
 ///    - Extract the tail element of the struct which are of type `T` and `U`, respectively.
 /// 4. Coercion between smart pointers of wrapper structs.
 ///    - Apply the logic from item 2 then item 3.
+/// 5. Coercion through a pointer refinement, `pattern_type!(*const T is !null)`.
+///    - Trust core's `NonNull<T>` stores its pointer in that pattern type, so every coercion
+///      through `Box`, `Rc`, `Arc` or `NonNull` reaches one.
+///    - Peel it to the pointer it refines, as rustc's own unsizing does, and apply the base case.
 #[allow(clippy::panic)] // Internal validation - source/dest must be pointers
 pub(crate) fn extract_unsize_casting<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -217,16 +223,102 @@ impl Iterator for CoerceUnsizedIterator<'_> {
             self.dst_ty = Some(dst_fields[coerce_index].ty_with_args(dst_args));
             Some(src_fields[coerce_index].name.clone())
         } else {
-            // external enum: (TyKind, TyKind) — base pointer case
-            // Base case is always a pointer (Box, raw_pointer or reference).
-            assert!(
-                extract_pointee(self.tcx, src_ty).is_some(),
-                "Expected a pointer, but found {src_ty:?}"
-            );
-            None
+            match pointer_refinement_bases(src_ty, dst_ty) {
+                // A pointer refinement: step into the pointer it refines. The next item is
+                // then the base case below.
+                Ok(Some((src_base, dst_base))) => {
+                    self.src_ty = Some(src_base);
+                    self.dst_ty = Some(dst_base);
+                    Some(PATTERN_TYPE_BASE_FIELD.to_string())
+                }
+                // external enum: (TyKind, TyKind) — base pointer case
+                // Base case is always a pointer (Box, raw_pointer or reference).
+                Ok(None) => {
+                    assert!(
+                        extract_pointee(self.tcx, src_ty).is_some(),
+                        "Expected a pointer, but found {src_ty:?}"
+                    );
+                    None
+                }
+                // Fail closed. The vtable or length this coercion stores decides which
+                // methods are reachable, so the compile stops rather than guess it.
+                Err(reason) => self.tcx.dcx().fatal(format!(
+                    "trust-mc cannot verify the unsized coercion from `{}` to `{}`: {reason}",
+                    rustc_internal::internal(self.tcx, src_ty),
+                    rustc_internal::internal(self.tcx, dst_ty),
+                )),
+            }
         };
         Some(CoerceUnsizedInfo { field, src_ty, dst_ty })
     }
+}
+
+/// The `CoerceUnsizedInfo::field` of the step from a pattern type into the type it refines.
+/// A pattern type is laid out as its base type, which rustc projects as field 0
+/// (`rustc_const_eval::interpret::cast::unsize_into`); upstream Kani names the step the same.
+pub(crate) const PATTERN_TYPE_BASE_FIELD: &str = "0";
+
+/// Classify one step of an unsized coercion with respect to pattern types.
+///
+/// * `Ok(None)`: neither type is a pattern type.
+/// * `Ok(Some((src_base, dst_base)))`: both are the same pointer refinement, a builtin pointer
+///   (raw pointer or reference) restricted to `!null`. Unsizing sees through it to that
+///   pointer. This is what rustc does: `find_tails_for_unsizing` (rustc_monomorphize) and
+///   `unsize_ptr` (rustc_codegen_ssa) peel `(Pat, Pat)`, `coerce_unsized_into` accepts only
+///   `NotNull` on both sides, and coherence rejects a `CoerceUnsized` impl whose two patterns
+///   differ (trust `45dc60873`, `rustc_hir_analysis/src/coherence/builtin.rs`).
+/// * `Err(reason)`: any other pattern type on either side. No rustc unsizing path accepts it,
+///   so there is no metadata to reproduce and the caller must fail closed.
+pub(crate) fn pointer_refinement_bases(
+    src_ty: TyStable,
+    dst_ty: TyStable,
+) -> Result<Option<(TyStable, TyStable)>, String> {
+    let (src_base, src_pattern) = match src_ty.kind() {
+        TyKind::RigidTy(RigidTy::Pat(base, pattern)) => (base, pattern),
+        _ => {
+            return match dst_ty.kind() {
+                TyKind::RigidTy(RigidTy::Pat(..)) => {
+                    Err("the target is a pattern type and the source is not".to_string())
+                }
+                _ => Ok(None),
+            };
+        }
+    };
+    let TyKind::RigidTy(RigidTy::Pat(dst_base, dst_pattern)) = dst_ty.kind() else {
+        return Err("the source is a pattern type and the target is not".to_string());
+    };
+    if src_pattern != dst_pattern {
+        return Err(format!(
+            "the source pattern {src_pattern:?} and the target pattern {dst_pattern:?} differ"
+        ));
+    }
+    if !is_not_null_pattern(&src_pattern) {
+        return Err(format!("the pattern {src_pattern:?} does not refine a pointer"));
+    }
+    for (side, base) in [("source", src_base), ("target", dst_base)] {
+        if !matches!(base.kind(), TyKind::RigidTy(RigidTy::RawPtr(..) | RigidTy::Ref(..))) {
+            return Err(format!(
+                "the {side} pattern type refines `{base:?}`, which is not a pointer"
+            ));
+        }
+    }
+    Ok(Some((src_base, dst_base)))
+}
+
+/// Whether a pattern is the `!null` pointer refinement.
+///
+/// Trust's rustc_public has `Pattern::NotNull`. The frozen nightly API has only
+/// `Pattern::Range`, so no pattern it can describe refines a pointer.
+#[cfg(trust_toolchain)]
+fn is_not_null_pattern(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::NotNull)
+}
+
+/// See the Trust definition above.
+#[cfg(not(trust_toolchain))]
+fn is_not_null_pattern(pattern: &Pattern) -> bool {
+    let _ = pattern;
+    false
 }
 
 /// Get information about an unsized coercion.
@@ -246,7 +338,7 @@ fn custom_coerce_unsize_info<'tcx>(
         value: trait_ref,
     }) {
         Ok(ImplSource::UserDefined(ImplSourceUserDefinedData { impl_def_id, .. })) => tcx
-            .coerce_unsized_info(impl_def_id)
+            .coerce_unsized_info(*impl_def_id)
             .expect("coerce_unsized_info should succeed for user-defined impl")
             .custom_kind
             .expect("custom_kind should be present for CoerceUnsized impl"),

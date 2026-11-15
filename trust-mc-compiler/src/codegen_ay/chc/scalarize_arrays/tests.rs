@@ -1036,3 +1036,15 @@ fn test_carry_rhs_scalarized_lane_survives_local_and_final_prune() {
         "the consuming lane copy must remain tied to the carried lane",
     );
 }
+
+#[test]
+fn mentioning_in_order_merges_both_names_ascending_without_duplicates() {
+    use std::collections::HashMap;
+    let mut mentions: HashMap<&str, Vec<usize>> = HashMap::new();
+    mentions.insert("arr", vec![0, 3, 5, 9]);
+    mentions.insert("arr__out", vec![3, 4, 9, 12]);
+    assert_eq!(super::mentioning_in_order(&mentions, "arr", "arr__out"), vec![0, 3, 4, 5, 9, 12]);
+    assert_eq!(super::mentioning_in_order(&mentions, "arr", "missing"), vec![0, 3, 5, 9]);
+    assert_eq!(super::mentioning_in_order(&mentions, "missing", "arr__out"), vec![3, 4, 9, 12]);
+    assert!(super::mentioning_in_order(&mentions, "x", "y").is_empty());
+}

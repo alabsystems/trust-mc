@@ -7,6 +7,9 @@
 //! Extracted from `codegen_decl_state_vars_collections.rs` for 500-LOC compliance
 //! and to keep wrapped-ref propagation logic isolated from collection aux state.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashMap;
 
 use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind};
@@ -29,7 +32,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if fields.len() != 1 {
             return None;
         }
-        let field_ty = fields[0].ty_with_args(&args);
+        let field_ty = mono_ty::field_ty(&fields[0], &args)?;
         match field_ty.kind() {
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => Some((0, inner)),
             _ => None,
@@ -121,7 +124,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     fn arg_ref_pointee_idx_for_derived_ref_rvalue(&self, rhs: &Rvalue) -> Option<usize> {
         match rhs {
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
             | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                 self.arg_ref_pointee_idx_for_use_place(place)
             }
@@ -250,7 +253,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     fn coroutine_root_for_rvalue(rhs: &Rvalue, root_map: &HashMap<usize, usize>) -> Option<usize> {
         match rhs {
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
             | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _)
                 if place.projection.is_empty() =>
             {
@@ -261,7 +264,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // across basic blocks, producing new locals that copy the inner &mut
             // from these re-wrapped Pins. Propagate the root through single-field
             // projections so later deref sites resolve the coroutine root.
-            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 if place.projection.len() == 1
                     && matches!(place.projection[0], ProjectionElem::Field(..)) =>
             {

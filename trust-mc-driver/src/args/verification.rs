@@ -15,6 +15,7 @@ use std::str::FromStr;
 use clap::error::{Error, ErrorKind};
 
 use super::cargo::CargoCommonArgs;
+use crate::args::compiler_route::CompilerRouteArgs;
 use crate::args::cargo::CargoTargetArgs;
 use crate::args::common::*;
 use crate::args::solver::{
@@ -83,6 +84,15 @@ pub(crate) struct VerificationArgs {
     /// Exit with failure if any harness succeeds without validation.
     #[arg(long)]
     pub fail_on_unvalidated_success: bool,
+
+    /// Run even when the external `ay` solver binary is not the AY revision this
+    /// build pins (another commit, a dirty build, or no build stamp at all).
+    /// Without it such a binary is refused. With it the run proceeds, warns, prints
+    /// `[AY:SOLVER_PIN_MISMATCH:...]` for every harness, and reports every success
+    /// as SUCCESSFUL (UNVALIDATED). Equivalent to `TRUST_MC_ALLOW_UNPINNED_AY=1`.
+    /// The binary is `$TRUST_MC_AY_BIN` when set, otherwise `ay` on PATH.
+    #[arg(long)]
+    pub allow_unpinned_ay: bool,
 
     /// Relax the vacuity gate (V4): by default a harness whose every non-cover check
     /// is provably UNREACHABLE is a FAILURE — its assumptions were contradictory
@@ -329,6 +339,23 @@ pub(crate) struct VerificationArgs {
     #[arg(long, hide_short_help = true)]
     pub ay_chc_no_retry: bool,
 
+    /// Solve CHC obligations in a deterministic, fixed engine order.
+    ///
+    /// Selects `AdaptiveExecutionMode::DeterministicSequential`: the portfolio
+    /// bypasses classification and parallel engine races, running engines in the
+    /// canonical order with deterministic shares of the budget. Use this for
+    /// reproducibility runs and stable regression measurements; ordinary runs
+    /// keep the adaptive parallel default, which is faster.
+    ///
+    /// The selection is recorded in the run's per-property execution envelope,
+    /// so a measurement can be told apart from an ordinary run after the fact.
+    /// `TRUST_MC_AY_CHC_DETERMINISTIC=1` (or AY's own `AY_DETERMINISTIC=1`) has
+    /// the same effect; this flag outranks both.
+    ///
+    /// Only effective when `--ay-chc` is enabled.
+    #[arg(long, hide_short_help = true)]
+    pub ay_chc_deterministic: bool,
+
     /// Enable verbose CHC debug tracing in the compiler (experimental).
     ///
     /// Prints CHC encoding details to stderr for troubleshooting.
@@ -339,9 +366,11 @@ pub(crate) struct VerificationArgs {
     ///
     /// By default, trust-mc selects logic automatically:
     /// - CHC mode: HORN
-    /// - BMC mode: QF_AUFBV (or ALL with datatypes)
+    /// - BMC mode: QF_AUFBV (or ALL with datatypes or floating point)
     ///
-    /// Use this option to force a specific logic for experimentation.
+    /// Use this option to force a specific logic for experimentation. A named
+    /// logic is kept when the query uses floating point (`--ay-logic QF_AUFBV`
+    /// reproduces the narrow logic), but still widens to ALL for datatypes.
     /// Common values: HORN, QF_AUFBV, QF_ABV, ALL, QF_DT
     #[arg(long, hide_short_help = true)]
     pub ay_logic: Option<String>,
@@ -518,6 +547,9 @@ pub(crate) struct VerificationArgs {
 
     #[command(flatten)]
     pub checks: CheckArgs,
+
+    #[command(flatten)]
+    pub compiler_route: CompilerRouteArgs,
 
     #[command(flatten)]
     pub common_args: CommonArgs,

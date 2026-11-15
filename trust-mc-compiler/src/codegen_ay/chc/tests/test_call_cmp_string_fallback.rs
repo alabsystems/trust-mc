@@ -110,6 +110,10 @@ fn remove_shared_receiver_mapping(chc_ctx: &mut ChcCtx<'_, '_>, actual_args: &[O
     let receiver_local = match &actual_args[0] {
         Operand::Copy(place) | Operand::Move(place) => place.local,
         Operand::Constant(..) => panic!("expected shared receiver operand, got constant"),
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(..) => {
+            panic!("expected shared receiver operand, got runtime checks")
+        }
     };
     let removed_idx = chc_ctx.state_var_mgr.local_to_state_idx.remove(&receiver_local);
     assert!(

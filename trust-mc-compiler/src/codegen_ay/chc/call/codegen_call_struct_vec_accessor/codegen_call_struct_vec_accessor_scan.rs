@@ -10,6 +10,7 @@
 //!
 //! Part of #3348: method-based Vec accessor/mutator encoding gap.
 
+use crate::callee_body::CalleeBody;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
@@ -27,7 +28,7 @@ pub(in crate::codegen_ay::chc) fn resolve_callee_body(
     fn_def: rustc_public::ty::FnDef,
     fn_substs: &rustc_public::ty::GenericArgs,
 ) -> Option<Body> {
-    Instance::resolve(fn_def, fn_substs).ok()?.body()
+    Instance::resolve(fn_def, fn_substs).ok()?.callee_body()
 }
 
 /// Scan callee MIR for Vec Index/IndexMut, tracing field ref → deref → index
@@ -85,7 +86,7 @@ pub(in crate::codegen_ay::chc) fn scan_vec_as_slice_pattern(
                 continue;
             }
             match rhs {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                     if place.projection.is_empty() =>
                 {
                     aliases.insert(lhs.local, place.local);
@@ -190,7 +191,7 @@ fn scan_field_refs_and_stores(body: &Body) -> (FieldRefMap, Option<StoredValue>)
             if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                 try_record_field_ref(place, rvalue, &mut field_ref_locals);
                 if let Some(rustc_public::mir::ProjectionElem::Deref) = place.projection.first() {
-                    if let Rvalue::Use(operand) = rvalue {
+                    if let Rvalue::Use(operand, ..) = rvalue {
                         deref_store_value = extract_stored_value(operand, arg_count);
                     }
                 }
@@ -324,6 +325,8 @@ fn extract_stored_value(operand: &Operand, arg_count: usize) -> Option<StoredVal
                 None
             }
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 

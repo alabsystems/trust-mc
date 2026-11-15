@@ -7,6 +7,8 @@
 //! downcast_unchecked_ref, vtable intrinsics, IndexRange len.
 //! Extracted from codegen_call_dispatch_misc (Part of #4010).
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
 use crate::codegen_ay::stubs::StubKind;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
@@ -289,6 +291,13 @@ fn emit_shared_ptr_inner_drop_success(
     target: rustc_public::mir::BasicBlockIdx,
     bb_idx: usize,
 ) {
+    // The walk's side-channel checks are real at this drop.
+    ctx.emit_deferred_inline_checks_at(
+        from_app,
+        stmt_constraints,
+        bb_idx,
+        inline_result.deferred_checks.clone(),
+    );
     let inline_guard = extract_inline_assert_guard(&inline_result.value);
     if let Some(guard) = &inline_guard {
         ctx.emit_error_rule_for_condition(from_app, guard.clone(), stmt_constraints, bb_idx);
@@ -443,7 +452,7 @@ fn trace_rc_local_to_concrete_call(
             if place.local != local_idx || !place.projection.is_empty() {
                 continue;
             }
-            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src)) = rhs
+            if let Rvalue::Use(Operand::Move(src) | Operand::Copy(src), ..) = rhs
                 && src.projection.is_empty()
                 && src.local != local_idx
             {
@@ -503,11 +512,14 @@ fn try_emit_shared_pointer_dyn_drop_dispatch(
     // Resolve drop bodies for each candidate.
     let mut drop_bodies: Vec<(u64, rustc_public::mir::Body, Instance)> = Vec::new();
     for candidate in &candidates {
-        let drop_instance = Instance::resolve_drop_in_place(candidate.concrete_ty);
+        let Some(drop_instance) = mono_ty::drop_in_place(candidate.concrete_ty) else {
+            ctx.record_sound_fallback_reason(mono_ty::DROP_GLUE_UNRESOLVED);
+            continue;
+        };
         if drop_instance.is_empty_shim() {
             continue;
         }
-        if let Some(body) = drop_instance.body() {
+        if let Some(body) = drop_instance.callee_body() {
             drop_bodies.push((candidate.vtable_id, body, drop_instance));
         }
     }
@@ -532,7 +544,7 @@ fn try_emit_shared_pointer_dyn_drop_dispatch(
         // Unique candidate — inline directly without vtable guard.
         let (_, ref body, ref drop_instance) = drop_bodies[0];
         let params = [value_ptr];
-        ctx.register_callee_body_statics(body);
+        ctx.register_callee_body_consts(body);
         ctx.mark_inline_field_reads(body, &params, bb_idx);
         let local_for_vtable = wrapper_local_idx.unwrap_or(dest_local);
         let vtable_disc = ctx.try_extract_vtable_discriminant_for_trait(
@@ -543,16 +555,25 @@ fn try_emit_shared_pointer_dyn_drop_dispatch(
         let mut caller_vtable_ids = std::collections::HashMap::new();
         caller_vtable_ids.insert(1, vtable_disc);
         if let Some(inline_result) =
-            crate::codegen_ay::chc::call::inline_body::translate_inline_body(
-                ctx,
-                body,
-                &params,
-                bb_idx,
-                &caller_vtable_ids,
-                Some(*drop_instance),
-                0,
-            )
+            crate::codegen_ay::chc::call::inline_body::walk_drop_body(ctx, |ctx| {
+                crate::codegen_ay::chc::call::inline_body::translate_inline_body(
+                    ctx,
+                    body,
+                    &params,
+                    bb_idx,
+                    &caller_vtable_ids,
+                    Some(*drop_instance),
+                    0,
+                )
+            })
         {
+            // The walk's side-channel checks are real at this drop.
+            ctx.emit_deferred_inline_checks_at(
+                from_app,
+                stmt_constraints,
+                bb_idx,
+                inline_result.deferred_checks.clone(),
+            );
             let inline_guard = extract_inline_assert_guard(&inline_result.value);
             if let Some(guard) = &inline_guard {
                 ctx.emit_error_rule_for_condition(
@@ -583,9 +604,23 @@ fn try_emit_shared_pointer_dyn_drop_dispatch(
         return false;
     }
 
-    // Multi-candidate: emit dealloc-only for now (sound over-approximation).
-    // Full D2 multi-impl dispatch with vtable guards is handled by the
-    // Drop-terminator path; call-terminator multi-candidate is rare.
+    // Multi-candidate: emit dealloc-only for now. Full D2 multi-impl
+    // dispatch with vtable guards is handled by the Drop-terminator path;
+    // call-terminator multi-candidate is rare. Skipping the candidates' drop
+    // bodies is sound for the state they write (the object is being freed)
+    // and drops every check they make, so a candidate whose drop can fail
+    // fails closed (fix/chc-walker-fail-closed, item c: this skip recorded
+    // nothing).
+    let stubs = crate::kani_middle::transform::walker_stub_map();
+    if drop_bodies.iter().any(|(_, _, drop_instance)| {
+        crate::codegen_ay::obligation_free_walk::instance_obligation_verdict(
+            ctx.tcx,
+            *drop_instance,
+            &stubs,
+        ) != crate::codegen_ay::obligation_free_walk::Verdict::Free
+    }) {
+        ctx.record_sound_fallback_reason("shared_ptr_dyn_drop_candidates_unwalked");
+    }
     let new_output_args = ctx.build_output_args(modified_locals, &[dest_local]);
     ctx.emit_goto_rule_extra(
         from_app,
@@ -685,65 +720,89 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
             );
         }
 
+        // The complete native mem::drop(Box<dyn T>) executes T's actual glue,
+        // not merely allocation bookkeeping. Authenticate the function DefId.
+        let complete_dyn_box = (|| {
+            let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(def, generics)) =
+                func.ty(self.body.locals()).ok()?.kind()
+            else {
+                return None;
+            };
+            let instance = rustc_public::mir::mono::Instance::resolve(def, &generics).ok()?;
+            crate::codegen_ay::native_global_dyn_box_drop_value(self.tcx, &instance)
+        })();
+        if let Some(ty) = complete_dyn_box
+            && let [
+                rustc_public::mir::Operand::Copy(place) | rustc_public::mir::Operand::Move(place),
+            ] = args
+            && place.projection.is_empty()
+            && place.ty(self.body.locals()).ok().map(|input| self.resolve_body_ty(input))
+                == Some(ty)
+            && let Some(target) = target
+        {
+            let outputs = self.build_output_args(modified_locals, &[destination.local]);
+            let shared = std::sync::Arc::from(stmt_constraints.to_vec());
+            let transition = crate::codegen_ay::chc::rules::codegen_rules::TransitionContext {
+                from_app,
+                output_args: &outputs,
+                shared_constraints: &shared,
+                modified_locals,
+                bb_idx,
+            };
+            crate::codegen_ay::chc::rules::codegen_rules::transition_drop::codegen_native_dyn_box_drop(self,place,ty,*target,&transition);
+            return true;
+        }
+
         // Fix #2736: `drop(box_value)` often lowers to a call terminator instead
         // of `TerminatorKind::Drop`.
         if self.detect_box_drop_call(func, args) {
-            if let Some(target) = target {
-                let box_drop_local =
-                    args.first().and_then(|arg| shared_pointer_drop_local_from_drop_arg(self, arg));
-                let box_known_alloc_id = box_drop_local.and_then(|local| {
-                    traced_alloc_id_for_unprojected_drop_place(
-                        self,
-                        &rustc_public::mir::Place { local, projection: Vec::new() },
-                    )
-                });
-                let ptr_expr = args
-                    .first()
-                    .and_then(|arg| {
-                        if let rustc_public::mir::Operand::Copy(p)
-                        | rustc_public::mir::Operand::Move(p) = arg
-                        {
-                            if p.projection.is_empty()
-                                && self.flatten.flattened_tuple_locals.contains(&p.local)
-                            {
-                                return self.flattened_local_field_expr(
-                                    p.local,
-                                    0,
-                                    modified_locals,
-                                );
-                            }
-                        }
-                        self.resolve_ref_or_const_referent(arg, modified_locals)
-                            .or_else(|| self.resolve_ref_operand(arg, modified_locals))
-                            .or_else(|| self.translate_operand_with_modified(arg, modified_locals))
-                    })
-                    .or_else(|| box_known_alloc_id.map(rust_dealloc_base_ptr_for_known_alloc_id));
-                if let Some(ptr_expr) = ptr_expr
-                    && self.emit_box_dealloc_transition(
-                        bb_idx,
-                        from_app,
-                        *target,
-                        ptr_expr,
-                        box_known_alloc_id,
-                        stmt_constraints,
-                        modified_locals,
-                    )
-                {
-                    debug!("modeled mem::drop(Box<T>) as dealloc transition (bb{})", bb_idx);
-                } else {
-                    tracing::warn!(
-                        bb_idx,
-                        "CHC: Box dealloc encoding failed — recording fallback (Part of #3123)"
-                    );
-                    self.record_fallback();
-                    let new_output_args =
-                        self.build_output_args(modified_locals, &[destination.local]);
-                    self.emit_goto_rule(from_app, *target, &new_output_args, stmt_constraints);
-                }
-            } else {
-                self.record_diverging_call_drop(func, Some(bb_idx), "misc::box_drop_call", None);
+            let native_input = (|| {
+                let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(
+                    def,
+                    generics,
+                )) = func.ty(self.body.locals()).ok()?.kind()
+                else {
+                    return None;
+                };
+                let instance = rustc_public::mir::mono::Instance::resolve(def, &generics).ok()?;
+                crate::codegen_ay::native_bmc_box_drop_value(self.tcx, &instance)
+            })();
+            let Some(input) = native_input else { return false };
+            if crate::codegen_ay::native_bmc_has_custom_global_allocator(self.tcx) {
+                self.record_sound_fallback_reason("box_drop_custom_global_allocator_unmodeled");
+                return false;
             }
-            return true;
+            let [Operand::Copy(place) | Operand::Move(place)] = args else { return false };
+            if place.ty(self.body.locals()).ok().map(|ty| self.resolve_body_ty(ty)) != Some(input) {
+                return false;
+            }
+            let Some(checked) = self.checked_host_native_thin_box_drop(place) else {
+                self.record_sound_fallback_reason("native_box_drop_allocation_origin_unmodeled");
+                return false;
+            };
+            let Some(target) = target else {
+                self.record_diverging_call_drop(func, Some(bb_idx), "misc::box_drop_call", None);
+                return true;
+            };
+            if self.memory_safety_checks {
+                for check in checked.checks {
+                    self.emit_error_rule_for_condition(from_app, check, stmt_constraints, bb_idx);
+                }
+            }
+            let known = Self::try_extract_constant_addr(&checked.value).map(|(id, _)| id);
+            if self.emit_box_dealloc_transition(
+                bb_idx,
+                from_app,
+                *target,
+                checked.value,
+                known,
+                stmt_constraints,
+                modified_locals,
+            ) {
+                return true;
+            }
+            self.record_sound_fallback_reason("native_box_drop_deallocation_unmodeled");
+            return false;
         }
 
         // std::ptr::copy_nonoverlapping lowered as call terminator (Part of #2110)
@@ -1002,11 +1061,23 @@ impl<'tcx, 'body> CallDispatchMiscGenericPreroutes for ChcCtx<'tcx, 'body> {
             .resolve_callee_path(func)
             .is_some_and(|path| is_quarantined_cell_operation_path(&path))
         {
-            self.record_sound_fallback_reason("cell_accessor_semantics_quarantined");
             if let Some(target) = target {
-                let output_args = self.build_output_args(modified_locals, &[destination.local]);
-                self.emit_goto_rule(from_app, *target, &output_args, stmt_constraints);
+                // A quarantined mutator (`swap`, `update`, a declined `set`)
+                // writes the cells its arguments reach: havoc their registers
+                // and memory, not only the destination, so no check reads the
+                // pre-call value (review of fix/chc-cell-set-write: `a.swap(&b);
+                // assert!(a.get() == 1)` read SUCCESS on a demoted harness).
+                self.emit_interior_mut_call_havoc(
+                    args,
+                    destination,
+                    *target,
+                    from_app,
+                    stmt_constraints,
+                    modified_locals,
+                    "cell_accessor_semantics_quarantined",
+                );
             } else {
+                self.record_sound_fallback_reason("cell_accessor_semantics_quarantined");
                 self.record_diverging_call_drop(
                     func,
                     Some(bb_idx),

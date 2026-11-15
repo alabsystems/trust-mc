@@ -121,7 +121,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 };
                 let dest_local: usize = lhs.local;
 
-                if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::CopyForDeref(place) = rhs
                 {
                     if let Some(src_local) =
@@ -233,6 +233,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
 
+            // `<ManuallyDrop<T> as Deref>::deref` / `deref_mut` return
+            // `&self.value`: the argument's own address, so the result refers
+            // where the argument does (the call spine models it as that
+            // identity, `try_dispatch_array_iter_identity_call`). Without the
+            // edge a collection op through the result (`Vec::capacity`) read
+            // the reference local's own side state, which nothing wrote, and a
+            // counterexample over it was certified Genuine (walker fail-closed
+            // review 6, finding 8).
+            if let TerminatorKind::Call { func, args, destination, .. } = &bb_data.terminator.kind
+                && destination.projection.is_empty()
+                && self.detect_manually_drop_deref_call(func)
+                && let Some(Operand::Copy(place) | Operand::Move(place)) = args.first()
+                && place.projection.is_empty()
+            {
+                Self::add_numeric_ref_candidate(
+                    &mut candidates,
+                    &mut by_src,
+                    destination.local,
+                    place.local,
+                    NumericRefPropagationKind::CopyMove,
+                );
+            }
+
             // Part of #2110: preserve referent identity through slice pointer
             // materialization calls (`as_ptr`, `as_mut_ptr`).
             if let TerminatorKind::Call { func, args, destination, .. } = &bb_data.terminator.kind
@@ -271,7 +294,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         queue: &mut VecDeque<usize>,
         queued: &mut HashSet<usize>,
     ) {
-        if dest_local != target.local || !target.projections.is_empty() {
+        // Same sole-producer rule as Pass 1: a copy into a local that more than
+        // one statement assigns would carry one producer's referent onto every
+        // path through that local.
+        if (dest_local != target.local || !target.projections.is_empty())
+            && !self.local_has_multiple_whole_definitions(dest_local)
+        {
             self.ref_resolution.ref_targets.insert(dest_local, target);
             Self::enqueue_numeric_ref_local(queue, queued, dest_local);
         }
@@ -300,6 +328,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         "{phase_label} copy/move ref: {dest_local} from local {} -> {}",
                         candidate.src_local, src_target.local
                     );
+                    // Several producers that are all this same copy of `src`
+                    // (loop unwinding duplicates `_21 = copy _15`): `src`'s
+                    // edge is path-insensitive, so the copy's is too.
+                    if self.local_has_multiple_whole_definitions(dest_local)
+                        && self.whole_definitions_all_same_copy_of(dest_local, candidate.src_local)
+                        && (dest_local != src_target.local || !src_target.projections.is_empty())
+                    {
+                        debug!(
+                            dest_local,
+                            src_local = candidate.src_local,
+                            "{phase_label} copy/move ref: identical-copy producers keep the edge"
+                        );
+                        self.ref_resolution.ref_targets.insert(dest_local, src_target);
+                        Self::enqueue_numeric_ref_local(queue, queued, dest_local);
+                        return;
+                    }
                     self.insert_numeric_ref_target(dest_local, src_target, queue, queued);
                 }
             }
@@ -509,6 +553,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     _ => continue,
                 }
                 let agg_local: usize = lhs.local;
+                // The table is keyed by (aggregate, field), not by path. For an
+                // aggregate that more than one statement or call produces
+                // (`let h = if b { H { r: &m } } else { H { r: &n } };`) it would
+                // keep one producer's operand, and a reference read out of
+                // `h.r` would name `m` on the path that built `H { r: &n }`.
+                // Such an aggregate records no field source; readers of its
+                // fields keep their path-sensitive value.
+                if self.local_has_multiple_whole_definitions(agg_local) {
+                    continue;
+                }
                 for (field_idx, operand) in operands.iter().enumerate() {
                     if let Operand::Copy(place) | Operand::Move(place) = operand
                         && place.projection.is_empty()
@@ -525,10 +579,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             for stmt in &bb_data.statements {
                 if let StatementKind::Assign(
                     lhs,
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)),
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..),
                 ) = &stmt.kind
                     && place.projection.is_empty()
                     && lhs.projection.is_empty()
+                    && !self.local_has_multiple_whole_definitions(lhs.local)
                 {
                     copy_map.push((lhs.local, place.local));
                 }
@@ -557,6 +612,69 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         field_sources
     }
+    /// Drop every `ref_targets` edge that records the VALUE of a
+    /// reference-typed or raw-pointer-typed field instead of what a pointer
+    /// points at.
+    ///
+    /// `DerefProjectedCopy` records `_t = copy (*_r).p` as the place `h.p`
+    /// (the "value-of" relation), while every consumer of `ref_targets` reads
+    /// an edge as "points at". The two agree unless `p` is itself a pointer:
+    /// then `_t` holds `h.p`'s VALUE and points at `*h.p`, not at the slot
+    /// `h.p`. [`Self::resolve_adt_field_ref_targets`] repairs the edge when
+    /// the aggregate's field was built from a pointer with an edge of its own;
+    /// an edge it cannot repair (`HM { p: &mut *bx }`: a heap referent has no
+    /// register edge) was left as points-at-the-slot. A store `*_t = 7` then
+    /// overwrote the POINTER field `h.p` with 7, the heap referent kept its
+    /// old value, and `*bx` read it back: `*h.p = 7; drop(h); assert!(*bx !=
+    /// 7)` verified SUCCESSFUL clean, a modifies frame checked the slot inside
+    /// the footprint instead of the heap referent outside it
+    /// (tools/soundness-duals/modifies_frame_call_arg_escape_dual.rs), and the
+    /// safe twins were certified Genuine failures.
+    ///
+    /// An edge `_t -> (T, [.., Field(_, F)])` with `F` an address type
+    /// ([`ChcCtx::value_is_address`]: a reference, a raw pointer, or a wrapper
+    /// whose representation is one) is points-at only when `_t` points at an
+    /// `F` (`let pp = &mut h.p`, `_t: &mut F`). Any other such edge is a
+    /// value-of edge, and it is dropped: `_t` then resolves through its own
+    /// value, the pointer loaded out of the field, as every pointer without an
+    /// edge does.
+    ///
+    /// The wrappers count because the address is the same value under another
+    /// type. A generic `T: Deref<Target = dyn Trait>` call on a `Box<dyn
+    /// Trait>` reads `_34 = copy ((*_32).0.0)`, the box's `NonNull`, out of a
+    /// reference to the box local; the edge onto that `NonNull` field then
+    /// flowed through `_33 = _34 as *const dyn Trait` and `_10 = &(*_33)` into
+    /// the devirtualized method's `self`, whose `(*self).0` read the box's
+    /// own pointer bits as the trait object's first field: a constant 0, so
+    /// `bug_box_dyn_returns_zero` (tools/soundness-duals/
+    /// dyn_deref_generic_return_dual.rs) was PROVED and its safe twin got a
+    /// counterexample certified Genuine.
+    pub(super) fn drop_pointer_field_value_of_edges(&mut self) {
+        let stale: Vec<usize> = self
+            .ref_resolution
+            .ref_targets
+            .iter()
+            .filter_map(|(&local, target)| {
+                let ProjectionElem::Field(_, field_ty) = target.projections.last()? else {
+                    return None;
+                };
+                if !Self::value_is_address(*field_ty) {
+                    return None;
+                }
+                let local_ty = self.body.locals().get(local)?.ty;
+                (Self::deref_pointee_ty(local_ty) != Some(*field_ty)).then_some(local)
+            })
+            .collect();
+        for local in stale {
+            debug!(
+                local,
+                target = ?self.ref_resolution.ref_targets.get(&local),
+                "CHC: dropped a value-of edge onto a pointer-typed field (not a points-at edge)"
+            );
+            self.ref_resolution.ref_targets.remove(&local);
+        }
+    }
+
     /// Resolve ref_targets pointing to reference-typed ADT fields through aggregate
     /// field sources. Enables nested deref chains like `(*(*ref).inner).val`.
     pub(super) fn resolve_adt_field_ref_targets(
@@ -575,11 +693,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 let field_idx = match target.projections[0] {
                     ProjectionElem::Field(idx, field_ty) => {
-                        // Check if the field type is a reference/pointer.
-                        if !matches!(
-                            field_ty.kind(),
-                            TyKind::RigidTy(RigidTy::Ref(_, _, _) | RigidTy::RawPtr(_, _))
-                        ) {
+                        // The field's value must be an address, by the same
+                        // rule the value-of drop reads.
+                        if !Self::value_is_address(field_ty) {
                             return None;
                         }
                         idx
@@ -587,6 +703,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     _ => return None,
                 };
 
+                // Both ends are keyed by local: the reference that holds the
+                // field edge, and the aggregate whose field it names.
+                if self.local_has_multiple_whole_definitions(local)
+                    || self.local_has_multiple_whole_definitions(target.local)
+                {
+                    return None;
+                }
                 // Look up the aggregate field source for this field.
                 let &src_local = field_sources.get(&(target.local, field_idx))?;
                 // If the source local has a ref_target, use it.

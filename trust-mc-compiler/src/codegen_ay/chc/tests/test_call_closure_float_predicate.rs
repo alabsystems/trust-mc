@@ -135,11 +135,12 @@ fn test_any_where_float_guard_closure_avoids_inferable_summaries() {
         }
 
         let translation_drops = take_translation_drop_by_fn();
+        let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
         for fn_name in ["probe_any_where_float_guard_f32", "probe_any_where_float_guard_f64"] {
             let drop_count = translation_drops.get(fn_name).copied().unwrap_or(0);
             assert_eq!(
                 drop_count, 0,
-                "{fn_name} should have zero translation drops, map={translation_drops:?}"
+                "{fn_name} should have zero translation drops, map={translation_drops:?}, reasons={reasons:?}"
             );
         }
     });
@@ -213,11 +214,12 @@ fn test_any_where_float_guard_all_int_bounds_avoid_inferable_summaries() {
         }
 
         let translation_drops = take_translation_drop_by_fn();
+        let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
         for fn_name in PROBE_FN_NAMES {
             let drop_count = translation_drops.get(fn_name).copied().unwrap_or(0);
             assert_eq!(
                 drop_count, 0,
-                "{fn_name} should have zero translation drops, map={translation_drops:?}"
+                "{fn_name} should have zero translation drops, map={translation_drops:?}, reasons={reasons:?}"
             );
         }
     });

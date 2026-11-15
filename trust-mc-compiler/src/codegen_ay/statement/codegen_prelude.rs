@@ -51,19 +51,22 @@ pub(in crate::codegen_ay) enum AdapterStageKind {
 /// `modifies_frame_exit` markers the contracts transform plants in the
 /// modifies-wrapper closure.
 ///
-/// BMC enforcement is deliberately narrower than the CHC twin
-/// (`chc::modifies_frame`): only an EMPTY declared footprint (`()` wrapper
-/// tuple — no `#[kani::modifies]` clause) is enforced, and only for the store
-/// shapes the register-level model can attribute (ref-deref stores to
-/// pre-existing storage, raw-pointer/static deref stores). A non-empty
-/// footprint is fail-open (no checks), never a false positive. Before this
-/// existed, BMC treated the markers as pure no-ops, and
-/// `modifies/simple_fail` + `modifies/global_fail` — whose checked functions
-/// write with NO declared footprint — verified SUCCESSFUL (false proofs).
+/// Every store encoded inside the extent is classified against the innermost
+/// frame (`statement::modifies_frame`): accused (empty footprint, attributable
+/// shape), certified (covered by the resolved non-empty footprint), frame-local,
+/// or failed closed through `unsupported_with_fallback`. No store inside a
+/// frame is left unchecked. A non-empty footprint used to be fail-open, and
+/// `modifies-frame-offset-drop_repro.rs::check_evil` / `..._control.rs::check_caught`
+/// verified SUCCESSFUL while writing outside `modifies(&p.a)` (false proofs).
+///
+/// `Clone` so the BMC mini-inliner can carry the caller's frames into a callee
+/// body executed inside the extent.
+#[derive(Clone)]
 pub(in crate::codegen_ay) struct BmcModifiesFrame {
     /// Declared footprint is empty: every attributable store to pre-existing
     /// storage inside the extent violates the (absent) modifies clause.
-    /// `false` = declared footprint non-empty: not enforced by BMC (fail-open).
+    /// `false` = declared footprint non-empty: stores are certified against
+    /// `allowed` or fail closed.
     pub(in crate::codegen_ay) enforce_empty: bool,
     /// Env base names live before the frame was entered — storage that
     /// pre-exists the checked call. Stores to storage created INSIDE the
@@ -75,9 +78,9 @@ pub(in crate::codegen_ay) struct BmcModifiesFrame {
     /// path under one) be CERTIFIED with a passing assigns check — the real
     /// obligation Kani discharges per store, and what keeps a
     /// modifies-only harness from emitting zero VCs (vacuity gate).
-    /// A store outside the set stays fail-open (no check, never a false
-    /// accusation from name aliasing); `None` = footprint unresolved,
-    /// entirely fail-open as before.
+    /// A pre-existing store outside the set is never ACCUSED (name aliasing
+    /// is not precise enough) but fails closed — the proof demotes;
+    /// `None` = footprint unresolved, so nothing pre-existing is certifiable.
     pub(in crate::codegen_ay) allowed: Option<std::collections::BTreeSet<std::sync::Arc<str>>>,
 }
 
@@ -96,9 +99,19 @@ pub(in crate::codegen_ay) struct StatementCodegen<'a, 'tcx, 't> {
     /// Incoming edges for each block (edge predicate + predecessor env).
     pub(super) incoming_edges: std::collections::HashMap<usize, Vec<IncomingEdge>>,
     /// Tracks reference pointees for Deref resolution.
-    pub(super) ref_pointees: std::collections::BTreeMap<std::sync::Arc<str>, std::sync::Arc<str>>,
+    /// Path-sensitive: snapshotted per edge and merged at joins (`ref_pointee_table`).
+    pub(super) ref_pointees: super::RefPointees,
     /// Tracks locals that have gone out of scope (StorageDead).
     pub(super) dead_locals: std::collections::HashSet<usize>,
+    pub(super) maybe_dead_locals: std::collections::HashSet<usize>,
+    pub(super) storage_scope_known: bool,
+    pub(super) qualified_storage_lifetimes: super::stack_lifetime::QualifiedLifetimes,
+    pub(super) storage_lifetime_entries: std::cell::OnceCell<(
+        Vec<std::collections::HashSet<usize>>,
+        Vec<std::collections::HashSet<usize>>,
+    )>,
+    /// Static stack IDs cannot certify multiple address-taken activations.
+    pub(super) reused_stack_locals: std::cell::OnceCell<Option<std::collections::HashSet<usize>>>,
     /// Counter for generating unique synthetic pointee names (#366).
     pub(super) synthetic_pointee_counter: u32,
     /// Tracks flattened tuples: base_name -> field expressions.
@@ -126,6 +139,8 @@ pub(in crate::codegen_ay) struct StatementCodegen<'a, 'tcx, 't> {
     /// this maps `ssa_name → concrete_expr` so downstream consumers
     /// (e.g., `try_extract_layout_fields`) can resolve through Var indirection.
     pub(super) ssa_concrete_values: std::collections::HashMap<String, Expr>,
+    pub(super) bmc_box_pointer_check_casts: std::collections::HashMap<usize, u64>,
+    pub(super) bmc_box_pointer_check_alignment: Option<u64>,
     /// Stub-created indexed references for write propagation. Part of #3392.
     /// Maps pointee_base → (container_env_key, index_expr) for stub-dispatched
     /// IndexMut paths where the pointee name doesn't use `_idx_by_` convention.
@@ -151,6 +166,17 @@ pub(in crate::codegen_ay) struct StatementCodegen<'a, 'tcx, 't> {
     /// the filter/map/sum of a single `.iter().filter(..).map(..).sum()` chain all
     /// run in the same body's `StatementCodegen`.
     pub(super) adapter_closures: std::collections::HashMap<std::sync::Arc<str>, Vec<AdapterStage>>,
+    /// Set by a stub that decided its own callee's unwinding assertion (the
+    /// element-wise `collect` of a `map` chain, `try_collect_map_chain`), so
+    /// the generic modelled-call check after the stub
+    /// (`bmc_model_call_unwinding_check`) does not fail the call closed.
+    /// Cleared before each stub and taken by that check.
+    pub(super) stub_stated_unwinding: bool,
+    /// The two values the last `PartialEq::eq` / `ne` or `raw_eq` model
+    /// compared, for the comparison's unwinding check
+    /// (`bmc_compare_unwinding_check`), which takes it. Set by those models
+    /// only when both values were read, cleared at their entry.
+    pub(super) compared_values: Option<(Expr, Expr)>,
     /// SwitchInt→variant bridge (Effort 2, #3017): a `Rvalue::Discriminant(P)` assigned
     /// to a bare local, keyed by that local's index, so the following `SwitchInt` on it
     /// can pin the active variant. Reset at each block-0 entry (per function / inline).
@@ -179,6 +205,45 @@ pub(in crate::codegen_ay) struct StatementCodegen<'a, 'tcx, 't> {
     /// sentinel lookup reads it; a stale value can therefore never do worse than
     /// leave the pre-existing `unreachable` label in place.
     pub(super) current_bb: usize,
+    /// While a write through a derived name is carried up into its root
+    /// (`try_propagate_deref_write_to_parent_datatype`), that derived name:
+    /// the root's new value is built from it, so it and the entries above it
+    /// on its chain are already the root's, and re-selecting them
+    /// (`refresh_derived_field_entries`) only hands the solver a deeper term
+    /// (`negative/elem_field_ref_depth.rs::tuple_field_array_elem_field_safe`
+    /// went undecided on it).
+    pub(super) derived_write_source: Option<String>,
+    /// Which blocks of `body` can continue (reach a `Return` or a cycle), the
+    /// complement being PANIC-ONLY: `chc::compute_may_continue_blocks`,
+    /// computed on first use by [`Self::global_alloc_naming`].
+    pub(super) may_continue_blocks: Option<Vec<bool>>,
+    /// Synthetic const-reference pointee base -> the constant allocation it
+    /// points into and the byte offset it points at.
+    ///
+    /// `track_const_ref_pointees` mints a fresh `const_pointee_N` per BORROW,
+    /// which is right for the VALUE and wrong for the ADDRESS: two borrows of
+    /// one static must share an address, and two different statics must not.
+    /// Keyed on the allocation, `derived_place_address` can place `&S[i]` at
+    /// `base + offset + i * size` inside the allocation's ONE address symbol
+    /// (`global_alloc::global_alloc_address`, shared with the raw-pointer
+    /// lane) — without which
+    /// `&S1[0]` and `&S1[1]` were literally the SAME symbol and `&S1[0]` and
+    /// `&S2[0]` two unrelated ones, so `assert!(!ptr::eq(&S1[0], &S2[0]) &&
+    /// !ptr::eq(&S1[0], &S1[1]))` was FAILED [AY:CTREX_CAT:Genuine] in BMC
+    /// (adversarial review of m3/soundness-fixes-2, 2026-09-14; red on main).
+    pub(super) const_pointee_objects: std::collections::HashMap<
+        std::sync::Arc<str>,
+        crate::codegen_ay::shared::const_pointer::ConstPtr,
+    >,
+    /// Base names that hold a SUB-SLICE VIEW built by a range index.
+    ///
+    /// The view's own value carries a backing shifted by the start, so every
+    /// read THROUGH the view is exact. A model that reads the SOURCE by another
+    /// path is not: `let s = &a[1..3]; assert!(s.contains(&2) && s.contains(&3))`
+    /// was FAILED [AY:CTREX_CAT:Genuine] for `a = [1,2,3,4]` (adversarial review
+    /// of m3/soundness-fixes-2, 2026-09-14; red on main too). Consulted by
+    /// `bmc_subslice_consumer_fail_closed`.
+    pub(super) shifted_subslice_views: std::collections::HashSet<std::sync::Arc<str>>,
     /// FC-06 (BMC): stack of active modifies frames (innermost last). Pushed
     /// on `modifies_frame_enter`, popped on `modifies_frame_exit`; consulted
     /// by the ref-deref and raw-pointer store paths.
@@ -194,6 +259,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Self {
         // Initialize memory model for heap operations (#24).
         ctx.init_memory();
+        // Global allocations reached through this body's constants get their
+        // address symbol, validity, allocation identity and initializer bytes
+        // before any statement can read them (global_alloc.rs).
+        super::global_alloc::materialize_body_global_allocs(ctx, body);
         let mut codegen = Self {
             ctx,
             body,
@@ -203,8 +272,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             current_path_condition: None,
             current_env: Env::new(),
             incoming_edges: std::collections::HashMap::new(),
-            ref_pointees: std::collections::BTreeMap::new(),
+            ref_pointees: super::RefPointees::new(),
             dead_locals: std::collections::HashSet::new(),
+            maybe_dead_locals: std::collections::HashSet::new(),
+            storage_scope_known: false,
+            qualified_storage_lifetimes: Default::default(),
+            storage_lifetime_entries: std::cell::OnceCell::new(),
+            reused_stack_locals: std::cell::OnceCell::new(),
             synthetic_pointee_counter: 0,
             flattened_tuples: std::collections::HashMap::new(),
             tuple_usage,
@@ -217,22 +291,66 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             entry_map_bases: std::collections::HashMap::new(),
             entry_keys: std::collections::HashMap::new(),
             ssa_concrete_values: std::collections::HashMap::new(),
+            bmc_box_pointer_check_casts: super::box_deref::compiler_pointer_check_casts(body),
+            bmc_box_pointer_check_alignment: None,
             stub_indexed_refs: std::collections::HashMap::new(),
             repeat_array_values: std::collections::HashMap::new(),
             parent_fn_ptr_callees: Vec::new(),
             parent_foreign_fn_ptrs: Vec::new(),
             adapter_closures: std::collections::HashMap::new(),
+            stub_stated_unwinding: false,
+            compared_values: None,
             discr_of_local: std::collections::HashMap::new(),
             current_variant_facts: Vec::new(),
             pending_edge_variant_facts: std::collections::HashMap::new(),
             bridge_enum_read: None,
             unwind_assert_blocks: super::unwind_sentinel::unwind_assert_sentinel_blocks(body),
             current_bb: 0,
+            derived_write_source: None,
+            may_continue_blocks: None,
+            const_pointee_objects: std::collections::HashMap::new(),
+            shifted_subslice_views: std::collections::HashSet::new(),
             modifies_frames: Vec::new(),
         };
+        codegen.initialize_storage_block(0);
         // Initialize synthetic pointees for reference-type arguments (#407).
         codegen.init_reference_arguments();
         codegen
+    }
+
+    /// Storage facts belong to this CFG point, independently of traversal order.
+    pub(super) fn initialize_storage_block(&mut self, block: usize) {
+        let entry = {
+            let (must, may) = self
+                .storage_lifetime_entries
+                .get_or_init(|| crate::codegen_ay::chc::stack_storage_liveness_at_entry(self.body));
+            must.get(block).zip(may.get(block)).map(|(must, may)| (must.clone(), may.clone()))
+        };
+        if let Some((must, may)) = entry {
+            self.dead_locals = must;
+            self.maybe_dead_locals = may;
+            self.storage_scope_known = true;
+        } else {
+            self.dead_locals.clear();
+            self.maybe_dead_locals.clear();
+            self.storage_scope_known = false;
+        }
+    }
+
+    pub(super) fn stack_local_is_live(&self, local: usize) -> Option<bool> {
+        if !self.storage_scope_known || local >= self.body.locals().len() {
+            None
+        } else if self.dead_locals.contains(&local) {
+            Some(false)
+        } else if self.maybe_dead_locals.contains(&local) {
+            None
+        } else {
+            let reused = self
+                .reused_stack_locals
+                .get_or_init(|| crate::codegen_ay::chc::reused_address_taken_locals(self.body))
+                .as_ref()?;
+            if reused.contains(&local) { None } else { Some(true) }
+        }
     }
 
     /// Initialize synthetic pointee variables for function arguments that are reference types.
@@ -335,12 +453,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // frame would misattribute MIR-transform-inlined callees to the
             // harness itself.
             let in_mini_inline = !self.ctx.bmc_mini_inline_stack.is_empty();
-            if !in_mini_inline
-                && let Some(encl) = self.enclosing_local_fn_name(span)
-            {
+            if !in_mini_inline && let Some(encl) = self.enclosing_local_fn_name(span) {
                 loc = loc.with_function(&encl);
             } else if let Some(fn_ctx) = self.ctx.current_fn() {
-                loc = loc.with_function(fn_ctx.name.as_str());
+                // The frame name is `Instance::name`, which Trust prints with the local
+                // crate in front; report the crate-relative name the nightly prints
+                // (`rustc_compat::instance_name`), keeping a mini-inline frame's `#f<n>`
+                // salt, so a check reads the same on both compiler routes.
+                let crate_relative =
+                    crate::rustc_compat::instance_name(self.ctx.tcx, fn_ctx.instance);
+                let salt = fn_ctx
+                    .name
+                    .rfind("#f")
+                    .map(|at| &fn_ctx.name[at..])
+                    .filter(|suffix| {
+                        suffix.len() > 2 && suffix[2..].bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .unwrap_or("");
+                loc = loc.with_function(&format!("{crate_relative}{salt}"));
             }
             loc
         })
@@ -357,8 +487,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // item extent.
             let def_span = tcx.source_span(def_id);
             if def_span.contains(internal) {
-                let tighter =
-                    best.as_ref().map(|(b, _)| b.contains(def_span)).unwrap_or(true);
+                let tighter = best.as_ref().map(|(b, _)| b.contains(def_span)).unwrap_or(true);
                 if tighter {
                     best = Some((def_span, tcx.def_path_str(def_id)));
                 }

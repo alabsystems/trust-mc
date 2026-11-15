@@ -37,6 +37,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let (operand_place, ref_base) = match operand {
             Operand::Copy(place) | Operand::Move(place) => (place, self.ssa_base_name(place)),
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
 
         let ptr_expr = self.slice_cast_known_pointer_identity(&ref_base);

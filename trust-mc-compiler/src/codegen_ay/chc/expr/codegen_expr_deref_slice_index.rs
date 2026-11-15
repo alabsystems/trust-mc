@@ -159,21 +159,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // whole-width bvadd smears the index across the id bits and the load's
         // heap bounds check gets dropped for non-foldable obj_ids.
         let elem_size = self.get_type_size(elem_ty).unwrap_or(1) as u64;
-        let byte_offset = if elem_size <= 1 {
-            idx_expr
-        } else {
-            idx_expr.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH))
-        };
-        // `step_split_pointer` advances an address by a byte offset in the
-        // offset lane, leaving the obj_id lane alone. Address in, address out —
-        // the tag is inherited from `PtrRepr::into_data`, not re-derived.
-        let elem_addr = Loc::of_address(
-            crate::codegen_ay::chc::pointer_step::step_split_pointer(
-                data_ptr.into_expr(),
-                byte_offset,
-            )
-            .result,
+        // `step_split_pointer_index` advances an address by `idx * elem_size`
+        // bytes in the offset lane, leaving the obj_id lane alone. Address in,
+        // address out — the tag is inherited from `PtrRepr::into_data`, not
+        // re-derived.
+        let step = crate::codegen_ay::chc::pointer_step::step_split_pointer_index(
+            data_ptr.into_expr(),
+            coerce_bitvec_width_safe(idx_expr, POINTER_WIDTH, SignExtension::ZeroExtend),
+            elem_size,
         );
+        // The lane result keeps only the low 32 bits of the byte offset. The
+        // index check compares against the slice's CLAIMED length, not the
+        // allocation, so an index past the lane folded onto a low element and
+        // passed the allocation bound below (`from_raw_parts(p, 1 << 33)[1 <<
+        // 32] == p[0]` was proven). State the step's exactness: it fails only
+        // for an access that is already out of bounds.
+        if let Some(exact) = step.same_object_ok.filter(|e| *e != Expr::bool_const(true)) {
+            self.heap_state.pending_checks.push(exact);
+        }
+        let elem_addr = Loc::of_address(step.result);
 
         // Raw-alloc route: strict element-access bound for a slice whose base
         // local walk-resolves to a stack or `__rust_alloc` allocation (e.g.
@@ -182,7 +186,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `load_from_memory`'s heap_access_checks fail-open on the opaque
         // obj_id lane, so without this the claimed length is the only bound).
         let bound_checks =
-            self.provenance_deref_bound_checks(elem_addr.as_expr(), elem_ty, local_idx);
+            self.provenance_deref_bound_checks(elem_addr.as_expr(), elem_ty, local_idx, None);
         self.heap_state.pending_checks.extend(bound_checks);
 
         debug!(local_idx, ?elem_size, "CHC: slice deref+index via memory model (#4099)");

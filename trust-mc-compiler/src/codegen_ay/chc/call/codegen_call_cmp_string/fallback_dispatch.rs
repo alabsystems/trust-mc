@@ -61,8 +61,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // DEMOTING category for the old, un-gated `P_inf_<callee>`
             // declare-fun summary, which assumed callee determinism with no
             // established purity fact (see `try_build_inferable_constraint`);
-            // it stays intact with zero producers. The congruent-table lane is
-            // a different construct with its own accounting — the builder
+            // it stays intact with zero producers. The gated congruent-UF lane
+            // is a different construct with its own accounting — the builder
             // records `call_uf_congruent_summary` with the destination's var
             // identity, exactly once per event.
             self.emit_goto_rule_extra(
@@ -125,33 +125,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Summarise an unhandled call as an UNINTERPRETED FUNCTION of its
     /// arguments — but only behind an ESTABLISHED purity fact (Part of #4270 /
-    /// TL18; supersedes the #3395 `P_inf_<callee>` declare-fun lane).
+    /// TL18; supersedes the un-gated #3395 `P_inf_<callee>` declare-fun lane).
     ///
     /// Returns `Some(constraint)` binding the destination's output state var to
     /// a congruent summary term, or `None` to leave the caller's sound
     /// over-approximation (destination havoced) in place.
     ///
-    /// # Why there is no `declare-fun` here any more
+    /// # Why the `declare-fun` is back, and what changed
     ///
-    /// The original lane declared `P_inf_<callee>(arg_sorts) -> ret_sort` and
-    /// equated the destination to its application. `ay-chc`'s parser REJECTS
-    /// any `declare-fun` whose return sort is not Bool (parser/commands.rs:
-    /// "Non-predicate function declaration: '<name>' with return sort <S>.
-    /// Only Bool-returning functions (predicates) are supported in ay-chc."),
-    /// and that error aborts the parse of the WHOLE problem — a single such
-    /// declaration cost the harness its entire verification, coming back
-    /// UNKNOWN having never been solved. Observed in the corpus:
+    /// The original `P_inf_<callee>` lane declared `(declare-fun P_inf_<callee>
+    /// (arg_sorts) ret_sort)` and equated the destination to its application —
+    /// but with NO purity fact behind it, and against an `ay-chc` that REJECTED
+    /// any `declare-fun` whose return sort was not Bool, aborting the parse of
+    /// the WHOLE problem. A single such declaration cost the harness its entire
+    /// verification, coming back UNKNOWN having never been solved. Observed in
+    /// the corpus:
     ///   P_inf_std::…::alloc_zeroed  ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
     ///   P_inf_std::…::alloc         ((_ BitVec 64) (_ BitVec 128)) (_ BitVec 64)
     ///   P_inf_std::collections::VecDeque::<T>::new  ()             (_ BitVec 64)
-    /// There is also no global-constant escape hatch: ay-chc aliases
-    /// `declare-const` to `declare-var`, and any free symbol becomes a
-    /// PER-CLAUSE universally quantified variable. Two calls are always two
-    /// different Horn rules, so a shared free variable gives no sharing at all.
-    /// `call_uf_table.rs` therefore encodes the UF the way this codebase
-    /// already encodes symbolic float arithmetic: a frozen `Array` column
-    /// threaded through every relation and never modified, so `select` over it
-    /// is congruent along a trace while staying universally quantified.
+    ///
+    /// ay 0.23.0 accepts a non-Bool scalar `declare-fun` as an ordinary
+    /// uninterpreted function with congruence, so `call_uf_table.rs` now emits
+    /// exactly that — one stable symbol and signature per MONOMORPHISED
+    /// callee — in place of the frozen `Array` state column that stood in for
+    /// it in between. What did NOT come back is the old lane's willingness to
+    /// summarise any callee at all: the purity gate below is unchanged and is
+    /// still the only thing that licenses a summary.
     ///
     /// # Why the gate, and why it is not the signature
     ///
@@ -190,7 +189,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // THE GATE FIRST — nothing is translated for a callee we may not
         // summarise, so a refusal costs no work and leaves no residue.
-        if !self.call_uf_table_declared() {
+        if !self.call_uf_congruence_enabled() {
             return None;
         }
         let callee_path = self.resolve_callee_path(func)?;
@@ -219,10 +218,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let summary = self.call_uf_summary_term(&instance, &arg_exprs, &out_sort)?;
 
         // Accounted exactly once, with the destination's var identity (Task
-        // #78). `call_uf_congruent_summary` is blessed SoundHavoc in
-        // `codegen_ctx::fallback_soundness` under the audit written there and
-        // in `call_uf_table.rs`; the un-gated `call_dispatch_fallback_prebuilt`
-        // fail-close still covers every callee this gate refuses.
+        // #78). `call_uf_congruent_summary` is deliberately NOT on the
+        // `SoundHavoc` bless list in `codegen_ctx::fallback_soundness` — read
+        // the rationale recorded in place there — so a `Success` reaching a
+        // verdict through this lane is DEMOTED, not returned clean. (An earlier
+        // revision of this comment claimed the opposite; the bless list is the
+        // authority.) The un-gated `call_dispatch_fallback_prebuilt` fail-close
+        // still covers every callee the purity gate refuses.
         self.record_sound_fallback_reason_identified(
             "call_uf_congruent_summary",
             Some(dest_var_name.as_str()),
@@ -230,7 +232,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         debug!(
             callee = %callee_path,
             ?out_sort,
-            "UF summary EMITTED: established-pure scalar callee, congruent table term"
+            "UF summary EMITTED: established-pure scalar callee, first-class congruent UF"
         );
         Some(dest_var.eq(summary))
     }

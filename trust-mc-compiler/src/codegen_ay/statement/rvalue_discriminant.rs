@@ -8,6 +8,8 @@
 //! checked arithmetic results, bitvec-stored enums (ControlFlow/Result/Option/unit),
 //! datatype is-constructor testers, codegen_place fallback, and symbolic fallback.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::sync::Arc;
 
 use ay_bindings::{Expr, Sort, SortInner};
@@ -16,6 +18,7 @@ use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, Place, ProjectionElem, Rvalue};
 use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+use rustc_public_bridge::IndexedVal;
 use tracing::{debug, warn};
 
 use super::{IntoOption, StatementCodegen};
@@ -35,16 +38,44 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     pub(super) fn codegen_discriminant(&mut self, place: &Place, rvalue: &Rvalue) -> Option<Expr> {
         let base_name: Arc<str> = self.ssa_base_name(place).into();
 
-        // If place has a Deref projection, follow the reference to find the pointee
+        // If place has a Deref projection, follow the reference to find the pointee.
+        //
+        // The projections AFTER the deref name a part of the pointee: for
+        // `Discriminant((*_14).0)` the pointee base alone is the whole struct,
+        // and its discriminant (a single-constructor datatype, always 0) was
+        // taken for the Option field's — `matches!(self.o, Some(4))` read `None`
+        // and the BMC lane proved `assert!(!w.hit_match())`
+        // (tools/soundness-duals/negative/review_r04_nested_with_address.rs).
+        // Field and downcast projections extend the base by their ssa suffixes;
+        // any other projection keeps the syntactic name.
         let target_base = if !place.projection.is_empty()
             && matches!(place.projection[0], ProjectionElem::Deref)
         {
             let ref_base =
                 crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), place.local);
-            self.ref_pointees
-                .get(ref_base.as_str())
-                .cloned()
-                .unwrap_or_else(|| Arc::clone(&base_name))
+            match self.ref_pointees.get(ref_base.as_str()).cloned() {
+                Some(pointee) => {
+                    let mut base = pointee.to_string();
+                    let mut exact = true;
+                    for proj in &place.projection[1..] {
+                        match proj {
+                            ProjectionElem::Field(field, _) => {
+                                base = crate::codegen_ay::names::indexed_field_name(&base, *field);
+                            }
+                            ProjectionElem::Downcast(variant_idx) => {
+                                use std::fmt::Write;
+                                let _ = write!(base, "_variant_{}", variant_idx.to_index());
+                            }
+                            _ => {
+                                exact = false;
+                                break;
+                            }
+                        }
+                    }
+                    if exact { Arc::from(base) } else { Arc::clone(&base_name) }
+                }
+                None => Arc::clone(&base_name),
+            }
         } else {
             base_name
         };
@@ -128,8 +159,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Datatype is-constructor testers
         if let SortInner::Datatype(dt) = dt_expr.sort().inner() {
+            // A single-constructor datatype is a struct or tuple value, not the
+            // encoding of a multi-variant enum place: its constant constructor
+            // index says nothing about the place's variant.
+            if dt.constructors.len() < 2
+                && place.ty(self.body.locals()).into_option().is_some_and(|ty| {
+                    matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(def, _)) if def.variants().len() >= 2)
+                })
+            {
+                debug!(
+                    "codegen_rvalue_discriminant: {} holds a {} value, not the enum place {:?}",
+                    target_base, dt.name, place
+                );
+                return None;
+            }
             // Allocation Result types: force Ok discriminant (0).
-            if dt.name.contains("Result") && dt.name.contains("AllocError") {
+            if crate::codegen_ay::names::is_alloc_result_sort_name(&dt.name) {
                 debug!(
                     "codegen_rvalue_discriminant: Allocation Result - forcing Ok (discriminant 0)"
                 );
@@ -494,6 +539,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 self.current_variant_facts.retain(|f| !f.place_key.starts_with(&*root));
             }
             None => self.current_variant_facts.clear(),
+        }
+    }
+
+    /// An earlier scalar discriminant remains a valid old SSA value, but a
+    /// later switch on it cannot refine storage overwritten in the meantime.
+    pub(super) fn kill_discriminant_bridges_for_place(&mut self, place: &Place) {
+        match self.variant_fact_kill_root(place) {
+            Some(root) => {
+                self.discr_of_local.retain(|_, scrutinee| !scrutinee.place_key.starts_with(&*root));
+            }
+            None => self.discr_of_local.clear(),
         }
     }
 

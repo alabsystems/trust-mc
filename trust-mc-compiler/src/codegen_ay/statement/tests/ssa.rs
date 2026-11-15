@@ -883,7 +883,7 @@ fn test_ssa_base_name_real_struct_field_access() {
                     check_place(&mut codegen, place, &mut found_field_place);
                     // Also check rvalue operand places (e.g., Copy(local_1.field_0))
                     match rvalue {
-                        Rvalue::Use(Operand::Copy(p)) | Rvalue::Use(Operand::Move(p)) => {
+                        Rvalue::Use(Operand::Copy(p), ..) | Rvalue::Use(Operand::Move(p), ..) => {
                             check_place(&mut codegen, p, &mut found_field_place);
                         }
                         _ => {}
@@ -924,7 +924,7 @@ fn test_ssa_base_name_real_enum_downcast() {
                 if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                     check_place(&mut codegen, place, &mut found_downcast);
                     match rvalue {
-                        Rvalue::Use(Operand::Copy(p)) | Rvalue::Use(Operand::Move(p)) => {
+                        Rvalue::Use(Operand::Copy(p), ..) | Rvalue::Use(Operand::Move(p), ..) => {
                             check_place(&mut codegen, p, &mut found_downcast);
                         }
                         _ => {}
@@ -965,7 +965,7 @@ fn test_ssa_base_name_real_deref() {
                 if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                     check_place(&mut codegen, place, &mut found_deref);
                     match rvalue {
-                        Rvalue::Use(Operand::Copy(p)) | Rvalue::Use(Operand::Move(p)) => {
+                        Rvalue::Use(Operand::Copy(p), ..) | Rvalue::Use(Operand::Move(p), ..) => {
                             check_place(&mut codegen, p, &mut found_deref);
                         }
                         _ => {}

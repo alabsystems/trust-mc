@@ -118,7 +118,9 @@ fn test_inline_rvalue_to_expr_resolves_len_from_datatype_local() {
             "resolved len should be pointer-width bitvec"
         );
         assert!(
-            expr.to_string().contains("fld_len"),
+            // ay folds fld_len over the constructor (8a7c063209) to the stored length.
+            expr.to_string().contains("fld_len")
+                || matches!(expr.value(), ExprValue::BitVecConst { .. }),
             "resolved inline len should select fld_len, got {expr:?}"
         );
     });
@@ -160,9 +162,14 @@ fn test_translate_inline_body_reads_vec_len_from_ptr_backed_memory() {
             inline_result.value
         );
         assert!(
-            constraint_tree_contains(&inline_result.value, &|expr| is_selector_named(
-                expr, "fld_ptr"
-            )),
+            constraint_tree_contains(&inline_result.value, &|expr| {
+                is_selector_named(expr, "fld_ptr")
+                    // The fixture's fld_ptr is the literal 0 inside the constructor, and ay
+                    // folds the selector over the constructor (8a7c063209): the address is
+                    // then 0 + 16, the len field's offset.
+                    || matches!(expr.value(), ExprValue::Select { index, .. }
+                        if index.to_string() == "(bvadd #x0000000000000000 #x0000000000000010)")
+            }),
             "inline body result should derive its address from the Vec fld_ptr selector, got {:?}",
             inline_result.value
         );

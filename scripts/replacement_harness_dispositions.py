@@ -37,7 +37,7 @@ DEFAULT_OUTPUT = (
 
 EXPECTED_OUTCOMES = frozenset({"PROOF", "CTREX", "UNKNOWN", "ERROR", "BMC_SAFE"})
 ACTIVE_EXECUTION_STATES = frozenset(
-    {"complete", "missing_verdict", "watchdog_cleanup", "watchdog_timeout"}
+    {"complete", "missing_verdict", "watchdog_cleanup", "watchdog_timeout", "identity_mismatch"}
 )
 INVENTORY_FIELDS = frozenset({"file", "harness", "expected", "lane"})
 CLOSURE_FIELDS = frozenset(
@@ -63,6 +63,71 @@ EXTERNAL_MOD_TEMPLATE = (
 
 class DispositionError(ValueError):
     """The frozen inventory cannot be mapped to current source unambiguously."""
+
+
+COVER_ORACLES = REPO_ROOT / "tools/replacement-inventory/cover-property-oracles.json"
+COVER_STATUSES = frozenset({"SATISFIED", "UNSATISFIABLE", "UNREACHABLE", "UNDETERMINED"})
+
+
+def cover_expectations(row: dict[str, Any]) -> list[dict[str, str]] | None:
+    """Return source-bound cover requirements, never inferred from a safety result."""
+    if not row["file"].startswith("tests/expected/cover/"):
+        return None
+    authority = _read_object(COVER_ORACLES)
+    candidates = [
+        item for item in authority.get("rows", [])
+        if (item.get("file"), item.get("harness")) == (row["file"], row["harness"])
+    ]
+    if authority.get("schema_version") != 1 or len(candidates) != 1:
+        raise DispositionError(f"{row['file']}::{row['harness']}: missing/ambiguous cover oracle")
+    item = candidates[0]
+    if item.get("expected") != row["expected"]:
+        raise DispositionError(f"{row['file']}::{row['harness']}: cover safety oracle mismatch")
+    for name, digest in (("file", "source_sha256"), ("expectation_file", "expectation_sha256")):
+        path = Path(item[name])
+        if path.is_absolute() or ".." in path.parts:
+            raise DispositionError("unsafe cover oracle path")
+        if hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest() != item[digest]:
+            raise DispositionError(f"{path}: cover oracle source changed")
+    properties = item.get("properties")
+    if not isinstance(properties, list) or not properties:
+        raise DispositionError("cover oracle requires nonempty properties")
+    seen: set[str] = set()
+    for prop in properties:
+        if (
+            not isinstance(prop, dict) or set(prop) != {"description", "status"}
+            or not isinstance(prop["description"], str) or not prop["description"]
+            or prop["description"] in seen or not isinstance(prop["status"], str)
+            or prop["status"] not in COVER_STATUSES
+        ):
+            raise DispositionError("malformed/duplicate cover oracle property")
+        seen.add(prop["description"])
+    return properties
+
+
+def cover_mismatch(row: dict[str, Any], observed: Any, error: Any = None) -> str | None:
+    """Require every exact named property, including intentional undetermined ones."""
+    expected = cover_expectations(row)
+    if expected is None:
+        return None
+    if error:
+        return f"malformed cover output: {error}"
+    if not isinstance(observed, list):
+        return "missing cover properties"
+    actual: dict[str, str] = {}
+    for prop in observed:
+        if (
+            not isinstance(prop, dict) or set(prop) != {"description", "status"}
+            or not isinstance(prop.get("description"), str)
+            or not isinstance(prop.get("status"), str)
+            or prop["description"] in actual
+        ):
+            return "malformed/duplicate cover properties"
+        actual[prop["description"]] = prop["status"]
+    wanted = {prop["description"]: prop["status"] for prop in expected}
+    if actual != wanted:
+        return f"cover properties differ: expected={wanted!r}; observed={actual!r}"
+    return None
 
 
 def _read_object(path: Path) -> dict[str, Any]:
@@ -442,6 +507,8 @@ def _qualified_driver_harness(
 
 
 def _plan_row(row: dict[str, str]) -> dict[str, Any]:
+    # Fail source disposition generation if a frozen cover oracle drifts.
+    cover_expectations(row)
     source_path = REPO_ROOT / row["file"]
     if not source_path.is_file():
         raise DispositionError(f"{row['file']}::{row['harness']}: source file is missing")
@@ -637,6 +704,7 @@ def build_dispositions(
         "schema_version": 1,
         "artifact_kind": "trust-mc.replacement_harness_dispositions",
         "authority": {
+            "cover_oracle_sha256": hashlib.sha256(COVER_ORACLES.read_bytes()).hexdigest(),
             "inventory": _source_relative(inventory_path),
             "denominator": inventory["denominator"],
             "row_sha256": inventory["row_sha256"],
@@ -661,6 +729,45 @@ def build_dispositions(
             ),
         },
         "rows": plan_rows,
+    }
+
+
+def active_proof_inventory(dispositions: dict[str, Any]) -> dict[str, Any]:
+    """Render the ACTIVE `PROOF` subset — the replacement BAR — as an inventory.
+
+    The frozen proof inventory is the historical DENOMINATOR and never moves.
+    This is the BAR: what the incumbent actually does.  Upstream-inactive rows
+    are absent here and nowhere else — they keep their place in the 818-row
+    authority, in the frozen proof authority, and in the schema-v2 report, with
+    zero execution and zero proof credit.  Un-gating one moves it back in here
+    automatically, which changes this digest and forces an explicit authority
+    update.
+    """
+
+    summary = dispositions["summary"]["proof"]
+    rows = [
+        {field: row[field] for field in ("expected", "file", "harness", "lane")}
+        for row in dispositions["rows"]
+        if row["expected"] == "PROOF" and row["disposition"] == "active"
+    ]
+    digest = _row_digest(rows)
+    if len(rows) != summary["bar"] or digest != summary["active_inventory_row_sha256"]:
+        raise DispositionError(
+            "active proof inventory does not reproduce the checked disposition bar"
+        )
+    return {
+        "schema_version": 1,
+        "suite": "tests/trust-mc",
+        "provenance": (
+            f"active PROOF subset of {dispositions['authority']['proof_inventory']} "
+            f"({summary['historical']} historical rows) source-bound by "
+            f"{_source_relative(DEFAULT_OUTPUT)}; "
+            f"{summary['upstream_inactive']} upstream-inactive rows are outside "
+            "the bar with zero execution and zero proof credit"
+        ),
+        "denominator": len(rows),
+        "row_sha256": digest,
+        "rows": rows,
     }
 
 
@@ -718,6 +825,19 @@ def validate_runtime_records(
                 raise DispositionError(
                     f"{records_path}: active row was not executed: {key[0]}::{key[1]}"
                 )
+            if execution.get("state") != "complete" and (
+                record.get("status") != "FAIL" or record.get("verdict") != "ERROR"
+            ):
+                raise DispositionError(
+                    f"{records_path}: incomplete execution received verdict credit: "
+                    f"{key[0]}::{key[1]}"
+                )
+            if record.get("status") == "PASS":
+                mismatch = cover_mismatch(
+                    row, record.get("cover_properties"), record.get("cover_error")
+                )
+                if mismatch is not None:
+                    raise DispositionError(f"{records_path}: {key[0]}::{key[1]}: {mismatch}")
         elif (
             record.get("verdict") != "SKIP"
             or record.get("status") != "SKIP"
@@ -735,18 +855,45 @@ def validate_runtime_records(
         "authority": dispositions["authority"],
         "historical_total": summary["historical_total"],
         "active_executed": summary["active"],
+        "active_attempted": summary["active"],
+        "active_completed": sum(
+            record.get("metadata", {}).get("execution", {}).get("state") == "complete"
+            for record in records
+        ),
+        # This is execution-attempt accounting, including errors. In
+        # particular an identity mismatch ran the driver, but did not run the
+        # selected harness and must receive no verdict or proof credit.
+        "active_identity_mismatch": sum(
+            record.get("metadata", {}).get("execution", {}).get("state") == "identity_mismatch"
+            for record in records
+        ),
+        "execution_states": dict(sorted(Counter(
+            record.get("metadata", {}).get("execution", {}).get("state")
+            for record in records
+        ).items())),
         "inactive_accounted": summary["inactive_accounted"],
+        # `bar` / `upstream_inactive` / `local_inactive` travel with the counts
+        # so a consumer of the runtime accounting can tell the two kinds of
+        # zero-credit row apart without re-deriving the plan: upstream-disabled
+        # rows are outside the bar, ours are inside it and still block.
         "proof": {
             "historical": summary["proof"]["historical"],
             "active_executed": summary["proof"]["active"],
+            "bar": summary["proof"]["bar"],
             "inactive_zero_credit": summary["proof"]["inactive_zero_credit"],
+            "upstream_inactive": summary["proof"]["upstream_inactive"],
+            "local_inactive": summary["proof"]["local_inactive"],
+            "supersession_candidates": summary["proof"]["supersession_candidates"],
             "authority_row_sha256": summary["proof"]["authority_row_sha256"],
             "active_inventory_row_sha256": summary["proof"]["active_inventory_row_sha256"],
         },
         "non_proof": {
             "historical": summary["non_proof"]["historical"],
             "active_executed": summary["non_proof"]["active"],
+            "bar": summary["non_proof"]["bar"],
             "inactive_zero_credit": summary["non_proof"]["inactive_zero_credit"],
+            "upstream_inactive": summary["non_proof"]["upstream_inactive"],
+            "local_inactive": summary["non_proof"]["local_inactive"],
             "authority_row_sha256": summary["non_proof"]["authority_row_sha256"],
             "active_inventory_row_sha256": summary["non_proof"]["active_inventory_row_sha256"],
         },
@@ -796,6 +943,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="emit the checked execution plan with ASCII unit separators",
     )
+    parser.add_argument(
+        "--emit-active-proof-inventory",
+        type=Path,
+        help="write the checked ACTIVE PROOF subset (the replacement bar) as an inventory",
+    )
     parser.add_argument("--records-jsonl", type=Path, help="validate a runtime JSONL record set")
     parser.add_argument("--runtime-accounting-output", type=Path)
     return parser.parse_args(argv)
@@ -810,12 +962,25 @@ def main(argv: list[str] | None = None) -> int:
             args.non_proof_closure.resolve(),
         )
         rendered = _render(dispositions)
-        if args.check or args.emit_shell_plan or args.records_jsonl:
+        if (
+            args.check
+            or args.emit_shell_plan
+            or args.records_jsonl
+            or args.emit_active_proof_inventory
+        ):
             if args.output.read_text(encoding="utf-8") != rendered:
                 raise DispositionError(f"{args.output}: disposition artifact is stale")
         else:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(rendered, encoding="utf-8")
+
+        if args.emit_active_proof_inventory is not None:
+            # Derived from the artifact that was just checked against source, so
+            # it cannot drift: it is regenerated at every gate run.
+            args.emit_active_proof_inventory.parent.mkdir(parents=True, exist_ok=True)
+            args.emit_active_proof_inventory.write_text(
+                _render(active_proof_inventory(dispositions)), encoding="utf-8"
+            )
 
         runtime = None
         if args.records_jsonl is not None:
@@ -840,8 +1005,9 @@ def main(argv: list[str] | None = None) -> int:
                 "replacement_harness_dispositions: "
                 f"{action} historical={summary['historical_total']} "
                 f"active={summary['active']} inactive={summary['inactive_accounted']} "
-                f"proof_active={summary['proof']['active']} "
-                f"proof_inactive={summary['proof']['inactive_zero_credit']}"
+                f"proof_bar={summary['proof']['bar']} "
+                f"proof_upstream_inactive={summary['proof']['upstream_inactive']} "
+                f"proof_local_inactive={summary['proof']['local_inactive']}"
             )
         return 0
     except (DispositionError, OSError, json.JSONDecodeError) as err:

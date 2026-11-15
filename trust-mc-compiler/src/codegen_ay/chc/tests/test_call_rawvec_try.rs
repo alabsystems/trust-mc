@@ -188,20 +188,36 @@ fn test_rawvec_via_vec_push() {
             "Found {rawvec_candidate_calls} RawVec-like call(s) but none classified as RawVec stubs"
         );
 
-        let vc = mir_to_chc(
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the Vec's arrays are never
+        // read, so write-only array elimination (85da41dad) and orphan pruning drop its rules.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_vec_push_rawvec",
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_vec_push_rawvec", body.blocks.len());
-        assert!(
-            vc.rules.len() >= body.blocks.len(),
-            "vec push should produce at least one rule per bb (got {} rules for {} bbs)",
-            vc.rules.len(),
-            body.blocks.len()
-        );
+        // One rule per MIR block is not an engine invariant: `v` has drop glue, so the MIR has
+        // unwind cleanup blocks that get no relation. Pin instead that every declared
+        // (return-reachable, non-cleanup) block relation has an outgoing transition rule.
+        for rel in vc.relations.iter().filter(|rel| !is_error_head(rel.name.as_str())) {
+            assert!(
+                vc.rules.iter().any(|rule| {
+                    rule.body
+                        .relation
+                        .as_ref()
+                        .is_some_and(|app| app.name.as_str() == rel.name.as_str())
+                }),
+                "vec push: block relation {} has no outgoing transition rule",
+                rel.name.as_str()
+            );
+        }
     });
 }
 
@@ -331,7 +347,14 @@ fn test_rawvec_capacity_dedup_skips_vec_slot_update_when_marked() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_vec_push_for_rawvec_skip");
         let body = instance.body().expect("function body");
         let mut chc_ctx =
-            ChcCtx::new(ctx.tcx, &body, "probe_vec_push_for_rawvec_skip", ChcConfig::default());
+            ChcCtx::new(
+                ctx.tcx,
+                &body,
+                "probe_vec_push_for_rawvec_skip",
+                // Full frame: the destination local is not live in the successor block, so
+                // frame narrowing (default on) drops its column; this test pins slot routing.
+                ChcConfig { frame_narrowing: false, ..ChcConfig::default() },
+            );
         chc_ctx.declare_block_relations();
 
         let mut call_site = None;
@@ -393,7 +416,8 @@ fn test_rawvec_capacity_dedup_skips_vec_slot_update_when_marked() {
         assert_eq!(chc_ctx.vc.rules.len(), before_rules + 1, "expected one RawVec transition rule");
         let rule = chc_ctx.vc.rules.last().expect("rawvec call should emit one rule");
 
-        let vec_head_arg = rule.head.args.get(vec_idx).expect("vec slot should exist in rule head");
+        let vec_head_arg = head_arg_for_state_idx(&chc_ctx, rule, vec_idx)
+            .expect("vec slot should exist in rule head");
         assert!(
             matches!(vec_head_arg.value(), ExprValue::Var { name } if name.as_str() == &*vec_in_name),
             "dedup skip should keep Vec slot on input var {vec_in_name}, got {:?}",
@@ -405,7 +429,8 @@ fn test_rawvec_capacity_dedup_skips_vec_slot_update_when_marked() {
         );
 
         let dest_head_arg =
-            rule.head.args.get(dest_idx).expect("destination slot should exist in rule head");
+            head_arg_for_state_idx(&chc_ctx, rule, dest_idx)
+                .expect("destination slot should exist in rule head");
         assert!(
             matches!(dest_head_arg.value(), ExprValue::Var { name } if name.as_str() == &*dest_out_name),
             "rawvec skip path should still route destination slot through output var {dest_out_name}"

@@ -7,6 +7,7 @@
 //! Split out of `codegen_call_coroutine.rs` to keep the top-level dispatcher
 //! file under the repo's 500-line limit.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::CrateDef;
@@ -72,6 +73,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
 
         let mut visited = std::collections::HashSet::new();
@@ -121,7 +124,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 match rvalue {
                     Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    | Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return Some(src.local);
@@ -234,6 +237,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let place = match arg {
                 Operand::Copy(place) | Operand::Move(place) => place,
                 Operand::Constant(_) => return None,
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => return None,
             };
             self.resolve_coroutine_root_expr(place.local, dcx.modified_locals).or_else(|| {
                 let caller_local =
@@ -317,26 +322,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         let leaf_sort = leaf_expr.sort().clone();
 
+        // The resume is not walked: its outcome and payloads are booked
+        // havocs (Rule E).
+        let dest_sort = dcx
+            .destination
+            .ty(self.body.locals())
+            .ok()
+            .map(|ty| self.resolve_body_ty(ty))
+            .and_then(Self::translate_ty);
+        let mut mint = |prefix: &'static str, sort: ay_bindings::Sort| {
+            Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_COROUTINE_STATE,
+                super::chc_fresh_name(prefix),
+                sort,
+            )
+        };
         let yielded_expr = super::try_construct_coroutine_state_expr(
             &leaf_sort,
             yield_is_zst,
             complete_is_zst,
             allow_complete_branch,
+            &mut mint,
         )
         .or_else(|| {
-            dcx.destination
-                .ty(self.body.locals())
-                .ok()
-                .map(|ty| self.resolve_body_ty(ty))
-                .and_then(Self::translate_ty)
-                .and_then(|sort| {
-                    super::try_construct_coroutine_state_expr(
-                        &sort,
-                        yield_is_zst,
-                        complete_is_zst,
-                        allow_complete_branch,
-                    )
-                })
+            dest_sort.and_then(|sort| {
+                super::try_construct_coroutine_state_expr(
+                    &sort,
+                    yield_is_zst,
+                    complete_is_zst,
+                    allow_complete_branch,
+                    &mut mint,
+                )
+            })
         });
         let Some(yielded_expr) = yielded_expr else {
             return false;

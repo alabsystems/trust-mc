@@ -10,6 +10,8 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use super::common::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_middle::ty::TypingEnv;
 
 const MONOMORPHIZED_LAYOUT_SOURCE: &str = r#"

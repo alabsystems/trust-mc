@@ -106,12 +106,46 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// The capacity a `RawVecGrowOne` call leaves. `grow_one` (one or two
+    /// arguments: `self` and, on `RawVecInner`, the element layout) is
+    /// `grow_amortized(cap, 1)` (`shared::vec_capacity`); it was `cap + 1`, so
+    /// a push past a full Vec left one free slot where std doubles. The stub
+    /// also stands for `reserve_exact` and `grow_amortized` (`self`, `len`,
+    /// `additional`, ...), which take different rules and which it does not
+    /// tell apart, so their grown capacity is a fresh value of at least
+    /// `len + additional` (`vec_fresh_grown_cap`). It was the exact
+    /// requirement for both (walker fail-closed review, round 2 of the repair
+    /// after the merge with main).
+    fn rawvec_grown_cap(
+        &mut self,
+        cx: &ChcCallContext<'_>,
+        coll_local: usize,
+        len: &Expr,
+        cap: &Expr,
+        extra_constraints: &mut Vec<Expr>,
+    ) -> Expr {
+        if cx.args.len() >= 3 {
+            let additional = self
+                .translate_operand_with_modified(&cx.args[2], cx.modified_locals)
+                .unwrap_or_else(|| Expr::bitvec_const(1u64, POINTER_WIDTH));
+            let required_cap = len.clone().bvadd(additional);
+            return self.vec_fresh_grown_cap(cap, &required_cap, extra_constraints);
+        }
+        let required_cap = cap.clone().bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
+        self.vec_reserved_cap(
+            Some(self.body.locals()[coll_local].ty),
+            cap,
+            &required_cap,
+            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            extra_constraints,
+        )
+    }
+
     /// Model capacity growth for RawVecGrowOne on the parent Vec (Part of #2877).
     ///
     /// Resolves `args[0]` through ref_targets to find the parent Vec state var.
     /// If found and it has `fld_cap`, updates capacity:
-    /// - 3 args (reserve_exact/grow_amortized): `new_cap = ite(cap < len + additional, len + additional, cap)`
-    /// - 1 arg (grow_one): `new_cap = cap + 1`
+    /// as `rawvec_grown_cap` says.
     ///
     /// Falls back to no-op (sound over-approximation) when the parent Vec
     /// cannot be resolved.
@@ -148,16 +182,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let cap = self.flattened_local_field_expr(coll_local, 2, cx.modified_locals);
             let data = self.flattened_local_field_expr(coll_local, 3, cx.modified_locals);
             if let (Some(ptr), Some(len), Some(cap), Some(data)) = (ptr, len, cap, data) {
-                let new_cap = if cx.args.len() >= 3 {
-                    let additional = self
-                        .translate_operand_with_modified(&cx.args[2], cx.modified_locals)
-                        .unwrap_or_else(|| Expr::bitvec_const(1u64, POINTER_WIDTH));
-                    let required_cap = len.clone().bvadd(additional);
-                    let grow_needed = cap.clone().bvult(required_cap.clone());
-                    Expr::ite(grow_needed, required_cap, cap)
-                } else {
-                    cap.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH))
-                };
+                let new_cap = self.rawvec_grown_cap(cx, coll_local, &len, &cap, extra_constraints);
                 let projected_update = ProjectedVecUpdate { ptr, len, cap: new_cap, data };
                 if self.constrain_projected_vec_fields_for_rawvec_call(
                     coll_local,
@@ -207,21 +232,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         let ChcVecFields { vec_sort, ptr, len, cap, data } = fields;
 
-        // Compute new capacity based on argument count.
-        // reserve_exact/grow_amortized: 3 args (self, len, additional)
-        // grow_one: 1 arg (self)
-        let new_cap = if cx.args.len() >= 3 {
-            // reserve_exact(self, len, additional): new_cap = max(cap, len + additional)
-            let additional = self
-                .translate_operand_with_modified(&cx.args[2], cx.modified_locals)
-                .unwrap_or_else(|| Expr::bitvec_const(1u64, POINTER_WIDTH));
-            let required_cap = len.clone().bvadd(additional);
-            let grow_needed = cap.clone().bvult(required_cap.clone());
-            Expr::ite(grow_needed, required_cap, cap)
-        } else {
-            // grow_one: new_cap = cap + 1
-            cap.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH))
-        };
+        let new_cap = self.rawvec_grown_cap(cx, coll_local, &len, &cap, extra_constraints);
 
         if let Some((out_name, out_sort)) =
             self.state_var_mgr.output_state_vars.get(vec_idx).cloned()

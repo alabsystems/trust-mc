@@ -25,8 +25,22 @@ pub(super) fn try_codegen_box_drop(
     target: usize,
     tctx: &TransitionContext<'_>,
 ) -> bool {
-    if !drop_ty.is_some_and(ChcCtx::is_box_ty) {
+    if !drop_ty.is_some_and(|ty| matches!(ty.kind(),rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def,_)) if def.is_box())) {
         return false;
+    }
+    if crate::codegen_ay::shared::native_box_raw::native_bmc_has_custom_global_allocator(ctx.tcx) {
+        ctx.record_sound_fallback_reason("box_drop_custom_global_allocator_unmodeled");
+        return false;
+    }
+
+    if let Some(ty) = drop_ty {
+        use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+        if let TyKind::RigidTy(RigidTy::Adt(_, args)) = ty.kind()
+            && matches!(args.0.first(), Some(GenericArgKind::Type(inner)) if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))))
+        {
+            super::native_box::codegen_native_dyn_box_drop(ctx, place, ty, target, tctx);
+            return true;
+        }
     }
 
     // Fix #2736: Emit Box dealloc safety checks at ALL track levels.
@@ -38,41 +52,44 @@ pub(super) fn try_codegen_box_drop(
         return true;
     }
 
-    let local_idx: usize = place.local;
-    // Fix #2745: drop places can be assigned earlier in the same block
-    // (`_tmp = move _box; drop(_tmp)`). Use the modified-place translation so
-    // dealloc checks see the post-statement value, not the unconstrained block input.
-    let ptr_expr =
-        if place.projection.is_empty() && ctx.flatten.flattened_tuple_locals.contains(&local_idx) {
-            // Box<T> locals are flattened. Drop(Box) only needs the pointer slot,
-            // so bypass generic bare-read translation to avoid spurious
-            // place_translation_drop diagnostics on the deallocation path.
-            ctx.flattened_local_field_expr(local_idx, 0, tctx.modified_locals)
-        } else {
-            ctx.translate_place_with_modified(place, tctx.modified_locals)
+    // This shortcut deallocates only. A real pointee destructor or a user's
+    // allocator can change observable state, so leave those to their actual
+    // body/refusal path even when a MIR producer bypassed preprocessing.
+    if !drop_ty.is_some_and(|ty| {
+        crate::codegen_ay::shared::native_box_raw::native_bmc_box_drop_is_modeled(ctx.tcx, ty)
+    }) {
+        return false;
+    }
+
+    let Some(checked) = ctx.checked_host_native_thin_box_drop(place) else {
+        ctx.record_sound_fallback_reason("native_box_drop_allocation_origin_unmodeled");
+        return false;
+    };
+    let known_alloc_id = ChcCtx::try_extract_constant_addr(&checked.value).map(|(id, _)| id);
+    if ctx.memory_safety_checks {
+        for check in checked.checks {
+            ctx.emit_error_rule_for_condition_shared(
+                tctx.from_app,
+                check,
+                tctx.shared_constraints,
+                tctx.bb_idx,
+            );
         }
-        .or_else(|| {
-            let drop_vec_idx = ctx.try_state_idx_for_local(local_idx)?;
-            ctx.state_var_mgr
-                .state_vars
-                .get(drop_vec_idx)
-                .map(|(var_name, var_sort)| Expr::var(&**var_name, var_sort.clone()))
-        });
-    let known_alloc_id = traced_alloc_id_for_unprojected_drop_place(ctx, place);
-    let ptr_expr =
-        ptr_expr.or_else(|| known_alloc_id.map(rust_dealloc_base_ptr_for_known_alloc_id));
-    if let Some(ptr_expr) = ptr_expr
-        && ctx.emit_box_dealloc_transition(
-            tctx.bb_idx,
-            tctx.from_app,
-            target,
-            ptr_expr,
-            known_alloc_id,
-            tctx.shared_constraints,
-            tctx.modified_locals,
-        )
-    {
-        debug!(bb_idx = tctx.bb_idx, local_idx, "CHC: Drop(Box) → dealloc with double-free check");
+    }
+    if ctx.emit_box_dealloc_transition(
+        tctx.bb_idx,
+        tctx.from_app,
+        target,
+        checked.value,
+        known_alloc_id,
+        tctx.shared_constraints,
+        tctx.modified_locals,
+    ) {
+        debug!(
+            bb_idx = tctx.bb_idx,
+            local_idx = place.local,
+            "CHC: native Drop(Box) with authenticated birth and exact allocator layout"
+        );
         return true;
     }
 
@@ -131,7 +148,6 @@ pub(in crate::codegen_ay::chc) fn collect_box_dyn_dealloc_effects(
     pending_updates
         .push(obj_valid_out.eq(obj_valid_in.store(obj_id_expr, Expr::bool_const(false))));
     pending_updates.push(obj_size_out.eq(obj_size_in));
-    ctx.mark_heap_metadata_modified();
 
     Some(BoxDynDeallocEffects {
         bv_ptr,
@@ -225,18 +241,6 @@ fn try_codegen_box_dyn_drop(
         return;
     }
 
-    // Try concrete type resolution via MIR Unsize coercion (#4097 D2).
-    if try_concrete_box_dyn_drop(
-        ctx,
-        place,
-        &dealloc_effects.bv_ptr,
-        &dealloc_effects.pending_updates,
-        target,
-        tctx,
-    ) {
-        return;
-    }
-
     // Inner drop dispatch failed — fall back to dealloc-only.
     emit_box_dyn_dealloc_only_fallback(
         ctx,
@@ -260,81 +264,6 @@ fn extract_box_inner_ty(box_ty: rustc_public::ty::Ty) -> Option<rustc_public::ty
     }
 }
 
-/// Try resolving the concrete type from Unsize coercion and inline its drop.
-fn try_concrete_box_dyn_drop(
-    ctx: &mut ChcCtx<'_, '_>,
-    place: &rustc_public::mir::Place,
-    bv_ptr: &Expr,
-    dealloc_updates: &[Expr],
-    target: usize,
-    tctx: &TransitionContext<'_>,
-) -> bool {
-    use crate::codegen_ay::chc::call::inline_body::extract_inline_assert_guard;
-
-    let Some(concrete_ty) = find_concrete_source_for_box_dyn_local(ctx, place.local) else {
-        return false;
-    };
-    use rustc_public::mir::mono::Instance;
-    let drop_instance = Instance::resolve_drop_in_place(concrete_ty);
-    if drop_instance.is_empty_shim() {
-        return false;
-    }
-    let Some(body) = drop_instance.body() else {
-        return false;
-    };
-    let params = [bv_ptr.clone()];
-    ctx.register_callee_body_statics(&body);
-    ctx.mark_inline_field_reads(&body, &params, tctx.bb_idx);
-    let caller_vtable_ids = std::collections::HashMap::new();
-    let Some(inline_result) = crate::codegen_ay::chc::call::inline_body::translate_inline_body(
-        ctx,
-        &body,
-        &params,
-        tctx.bb_idx,
-        &caller_vtable_ids,
-        Some(drop_instance),
-        0,
-    ) else {
-        return false;
-    };
-    let inline_guard = extract_inline_assert_guard(&inline_result.value);
-    if let Some(guard) = &inline_guard {
-        ctx.emit_error_rule_for_condition_shared(
-            tctx.from_app,
-            guard.clone(),
-            tctx.shared_constraints,
-            tctx.bb_idx,
-        );
-    }
-    for check in ctx.heap_state.pending_checks.drain(..).collect::<Vec<_>>() {
-        ctx.emit_error_rule_for_condition_shared(
-            tctx.from_app,
-            check,
-            tctx.shared_constraints,
-            tctx.bb_idx,
-        );
-    }
-    let mut extra_constraints = Vec::new();
-    extra_constraints.append(&mut ctx.heap_state.pending_updates);
-    extra_constraints.append(&mut ctx.heap_state.drain_store_chains(&ctx.diagnostics));
-    extra_constraints.extend(inline_guard);
-    extra_constraints.extend_from_slice(dealloc_updates);
-    let new_output_args = ctx.build_block_output_args(tctx.modified_locals, None);
-    ctx.emit_goto_rule_extra(
-        tctx.from_app,
-        target,
-        &new_output_args,
-        tctx.shared_constraints,
-        extra_constraints,
-    );
-    debug!(
-        bb_idx = tctx.bb_idx,
-        ?concrete_ty,
-        "CHC: Drop(Box<dyn auto>) → concrete drop + dealloc (#4097 D2)"
-    );
-    true
-}
-
 /// Emit dealloc-only fallback when inner drop dispatch fails for Box<dyn T>.
 fn emit_box_dyn_dealloc_only_fallback(
     ctx: &mut ChcCtx<'_, '_>,
@@ -343,6 +272,16 @@ fn emit_box_dyn_dealloc_only_fallback(
     target: usize,
     tctx: &TransitionContext<'_>,
 ) {
+    let dealloc_updates =
+        super::effects::compose_box_deallocation_updates(ctx, &dealloc_updates).unwrap_or_default();
+    for check in ctx.heap_state.pending_checks.drain(..).collect::<Vec<_>>() {
+        ctx.emit_error_rule_for_condition_shared(
+            tctx.from_app,
+            check,
+            tctx.shared_constraints,
+            tctx.bb_idx,
+        );
+    }
     let new_output_args = ctx.build_block_output_args(tctx.modified_locals, None);
     ctx.emit_goto_rule_extra(
         tctx.from_app,
@@ -368,93 +307,47 @@ fn emit_box_dyn_dealloc_only_fallback(
     }
 }
 
-/// Part of #4097 D2: Find the concrete source type for a Box<dyn AutoTrait> local
-/// by scanning the MIR body for Unsize coercion assignments.
-///
-/// For `_N: Box<dyn Send> = Box::new(Concrete{})`, the MIR contains an
-/// Unsize cast `_N = move _M as Box<dyn Send>` where `_M: Box<Concrete>`.
-/// This function traces the assignment chain to find `Concrete`.
-///
-/// Also follows Move/Copy chains: if `_dropped = move _N` and `_N` was
-/// the Unsize cast target, we follow through.
-///
-/// For nested dyn chains (`Box<Box<dyn Send>>` unsized to `Box<dyn Send>`),
-/// the Unsize source is itself `Box<dyn T>`. In that case, recursively trace
-/// the source operand's local to find the original concrete type.
+/// Compiler-only inspection for native Unsize producers. It never supplies
+/// runtime allocation/destructor authority (the exact native origin does).
+#[cfg(test)]
 pub(super) fn find_concrete_source_for_box_dyn_local(
-    ctx: &crate::codegen_ay::chc::ChcCtx<'_, '_>,
-    local_idx: usize,
-) -> Option<rustc_public::ty::Ty> {
-    find_concrete_source_for_box_dyn_local_depth(ctx, local_idx, 8)
-}
-
-fn find_concrete_source_for_box_dyn_local_depth(
-    ctx: &crate::codegen_ay::chc::ChcCtx<'_, '_>,
-    local_idx: usize,
-    depth_remaining: usize,
+    ctx: &ChcCtx<'_, '_>,
+    local: usize,
 ) -> Option<rustc_public::ty::Ty> {
     use rustc_public::mir::{CastKind, Operand, PointerCoercion, Rvalue, StatementKind};
-    use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
-
-    if depth_remaining == 0 {
-        return None;
-    }
-
-    // Check for direct Unsize cast to this local.
-    for bb in &ctx.body.blocks {
-        for stmt in &bb.statements {
-            if let StatementKind::Assign(place, rhs) = &stmt.kind
-                && place.local == local_idx
-            {
-                match rhs {
-                    Rvalue::Cast(
-                        CastKind::PointerCoercion(PointerCoercion::Unsize),
-                        operand,
-                        _,
-                    ) => {
-                        let src_ty = operand.ty(ctx.body.locals()).ok()?;
-                        // Extract T from Box<T>.
-                        if let TyKind::RigidTy(RigidTy::Adt(_, args)) = src_ty.kind() {
-                            let inner_ty = args.0.first().and_then(|ga| match ga {
-                                GenericArgKind::Type(t) => Some(*t),
-                                _ => None,
-                            })?;
-                            // If the inner type is itself dyn (nested dyn chain),
-                            // trace through the source operand to find the original
-                            // concrete type.
-                            if matches!(inner_ty.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
-                                if let Operand::Copy(src) | Operand::Move(src) = operand
-                                    && src.projection.is_empty()
-                                    && src.local != local_idx
-                                {
-                                    return find_concrete_source_for_box_dyn_local_depth(
-                                        ctx,
-                                        src.local,
-                                        depth_remaining - 1,
-                                    );
-                                }
-                                return None;
-                            }
-                            return Some(inner_ty);
-                        }
-                        return None;
-                    }
-                    // Follow Move/Copy chains.
-                    Rvalue::Use(Operand::Move(src) | Operand::Copy(src))
-                        if src.projection.is_empty() =>
-                    {
-                        let src_local: usize = src.local;
-                        if src_local != local_idx {
-                            return find_concrete_source_for_box_dyn_local_depth(
-                                ctx,
-                                src_local,
-                                depth_remaining - 1,
-                            );
-                        }
-                    }
-                    _ => {}
+    let mut seen = std::collections::HashSet::new();
+    let mut next = local;
+    for _ in 0..32 {
+        if !seen.insert(next) {
+            return None;
+        }
+        let mut definitions =
+            ctx.body.blocks.iter().flat_map(|block| &block.statements).filter_map(|statement| {
+                match &statement.kind {
+                    StatementKind::Assign(place, rhs) if place.local == next => Some((place, rhs)),
+                    _ => None,
                 }
+            });
+        let (destination, rhs) = definitions.next()?;
+        if !destination.projection.is_empty() || definitions.next().is_some() {
+            return None;
+        }
+        match rhs {
+            Rvalue::Use(Operand::Copy(source) | Operand::Move(source), ..)
+                if source.projection.is_empty() =>
+            {
+                next = source.local
             }
+            Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize), source, target) => {
+                crate::codegen_ay::shared::native_box_drop::native_global_box_pointee(
+                    ctx.tcx, *target,
+                )?;
+                let ty = source.ty(ctx.body.locals()).ok()?;
+                return crate::codegen_ay::shared::native_box_drop::native_global_box_pointee(
+                    ctx.tcx, ty,
+                );
+            }
+            _ => return None,
         }
     }
     None

@@ -742,7 +742,8 @@ fn test_coerce_eq_datatype_slice_to_array_extracts_fld_data() {
     let constraint = result.unwrap();
     let text = constraint.to_string();
     assert!(
-        text.contains("fld_data") || text.contains("const_array") || text.contains("select"),
+        // ay folds fld_data over the constructor (8a7c063209): the array itself appears.
+        text.contains("fld_data") || text.contains("const_array") || text.contains("select") || text.contains("(as const"),
         "constraint should reference fld_data extraction, got: {text}"
     );
 }

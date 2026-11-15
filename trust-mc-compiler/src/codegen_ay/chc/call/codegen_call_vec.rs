@@ -160,6 +160,11 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
         debug!("vec_core_stub stub={:?} dest={}", stub, dest_local);
         let mut extra_constraints: Vec<Expr> = Vec::new();
         let mut extra_dests: Vec<usize> = Vec::new();
+        // The "capacity overflow" panic of `Vec::extend` from a range, stated
+        // as a check before the length update that assumes it.
+        let mut extend_capacity_check: Option<Expr> = None;
+        // `Vec::split_off`'s panic when `at > len`, stated the same way.
+        let mut split_off_bounds_check: Option<Expr> = None;
 
         // Resolve collection local for length tracking (args[0] is &self for most methods)
         let collection_local = self.resolve_collection_local(args);
@@ -234,7 +239,13 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                 );
             }
             StubKind::VecReserve | StubKind::VecReserveExact => {
+                use crate::codegen_ay::shared::vec_capacity::VecGrowth;
                 self.vec_op_reserve(
+                    if stub == StubKind::VecReserveExact {
+                        VecGrowth::Exact
+                    } else {
+                        VecGrowth::Amortized
+                    },
                     args,
                     modified_locals,
                     collection_local,
@@ -321,9 +332,11 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                 );
             }
             StubKind::VecAsPtr | StubKind::VecAsMutPtr => {
+                let field_projections = self.resolve_collection_field_projections(args);
                 self.vec_op_as_ptr(
                     modified_locals,
                     collection_local,
+                    &field_projections,
                     dest_local,
                     &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
                 );
@@ -362,6 +375,18 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                     &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
                 );
             }
+            StubKind::VecExtendFromSlice | StubKind::VecExtendRange
+                if args.get(1).and_then(|op| op.ty(self.body.locals()).ok()).is_some_and(|ty| {
+                    !crate::codegen_ay::reduce_loop_rule::extend_source_is_modelled(ty)
+                }) =>
+            {
+                // An adapter source (`map`, `filter`, `take`, a user iterator):
+                // the models read only the sequence underneath, never the
+                // adapter's closure or its element count
+                // (`reduce_loop_rule::extend_source_is_modelled`).
+                debug!(?stub, "Vec extend from an adapter the models do not read — fail closed");
+                self.record_sound_fallback_reason("vec_extend_adapter_unmodelled");
+            }
             StubKind::VecExtendFromSlice | StubKind::VecExtendRange => {
                 // Part of #3607 D3: detect Range argument type at dispatch time.
                 // `<Vec as Extend<T>>::extend` resolves to VecExtendFromSlice by
@@ -376,7 +401,7 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                     })
                     .unwrap_or(false);
                 if is_range || matches!(stub, StubKind::VecExtendRange) {
-                    self.vec_op_extend_range(
+                    extend_capacity_check = self.vec_op_extend_range(
                         args,
                         modified_locals,
                         collection_local,
@@ -483,7 +508,7 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
             }
             // Part of #4135: Vec::split_off(at) -> Vec<T>.
             StubKind::VecSplitOff => {
-                self.vec_op_split_off(
+                split_off_bounds_check = self.vec_op_split_off(
                     args,
                     modified_locals,
                     collection_local,
@@ -552,6 +577,59 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
         // Emitting error rules for stack-local writes adds spurious reachability
         // to error state. Clear instead of emit. Part of #3359.
         self.heap_state.pending_checks.clear();
+
+        // The closure `retain`, `dedup_by(_key)` and `sort_by(_key)` run on
+        // the elements is never walked: the models only constrain the
+        // result. A closure that can carry an obligation (an `assert!`, an
+        // overflowing add) lost it, and `v.retain(|x| { assert!(*x < 200);
+        // true })` verified clean where Kani fails (walker fail-closed review 6
+        // round 3, `h17_retain_bug`, `h18_sort_by_key_bug`). Such a closure
+        // gets an uncertified reach check wherever the call is reached.
+        if matches!(stub, StubKind::VecRetain | StubKind::VecDedup | StubKind::VecSort)
+            && super::codegen_call_iterator_adapter::closure_arg_may_carry_obligation(self, args)
+        {
+            let t = super::codegen_call_virtual_inline::uncertified_check::uncertified_reach_check(
+                self,
+                super::codegen_call_virtual_inline::uncertified_check::VEC_CLOSURE_STEP_UNCERTIFIED,
+            );
+            let check = super::inline_body::DeferredInlineCheck {
+                check: t,
+                kind: trust_mc_core::violation::PropertyKind::Assertion,
+                message: Some(format!(
+                    "a closure `{stub:?}` runs on the elements can fail its checks (not \
+                     replayed by the CHC encoder)"
+                )),
+                write_mark: self.heap_state.write_mark(),
+                merge_key: None,
+            };
+            let mut body: Vec<Expr> = stmt_constraints.to_vec();
+            body.extend(extra_constraints.iter().cloned());
+            self.emit_deferred_inline_checks_at(from_app, &body, target, vec![check]);
+        }
+
+        // The condition reads the call's entry state only, so it is posed on
+        // the statement constraints alone: the length update's constraints
+        // assume it.
+        if let Some(no_panic) = extend_capacity_check {
+            let check = super::inline_body::DeferredInlineCheck {
+                check: no_panic,
+                kind: trust_mc_core::violation::PropertyKind::Assertion,
+                message: Some("capacity overflow".to_string()),
+                write_mark: self.heap_state.write_mark(),
+                merge_key: None,
+            };
+            self.emit_deferred_inline_checks_at(from_app, stmt_constraints, target, vec![check]);
+        }
+        if let Some(no_panic) = split_off_bounds_check {
+            let check = super::inline_body::DeferredInlineCheck {
+                check: no_panic,
+                kind: trust_mc_core::violation::PropertyKind::Assertion,
+                message: Some("`at` split index should be <= len".to_string()),
+                write_mark: self.heap_state.write_mark(),
+                merge_key: None,
+            };
+            self.emit_deferred_inline_checks_at(from_app, stmt_constraints, target, vec![check]);
+        }
 
         let new_output_args = self.build_output_args(modified_locals, &extra_dests);
         self.emit_goto_rule_extra(

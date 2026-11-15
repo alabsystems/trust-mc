@@ -3,7 +3,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
 use super::*;
+use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation};
 use crate::test_support::test_result;
+use std::borrow::Cow;
 use std::fs;
 use tempfile::TempDir;
 
@@ -190,6 +192,120 @@ fn test_proof_qualifiers_marker_omits_kani_mem_overapprox_success_qualifier() {
         proof_qualifiers_marker(&result).as_deref(),
         Some("[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule,sound_fallback=2]")
     );
+}
+
+fn anonymous_chc_check(status: CheckStatus) -> Property {
+    Property {
+        description: Cow::Borrowed("CHC verification: error unreachable (ay-chc)"),
+        property_id: PropertyId { fn_name: None, class: Cow::Borrowed("chc"), id: 0 },
+        source_location: RawSourceLocation { column: None, file: None, function: None, line: None },
+        status,
+        trace: None,
+    }
+}
+
+fn attributed_check(class: &'static str, status: CheckStatus) -> Property {
+    Property {
+        description: Cow::Borrowed("assertion failed: a + b < 200"),
+        property_id: PropertyId {
+            fn_name: Some("check".to_string()),
+            class: Cow::Borrowed(class),
+            id: 1,
+        },
+        source_location: RawSourceLocation {
+            column: Some("5".to_string()),
+            file: Some("pass.rs".to_string()),
+            function: Some("check".to_string()),
+            line: Some("9".to_string()),
+        },
+        status,
+        trace: None,
+    }
+}
+
+/// T1 first green: a CHC proof whose only check is the anonymous `chc.0` fallback names no
+/// property, which is how a bypassed `assert!` override went unnoticed. It must not read
+/// as a clean proof.
+#[test]
+fn test_proof_qualifiers_marker_names_a_success_with_only_the_anonymous_chc_check() {
+    let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+    result.results = vec![anonymous_chc_check(CheckStatus::Success)];
+
+    assert_eq!(
+        proof_qualifiers_marker(&result).as_deref(),
+        Some("[AY:PROOF_QUALIFIERS:unattributed_check=chc.0]")
+    );
+    assert_eq!(reported_proof_qualifiers(&result), vec![UNATTRIBUTED_CHC_CHECK_QUALIFIER]);
+}
+
+#[test]
+fn test_proof_qualifiers_marker_ignores_covers_next_to_the_anonymous_chc_check() {
+    let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+    result.results = vec![
+        anonymous_chc_check(CheckStatus::Success),
+        attributed_check("cover", CheckStatus::Satisfied),
+    ];
+    result.proof_qualifiers.push("trivial_safe=no_error_rule".to_string());
+    result.sound_fallback_count = 1;
+
+    assert_eq!(
+        proof_qualifiers_marker(&result).as_deref(),
+        Some(
+            "[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule,unattributed_check=chc.0,sound_fallback=1]"
+        )
+    );
+}
+
+/// V7: a `should_panic` harness cannot stand on the anonymous `chc.0` check. It names no
+/// property, so it cannot show the failure was a panic (the parity-1 review's
+/// `sp_abort_refuted` / `sp_unreachable_unchecked_refuted` printed "encountered one or more
+/// panics as expected" resting on it alone).
+#[test]
+fn test_should_panic_rests_on_unattributed_chc_check_only_when_every_failure_is_anonymous() {
+    let mut result = test_result(VerificationStatus::Failure, FailedProperties::PanicsOnly);
+    result.results = vec![anonymous_chc_check(CheckStatus::Failure)];
+    assert!(should_panic_rests_on_unattributed_chc_check(&result));
+
+    // A cover beside it does not attribute the failure.
+    result.results.push(attributed_check("cover", CheckStatus::Satisfied));
+    assert!(should_panic_rests_on_unattributed_chc_check(&result));
+
+    // A registered panic property does.
+    result.results = vec![attributed_check("assertion", CheckStatus::Failure)];
+    assert!(!should_panic_rests_on_unattributed_chc_check(&result));
+
+    // Mixed: one attributed and one anonymous failure is not "resting only on chc.0".
+    result.results = vec![
+        attributed_check("assertion", CheckStatus::Failure),
+        anonymous_chc_check(CheckStatus::Failure),
+    ];
+    assert!(!should_panic_rests_on_unattributed_chc_check(&result));
+
+    // No failing check at all.
+    result.results = vec![anonymous_chc_check(CheckStatus::Success)];
+    assert!(!should_panic_rests_on_unattributed_chc_check(&result));
+}
+
+#[test]
+fn test_proof_qualifiers_marker_stays_clean_for_attributed_checks() {
+    let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+    result.results = vec![attributed_check("assertion", CheckStatus::Success)];
+    assert_eq!(proof_qualifiers_marker(&result).as_deref(), Some("[AY:PROOF_QUALIFIERS:clean]"));
+
+    // No checks at all is the no-checks gate's business, not this qualifier's.
+    result.results.clear();
+    assert_eq!(unattributed_chc_check_qualifier(&result), None);
+}
+
+#[test]
+fn test_unattributed_chc_check_leaves_failed_results_unqualified() {
+    let mut result = test_result(VerificationStatus::Failure, FailedProperties::PanicsOnly);
+    result.results = vec![anonymous_chc_check(CheckStatus::Failure)];
+
+    assert_eq!(unattributed_chc_check_qualifier(&result), None);
+    assert_eq!(proof_qualifiers_marker(&result), None);
+    assert!(reported_proof_qualifiers(&result).is_empty());
+    assert_eq!(result.status, VerificationStatus::Failure);
 }
 
 #[test]
@@ -417,6 +533,70 @@ mod task78 {
     use std::borrow::Cow;
     use std::collections::HashMap;
 
+    /// Matching typed slice of the retained native Parity-array observation:
+    /// two fail-closed drops, two accounted return havocs, incomplete identity
+    /// and no per-site properties. Raw SAT is not a concrete source CEX.
+    #[test]
+    fn typed_custom_comparison_drop_stays_uncertified() {
+        use crate::ctrex_classify::classify_ctrex;
+        use crate::project::Project;
+        use crate::test_support::{test_harness, test_metadata};
+        use crate::unsoundness_counts::UnsoundnessCounts;
+        use crate::verification_result::CtrexCategory;
+        use trust_mc_metadata::ChcTranslationDropInfo;
+
+        let name = "probe_custom_eq_array";
+        let harness = test_harness("captured::probe_custom_eq_array", "captured");
+        let mut metadata = test_metadata("captured", None, None);
+        metadata.proof_harnesses.push(harness.clone());
+        metadata.chc_translation_drops = Some(ChcTranslationDropInfo {
+            place_count: 2,
+            per_harness: [(name.to_string(), 2)].into(),
+            sound_havoc_count: 2,
+            sound_havoc_per_harness: [(name.to_string(), 2)].into(),
+            ..Default::default()
+        });
+        let mut project = Project::default();
+        project.metadata.push(metadata);
+        let counts = UnsoundnessCounts::from_project(&project).get_for_crate("captured");
+        let CtrexCategory::OverApproximation { categories } = classify_ctrex(&harness, &counts)
+        else {
+            panic!("actual typed translation drops must not certify a source counterexample")
+        };
+        assert_eq!(categories.len(), 2);
+        assert!(categories.contains(&"chc_translation_drop=2".to_string()));
+        assert!(categories.contains(&"chc_sound_havoc_drop=2".to_string()));
+        assert!(!super::ctrex_certifiable_genuine(&categories, &evidence(false, 2, &[]), &[]));
+
+        // Even fabricated independence and a matching event count cannot
+        // erase the compiler's actual incomplete-identity refusal.
+        assert!(!super::ctrex_certifiable_genuine(
+            &categories,
+            &evidence(false, 4, &[(3, Some(false))]),
+            &[failing_error_p(3)],
+        ));
+    }
+
+    /// The paired native false primitive assertion has complete identity and
+    /// no drops. The real classifier must retain its concrete counterexample,
+    /// so a blanket refusal cannot satisfy the preceding negative control.
+    #[test]
+    fn typed_complete_false_assertion_is_a_genuine_counterexample() {
+        use crate::ctrex_classify::classify_ctrex;
+        use crate::project::Project;
+        use crate::test_support::{test_harness, test_metadata};
+        use crate::unsoundness_counts::UnsoundnessCounts;
+        use crate::verification_result::CtrexCategory;
+
+        let harness = test_harness("captured::probe_eq_real_counterexample", "captured");
+        let mut metadata = test_metadata("captured", None, None);
+        metadata.proof_harnesses.push(harness.clone());
+        let mut project = Project::default();
+        project.metadata.push(metadata);
+        let counts = UnsoundnessCounts::from_project(&project).get_for_crate("captured");
+        assert_eq!(classify_ctrex(&harness, &counts), CtrexCategory::Genuine);
+    }
+
     fn failing_error_p(id: u32) -> Property {
         Property {
             description: Cow::Borrowed("assertion failed"),
@@ -442,13 +622,141 @@ mod task78 {
             accounted,
             approximated_vars: vec!["_freed".to_string()],
             dependent_by_id: deps.iter().copied().collect::<HashMap<u32, Option<bool>>>(),
+            relation_by_id: deps.iter().map(|(id, _)| (*id, format!("error_p{id}"))).collect(),
         }
+    }
+
+    /// kani/Intrinsics/FastMath/add_overflow_f32.rs as emitted at 9e086301c
+    /// (relations renamed): `error_p6`/`error_p7` are the operand-finiteness
+    /// checks, and a result check over the table value is added as `error_p8`.
+    const FAST_ADD_CHC: &str = r#"
+(set-logic HORN)
+(declare-var x (_ BitVec 32))
+(declare-var y (_ BitVec 32))
+(declare-var z (_ BitVec 32))
+(declare-var z__out (_ BitVec 32))
+(declare-var float_binop_tbl_f32 (Array (_ BitVec 72) (_ BitVec 32)))
+(declare-rel bb0 ((_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (Array (_ BitVec 72) (_ BitVec 32))))
+(declare-rel bb2 ((_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (Array (_ BitVec 72) (_ BitVec 32))))
+(declare-rel bb3 ((_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (Array (_ BitVec 72) (_ BitVec 32))))
+(declare-rel error ())
+(declare-rel error_p6 ())
+(declare-rel error_p7 ())
+(declare-rel error_p8 ())
+(rule (=> true (bb0 x y z float_binop_tbl_f32)))
+(rule (=> (bb0 x y z float_binop_tbl_f32) (bb2 x y z float_binop_tbl_f32)))
+(rule (=> error_p6 error))
+(rule (=> (and (bb2 x y z float_binop_tbl_f32) (not (not (= ((_ extract 30 23) x) #xff)))) error_p6))
+(rule (=> error_p7 error))
+(rule (=> (and (bb2 x y z float_binop_tbl_f32) (not (not (= ((_ extract 30 23) y) #xff)))) error_p7))
+(rule (=> (and (bb2 x y z float_binop_tbl_f32) (= z__out (select float_binop_tbl_f32 (concat (concat #x00 x) y)))) (bb3 x y z__out float_binop_tbl_f32)))
+(rule (=> error_p8 error))
+(rule (=> (and (bb3 x y z float_binop_tbl_f32) (= ((_ extract 30 23) z) #xff)) error_p8))
+(query error)
+"#;
+
+    fn table_evidence(deps: &[(u32, Option<bool>)]) -> ApproximationEvidence {
+        ApproximationEvidence {
+            approximated_vars: vec![trust_mc_core::chc::FLOAT_BINOP_TABLE_F32.to_string()],
+            ..evidence(true, 1, deps)
+        }
+    }
+
+    /// T1 (row 72, FastMath): an operand-finiteness failure the dependence
+    /// analysis finds independent of the float table replays without it.
+    #[test]
+    fn table_independent_operand_failure_replays() {
+        let replay = super::float_table_ctrex_replay(
+            FAST_ADD_CHC,
+            &table_evidence(&[(6, Some(false)), (7, Some(false)), (8, Some(true))]),
+            &[failing_error_p(6)],
+        );
+        let summary = replay.expect("a table is freed").expect("error_p6 replays");
+        assert!(summary.contains("error_p6"), "{summary}");
+    }
+
+    /// The gate never trusts the dependence verdict alone: a check marked
+    /// independent that in fact reads the table value does not replay, so the
+    /// counterexample stays uncertified.
+    #[test]
+    fn table_dependent_failure_does_not_replay_even_if_marked_independent() {
+        let replay = super::float_table_ctrex_replay(
+            FAST_ADD_CHC,
+            &table_evidence(&[(6, Some(false)), (7, Some(false)), (8, Some(false))]),
+            &[failing_error_p(8)],
+        );
+        assert!(replay.expect("a table is freed").is_err());
+    }
+
+    /// No violated independent check, or no table freed at all.
+    #[test]
+    fn table_replay_gate_scope() {
+        let replay = super::float_table_ctrex_replay(
+            FAST_ADD_CHC,
+            &table_evidence(&[(6, Some(true))]),
+            &[failing_error_p(6)],
+        );
+        assert!(replay.expect("a table is freed").is_err(), "a dependent check is never replayed");
+        assert!(
+            super::float_table_ctrex_replay(
+                FAST_ADD_CHC,
+                &evidence(true, 1, &[(6, Some(false))]),
+                &[failing_error_p(6)],
+            )
+            .is_none(),
+            "the gate applies only when a float-binop table is freed"
+        );
     }
 
     /// The taint shape shared by every unhandled-indirect-call harness: one
     /// SoundFallback event bumps both `chc_translation_drop` AND `unhandled_calls`.
     fn unhandled_call_taint() -> Vec<String> {
         vec!["chc_translation_drop=1".to_string(), "unhandled_calls=1".to_string()]
+    }
+
+    fn failing_check(description: &'static str) -> Property {
+        Property { description: Cow::Borrowed(description), ..failing_error_p(0) }
+    }
+
+    /// BMC lane (no error_p properties in the artifact): a counterexample whose
+    /// only taint is `offset_provenance_unresolved` certifies Genuine when no
+    /// failing check is a same-allocation obligation, and stays tainted when one
+    /// is, when another taint rides along, or when the artifact is a CHC one.
+    #[test]
+    fn bmc_offset_only_taint_certifies_off_the_same_allocation_family() {
+        let offset = vec!["offset_provenance_unresolved=2".to_string()];
+        let bmc = evidence(true, 0, &[]);
+        assert!(super::bmc_offset_only_ctrex_is_genuine(
+            &offset,
+            &bmc,
+            &[failing_check("assertion failed: *before == 2")],
+        ));
+        assert!(!super::bmc_offset_only_ctrex_is_genuine(
+            &offset,
+            &bmc,
+            &[
+                failing_check("assertion failed: offset != 0"),
+                failing_check(
+                    "Offset result and original pointer should point to the same allocation"
+                ),
+            ],
+        ));
+        let mixed = vec![
+            "offset_provenance_unresolved=1".to_string(),
+            "chc_sound_havoc_drop=1".to_string(),
+        ];
+        assert!(!super::bmc_offset_only_ctrex_is_genuine(
+            &mixed,
+            &bmc,
+            &[failing_check("assertion failed: x == 1")],
+        ));
+        let chc = evidence(true, 0, &[(3, Some(false))]);
+        assert!(!super::bmc_offset_only_ctrex_is_genuine(
+            &offset,
+            &chc,
+            &[failing_check("assertion failed: x == 1")],
+        ));
+        assert!(!super::bmc_offset_only_ctrex_is_genuine(&offset, &bmc, &[]));
     }
 
     /// dual_77_independent: complete plumbing, violated `error_p3` is data
@@ -481,6 +789,20 @@ mod task78 {
     fn incomplete_identity_stays_tainted() {
         // Two chc_translation_drops but only one accounted: effective = (2+1)−1 = 2 != 1.
         let taint = vec!["chc_translation_drop=2".to_string(), "unhandled_calls=1".to_string()];
+        assert!(!super::ctrex_certifiable_genuine(
+            &taint,
+            &evidence(true, 1, &[(3, Some(false))]),
+            &[failing_error_p(3)],
+        ));
+    }
+
+    /// An unstubbed abstraction frees a value the compiler never accounts, so
+    /// it blocks certification even when the counts coincide: one unstubbed
+    /// abstraction against one accounted havoc of a different event
+    /// (unstubbed_abstraction_safe.rs, decision REDS-REST).
+    #[test]
+    fn unstubbed_abstraction_blocks_certification_whatever_the_counts() {
+        let taint = vec!["unstubbed_abstraction=1".to_string()];
         assert!(!super::ctrex_certifiable_genuine(
             &taint,
             &evidence(true, 1, &[(3, Some(false))]),
@@ -561,4 +883,205 @@ mod task78 {
             &[failing_error_p(1)],
         ));
     }
+}
+
+fn no_checks_test_property() -> crate::property_model::Property {
+    crate::property_model::Property {
+        description: std::borrow::Cow::Borrowed("test assertion"),
+        property_id: crate::property_model::PropertyId {
+            fn_name: Some("h".to_string()),
+            class: std::borrow::Cow::Borrowed("assertion"),
+            id: 1,
+        },
+        source_location: crate::property_model::RawSourceLocation {
+            column: None,
+            file: None,
+            function: None,
+            line: None,
+        },
+        status: crate::property_model::CheckStatus::Success,
+        trace: None,
+    }
+}
+
+/// A success over an EMPTY obligation set is refused — the verdict
+/// `a_harness_with_no_checks_is_inconclusive_not_proved` pins end to end.
+#[test]
+fn no_checks_gate_refuses_a_success_with_no_obligations() {
+    let result = test_result(VerificationStatus::Success, FailedProperties::None);
+    assert!(result.results.is_empty());
+    assert!(no_checks_gate_fires(&result, false));
+}
+
+#[test]
+fn no_checks_gate_leaves_real_checks_failures_and_should_panic_alone() {
+    let mut proved = test_result(VerificationStatus::Success, FailedProperties::None);
+    proved.results.push(no_checks_test_property());
+    assert!(!no_checks_gate_fires(&proved, false), "a real proof must not be refused");
+
+    let failed = test_result(VerificationStatus::Failure, FailedProperties::Other);
+    assert!(!no_checks_gate_fires(&failed, false), "already failed closed");
+
+    let should_panic = test_result(VerificationStatus::Success, FailedProperties::None);
+    assert!(!no_checks_gate_fires(&should_panic, true), "should_panic verdicts are panic-shaped");
+}
+
+/// Both wordings carry the tag that kani-domination, the CLI tests and the
+/// expected files key on; only the certified one names the qualifier the
+/// verdict carries, and only the uncertified one says an obligation may have
+/// been dropped.
+#[test]
+fn no_checks_marker_keeps_the_tag_for_both_causes() {
+    for certified in [true, false] {
+        let marker = no_checks_marker("h", certified);
+        assert!(
+            marker.starts_with(
+                "[AY:VACUOUS:no-checks] h: the harness produced no verification conditions"
+            ),
+            "{marker}"
+        );
+    }
+    let certified = no_checks_marker("h", true);
+    assert!(certified.contains(OBLIGATION_FREE_CERTIFIED_QUALIFIER), "{certified}");
+    assert!(certified.contains("never as a clean proof"), "{certified}");
+    let uncertified = no_checks_marker("h", false);
+    assert!(uncertified.contains("may have been dropped"), "{uncertified}");
+    assert!(!uncertified.contains("SUCCESSFUL"), "{uncertified}");
+}
+
+/// D16's second step: a certified empty obligation set is a success that is
+/// never clean, an uncertified one fails closed.
+#[test]
+fn settle_no_checks_result_keeps_a_certified_success_and_fails_an_uncertified_one() {
+    let mut certified = test_result(VerificationStatus::Success, FailedProperties::None);
+    settle_no_checks_result(&mut certified, true);
+    assert_eq!(certified.status, VerificationStatus::Success);
+    assert!(matches!(certified.failed_properties, FailedProperties::None));
+    assert!(certified.is_certified_obligation_free());
+    assert_eq!(
+        proof_qualifiers_marker(&certified).as_deref(),
+        Some("[AY:PROOF_QUALIFIERS:no_checks=compiler_certified_obligation_free]"),
+        "the qualifier must displace `clean`"
+    );
+    // Settling twice does not stack the qualifier.
+    settle_no_checks_result(&mut certified, true);
+    assert_eq!(certified.proof_qualifiers.len(), 1);
+
+    let mut uncertified = test_result(VerificationStatus::Success, FailedProperties::None);
+    settle_no_checks_result(&mut uncertified, false);
+    assert_eq!(uncertified.status, VerificationStatus::Failure);
+    assert!(matches!(uncertified.failed_properties, FailedProperties::Other));
+    assert!(!uncertified.is_certified_obligation_free());
+    assert_eq!(proof_qualifiers_marker(&uncertified), None);
+}
+
+/// The gate runs twice per harness (once before and once after the two-lane
+/// retry). A result it already settled as certified must not trip it again,
+/// or the marker prints twice.
+#[test]
+fn no_checks_gate_does_not_fire_twice_on_a_settled_certified_result() {
+    let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+    assert!(no_checks_gate_fires(&result, false));
+    settle_no_checks_result(&mut result, true);
+    assert!(!no_checks_gate_fires(&result, false), "settled: still empty, still a success");
+}
+
+// ── An exhausted unwinding bound is never a counterexample ──────────────────
+//
+// Two classes carry the same meaning and must be treated identically: `"unwind"`
+// (the BMC loop bound) and `"recursion"` (the recursive-inline bound, planted by
+// `verdict_policy::recursion_unwind_property`). Measured defect: only `"unwind"`
+// was recognised, so a recursion unwinding assertion on the trustc route
+// (`kani/DynTrait/unsized_cast.rs`, `unsized_rc_cast.rs` — `Box`/`Rc` drop-glue
+// dyn dispatch) was classified `[AY:CTREX_CAT:Genuine]` and reported a CERTIFIED
+// failure on a program the frozen-nightly route proves.
+
+#[test]
+fn test_unwind_bound_exhausted_sees_a_failed_loop_unwinding_assertion() {
+    assert!(unwind_bound_exhausted(&[attributed_check("unwind", CheckStatus::Failure)]));
+}
+
+#[test]
+fn test_unwind_bound_exhausted_sees_a_failed_recursion_unwinding_assertion() {
+    assert!(
+        unwind_bound_exhausted(&[attributed_check("recursion", CheckStatus::Failure)]),
+        "a recursion unwinding assertion is the recursive sibling of the loop unwind bound: \
+         the search was truncated, so the harness must not certify a counterexample"
+    );
+}
+
+#[test]
+fn test_unwind_bound_exhausted_ignores_a_passing_unwinding_assertion() {
+    assert!(!unwind_bound_exhausted(&[
+        attributed_check("unwind", CheckStatus::Success),
+        attributed_check("recursion", CheckStatus::Success),
+    ]));
+}
+
+#[test]
+fn test_unwind_bound_exhausted_ignores_an_ordinary_failed_assertion() {
+    assert!(!unwind_bound_exhausted(&[
+        attributed_check("assertion", CheckStatus::Failure),
+        anonymous_chc_check(CheckStatus::Failure),
+    ]));
+}
+
+#[test]
+fn test_unwind_bound_exhausted_fires_on_a_recursion_failure_beside_other_checks() {
+    // The whole-harness rule: one truncated search taints every sibling verdict,
+    // because the model that satisfied `(or viol_0 … viol_n)` may have used the
+    // cut edge. Same position upstream Kani takes.
+    assert!(unwind_bound_exhausted(&[
+        attributed_check("memory_safety", CheckStatus::Success),
+        attributed_check("recursion", CheckStatus::Failure),
+        attributed_check("assertion", CheckStatus::Success),
+    ]));
+}
+
+// ── CHC exact-derivation counterexamples are not undecided verdicts ─────────
+//
+// Root cause measured 2026-09-14 (docs/chc-unknown-root-causes-2026-09-14.md,
+// group G8): `interpret_chc_trivial_unsafe` DERIVES `error` and prints
+// "(exact CHC derivation)", but when per-property attribution finds no
+// `error_p{N}` it reports the legacy aggregate `chc.0` property, whose class is
+// "chc" and whose failure class is the reachable check's kind. A memory-safety
+// / pointer-overflow / valid-value counterexample therefore arrived spelled
+// exactly like a solver that could not decide, and was categorised `Unknown`.
+
+#[test]
+fn an_undecided_chc_failure_is_still_undecided() {
+    // The shape `call_ay`'s undecided-model arm preserves: Other, no non-chc
+    // failing property, and no exact derivation. Unchanged by the fix.
+    assert!(chc_failure_is_undecided(FailedProperties::Other, false, false));
+}
+
+#[test]
+fn an_exactly_derived_chc_failure_is_decided() {
+    // Same shape, plus the driver's own derivation witness.
+    assert!(!chc_failure_is_undecided(FailedProperties::Other, false, true));
+}
+
+#[test]
+fn a_non_chc_violation_is_decided_with_or_without_the_flag() {
+    // A decided non-assertion violation (BMC overflow / bounds check) reports a
+    // failing property outside class "chc"; it never depended on the flag.
+    assert!(!chc_failure_is_undecided(FailedProperties::Other, true, false));
+    assert!(!chc_failure_is_undecided(FailedProperties::Other, true, true));
+}
+
+#[test]
+fn panics_only_is_decided_whatever_the_flag_says() {
+    // `PanicsOnly` names the failing class, so it was never the undecided
+    // spelling. The flag must not change that either way.
+    assert!(!chc_failure_is_undecided(FailedProperties::PanicsOnly, false, false));
+    assert!(!chc_failure_is_undecided(FailedProperties::PanicsOnly, false, true));
+}
+
+#[test]
+fn the_flag_defaults_to_false_on_a_plain_result() {
+    // Fail-closed default: every producer that computed no derivation leaves it
+    // unset, so `test_result` (and every non-CHC lane) keeps the old reading.
+    let r = test_result(VerificationStatus::Failure, FailedProperties::Other);
+    assert!(!r.chc_exact_counterexample);
+    assert!(chc_failure_is_undecided(r.failed_properties, false, r.chc_exact_counterexample));
 }

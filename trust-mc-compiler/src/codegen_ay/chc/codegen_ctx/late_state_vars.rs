@@ -11,7 +11,8 @@ use std::sync::Arc;
 use ay_bindings::{Expr, Sort};
 use trust_mc_core::chc::RelationApp;
 
-use super::{ChcCtx, push_pending_var_decl};
+use super::ChcCtx;
+use super::globals::push_pending_var_decl;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Register a late-created type array as both a state variable pair and VarDecl.
@@ -151,6 +152,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return (Arc::clone(in_n), Arc::clone(out_n), Some(idx));
         }
         (Arc::clone(arr_name), Arc::from(arr_out_name), None)
+    }
+
+    /// Declare a state variable's input/output column pair: the two
+    /// `declare-var`s of a relation column, registered with the state-variable
+    /// manager. A column is not a fresh value (Rule E, `fresh_vars.rs`): the
+    /// relation threads it from rule to rule.
+    pub(in crate::codegen_ay::chc) fn declare_state_column_pair(
+        &mut self,
+        in_name: &Arc<str>,
+        out_name: &Arc<str>,
+        sort: Sort,
+    ) {
+        push_pending_var_decl(Arc::clone(in_name), sort.clone());
+        push_pending_var_decl(Arc::clone(out_name), sort.clone());
+        self.state_var_mgr.push_state_var_pair_arc(Arc::clone(in_name), out_name, sort);
     }
 
     /// Late-declare a collection auxiliary state variable (present/len) and add

@@ -368,11 +368,21 @@ fn test_codegen_vec_special_layout_via_mir() {
         let ptr = expr.clone().field_select(&dt_name, "fld_ptr", Sort::bitvec(POINTER_WIDTH));
         let len = expr.clone().field_select(&dt_name, "fld_len", Sort::bitvec(POINTER_WIDTH));
         let cap = expr.clone().field_select(&dt_name, "fld_cap", Sort::bitvec(POINTER_WIDTH));
-        let data = expr.field_select(
-            &dt_name,
-            "fld_data",
-            Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(32)),
+        // The probe's first Vec aggregate need not be Vec<u32>; take the element sort
+        // from the declared fld_data field (ay checks selector result sorts).
+        let data_sort = expr
+            .sort()
+            .datatype_sort()
+            .and_then(|dt| dt.constructors.first())
+            .and_then(|ctor| ctor.fields.iter().find(|f| f.name == "fld_data"))
+            .map(|f| f.sort.clone())
+            .expect("Vec aggregate declares fld_data");
+        assert_eq!(
+            data_sort.array_sort().map(|a| a.index_sort.bitvec_width()),
+            Some(Some(POINTER_WIDTH)),
+            "fld_data should be indexed by a pointer-width bitvector"
         );
+        let data = expr.field_select(&dt_name, "fld_data", data_sort);
 
         assert_eq!(ptr.sort().bitvec_width(), Some(POINTER_WIDTH));
         assert_eq!(len.sort().bitvec_width(), Some(POINTER_WIDTH));

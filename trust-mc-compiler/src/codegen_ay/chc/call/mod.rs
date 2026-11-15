@@ -15,7 +15,7 @@ pub(in crate::codegen_ay::chc) use super::{
     Rule, RuleBody, UnknownProjectionPolicy, chc_debug_enabled, chc_fresh_name, codegen_ctx,
     codegen_expr_assert, codegen_expr_constant, codegen_expr_heap, codegen_expr_signedness,
     codegen_rules, codegen_rules_helpers, codegen_stmt_flatten, codegen_types,
-    collect_field_projections, constant_index_offset, declare_pending_var, dyn_coercion,
+    collect_field_projections, constant_index_offset, dyn_coercion, dyn_dispatch_scope,
     heap_store_chains, pointer_step, quantifier_encoding, stmt_accumulator, stubs_option_helpers,
     ty_signedness,
 };
@@ -67,11 +67,38 @@ mod codegen_call_block_on_spawn;
 mod codegen_call_block_on_specialize;
 mod codegen_call_catch_unwind;
 pub(in crate::codegen_ay::chc) mod codegen_call_cell;
+mod codegen_call_cell_register;
+pub(in crate::codegen_ay) mod codegen_call_static_atomic_address;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_box_into_raw;
+mod native_box_uninit;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_capability;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_custody;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_domain;
+#[cfg(all(trust_toolchain, version("1.101")))]
+pub(in crate::codegen_ay::chc) mod native_init_handoff;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_memory;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_observers;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_shadow;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_values;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_init_write;
+#[cfg(all(trust_toolchain, version("1.101")))]
+mod native_maybe_access;
+pub(in crate::codegen_ay::chc) use codegen_call_cell_register::substitute_vars;
 pub(in crate::codegen_ay::chc) mod codegen_call_closure;
 mod codegen_call_cmp;
 mod codegen_call_cmp_array_stub;
 mod codegen_call_cmp_operand;
 mod codegen_call_cmp_ord;
+mod codegen_call_cmp_semantic;
 pub(in crate::codegen_ay) mod codegen_call_cmp_string;
 pub(in crate::codegen_ay::chc) mod codegen_call_collections;
 pub(in crate::codegen_ay::chc) mod codegen_call_coroutine;
@@ -94,6 +121,7 @@ mod codegen_call_index_range_len;
 mod codegen_call_iter_collect_method;
 pub(in crate::codegen_ay::chc) mod codegen_call_iterator_adapter;
 mod codegen_call_kani;
+pub(crate) mod codegen_call_kani_any_vec;
 mod codegen_call_kani_hooks;
 mod codegen_call_kani_hooks_model;
 mod codegen_call_kani_hooks_pointer;
@@ -102,6 +130,8 @@ pub(in crate::codegen_ay::chc) mod codegen_call_kani_model_dst;
 mod codegen_call_kani_model_dyn;
 mod codegen_call_kani_model_mem_init;
 mod codegen_call_kani_model_zst;
+mod codegen_call_model_unwind;
+pub(in crate::codegen_ay::chc) mod fn_ptr_targets;
 pub(in crate::codegen_ay::chc) use self::codegen_call_kani_model_zst::{
     canonical_zst_expr, canonical_zst_expr_for_sort,
 };
@@ -110,6 +140,7 @@ pub(in crate::codegen_ay::chc) mod codegen_call_misc;
 mod codegen_call_numeric;
 pub(in crate::codegen_ay::chc) mod codegen_call_option_result;
 mod codegen_call_option_result_emit;
+mod codegen_call_promoted_option_predicate;
 pub(in crate::codegen_ay::chc) mod codegen_call_ptr;
 mod codegen_call_ptr_helpers;
 pub(in crate::codegen_ay::chc) mod codegen_call_ptr_identity;
@@ -124,7 +155,18 @@ mod codegen_call_simd;
 mod codegen_call_simd_lib;
 mod codegen_call_simd_ops;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
-pub(in crate::codegen_ay::chc) use codegen_call_simd_ops::codegen_simd_shuffle;
+pub(in crate::codegen_ay::chc) use codegen_call_simd::SimdIntrinsicKind;
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+pub(in crate::codegen_ay::chc) use codegen_call_simd::{
+    SimdLayoutInfo, extract_simd_layout, resolve_simd_array,
+};
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+pub(in crate::codegen_ay::chc) use codegen_call_simd_lib::try_dispatch_simd_lib_call;
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+pub(in crate::codegen_ay::chc) use codegen_call_simd_ops::{
+    SimdBinopOrigin, codegen_simd_elementwise_binop, codegen_simd_shift, codegen_simd_shuffle,
+    divisor_lanes_nonzero,
+};
 mod codegen_call_slice;
 mod codegen_call_slice_get;
 mod codegen_call_slice_helpers;
@@ -133,6 +175,7 @@ mod codegen_call_slice_index_capture;
 mod codegen_call_slice_provenance;
 mod codegen_call_slice_query;
 mod codegen_call_slice_range;
+mod codegen_call_slice_repeat;
 mod codegen_call_slice_zst_eq;
 mod codegen_call_spine_helpers;
 mod codegen_call_string;
@@ -171,19 +214,33 @@ pub(in crate::codegen_ay::chc) mod codegen_slice_op;
 pub(in crate::codegen_ay::chc) mod dispatch_helpers;
 mod inline_aggregate;
 pub(in crate::codegen_ay::chc) mod inline_alias_writeback;
+mod inline_array_semantic_eq;
 pub(in crate::codegen_ay::chc) mod inline_body;
 mod inline_bool_return;
 pub(in crate::codegen_ay::chc) mod inline_budget;
+mod inline_const_origin;
 pub(in crate::codegen_ay::chc) mod inline_field_map;
 pub(in crate::codegen_ay::chc) mod inline_field_map_reconstruct;
+mod inline_iterator_eq;
 pub(in crate::codegen_ay::chc) mod inline_known_calls;
 mod inline_known_calls_math;
 mod inline_known_calls_raw_ptr;
 mod inline_known_calls_simd;
+pub(in crate::codegen_ay::chc) mod inline_mut_ref_owner;
+mod inline_readonly_capture;
+pub(in crate::codegen_ay::chc) mod inline_readonly_ref;
+pub(in crate::codegen_ay::chc) mod inline_ref_arg_binding;
 mod inline_result_shared;
 pub(in crate::codegen_ay::chc) mod inline_shared;
+mod inline_str_chars;
+pub(in crate::codegen_ay::chc) mod inline_walk_guard;
+pub(in crate::codegen_ay::chc) mod inline_work_budget;
+pub(in crate::codegen_ay::chc) mod native_drop_memory;
+pub(in crate::codegen_ay::chc) mod native_dyn_drop;
+pub(in crate::codegen_ay::chc) mod native_dyn_origin;
 mod ptr_offset_common;
 pub(in crate::codegen_ay::chc) mod ptr_receiver_mem;
+pub(in crate::codegen_ay::chc) mod range_span;
 
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 pub(in crate::codegen_ay::chc) fn try_inline_nested_call_step(
@@ -248,5 +305,6 @@ pub(in crate::codegen_ay::chc) fn build_dispatch_ite_chain_for_test(
         vtable_disc,
         bb_idx,
         caller_vtable_ids,
+        &super::dyn_dispatch_scope::DynDispatchScope::unknown(),
     )
 }

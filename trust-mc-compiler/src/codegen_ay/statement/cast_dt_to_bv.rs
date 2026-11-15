@@ -167,7 +167,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // constructors. Return the operand re-translated as bv128 via the scalar
         // path in operand_scalar.rs, which handles TypeId with provenance-aware
         // raw-byte extraction.
-        if (dt.name == "TypeId" || dt.name.ends_with("::TypeId")) && dst_width == 128 {
+        if crate::codegen_ay::names::is_type_id_sort_name(&dt.name) && dst_width == 128 {
             if let Some(ty) = operand.ty(self.body.locals()).into_option()
                 && let TyKind::RigidTy(RigidTy::Adt(..)) = ty.kind()
             {
@@ -239,7 +239,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         });
         let (ptr_field, meta_field) = match (named_ptr, named_meta) {
             (Some(ptr_field), Some(meta_field)) => (ptr_field, meta_field),
-            _ if sdt.name.starts_with("Slice_") || sdt.name.starts_with("Dyn_") => {
+            _ if crate::codegen_ay::names::is_slice_sort_name(&sdt.name)
+                || crate::codegen_ay::names::is_dyn_sort_name(&sdt.name) =>
+            {
                 (&c.fields[0], &c.fields[1])
             }
             _ => return None,

@@ -12,6 +12,9 @@
 //! - `try_codegen_array_inner_option_map_impl`: Option::map lifting Option<usize> → Option<T>
 //!   using parent array data.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, Ty, TyKind};
@@ -426,5 +429,5 @@ fn option_payload_ty(ctx: &ChcCtx<'_, '_>, ty: Ty) -> Option<Ty> {
     };
     let fields = variants[some_idx].fields();
     let field = fields.first()?;
-    Some(ctx.resolve_body_ty(field.ty_with_args(&args)))
+    Some(ctx.resolve_body_ty(mono_ty::field_ty(field, &args)?))
 }

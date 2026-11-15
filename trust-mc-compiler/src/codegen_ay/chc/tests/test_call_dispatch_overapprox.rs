@@ -336,12 +336,21 @@ fn test_can_read_unaligned_packed_char_avoids_kani_mem_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_read_unaligned");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_read_unaligned");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_read_unaligned",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_read_unaligned", body.blocks.len());
         assert_eq!(
-            crate::codegen_ay::take_kani_mem_overapprox_count(),
+            diagnostics.kani_mem_overapprox.get(),
             0,
             "packed char can_read_unaligned should no longer hit kani_mem_overapprox"
         );
@@ -370,12 +379,21 @@ fn test_can_dereference_packed_char_avoids_kani_mem_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_dereference");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_dereference");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_dereference",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_dereference", body.blocks.len());
         assert_eq!(
-            crate::codegen_ay::take_kani_mem_overapprox_count(),
+            diagnostics.kani_mem_overapprox.get(),
             0,
             "packed char can_dereference should no longer hit kani_mem_overapprox"
         );
@@ -585,11 +603,20 @@ fn test_can_dereference_packed_byte_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_dereference_packed_byte");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_dereference_packed_byte");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_dereference_packed_byte",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_dereference_packed_byte", body.blocks.len());
-        let overapprox = crate::codegen_ay::take_kani_mem_overapprox_count();
+        let overapprox = diagnostics.kani_mem_overapprox.get();
         assert_eq!(
             overapprox, 0,
             "packed byte-field can_dereference should not hit kani_mem_overapprox (got {overapprox})"
@@ -603,11 +630,20 @@ fn test_can_dereference_packed_char_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_dereference_packed_char");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_dereference_packed_char");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_dereference_packed_char",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_dereference_packed_char", body.blocks.len());
-        let overapprox = crate::codegen_ay::take_kani_mem_overapprox_count();
+        let overapprox = diagnostics.kani_mem_overapprox.get();
         assert_eq!(
             overapprox, 0,
             "packed char-field can_dereference should not hit kani_mem_overapprox (got {overapprox})"
@@ -639,11 +675,20 @@ fn test_can_read_unaligned_packed_byte_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_read_unaligned_packed_byte");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_read_unaligned_packed_byte");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_read_unaligned_packed_byte",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_read_unaligned_packed_byte", body.blocks.len());
-        let overapprox = crate::codegen_ay::take_kani_mem_overapprox_count();
+        let overapprox = diagnostics.kani_mem_overapprox.get();
         assert_eq!(
             overapprox, 0,
             "packed byte-field can_read_unaligned should not hit kani_mem_overapprox (got {overapprox})"
@@ -657,11 +702,20 @@ fn test_can_read_unaligned_packed_char_overapprox() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_can_read_unaligned_packed_char");
         let body = instance.body().expect("function body");
 
-        let _ = crate::codegen_ay::take_kani_mem_overapprox_count();
-        let vc = mir_to_chc_default(ctx.tcx, &body, "probe_can_read_unaligned_packed_char");
+        // Mem track level: at Reg level `&raw const packed.field` is lowered as the
+        // field VALUE, which kani::mem correctly refuses as an address (dbc927890,
+        // f55288b57) and over-approximates. Count this translation's own over-approximations
+        // (the process-global counter is shared with concurrent tests).
+        let chc_ctx = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_can_read_unaligned_packed_char",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (vc, _, diagnostics) = chc_ctx.translate_with_diagnostics();
 
         assert_vc_structure(&vc, "probe_can_read_unaligned_packed_char", body.blocks.len());
-        let overapprox = crate::codegen_ay::take_kani_mem_overapprox_count();
+        let overapprox = diagnostics.kani_mem_overapprox.get();
         assert_eq!(
             overapprox, 0,
             "packed char-field can_read_unaligned should not hit kani_mem_overapprox (got {overapprox})"
@@ -872,53 +926,36 @@ const VALUE_ARG_COMPLEX_SOURCE: &str = r#"
         }
     }
 
+    // Applied twice, like the uf_call_ congruence probes: a pure scalar callee reaches
+    // the call-summary lane when it is applied more than once (3fda9d8ed).
     pub fn probe_value_args(x: u32, y: u32) -> u32 {
-        complex_value(x, y)
+        complex_value(x, y).wrapping_add(complex_value(x, y))
     }
 "#;
 
 #[test]
 fn test_value_args_catchall_keeps_inferable_predicate() {
-    let _ = take_inferable_summary_names_by_fn();
     with_test_ay_ctx_for_source(VALUE_ARG_COMPLEX_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_value_args");
         let body = instance.body().expect("function body");
         let vc = mir_to_chc_default(ctx.tcx, &body, "probe_value_args");
 
-        // Value-type args (no &mut receiver) SHOULD produce P_inf_ declarations.
-        // has_mut_receiver returns false (first arg is u32, not &mut T).
-        let inferable_decls: Vec<_> = vc
+        // Value-type args (no &mut receiver) keep a call summary. The ungated P_inf_
+        // relation column was retired (578c49951); summaries are first-class,
+        // purity-gated uninterpreted functions named uf_call_<tag>_<key> (3fda9d8ed).
+        let summary_funs: Vec<_> = vc
             .decls
             .iter()
-            .filter_map(|d| {
-                if let trust_mc_core::decl::Decl::Fun { name, .. } = d {
-                    if name.starts_with("P_inf_") { Some(name.as_str()) } else { None }
-                } else {
-                    None
+            .filter_map(|d| match d {
+                trust_mc_core::decl::Decl::Fun { name, .. } if name.starts_with("uf_call_") => {
+                    Some(name.as_str())
                 }
+                _ => None,
             })
             .collect();
         assert!(
-            !inferable_decls.is_empty(),
-            "calls without &mut receiver should keep inferable predicates, \
-             but no P_inf_ declarations found in VC"
-        );
-
-        let inferable_summary_names = take_inferable_summary_names_by_fn();
-        let summaries = inferable_summary_names
-            .get("probe_value_args")
-            .expect("value-arg catch-all should record inferable provenance for the harness");
-        assert!(
-            !summaries.is_empty(),
-            "value-arg catch-all should record at least one inferable summary name, got: {inferable_summary_names:?}"
-        );
-        assert!(
-            summaries.keys().all(|name| name.starts_with("P_inf_")),
-            "all recorded provenance entries must be inferable summary symbols, got: {summaries:?}"
-        );
-        assert!(
-            summaries.keys().any(|name| name.contains("complex_value")),
-            "value-arg catch-all should record the complex_value callee in inferable provenance, got: {summaries:?}"
+            summary_funs.iter().any(|name| name.contains("complex_value")),
+            "calls without &mut receiver should keep a call summary for complex_value, got {summary_funs:?}"
         );
     });
 }

@@ -39,6 +39,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let base_name = self.ssa_base_name(destination);
         let dest_name = self.ssa_name_from_base(&base_name, true);
         let symbolic_val = self.ctx.declare_var(&dest_name, sort);
+        self.ctx.bmc_sound_havoc("symbolic_result");
         self.env_update(base_name, symbolic_val);
     }
 

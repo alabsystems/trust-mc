@@ -475,11 +475,8 @@ fn test_init_rule_and_flattening() {
 
 #[test]
 fn test_bvashr_constrained_var_not_propagated() {
-    // Regression test for #3398: BvAShr was not handled by collect_constraint_vars,
-    // causing variables inside BvAShr to be falsely classified as "unconstrained".
-    //
-    // x__out appears inside BvAShr(x__out, #x1) — it IS constrained.
-    // Even though base var x is constant #x4, x__out must NOT be propagated.
+    // Regression test for #3398: x__out appears inside BvAShr(x__out, #x1).
+    // Even though base var x is constant #x4, x__out must NOT be pinned to it.
     let mut vc = ChcVc::new();
     vc.add_relation(RelationDecl::new("entry", vec![]));
     vc.add_relation(RelationDecl::new("bb0", vec![Sort::bitvec(64)]));
@@ -507,67 +504,18 @@ fn test_bvashr_constrained_var_not_propagated() {
 
     propagate_constants(&mut vc);
 
-    // bb0 should be stripped (x is constant #x4), but bb1 must keep its position
-    // because x__out is constrained by BvAShr, not an identity pass-through.
+    // bb0 should be stripped (x is constant #x4), but bb1 must keep its position:
+    // x__out is not an identity of x.
     let bb0 = find_relation(&vc, "bb0");
     assert_eq!(bb0.arity(), 0, "bb0: constant x should be stripped");
     let bb1 = find_relation(&vc, "bb1");
     assert_eq!(bb1.arity(), 1, "bb1: x__out is constrained by BvAShr, must not be propagated");
 }
 
-#[test]
-fn test_datatype_constructor_arg_propagated() {
-    // Updated for #3405: DatatypeConstructor arguments are value-defining, not
-    // value-restricting. A variable appearing only as a DT field is unconstrained
-    // — the constructor wraps the value but does not restrict what the variable
-    // can be. When the base variable (x) is a known constant, the __out variable
-    // (x__out) should be propagated through DT constructors.
-    //
-    // Originally from #3398 (expected arity=1), corrected after #3405 showed
-    // that blocking propagation through DT constructors caused -14 PROOF
-    // regression on iterator harnesses.
-    let mut vc = ChcVc::new();
-    vc.add_relation(RelationDecl::new("entry", vec![]));
-    vc.add_relation(RelationDecl::new("bb0", vec![Sort::bitvec(64)]));
-    vc.add_relation(RelationDecl::new("bb1", vec![Sort::bitvec(64)]));
-    vc.add_relation(RelationDecl::nullary("error"));
-
-    // entry → bb0(x=#x10)
-    vc.add_rule(Rule::new(
-        RuleBody::new(Some(RelationApp::nullary("entry")), vec![]),
-        RelationApp::new("bb0", vec![bv64(16)]),
-    ));
-
-    // bb0(x) → bb1(x__out) with constraint:
-    // wrapped = DatatypeConstructor("Option", "Some", [x__out], option_sort).
-    // x__out is NOT constrained by the constructor — it freely receives
-    // propagated constants (wrapped_var is unconstrained, so the Eq is
-    // trivially satisfiable for any x__out).
-    let x = bv64_var("x");
-    let x_out = bv64_var("x__out");
-    let option_sort = Sort::enum_type(
-        "Option",
-        vec![("Some", vec![("val", Sort::bitvec(64))]), ("None", vec![] as Vec<(&str, Sort)>)],
-    );
-    let wrapped =
-        Expr::datatype_constructor("Option", "Some", vec![x_out.clone()], option_sort.clone());
-    let wrapped_var = Expr::var("wrapped", option_sort);
-    vc.add_rule(Rule::new(
-        RuleBody::new(Some(RelationApp::new("bb0", vec![x])), vec![wrapped_var.eq(wrapped)]),
-        RelationApp::new("bb1", vec![x_out]),
-    ));
-
-    propagate_constants(&mut vc);
-
-    // bb1 arity drops to 0: x__out is unconstrained by DT constructor and gets
-    // propagated to the known constant value of x (#x10).
-    let bb1 = find_relation(&vc, "bb1");
-    assert_eq!(
-        bb1.arity(),
-        0,
-        "bb1: x__out inside DatatypeConstructor is unconstrained, should be propagated"
-    );
-}
+// `test_datatype_constructor_arg_propagated` (#3405) asserted that an `x__out`
+// occurring only inside a datatype constructor is pinned to its input constant.
+// That was the identity reading of an unbound head variable, which is a havoc;
+// the inverted test is `havoc_tests::bug_out_var_inside_unbound_constructor_is_havoc`.
 
 #[test]
 fn test_dt_arg_constrained_outside_dt() {
@@ -785,75 +733,19 @@ fn test_store_eq_different_not_folded() {
     );
 }
 
-#[test]
-fn test_out_var_invariant_unconstrained_propagated() {
-    // #3478: Document the __out naming invariant and its soundness implications.
-    //
-    // When X__out is unconstrained in the rule body AND X is a known constant,
-    // propagate_to_unconstrained_out_vars() assumes X__out == X (identity
-    // pass-through) and propagates the constant.
-    //
-    // This test verifies the propagation behavior and documents that correctness
-    // depends on the invariant: __out variables are ONLY created via
-    // push_state_var_pair(in_name, in_name + "__out", sort).
-    let mut vc = ChcVc::new();
-    vc.add_relation(RelationDecl::new("entry", vec![]));
-    vc.add_relation(RelationDecl::new("bb0", vec![Sort::bitvec(64)]));
-    vc.add_relation(RelationDecl::new("bb1", vec![Sort::bitvec(64)]));
-    vc.add_relation(RelationDecl::nullary("error"));
-
-    // entry → bb0(x=#x7)
-    vc.add_rule(Rule::new(
-        RuleBody::new(Some(RelationApp::nullary("entry")), vec![]),
-        RelationApp::new("bb0", vec![bv64(7)]),
-    ));
-
-    // bb0(x) → bb1(x__out) with NO constraints on x__out.
-    // The __out invariant says: unconstrained x__out is identity of x.
-    // Therefore x__out should receive the constant value #x7.
-    let x = bv64_var("x");
-    let x_out = bv64_var("x__out");
-    vc.add_rule(Rule::new(
-        RuleBody::new(Some(RelationApp::new("bb0", vec![x])), vec![]),
-        RelationApp::new("bb1", vec![x_out]),
-    ));
-
-    // bb1(x__out) ∧ x__out != #x7 → error()
-    // If propagation works correctly, x__out becomes #x7, the Eq(#x7, #x7)
-    // in the Not folds to true, Not(true) folds to false, and the error rule
-    // is eliminated.
-    let y = bv64_var("y");
-    vc.add_rule(Rule::new(
-        RuleBody::new(
-            Some(RelationApp::new("bb1", vec![y.clone()])),
-            vec![Expr::not(y.eq(bv64(7)))],
-        ),
-        RelationApp::nullary("error"),
-    ));
-
-    propagate_constants(&mut vc);
-
-    // bb1 arity drops to 0: x__out was propagated to constant #x7.
-    let bb1 = find_relation(&vc, "bb1");
-    assert_eq!(
-        bb1.arity(),
-        0,
-        "bb1: unconstrained x__out should be propagated via __out identity invariant"
-    );
-
-    assert_error_rule_dropped(&vc, "error rule after __out identity propagation");
-}
+// `test_out_var_invariant_unconstrained_propagated` (#3478) asserted that an
+// unbound `x__out` whose input is constant is re-bound to that constant. An
+// unbound head variable is a havoc, not an identity frame; the inverted test is
+// `havoc_tests::bug_unbound_out_var_is_havoc_not_identity`.
 
 #[test]
 fn test_out_var_constrained_not_propagated() {
-    // #3478: Counterpart to the above — when x__out IS constrained (appears in
-    // a body constraint that references a non-constant variable), propagation
-    // via the __out identity assumption must NOT happen.
+    // #3478: when x__out is bound to a non-constant variable, nothing may pin it
+    // to the input's constant.
     //
-    // Note: constraints like `x__out = x + 1` where `x` is constant will still
-    // resolve via arithmetic folding — that's correct constant propagation through
-    // the constraint itself, not the __out identity assumption. To test the identity
-    // assumption guard, we constrain x__out with a non-resolvable variable.
+    // Note: constraints like `x__out = x + 1` where `x` is constant still
+    // resolve via arithmetic folding — that is propagation through the
+    // constraint itself. This test binds x__out to a non-resolvable variable.
     let mut vc = ChcVc::new();
     vc.add_relation(RelationDecl::new("entry", vec![]));
     vc.add_relation(RelationDecl::new("bb0", vec![Sort::bitvec(64), Sort::bitvec(64)]));
@@ -868,8 +760,7 @@ fn test_out_var_constrained_not_propagated() {
     ));
 
     // bb0(x, y) → bb1(x__out) with constraint: x__out = y.
-    // x__out is constrained by the Eq with non-constant y — the __out identity
-    // assumption must NOT apply.
+    // x__out is constrained by the Eq with non-constant y.
     let x = bv64_var("x");
     let y = bv64_var("y");
     let x_out = bv64_var("x__out");
@@ -881,7 +772,7 @@ fn test_out_var_constrained_not_propagated() {
     propagate_constants(&mut vc);
 
     // bb1 arity stays 1: x__out is constrained by an Eq with non-constant y,
-    // so neither the __out identity assumption nor arithmetic folding applies.
+    // so arithmetic folding does not apply.
     let bb1 = find_relation(&vc, "bb1");
     assert_eq!(bb1.arity(), 1, "bb1: x__out constrained by non-constant y must NOT be propagated");
 }
@@ -971,4 +862,52 @@ fn test_select_cross_sort_const_prop_does_not_panic() {
 
     let result = substitute_vars(&original, &known);
     assert_eq!(result, original, "cross-sort select substitution must fall back");
+}
+
+/// The equalities constant propagation re-adds for the stripped positions of a
+/// body relation come in the order of that relation's arguments. They used to
+/// come in the iteration order of a `HashMap`, so one VC got differently
+/// ordered rule bodies from run to run (measured 2026-10-01: the most common
+/// CHC-lane text difference over the soundness duals). Eight positions: a
+/// random order matches the argument order once in 40320.
+#[test]
+fn test_readded_constant_equalities_follow_argument_order() {
+    use ay_bindings::ExprValue;
+    let n = 8;
+    let mut vc = ChcVc::new();
+    vc.add_relation(RelationDecl::new("entry", vec![]));
+    vc.add_relation(RelationDecl::new("R", vec![Sort::bitvec(64); n]));
+    vc.add_relation(RelationDecl::new("S", vec![Sort::bitvec(64)]));
+    vc.add_relation(RelationDecl::nullary("error"));
+    vc.add_rule(Rule::new(
+        RuleBody::new(Some(RelationApp::nullary("entry")), vec![]),
+        RelationApp::new("R", (0..n).map(|i| bv64(i as i64)).collect()),
+    ));
+    // Argument order deliberately unlike name order.
+    let names: Vec<String> = [5, 2, 7, 0, 3, 6, 1, 4].iter().map(|i| format!("a{i}")).collect();
+    let x = bv64_var("x");
+    vc.add_rule(Rule::new(
+        RuleBody::new(
+            Some(RelationApp::new("R", names.iter().map(|n| bv64_var(n)).collect())),
+            vec![x.clone().eq(bv64_var(&names[0]).bvadd(bv64_var(&names[1])))],
+        ),
+        RelationApp::new("S", vec![x]),
+    ));
+
+    propagate_constants(&mut vc);
+
+    let rule = vc.rules.iter().find(|r| r.head.name.as_str() == "S").expect("the S rule survives");
+    let readded: Vec<String> = rule
+        .body
+        .constraints
+        .iter()
+        .filter_map(|c| match c.value() {
+            ExprValue::Eq(lhs, rhs) => match (lhs.value(), rhs.value()) {
+                (ExprValue::Var { name }, ExprValue::BitVecConst { .. }) => Some(name.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(readded, names, "re-added equalities in body-argument order");
 }

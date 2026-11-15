@@ -12,8 +12,12 @@
 //!
 //! Niche-encoded enums are also handled (via the shared decoder).
 
-use super::{Allocation, Expr, StatementCodegen};
+use super::{Expr, StatementCodegen};
 use crate::codegen_ay::chc::expr::codegen_expr_constant_payload::decode_non_unit_enum_variant_index;
+use crate::codegen_ay::shared::const_pointer::ConstRead;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use tracing::debug;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -23,7 +27,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// at least one variant has fields and the enum has 2+ variants (not option-like).
     pub(super) fn codegen_multi_variant_enum_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         adt_def: rustc_public::ty::AdtDef,
         args: rustc_public::ty::GenericArgs,
@@ -89,7 +93,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Uses variant-specific field offsets from `VariantsShape::Multiple` layout.
     fn extract_variant_fields(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         args: &rustc_public::ty::GenericArgs,
         variant: &rustc_public::ty::VariantDef,
@@ -115,8 +119,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut field_exprs = Vec::with_capacity(variant.fields().len());
 
         for (idx, field) in variant.fields().iter().enumerate() {
-            let field_ty = field.ty();
-            let concrete_ty = Self::resolve_generic_ty(field_ty, args)?;
+            let concrete_ty = mono_ty::field_ty(field, args)?;
 
             let field_size_bytes =
                 concrete_ty.layout().ok().map(|l| l.shape().size.bytes()).unwrap_or(usize::MAX);

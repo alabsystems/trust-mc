@@ -10,6 +10,10 @@
 use super::{
     CrateDef, Expr, IntoOption, LayoutOf, Place, ProjectionElem, RigidTy, StatementCodegen, TyKind,
 };
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
+
 use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use ay_bindings::SortInner;
@@ -129,6 +133,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 heap_key, sort
             );
             let symbolic_value = self.ctx.declare_var(&name, sort);
+            self.ctx.bmc_sound_havoc("box_symbolic");
 
             // Store for consistency - repeated derefs get the same symbolic value
             self.heap_pointees.insert(std::sync::Arc::from(heap_key), symbolic_value.clone());
@@ -188,6 +193,46 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let name = def.name();
                 let trimmed = name.rsplit("::").next().unwrap_or(name.as_str());
                 matches!(trimmed, "Box" | "Rc" | "Arc" | "NonNull" | "Unique")
+            }
+            _ => false, // external enum: TyKind
+        }
+    }
+
+    /// Whether a value of this type CARRIES a pointer, not merely IS one.
+    ///
+    /// An `Option<*mut T>`, a `Result`, a tuple, an array or a struct holding a
+    /// reference all carry one, and a swap of two such values moves the pointers
+    /// with them. `is_pointer_like_ty` answers `false` for every one of those,
+    /// which is how `mem::swap` of two `Option<*mut u8>` values exchanged
+    /// nothing and recorded nothing (fourth adversarial review of
+    /// m3/soundness-fixes-2, 2026-09-14, defect M2/D3). Bounded at depth 3, the
+    /// same bound the CHC lane's `ty_carries_a_pointer_value` uses.
+    pub(in crate::codegen_ay) fn ty_carries_a_pointer_value(ty: rustc_public::ty::Ty) -> bool {
+        Self::ty_carries_a_pointer_value_at(ty, 0)
+    }
+
+    fn ty_carries_a_pointer_value_at(ty: rustc_public::ty::Ty, depth: u32) -> bool {
+        if depth > 2 {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)) => true,
+            TyKind::RigidTy(RigidTy::Tuple(tys)) => {
+                tys.iter().any(|t| Self::ty_carries_a_pointer_value_at(*t, depth + 1))
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, _) | RigidTy::Slice(elem)) => {
+                Self::ty_carries_a_pointer_value_at(elem, depth + 1)
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                if Self::is_pointer_like_ty(ty) {
+                    return true;
+                }
+                def.variants().into_iter().any(|v| {
+                    v.fields().into_iter().any(|f| {
+                        mono_ty::field_ty(&f, &args)
+                            .is_none_or(|t| Self::ty_carries_a_pointer_value_at(t, depth + 1))
+                    })
+                })
             }
             _ => false, // external enum: TyKind
         }
@@ -318,16 +363,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // If the pointer was created from &local as *const T, and local has gone
             // out of scope (StorageDead), emit a dead_object violation.
             //
-            // Gated on current_path_condition.is_some() because dead_locals is
-            // accumulated globally across blocks during traversal. In bb0 (entry
-            // block, path_condition=None), StorageDead of reference temporaries
-            // causes false positives. Assert terminators now propagate non-None
-            // path conditions to their target blocks (#762), enabling detection in
-            // post-Assert blocks where dead_object violations actually occur.
+            // Use this block's must/may storage facts, updated in statement
+            // order. A path-condition's presence is not lifetime evidence.
             let ptr_base = self.ssa_base_name(&ptr_place);
             if let Some(pointee_base) = self.ref_pointees.get(ptr_base.as_str()).cloned() {
-                let target_local_idx =
-                    Self::resolve_ref_chain_target(&self.ref_pointees, &pointee_base);
+                // A `X_deref` alias that `ref_pointees` does not resolve names the
+                // object pointer X points to, not local X. `Box::into_raw` leaves
+                // `p -> local_22_deref` with `local_22` an 8-byte pointer, so an i128
+                // payload read through `p` was checked as a 16-byte access to an
+                // 8-byte allocation and failed with a Genuine `pointer invalid`
+                // counterexample, and the `dead_object` check below would test the
+                // pointer's liveness instead of the object's. Neither applies then.
+                let resolution =
+                    Self::resolve_stack_storage_owner(&self.ref_pointees, &pointee_base);
+                if resolution.is_err() && !Self::layout_is_zst(pointee_ty) {
+                    self.ctx.unsupported_with_fallback(
+                        "raw_ptr_stack_lifetime_unknown",
+                        pointee_base.to_string(),
+                    );
+                }
+                let Ok(Some(owner)) = resolution else {
+                    // Silent exit 1 of 4. Four exits shared ONE debug! placed AFTER all of
+                    // them, which is how the absent extent obligation on
+                    // expected/ptr_to_ref_cast::check_zst_deref stayed invisible while the
+                    // corpus row kept scoring parity on the file as a whole.
+                    debug!(
+                        "  pointer_invalid size check SKIPPED: ref chain unresolved, pointee_base={}",
+                        pointee_base
+                    );
+                    continue;
+                };
 
                 // The ALLOCATION behind this pointer is the resolved local, and
                 // that local's type states its size. Reading a larger type
@@ -340,11 +405,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // from two static sizes; fires only when BOTH are known and
                 // access exceeds allocation, so an equal-size or shrinking
                 // cast — pinned green by the same corpus file — cannot trip it.
-                if let Some(alloc_size) = self
-                    .body
-                    .locals()
-                    .get(target_local_idx)
-                    .and_then(|decl| LayoutOf::new(decl.ty).size_of())
+                if owner.frame.as_ref() == self.ctx.current_fn_name()
+                    && let Some(alloc_size) = self
+                        .body
+                        .locals()
+                        .get(owner.local)
+                        .and_then(|decl| LayoutOf::new(decl.ty).size_of())
                     && let Some(access_size) = LayoutOf::new(pointee_ty).size_of()
                 {
                     // Emitted UNCONDITIONALLY once both sizes are known, with
@@ -356,7 +422,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // shrinking casts precisely to tell those apart.
                     debug!(
                         "  pointer_invalid size check: access {} vs allocation {} (local_{})",
-                        access_size, alloc_size, target_local_idx
+                        access_size, alloc_size, owner.local
                     );
                     // Guarded by chain SHAPE, not just resolvability: a
                     // pointee chain that passes through a `_field_` synthetic
@@ -367,27 +433,93 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // properties in derive-bounded-arbitrary. Only a direct
                     // whole-object chain is trusted with a statically-decided
                     // verdict.
-                    if !pointee_base.contains("_field_") {
+                    if !owner.has_field_projection {
                         self.record_violation_guarded(
                             Expr::bool_const(access_size > alloc_size),
                             "pointer_invalid",
                         );
+                    } else {
+                        // Silent exit 2 of 4.
+                        debug!(
+                            "  pointer_invalid size check SKIPPED: _field_ chain, pointee_base={}",
+                            pointee_base
+                        );
                     }
+                } else {
+                    // Silent exit 3 of 4: a size neither side states statically.
+                    debug!(
+                        "  pointer_invalid size check SKIPPED: size unknown (alloc local_{})",
+                        owner.local
+                    );
                 }
 
-                if self.dead_locals.contains(&target_local_idx)
-                    && self.current_path_condition.is_some()
-                {
-                    debug!(
-                        "  emitting dead_object violation: ptr {} -> pointee {} (local_{})",
-                        ptr_base, pointee_base, target_local_idx
-                    );
-                    self.record_violation_guarded(Expr::bool_const(true), "dead_object");
+                if !Self::layout_is_zst(pointee_ty) {
+                    match self.stack_owner_is_live(&owner) {
+                        Some(true) => {}
+                        Some(false) => {
+                            debug!(
+                                "  emitting dead_object violation: ptr {} -> pointee {} (local_{})",
+                                ptr_base, pointee_base, owner.local
+                            );
+                            self.record_violation_guarded(Expr::bool_const(true), "dead_object");
+                        }
+                        None => self.ctx.unsupported_with_fallback(
+                            "raw_ptr_stack_lifetime_unknown",
+                            owner.base.to_string(),
+                        ),
+                    }
                 }
+            } else {
+                // Silent exit 4 of 4, and the one that hides check_zst_deref: the
+                // pointer's base has no tracked pointee at all, so the size-check
+                // block -- the ONLY obligation that can catch a cast out of a
+                // zero-sized allocation -- is never entered. align_of::<Foo>() == 1
+                // makes every alignment obligation vacuous there, so nothing the
+                // harness asks can be false and it verifies SUCCESSFUL.
+                debug!(
+                    "  pointer_invalid size check SKIPPED: ptr_base={} absent from ref_pointees ({} entries)",
+                    ptr_base,
+                    self.ref_pointees.len()
+                );
             }
             // NOTE: pointer_invalid check (unknown provenance) also disabled because it
             // causes false positives for legitimate raw pointer casts. Tracking in #762.
         }
+    }
+
+    /// The local-name part of a qualified base name (`fn::local_N[_suffix]`).
+    ///
+    /// `pointee_base` is FULLY QUALIFIED, so a substring test over the whole string
+    /// also sees the FUNCTION name. A harness named `check_zst_deref` therefore made
+    /// `contains("_deref")` true and skipped the alias early-return in
+    /// `resolve_ref_chain_allocation`, dropping into a tail that needs an alias lookup
+    /// to hit; it returned None, the caller's `continue` fired, and the object-extent
+    /// obligation was never emitted. `align_of::<Foo>() == 1` makes every alignment
+    /// obligation vacuous for that cast, so nothing the harness asked could be false
+    /// and `expected/ptr_to_ref_cast::check_zst_deref` verified SUCCESSFUL against an
+    /// oracle of FAILED. Eight of that file's nine deref sites died this way; the lone
+    /// survivor was `Store::<'a, LEN>::from`, whose name happens to carry no `_deref`.
+    ///
+    /// `split_once` deliberately mirrors `resolve_ref_chain_target`'s
+    /// `split("::local_").nth(1)` and the alias tail's `split_once`, so the predicate that
+    /// GATES this decision and the index that IMPLEMENTS it always name the same local. A
+    /// nested `outer::local_1::inner::local_3` is pathological and unobserved; splitting it
+    /// two different ways in one function would be worse than either choice.
+    pub(super) fn local_part(qualified: &str) -> Option<&str> {
+        qualified.split_once("::local_").map(|(_, local)| local)
+    }
+
+    /// Whether this pointee name is a `_deref` ALIAS -- a property of the local
+    /// suffix, never of the enclosing function's name. See [`Self::local_part`].
+    pub(super) fn is_deref_alias(pointee_base: &str) -> bool {
+        Self::local_part(pointee_base).is_some_and(|local| local.contains("_deref"))
+    }
+
+    /// Whether this pointee name resolves through a `_field_` synthetic, tested on
+    /// the local suffix only. A function named `*_field_*` must not suppress the
+    /// obligation for every local inside it. See [`Self::local_part`].
+    pub(super) fn is_field_chain(pointee_base: &str) -> bool {
+        Self::local_part(pointee_base).is_some_and(|local| local.contains("_field_"))
     }
 
     /// Resolve the ultimate target local index from a ref_pointees chain.
@@ -401,7 +533,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ///
     /// Part of #2271: extracted from inline logic for testability.
     pub(super) fn resolve_ref_chain_target(
-        ref_pointees: &std::collections::BTreeMap<std::sync::Arc<str>, std::sync::Arc<str>>,
+        ref_pointees: &impl super::PointeeLookup,
         pointee_base: &str,
     ) -> usize {
         let Some(local_str) = pointee_base.split("::local_").nth(1) else {
@@ -416,7 +548,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Pattern: ptr -> ref_temp_deref -> source_local.
         let fn_prefix = pointee_base.split("::local_").next().unwrap_or("");
         let imm_key = crate::codegen_ay::names::local_name(fn_prefix, imm_idx);
-        if let Some(inner_pointee) = ref_pointees.get(imm_key.as_str()) {
+        if let Some(inner_pointee) = ref_pointees.lookup_pointee(imm_key.as_str()) {
             inner_pointee
                 .split("::local_")
                 .nth(1)
@@ -426,6 +558,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         } else {
             imm_idx
         }
+    }
+
+    /// `resolve_ref_chain_target`, or `None` when `pointee_base` is a `_deref`
+    /// alias whose pointer local has no tracked pointee: the alias then names
+    /// the object the pointer points to, whose local is unknown.
+    pub(super) fn resolve_ref_chain_allocation(
+        ref_pointees: &impl super::PointeeLookup,
+        pointee_base: &str,
+    ) -> Option<usize> {
+        let target = Self::resolve_ref_chain_target(ref_pointees, pointee_base);
+        if !Self::is_deref_alias(pointee_base) {
+            return Some(target);
+        }
+        let (fn_prefix, local_str) = pointee_base.split_once("::local_")?;
+        let local_idx = local_str.split('_').next()?.parse::<usize>().ok()?;
+        let pointer_key = crate::codegen_ay::names::local_name(fn_prefix, local_idx);
+        ref_pointees.lookup_pointee(pointer_key.as_str()).map(|_| target)
     }
 }
 

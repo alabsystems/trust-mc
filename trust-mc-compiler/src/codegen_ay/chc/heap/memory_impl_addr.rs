@@ -100,7 +100,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // memory. Loading from memory yields an unconstrained expression,
                     // causing false CTREX in downstream indexing. The state variable
                     // system always carries the correct value from the previous block.
-                    let loaded_addr = if at_base_local {
+                    let path_dependent =
+                        at_base_local && self.pointer_value_is_path_dependent(local_idx);
+                    let loaded_addr = if path_dependent {
+                        // The pointer's value differs per incoming path: only the
+                        // relation's state variable carries it path-precisely.
+                        self.try_resolve_local_expr(local_idx, modified_locals)
+                            .and_then(|expr| self.normalize_deref_address_expr(expr, current_ty))
+                            .or_else(|| {
+                                self.load_ptr_from_memory(current_addr.clone(), current_ty)
+                                    .and_then(|loaded| {
+                                        self.normalize_deref_address_expr(
+                                            loaded.into_addr_expr(),
+                                            current_ty,
+                                        )
+                                    })
+                            })
+                    } else if at_base_local {
                         self.known_stack_addr_expr(local_idx)
                             // `record_known_stack_addr_expr` only ever stores a
                             // canonical `concat(obj_id const, offset const)`
@@ -388,7 +404,48 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 if rt.local == local_idx {
                     return None;
                 }
-                let referent = Place { local: rt.local, projection: rt.projections };
+                let mut referent = Place { local: rt.local, projection: rt.projections };
+                // Rule B (design trust-mc-reds-final §4.2, C8a): the pointer is
+                // (object, offset, pointee type), so the referent must HOLD the
+                // pointee at offset 0. A pointer value loaded through a
+                // reference inherited that reference's target: `Rc::as_ptr`'s
+                // `RcInner` pointer, loaded out of `&Rc`, resolved to the `Rc`
+                // LOCAL, and `(*inner).value` read 16 bytes into an 8-byte stack
+                // slot (`rc_shared_handle_dual.rs::safe_rc_u32_raw_read_before_last_drop`,
+                // a false certificate). The part of the referent the pointee is
+                // is found by the one object-path rule, or the lane refuses.
+                // An unsized pointee (a slice of an array, a `dyn` of a
+                // concrete value) is the referent's own unsizing and keeps it.
+                if let Some(pointee_ty) = deref_pointee_ty(base_local_ty)
+                    && pointee_ty.layout().ok().is_some_and(|l| l.shape().is_sized())
+                {
+                    let referent_ty = referent.ty(self.body.locals()).ok()?;
+                    if !crate::codegen_ay::chc::decl::static_path::same_ty_modulo_regions(
+                        referent_ty,
+                        pointee_ty,
+                    ) {
+                        let Some(path) = crate::codegen_ay::chc::expr::codegen_expr_deref_field_offset::object_path_projections(
+                            referent_ty,
+                            0,
+                            pointee_ty,
+                        ) else {
+                            debug!(
+                                local_idx,
+                                referent = rt.local,
+                                ?referent_ty,
+                                ?pointee_ty,
+                                "CHC: ref-target recovery refused — the referent does not hold the pointee"
+                            );
+                            return None;
+                        };
+                        for step in path {
+                            referent.projection.push(rustc_public::mir::ProjectionElem::Field(
+                                step.field_idx,
+                                step.field_ty?,
+                            ));
+                        }
+                    }
+                }
                 // ADDRESS-OF a known referent place: `translate_ref_to_address`
                 // is the encoder's address producer, so its result IS a `Loc`
                 // — as of Wave 11 that is its return type, not a comment.
@@ -626,5 +683,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return dt_expr;
         }
         value
+    }
+}
+
+/// The pointee type of a reference or raw-pointer type.
+fn deref_pointee_ty(ty: rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(
+            rustc_public::ty::RigidTy::Ref(_, pointee, _)
+            | rustc_public::ty::RigidTy::RawPtr(pointee, _),
+        ) => Some(pointee),
+        _ => None,
     }
 }

@@ -15,6 +15,7 @@
 
 #![allow(dead_code, clippy::redundant_clone)]
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort, SortInner};
 use tracing::debug;
 
@@ -22,7 +23,7 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_closure::resolve_closure_body_for_operand;
 use super::codegen_call_coerce::CallCoerce;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_rules::CodegenRules;
 use super::codegen_types::CodegenTypes;
 use super::inline_body::{
@@ -74,6 +75,7 @@ fn result_shape(result_sort: &Sort) -> Option<ResultShape> {
 
 /// Build Result expression from extracted guard/ok_value and the Result shape.
 fn build_catch_unwind_result(
+    ctx: &mut ChcCtx<'_, '_>,
     guard: Option<Expr>,
     ok_value: Option<Expr>,
     shape: &ResultShape,
@@ -97,7 +99,10 @@ fn build_catch_unwind_result(
                 vec![ok_payload],
                 dest_sort.clone(),
             );
-            let err_payload = declare_pending_var(
+            // The caught panic's payload: a value the model does not compute.
+            let err_payload = Havoc::mint(
+                ctx,
+                sound_havoc::UNTRACKED_CALL_RESULT,
                 chc_fresh_name("catch_unwind_panic_payload"),
                 shape.err_field_sort.clone(),
             );
@@ -111,7 +116,10 @@ fn build_catch_unwind_result(
         }
         _ => {
             // (Some(_), None) or (None, None): always-panicking.
-            let err_payload = declare_pending_var(
+            // The caught panic's payload: a value the model does not compute.
+            let err_payload = Havoc::mint(
+                ctx,
+                sound_havoc::UNTRACKED_CALL_RESULT,
                 chc_fresh_name("catch_unwind_panic_payload"),
                 shape.err_field_sort.clone(),
             );
@@ -169,7 +177,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // NONDETERMINISTIC — both continuations must stay reachable.
         //
         // See tools/soundness-duals/catch_unwind_dual.rs.
-        let unwound = declare_pending_var(chc_fresh_name("__catch_unwind_unwound"), Sort::bool());
+        let unwound = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_CALL_RESULT,
+            chc_fresh_name("__catch_unwind_unwound"),
+            Sort::bool(),
+        );
         let result_value = Expr::ite(unwound, Expr::bitvec_const(1, 32), Expr::bitvec_const(0, 32));
         debug!(
             bb_idx = dcx.bb_idx,
@@ -235,7 +248,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let InlineReturn { value: result_expr, .. } = inline_result;
         let guard = extract_inline_assert_guard(&result_expr);
         let ok_value = strip_inline_assert_fallback(&result_expr);
-        Some(build_catch_unwind_result(guard, ok_value, shape, dest_sort))
+        Some(build_catch_unwind_result(self, guard, ok_value, shape, dest_sort))
     }
 
     fn emit_catch_unwind_rule(

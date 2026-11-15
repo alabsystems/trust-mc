@@ -294,7 +294,7 @@ impl CheckUninitVisitor {
     /// Analyze assignment into a union or union field.
     fn analyze_union_assign(&mut self, place: &Place, rvalue: &Rvalue) {
         match rvalue {
-            Rvalue::Use(operand) => {
+            Rvalue::Use(operand, ..) => {
                 // This is a union-to-union assignment, so we need to copy the
                 // initialization state.
                 if place.ty(&self.locals).expect("place should have valid type").kind().is_union() {

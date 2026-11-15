@@ -6,6 +6,8 @@
 // Converted from include!() to module for #2306.
 
 use crate::codegen_ay::types::{POINTER_WIDTH, bool_sort};
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -33,6 +35,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        self.compared_values = None;
         if args.len() < 2 {
             return None;
         }
@@ -113,6 +116,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             })
                         }
                         Operand::Constant(_) => false,
+                        #[cfg(trust_toolchain)]
+                        Operand::RuntimeChecks(_) => false,
                     }
                 };
                 // Check both operands - either being an array ref indicates deref failure
@@ -123,6 +128,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             _ => false, // non-enum: tuple (Option, Option) — covers None variants
         };
 
+        if !is_zst
+            && !deref_failed
+            && let (Some(l), Some(r)) = (&lhs, &rhs)
+            && l.sort() == r.sort()
+        {
+            self.compared_values = Some((l.clone(), r.clone()));
+        }
         let eq_result = if is_zst {
             // ZST comparison always returns true - no bytes to compare
             debug!("codegen_raw_eq: ZST detected, returning true");
@@ -173,6 +185,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         "codegen_raw_eq: sort mismatch, using symbolic result"
                     );
                     let sym_name = self.ctx.fresh_name("ay_raw_eq_sort_mismatch");
+                    self.ctx.bmc_sound_havoc("raw_eq_sort_mismatch");
                     self.ctx.declare_var(&sym_name, bool_sort())
                 }
             } else if lhs_expr.sort().is_bitvec() && rhs_expr.sort().is_bitvec() {
@@ -191,6 +204,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             debug!("codegen_raw_eq: couldn't resolve values, using symbolic bool");
             let sym_name = self.ctx.fresh_name("ay_raw_eq_result");
             let symbolic_result = self.ctx.declare_var(&sym_name, bool_sort());
+            self.ctx.bmc_sound_havoc("raw_eq_unresolved_values");
             self.bind_ssa_result(destination, symbolic_result);
             return target;
         };
@@ -212,6 +226,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 place.ty(self.body.locals()).into_option()
             }
             Operand::Constant(c) => Some(c.ty()),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => Some(rustc_public::ty::Ty::bool_ty()),
         };
 
         let Some(ty) = ty else { return false };

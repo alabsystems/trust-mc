@@ -39,9 +39,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// VecReserve / VecReserveExact: cap = max(cap, len + additional).
+    /// VecReserve / VecReserveExact: the capacity `RawVec` leaves after a
+    /// reservation for `len + additional` (`shared::vec_capacity`): amortized
+    /// growth for `reserve`, the requirement itself for `reserve_exact`. Both
+    /// were `max(cap, len + additional)`, so `Vec::<u8>::new(); v.reserve(3);
+    /// v.capacity() == 3` verified clean where Kani fails (std gives 8; walker
+    /// fail-closed review, round 2 of the repair after the merge with main,
+    /// `vec_capacity_growth_dual.rs`).
     pub(in crate::codegen_ay::chc) fn vec_op_reserve(
         &mut self,
+        growth: crate::codegen_ay::shared::vec_capacity::VecGrowth,
         args: &[Operand],
         modified_locals: &HashSet<usize>,
         collection_local: Option<usize>,
@@ -62,8 +69,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Rust's Vec::reserve panics on capacity overflow (checked_add),
             // so assume no wraparound — blocks false PROOF from wrapped required.
             acc.constraints.push(required.clone().bvuge(current_len.clone()));
-            let grow_needed = current_cap.clone().bvult(required.clone());
-            let new_cap = Expr::ite(grow_needed, required, current_cap);
+            let new_cap = self.vec_reserved_cap(
+                Some(self.body.locals()[coll_local].ty),
+                &current_cap,
+                &required,
+                growth,
+                acc.constraints,
+            );
             self.collection_cap_set(&cap_var_name, new_cap.clone(), acc);
             // Part of #1037 V2: cap >= len background invariant on sidecar path.
             Self::emit_cap_ge_len(new_cap, current_len, acc.constraints);
@@ -80,8 +92,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let required_cap = len.clone().bvadd(additional);
                 // Part of #3409: guard against unsigned overflow on len+additional.
                 acc.constraints.push(required_cap.clone().bvuge(len.clone()));
-                let grow_needed = cap.clone().bvult(required_cap.clone());
-                let new_cap = Expr::ite(grow_needed, required_cap, cap);
+                let new_cap = self.vec_reserved_cap(
+                    Some(self.body.locals()[coll_local].ty),
+                    &cap,
+                    &required_cap,
+                    growth,
+                    acc.constraints,
+                );
                 // Part of #1037 V2: cap >= len background invariant on projected path.
                 Self::emit_cap_ge_len(new_cap.clone(), len.clone(), acc.constraints);
                 if !self.constrain_projected_vec_fields_for_call(
@@ -124,8 +141,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let required_cap = len.clone().bvadd(additional);
                     // Part of #3409: guard against unsigned overflow on len+additional.
                     acc.constraints.push(required_cap.clone().bvuge(len.clone()));
-                    let grow_needed = cap.clone().bvult(required_cap.clone());
-                    let new_cap = Expr::ite(grow_needed, required_cap, cap);
+                    let new_cap = self.vec_reserved_cap(
+                        Some(self.body.locals()[coll_local].ty),
+                        &cap,
+                        &required_cap,
+                        growth,
+                        acc.constraints,
+                    );
                     // Part of #1037 V2: cap >= len background invariant on Datatype path.
                     Self::emit_cap_ge_len(new_cap.clone(), len.clone(), acc.constraints);
                     if let Some((out_name, out_sort)) =

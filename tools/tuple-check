@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+#
+# Check the committed measurement tuple (tools/tuple.toml) against this
+# workspace, its sibling checkouts and the resolved Trust toolchain.
+#
+#   tools/tuple-check          human-readable; exit 0 match, 1 mismatch,
+#                              2 bad tuple or no python with tomllib
+#   tools/tuple-check --json   the same result as JSON, for provenance consumers
+#
+# See docs/KANI-LANE-REVIVAL.md, "The measurement tuple".
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The checker needs tomllib (python >= 3.11); macOS /usr/bin/python3 is 3.9.
+# Resolve it in a subshell: ay_python.sh exits 1 when none is found, and 1 is
+# this tool's "tuple mismatch" status, so report a missing interpreter as 2.
+# shellcheck source=scripts/ay_python.sh
+AY_PYTHON_BIN="$(. "${ROOT_DIR}/scripts/ay_python.sh" && printf '%s\n' "${AY_PYTHON_BIN}")" \
+    || exit 2
+
+exec "${AY_PYTHON_BIN}" "${ROOT_DIR}/scripts/tuple_check.py" --repo-root "${ROOT_DIR}" "$@"

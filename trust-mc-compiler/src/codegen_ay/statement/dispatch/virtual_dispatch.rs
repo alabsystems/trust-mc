@@ -63,6 +63,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Assign a symbolic return value to the destination.
         // This reuses the existing codegen_symbolic_result pattern which
         // creates a fresh unconstrained variable of the appropriate sort.
+        //
+        // That is an approximation of the CALL, not of its result alone: the
+        // callee body never runs, so its result, its writes through `&mut self`
+        // and its panics are all dropped. It must be COUNTED. Uncounted, a
+        // counterexample that exists only because the result is free was
+        // certified `Genuine` (`NonNull<dyn Shape>` -> `id() == 2`, which holds),
+        // and a proof whose callee panics was clean. `unsupported_with_fallback`
+        // bumps the demotion counter: the counterexample is not certified and a
+        // success is demoted.
+        let callee_label = format!("{}", fn_def.0.name());
+        self.ctx.unsupported_with_fallback("virtual call (callee body not executed)", callee_label);
         self.codegen_symbolic_result(destination);
 
         debug!("statement virtual dispatch: assigned symbolic result to destination");

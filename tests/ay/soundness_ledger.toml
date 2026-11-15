@@ -3,7 +3,7 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 
 # Machine-checked ledger for the repo-local false-PROOF regression corpus.
-# `cargo test -p trust-mc-driver soundness_ledger` fails closed if any listed file,
+# `targo --unverified test -p trust-mc-driver soundness_ledger` fails closed if any listed file,
 # harness, or accepted verdict directive disappears.
 
 [[entry]]

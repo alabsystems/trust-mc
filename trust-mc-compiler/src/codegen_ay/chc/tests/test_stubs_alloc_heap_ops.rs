@@ -492,12 +492,14 @@ fn test_dealloc_size_mismatch_at_ptr_level_emits_error_rule() {
         let body = instance.body().expect("function body");
 
         // Use Ptr track level — matching the failing compiletest harness.
-        let vc = mir_to_chc(
+        // The obligation is checked on the pre-pass VC (the rules translation emits):
+        // the post-translation passes fold its constant comparisons away.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_dealloc_size_mismatch",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Ptr, ..ChcConfig::default() },
-        );
+        ));
 
         assert!(!vc.rules.is_empty(), "VC should have rules for dealloc size-mismatch probe");
 
@@ -508,21 +510,10 @@ fn test_dealloc_size_mismatch_at_ptr_level_emits_error_rule() {
             "#3841: dealloc at Ptr level must generate error relation for safety checks"
         );
 
-        // The size-match check requires obj_size in error-targeting rules.
-        let has_obj_size_in_error = vc
-            .rules
-            .iter()
-            .filter(|r| r.head.name == "error")
-            .any(|rule| {
-                rule.body.constraints.iter().any(|c| {
-                    constraint_tree_contains(c, &|e: &Expr| {
-                        matches!(e.value(), ExprValue::Var { name, .. } if name.contains("obj_size"))
-                    })
-                })
-            });
+        // The size-match check compares the recorded allocation size with the dealloc size.
         assert!(
-            has_obj_size_in_error,
-            "#3841: dealloc error rules must reference obj_size for size-match check at Ptr level"
+            check_rules_compare_dealloc_size(&vc, 64, 32),
+            "#3841: dealloc error rules must compare the recorded size (64) with the dealloc size (32) at Ptr level"
         );
 
         // The VC must contain concrete size values (64 and 32).
@@ -545,30 +536,21 @@ fn test_dealloc_size_mismatch_at_mem_level_emits_error_rule() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_dealloc_size_mismatch");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(
+        // The obligation is checked on the pre-pass VC (the rules translation emits):
+        // the post-translation passes fold its constant comparisons away.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_dealloc_size_mismatch",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+        ));
 
         let has_error = vc.relations.iter().any(|r| r.name == "error");
         assert!(has_error, "dealloc at Mem level must generate error relation");
 
-        let has_obj_size_in_error = vc
-            .rules
-            .iter()
-            .filter(|r| r.head.name == "error")
-            .any(|rule| {
-                rule.body.constraints.iter().any(|c| {
-                    constraint_tree_contains(c, &|e: &Expr| {
-                        matches!(e.value(), ExprValue::Var { name, .. } if name.contains("obj_size"))
-                    })
-                })
-            });
         assert!(
-            has_obj_size_in_error,
-            "dealloc error rules must reference obj_size at Mem level (baseline)"
+            check_rules_compare_dealloc_size(&vc, 64, 32),
+            "dealloc error rules must compare the recorded size (64) with the dealloc size (32) at Mem level (baseline)"
         );
     });
 }
@@ -678,9 +660,16 @@ fn test_dealloc_size_mismatch_ptr_level_replays_layout_without_const_ref_drop() 
 
         let translation_drops = take_translation_drop_by_fn();
         let drop_count = translation_drops.get("probe_dealloc_size_mismatch").copied().unwrap_or(0);
-        assert!(
-            drop_count <= 2,
-            "probe_dealloc_size_mismatch translation drops should be minimal, got {drop_count}, map={translation_drops:?}"
+        // The per-function map is the sum of this translation's place, constant and
+        // unsupported-field-projection drops (translate.rs record_deltas), each pinned
+        // above. It used to be a process-global delta that concurrent tests' take_*
+        // resets could shrink, which is how a combined <= 2 pin could pass.
+        let components = diagnostics.place_translation_drop.get()
+            + diagnostics.const_translation_drop.get()
+            + diagnostics.unsupported_field_projection.get();
+        assert_eq!(
+            drop_count, components,
+            "probe_dealloc_size_mismatch per-function drop map must equal its components, map={translation_drops:?}"
         );
 
         let translation_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
@@ -709,50 +698,45 @@ fn test_dealloc_size_mismatch_with_deref_store_emits_error_rule() {
         let body = instance.body().expect("function body");
 
         // At Mem level (the effective level after auto-promotion from Ptr).
-        let vc = mir_to_chc(
+        // The obligation is checked on the pre-pass VC (the rules translation emits):
+        // the post-translation passes fold its constant comparisons away.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_dealloc_size_mismatch_with_store",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+        ));
 
         assert!(!vc.rules.is_empty(), "VC should have rules");
 
-        let error_rules: Vec<_> = vc.rules.iter().filter(|r| r.head.name == "error").collect();
+        let error_rules: Vec<_> = vc.rules.iter().filter(|r| is_error_check_rule(r)).collect();
         assert!(
             !error_rules.is_empty(),
             "#3841: dealloc with *ptr=42 must still generate error rules at Mem level"
         );
 
-        let has_obj_size_in_error = error_rules.iter().any(|rule| {
-            rule.body.constraints.iter().any(|c| {
-                constraint_tree_contains(c, &|e: &Expr| {
-                    matches!(e.value(), ExprValue::Var { name, .. } if name.contains("obj_size"))
-                })
-            })
-        });
         assert!(
-            has_obj_size_in_error,
-            "#3841: error rules must reference obj_size even with *ptr=42 deref store"
+            check_rules_compare_dealloc_size(&vc, 64, 32),
+            "#3841: error rules must compare the recorded size (64) with the dealloc size (32) even with *ptr=42 deref store"
         );
-        let has_concrete_obj_size_index_in_error = error_rules.iter().any(|rule| {
+        // The double-free check selects obj_valid at the allocation's concrete id, not at
+        // a raw pointer extract (the size check no longer selects obj_size at all when the
+        // recorded size is known, see check_rules_compare_dealloc_size).
+        let has_concrete_obj_id_index_in_error = error_rules.iter().any(|rule| {
             rule.body.constraints.iter().any(|c| {
                 constraint_tree_contains(c, &|e: &Expr| match e.value() {
                     ExprValue::Select { array, index } => {
                         constraint_tree_contains(array, &|inner| {
-                            matches!(inner.value(), ExprValue::Var { name, .. } if name.contains("obj_size"))
+                            matches!(inner.value(), ExprValue::Var { name, .. } if name.contains("obj_size") || name.contains("obj_valid"))
                         }) && matches!(index.value(), ExprValue::BitVecConst { width, .. } if *width == 32)
-                            && !constraint_tree_contains(index, &|inner| {
-                                matches!(inner.value(), ExprValue::BvExtract { .. })
-                            })
                     }
                     _ => false,
                 })
             })
         });
         assert!(
-            has_concrete_obj_size_index_in_error,
-            "#3841: dealloc error rules must index obj_size with a concrete alloc id, \
+            has_concrete_obj_id_index_in_error,
+            "#3841: dealloc error rules must index heap metadata with a concrete alloc id, \
              not only a raw pointer extract"
         );
 
@@ -768,6 +752,33 @@ fn test_dealloc_size_mismatch_with_deref_store_emits_error_rule() {
             "#3841: expected at least 3 rules, got {total_rules} (error_rules={error_count})"
         );
     });
+}
+
+/// The dealloc size-match obligation `recorded == 0 || recorded == dealloc_size` in a check
+/// rule: an equality between the recorded allocation size and the dealloc size. The recorded
+/// size is `select(obj_size, id)`, or the constant itself when the allocation id and its size
+/// are known (`known_recorded_size` in translate_rust_dealloc, 1aa2e464d); either form counts.
+fn check_rules_compare_dealloc_size(vc: &trust_mc_core::chc::ChcVc, alloc: u64, dealloc: u64) -> bool {
+    let is_const = |e: &Expr, v: u64| {
+        matches!(e.value(), ExprValue::BitVecConst { value, .. } if value.to_string() == v.to_string())
+    };
+    let is_recorded = |e: &Expr| {
+        is_const(e, alloc)
+            || constraint_tree_contains(e, &|n: &Expr| {
+                matches!(n.value(), ExprValue::Var { name, .. } if name.contains("obj_size"))
+            })
+    };
+    let carries_dealloc = |e: &Expr| constraint_tree_contains(e, &|n: &Expr| is_const(n, dealloc));
+    vc.rules.iter().filter(|r| is_error_check_rule(r)).any(|rule| {
+        rule.body.constraints.iter().any(|c| {
+            constraint_tree_contains(c, &|e: &Expr| match e.value() {
+                ExprValue::Eq(a, b) => {
+                    (is_recorded(a) && carries_dealloc(b)) || (is_recorded(b) && carries_dealloc(a))
+                }
+                _ => false,
+            })
+        })
+    })
 }
 
 fn expr_selects_array_at_obj_id(expr: &Expr, array_name: &str, obj_id: u32) -> bool {

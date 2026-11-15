@@ -6,12 +6,54 @@
 // Extracted from `clusters.rs` — Part of #4206.
 
 use ay_bindings::{Expr, Sort};
-use rustc_public::mir::alloc::AllocId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::types::RefTarget;
 use crate::codegen_ay::provenance::Loc;
+
+/// The object a constant-pointer local points into (D4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::codegen_ay::chc) struct ConstRefObject {
+    /// The target's object id (`global_objects`).
+    pub(in crate::codegen_ay::chc) obj_id: u32,
+    /// The byte offset the pointer carries into its target.
+    pub(in crate::codegen_ay::chc) offset: u64,
+    /// The pointer itself (target + this offset), when known exactly: lets a
+    /// known delta RE-DECODE the window there (D10,
+    /// `const_pointer::fixed_pointee_at`) instead of copying a fact about
+    /// another window.
+    pub(in crate::codegen_ay::chc) ptr: Option<crate::codegen_ay::shared::const_pointer::ConstPtr>,
+    /// For a `&&str` constant: the inner `&str`'s data pointer (its string's
+    /// object and offset), which a deref of the outer pointer reads.
+    pub(in crate::codegen_ay::chc) nested: Option<(u32, u64)>,
+}
+
+impl ConstRefObject {
+    /// This pointer moved by `delta` bytes (the same object).
+    pub(in crate::codegen_ay::chc) fn moved(&self, delta: i128) -> Option<ConstRefObject> {
+        let offset = u64::try_from(i128::from(self.offset).checked_add(delta)?).ok()?;
+        Some(ConstRefObject {
+            obj_id: self.obj_id,
+            offset,
+            ptr: self.ptr.and_then(|p| p.moved(delta)),
+            nested: None,
+        })
+    }
+
+    /// The address `concat(obj_id, 0) + offset`.
+    pub(in crate::codegen_ay::chc) fn address(&self) -> Expr {
+        let base = crate::codegen_ay::chc::decl::global_objects::object_base_for(self.obj_id);
+        if self.offset == 0 {
+            base
+        } else {
+            base.bvadd(Expr::bitvec_const(
+                u128::from(self.offset),
+                crate::codegen_ay::types::POINTER_WIDTH,
+            ))
+        }
+    }
+}
 
 /// Reference resolution state for deref chain, BigInt/BigRational, static,
 /// and const-ref lookups.
@@ -79,12 +121,27 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// into `const_ref_values` but still needs concrete `PtrMetadata`/slice length.
     pub(in crate::codegen_ay::chc) static_ref_len_seeds: HashMap<usize, Expr>,
 
-    /// Tracks which static state vars correspond to `static mut`.
+    /// The static state vars whose value can CHANGE during the run: every
+    /// `static mut`, and every static of a non-`Freeze` type (an atomic, a
+    /// `Cell`, an `UnsafeCell`), which an `&` can still write
+    /// (`shared::const_pointer::Fixedness::Live`).
     ///
-    /// Some call handlers can soundly fold immutable statics to their cached
-    /// initializer literals, but mutable statics must keep state-variable
-    /// semantics so prior stores remain visible.
+    /// Some call handlers can soundly fold a FIXED static to its cached
+    /// initializer literal, but a live one must keep state-variable semantics
+    /// so prior stores remain visible. This held only `static mut`, so an
+    /// atomic static read back its initializer after a store:
+    /// `RA.store(5); ATOMS[1].load() == 2` PROVED.
     pub(in crate::codegen_ay::chc) mutable_static_state_idxs: HashSet<usize>,
+
+    /// Each static state variable's Rust type (the static's type), for the
+    /// static place path (`decl::static_path`).
+    pub(in crate::codegen_ay::chc) static_state_ty: HashMap<usize, rustc_public::ty::Ty>,
+
+    /// For a local mapped to a LIVE static's state variable through a
+    /// constant pointer at an offset (D6): the path from the static's value to
+    /// the part the pointer names. Absent: the whole static.
+    pub(in crate::codegen_ay::chc) static_ref_paths:
+        HashMap<usize, Vec<crate::codegen_ay::chc::decl::static_path::StaticPathElem>>,
 
     /// Static state vars a FOREIGN callee could legally write: every `static
     /// mut` plus every immutable static whose type is non-`Freeze` (interior
@@ -101,11 +158,58 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// `S` through this table rather than by name matching.
     pub(in crate::codegen_ay::chc) c_symbol_static_state_idx: HashMap<String, usize>,
 
-    /// Concrete address expressions for each unique static, keyed by AllocId.
-    /// Each static gets a distinct obj_id in the split-pointer scheme (BV32++BV32),
-    /// making `&A as *const _ != &B as *const _` decidable.
-    /// Part of #3496 Bug B: static address distinctness.
-    pub(in crate::codegen_ay::chc) static_address_exprs: HashMap<AllocId, Expr>,
+    /// THE object table (D1, `decl::global_objects`): one object per global
+    /// allocation (constant memory or static), keyed by its identity
+    /// (`shared::const_pointer::TargetKey`), minted once by `mint_object`
+    /// before translation. Replaces the AllocId-keyed `static_address_exprs`
+    /// and `promoted_const_alloc_addresses` and the shared object-1 fallback.
+    pub(in crate::codegen_ay::chc) global_objects: HashMap<
+        crate::codegen_ay::shared::const_pointer::TargetKey,
+        crate::codegen_ay::chc::decl::global_objects::GlobalObject,
+    >,
+
+    /// The types the harness reads each global object at (D2), in first-noted
+    /// order: the pointee types of constant pointers into it and of pointers
+    /// derived from them. `seed_global_objects` seeds the fixed ones whole.
+    pub(in crate::codegen_ay::chc) object_read_types:
+        Vec<(crate::codegen_ay::shared::const_pointer::TargetKey, Vec<rustc_public::ty::Ty>)>,
+    /// Reads noted by `&self` decoders (`note_object_read_deferred`), drained
+    /// into `object_read_types`.
+    pub(in crate::codegen_ay::chc) pending_object_reads: std::cell::RefCell<
+        Vec<(crate::codegen_ay::shared::const_pointer::TargetKey, rustc_public::ty::Ty)>,
+    >,
+    /// The types the harness dereferences at (its body and pre-scanned
+    /// callees, panic-only blocks excluded): every FIXED object in the read set
+    /// is seeded at each of them too (D2), because a cast or byte offset reads
+    /// an object at a type no constant names.
+    pub(in crate::codegen_ay::chc) extra_read_types: Vec<rustc_public::ty::Ty>,
+    /// Set once the entry rule's seeds are final (end of the declaration
+    /// passes): a read noted later fails closed (`const_object_unseeded`).
+    pub(in crate::codegen_ay::chc) object_seeding_closed: bool,
+    /// Actual u8/BV8 entry cells, frozen before emission and retained after
+    /// bb0 consumes the working seed vector. None marks conflicting or
+    /// mismatched declarations. Later seeds/arrays cannot add authority.
+    pub(in crate::codegen_ay::chc) const_ref_entry_byte_seeds: HashMap<(u32, u64), Option<Expr>>,
+    /// (obj_id, type) pairs `seed_global_objects` already seeded.
+    pub(in crate::codegen_ay::chc) seeded_object_types: HashSet<(u32, rustc_public::ty::Ty)>,
+    /// (type_key, cell sort, obj_id, offset) cells already in
+    /// `const_ref_memory_inits`. The sort is part of the cell: an array's key
+    /// carries both its per-element cells and its whole-value cell at offset
+    /// 0, and the entry rule seeds the one whose sort the key registered.
+    pub(in crate::codegen_ay::chc) seeded_cells: HashSet<(Arc<str>, ay_bindings::Sort, u32, u64)>,
+
+    /// Statics whose layout size and typed-memory mirror are registered (by
+    /// the static collector or a callee pre-scan), so a later body does not
+    /// register them twice.
+    pub(in crate::codegen_ay::chc) registered_static_memory:
+        HashSet<rustc_public::mir::mono::StaticDef>,
+
+    /// The state-variable index of each static the harness keeps a state
+    /// variable for, keyed by the obj_id of its object in `global_objects`. The walker's static mirror
+    /// (`mirror_static_state_var_update`) writes exactly the state variable
+    /// of the static a store reached; a static discovered only in a callee
+    /// has an address but no state variable, and is absent.
+    pub(in crate::codegen_ay::chc) static_state_idx_by_obj: HashMap<u32, usize>,
 
     /// For a POINTER-typed static, the address of the allocation its
     /// initializer points at, keyed by the static's state-var index.
@@ -117,16 +221,25 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// slot's own object and `**Z` reads `Z`'s pointer bits as an `i32`.
     pub(in crate::codegen_ay::chc) static_pointee_addrs: HashMap<usize, Expr>,
 
-    /// Initial value of the allocation a pointer-typed static points at, keyed
-    /// by the STATIC's state-var index (the same value as
-    /// `static_alloc_init_values`, reached without the allocation id).
+    /// Initial value of the window a FIXED pointer-typed static points at,
+    /// keyed by the STATIC's state-var index.
     pub(in crate::codegen_ay::chc) static_pointee_init_values: HashMap<usize, Expr>,
 
-    /// Initial value of the allocation a pointer-typed static points at, keyed
-    /// by that allocation's id. Shared by every static pointing at it — the
-    /// `FOO`/`BAR` pair in kani's `anon_static` both name the same anonymous
-    /// nested allocation.
-    pub(in crate::codegen_ay::chc) static_alloc_init_values: HashMap<AllocId, Expr>,
+    /// THE decoded value of each fixed pointee window a pointer-typed static
+    /// or promoted shared array names, keyed by (target, offset,
+    /// length word, pointee type): two statics naming one window — kani's
+    /// `static FOO: &[i32] = &[42]; static BAR: &[i32] = &*FOO` — denote ONE
+    /// value, not two decodes with two fresh array bases whose free tails
+    /// could disagree.
+    pub(in crate::codegen_ay::chc) window_values: HashMap<
+        (
+            crate::codegen_ay::shared::const_pointer::TargetKey,
+            u64,
+            Option<u64>,
+            rustc_public::ty::Ty,
+        ),
+        Expr,
+    >,
 
     /// Maps reference locals assigned from constant references to unit enums (Part of #1905).
     pub(in crate::codegen_ay::chc) const_ref_discriminants: HashMap<usize, u64>,
@@ -139,6 +252,27 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// the Slice(fld_ptr, fld_len, fld_data) is stored here so that downstream
     /// VecIter/VecIterMut handlers can reconstruct the Slice for make_vec_into_iter_chc.
     pub(in crate::codegen_ay::chc) const_ref_slice_views: HashMap<usize, Expr>,
+    /// References whose `const_ref_values` / `const_ref_slice_views` fact was
+    /// dropped because the copy that carried it was not the unique producer.
+    /// Deliberately NOT cleared by `clear_path_insensitive_ref_metadata`: a deref
+    /// through such a local fails closed rather than loading memory at a value.
+    pub(in crate::codegen_ay::chc) deref_value_fact_dropped: HashSet<usize>,
+    /// Blocks where the slice `Iterator::next` stub recorded the payload-slot
+    /// value fact for a local (`stmt::codegen_stmt_payload_value_fact`).
+    pub(in crate::codegen_ay::chc) payload_slot_fact_sites: HashMap<usize, HashSet<usize>>,
+    /// Payload value facts kept across agreeing duplicated producers, keyed by
+    /// `(source, destination)`, with the source's producer blocks that must all
+    /// appear in `payload_slot_fact_sites` once translation is done.
+    pub(in crate::codegen_ay::chc) kept_payload_value_facts: HashMap<(usize, usize), Vec<usize>>,
+    /// Reference destinations of the slice index stubs (`Index::index`,
+    /// `IndexMut::index_mut`, `get_unchecked`) whose register holds the ELEMENT,
+    /// not its address (`call::codegen_call_slice_index`), checked once every
+    /// block is translated ([`ChcCtx::book_escaping_index_value_refs`]).
+    pub(in crate::codegen_ay::chc) index_value_ref_dests: HashSet<usize>,
+    /// Blocks the Small-mode transition loop skipped (no block relation, or not
+    /// reachable from `bb0`): no rule leaves them, so a write there reaches no
+    /// derivation.
+    pub(in crate::codegen_ay::chc) untranslated_transition_blocks: HashSet<usize>,
 
     /// Memory array initializations needed for promoted constant references.
     /// Each entry: (type_key, elem_sort, value_expr, promoted_obj_id, byte_offset).
@@ -148,19 +282,19 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// Part of #2986: byte_offset enables per-element array constant initialization.
     pub(in crate::codegen_ay::chc) const_ref_memory_inits: Vec<(Arc<str>, Sort, Expr, u32, u64)>,
 
-    /// Promoted constant object IDs keyed by local.
-    ///
-    /// Array-backed promoted refs sometimes lower to pointer-typed locals. When
-    /// statement lowering needs the concrete promoted address for such a local,
-    /// this map provides the exact object ID assigned during const-ref discovery.
-    pub(in crate::codegen_ay::chc) const_ref_promoted_obj_ids: HashMap<usize, u32>,
+    /// The object a constant-pointer local points into and the byte OFFSET it
+    /// points at (D4), keyed by local. Readers copy the whole record, never
+    /// the object id alone: `concat(obj, 0)` for a pointer into the middle of
+    /// an allocation is a different address.
+    pub(in crate::codegen_ay::chc) const_ref_objects: HashMap<usize, ConstRefObject>,
 
-    /// Maps promoted constant allocation IDs to their per-constant addresses.
-    /// When `pointer_scalar_expr` translates a promoted `const &T` reference,
-    /// it needs the per-constant address (not the shared obj_id=1 fallback).
-    /// Part of #3860: address mismatch between translate_constant and entry rule.
-    pub(in crate::codegen_ay::chc) promoted_const_alloc_addresses:
-        HashMap<rustc_public::mir::alloc::AllocId, Expr>,
+    /// The constant-memory object a pointer local points into at an UNKNOWN
+    /// or nonzero offset: PROVENANCE ONLY, for the offset alloc-bound checks
+    /// (`known_obj_id_for_operand`). Never an address. A `known_alloc_ids`
+    /// entry carries an implicit offset of ZERO (`codegen_stmt_fallback.rs`
+    /// `try_extract_data_obj_id`), and carrying one through `ptr.add(1)` made
+    /// the deref base `concat(obj, 0)`: `*ONE.add(1) == 1` PROVED.
+    pub(in crate::codegen_ay::chc) const_memory_provenance: HashMap<usize, u32>,
 
     /// Locals that received heap allocation results (Part of #3012).
     /// These locals hold pointers from exchange_malloc/RustAlloc stubs, which are
@@ -245,6 +379,24 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// Part of #3495: range subslice fat pointer constraint fix.
     pub(in crate::codegen_ay::chc) subslice_len: HashMap<usize, Expr>,
 
+    /// The `subslice_len` / `subslice_offset` entries a walk front door hands
+    /// the next walked body for its ARGUMENT locals (keyed by the callee's
+    /// local index, `1 + argument position`), taken at the walk's entry.
+    ///
+    /// The side tables are keyed by local index, and every walked body has
+    /// its own index space: a walk clears every entry of its body's locals on
+    /// entry and applies only these, so an argument local the walk never
+    /// writes cannot read the entry a caller walk or the host left at the
+    /// same index (walker fail-closed review 6 round 2, finding 3).
+    pub(in crate::codegen_ay::chc) inline_arg_subslice_seeds:
+        Option<(HashMap<usize, Expr>, HashMap<usize, Expr>)>,
+
+    /// The walked body's return-local (`_0`) `subslice_len` /
+    /// `subslice_offset` entries as the last walk to end left them, captured
+    /// before that walk restores the caller's entries (the fn-inline front
+    /// door propagates them to its destination).
+    pub(in crate::codegen_ay::chc) inline_return_subslice: (Option<Expr>, Option<Expr>),
+
     /// Caches subslice materialization addresses by (provenance_local, start_const).
     /// When two subslice operations share the same provenance and start offset,
     /// they reuse the same data address, preserving fat pointer identity.
@@ -295,11 +447,13 @@ impl RefResolution {
         self.ref_arg_pointee_idx.remove(&local);
         self.coroutine_root_map.remove(&local);
         self.static_ref_to_state_idx.remove(&local);
+        self.static_ref_paths.remove(&local);
         self.call_forwarded_raw_ptrs.remove(&local);
         self.const_ref_discriminants.remove(&local);
         self.const_ref_values.remove(&local);
         self.const_ref_slice_views.remove(&local);
-        self.const_ref_promoted_obj_ids.remove(&local);
+        self.const_ref_objects.remove(&local);
+        self.const_memory_provenance.remove(&local);
         self.alloc_result_locals.remove(&local);
         self.collection_mut_refs.remove(&local);
         self.collection_index_refs.remove(&local);
@@ -329,18 +483,34 @@ impl RefResolution {
             static_ref_value_seeds: HashMap::new(),
             static_ref_len_seeds: HashMap::new(),
             mutable_static_state_idxs: HashSet::new(),
+            static_state_ty: HashMap::new(),
+            static_ref_paths: HashMap::new(),
             c_writable_static_state_idxs: HashSet::new(),
             c_symbol_static_state_idx: HashMap::new(),
-            static_address_exprs: HashMap::new(),
+            global_objects: HashMap::new(),
+            object_read_types: Vec::new(),
+            registered_static_memory: HashSet::new(),
+            pending_object_reads: std::cell::RefCell::new(Vec::new()),
+            extra_read_types: Vec::new(),
+            object_seeding_closed: false,
+            const_ref_entry_byte_seeds: HashMap::new(),
+            seeded_object_types: HashSet::new(),
+            seeded_cells: HashSet::new(),
+            static_state_idx_by_obj: HashMap::new(),
             static_pointee_addrs: HashMap::new(),
             static_pointee_init_values: HashMap::new(),
-            static_alloc_init_values: HashMap::new(),
+            window_values: HashMap::new(),
             const_ref_discriminants: HashMap::new(),
             const_ref_values: HashMap::new(),
             const_ref_slice_views: HashMap::new(),
+            deref_value_fact_dropped: HashSet::new(),
+            payload_slot_fact_sites: HashMap::new(),
+            kept_payload_value_facts: HashMap::new(),
+            index_value_ref_dests: HashSet::new(),
+            untranslated_transition_blocks: HashSet::new(),
             const_ref_memory_inits: Vec::new(),
-            const_ref_promoted_obj_ids: HashMap::new(),
-            promoted_const_alloc_addresses: HashMap::new(),
+            const_ref_objects: HashMap::new(),
+            const_memory_provenance: HashMap::new(),
             alloc_result_locals: HashSet::new(),
             collection_mut_refs: HashMap::new(),
             collection_index_refs: HashMap::new(),
@@ -352,6 +522,8 @@ impl RefResolution {
             promoted_raw_values: HashMap::new(),
             subslice_offset: HashMap::new(),
             subslice_len: HashMap::new(),
+            inline_arg_subslice_seeds: None,
+            inline_return_subslice: (None, None),
             subslice_addr_cache: HashMap::new(),
             static_memory_inits: Vec::new(),
             static_alloc_sizes: Vec::new(),

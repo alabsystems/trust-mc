@@ -9,13 +9,14 @@
 //! composite 64-bit pointer representation; below `Ptr` they fall back to
 //! nondeterministic (sound over-approximation).
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::Expr;
 use tracing::warn;
 
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::codegen_rules::CodegenRules;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 use crate::args::ChcTrackLevel;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, bool_sort, coerce_bitvec_width_safe};
 
@@ -122,8 +123,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             "IsAllocated: pointer arg translation failed at Ptr+ level, \
              falling back to nondeterministic (sound over-approximation)"
         );
-        self.record_sound_fallback_reason("is_allocated_ptr_translation_failed");
-        declare_pending_var(chc_fresh_name("__is_allocated_nondet"), bool_sort())
+        let booked = self.record_sound_fallback_reason("is_allocated_ptr_translation_failed");
+        Havoc::booked(booked, chc_fresh_name("__is_allocated_nondet"), bool_sort())
     }
 
     /// Handle `KaniHook::PointerObject`: extract allocation ID from pointer.
@@ -175,14 +176,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         "PointerObject: pointer arg translation failed at Ptr+ level, \
                          falling back to nondeterministic (sound over-approximation)"
                     );
-                    self.record_sound_fallback_reason("ptr_object_translation_failed");
-                    declare_pending_var(chc_fresh_name("__ptr_obj_nondet"), out_sort.clone())
+                    let booked = self.record_sound_fallback_reason("ptr_object_translation_failed");
+                    Havoc::booked(booked, chc_fresh_name("__ptr_obj_nondet"), out_sort.clone())
                 }
             } else {
                 // Part of #3447: Record that pointer object ID is unconstrained
                 // at below-Ptr track level.
-                self.record_sound_fallback_reason("ptr_object_below_ptr_level");
-                declare_pending_var(chc_fresh_name("__ptr_obj_nondet"), out_sort.clone())
+                let booked = self.record_sound_fallback_reason("ptr_object_below_ptr_level");
+                Havoc::booked(booked, chc_fresh_name("__ptr_obj_nondet"), out_sort.clone())
             };
 
             let eq = self.make_coerced_eq_constraint(
@@ -256,14 +257,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         "PointerOffset: pointer arg translation failed at Ptr+ level, \
                          falling back to nondeterministic (sound over-approximation)"
                     );
-                    self.record_sound_fallback_reason("ptr_offset_translation_failed");
-                    declare_pending_var(chc_fresh_name("__ptr_off_nondet"), out_sort.clone())
+                    let booked = self.record_sound_fallback_reason("ptr_offset_translation_failed");
+                    Havoc::booked(booked, chc_fresh_name("__ptr_off_nondet"), out_sort.clone())
                 }
             } else {
                 // Part of #3447: Record that pointer offset is unconstrained
                 // at below-Ptr track level.
-                self.record_sound_fallback_reason("ptr_offset_below_ptr_level");
-                declare_pending_var(chc_fresh_name("__ptr_off_nondet"), out_sort.clone())
+                let booked = self.record_sound_fallback_reason("ptr_offset_below_ptr_level");
+                Havoc::booked(booked, chc_fresh_name("__ptr_off_nondet"), out_sort.clone())
             };
 
             let eq = self.make_coerced_eq_constraint(

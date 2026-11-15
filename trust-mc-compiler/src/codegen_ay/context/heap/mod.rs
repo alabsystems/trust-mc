@@ -11,7 +11,10 @@ use ay_bindings::{Expr, Sort};
 
 use super::AYCtx;
 
+mod box_validity;
 mod realloc;
+
+pub(in crate::codegen_ay) use box_validity::{BoxAllocation, BoxPointerOrigin};
 
 /// Heap allocation model state for BMC verification (#1100).
 ///
@@ -39,6 +42,16 @@ pub(in crate::codegen_ay) struct HeapState {
     /// Object size array: obj_size[ptr_id] = size_in_bytes
     /// Sort: (Array (_ BitVec POINTER_WIDTH) (_ BitVec POINTER_WIDTH))
     pub(super) obj_size: Option<Expr>,
+    /// Address-taken stack objects registered so far: `(address, size)`, each
+    /// kept out of every heap region and apart from the others
+    /// (`AYCtx::register_stack_object`).
+    pub(super) stack_objects: Vec<(Expr, u64)>,
+    /// Facts minted only by authenticated native allocation/address producers.
+    /// These do not inherit the legacy heap arrays' default live/unknown size.
+    pub(super) box_allocations: Vec<BoxAllocation>,
+    pub(super) box_numeric_addresses: Vec<Expr>,
+    pub(super) box_erased_addresses: Vec<Expr>,
+    pub(super) released_box_allocations: std::collections::HashSet<usize>,
 }
 
 /// Stride between heap allocations in address space (1MB).
@@ -47,6 +60,10 @@ pub(in crate::codegen_ay) struct HeapState {
 /// This ensures allocations don't overlap when used with the byte-addressed memory model.
 /// 1MB is chosen to be large enough for typical allocations while leaving room for many allocations.
 pub(super) const HEAP_STRIDE: u64 = 0x100000; // 1MB
+
+/// Stack objects registered while fewer than this many exist are kept apart
+/// from every earlier one (`AYCtx::register_stack_object`); later ones are not.
+pub(super) const MAX_PAIRWISE_STACK_OBJECTS: usize = 512;
 
 impl Default for HeapState {
     fn default() -> Self {
@@ -63,6 +80,11 @@ impl HeapState {
             next_alloc_id: 1, // 0 reserved for null
             obj_valid: None,
             obj_size: None,
+            stack_objects: Vec::new(),
+            box_allocations: Vec::new(),
+            box_numeric_addresses: Vec::new(),
+            box_erased_addresses: Vec::new(),
+            released_box_allocations: std::collections::HashSet::new(),
         }
     }
 
@@ -200,6 +222,21 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         let ptr = Expr::bitvec_const(base_addr as u128, POINTER_WIDTH);
         let ptr_obj = Self::heap_object_expr_from_alloc_id(id);
 
+        // Stack objects registered before this allocation stay out of its region
+        // (see `register_stack_object`). Each is confined to one region, so its
+        // start address decides.
+        let region_end = base_addr.checked_add(HEAP_STRIDE);
+        for (stack_addr, _) in self.heap_state.stack_objects.clone() {
+            let below = stack_addr.clone().bvult(ptr.clone());
+            let outside = match region_end {
+                Some(end) => {
+                    below.or(stack_addr.bvuge(Expr::bitvec_const(end as u128, POINTER_WIDTH)))
+                }
+                None => below,
+            };
+            self.assert(outside);
+        }
+
         // Initialize heap arrays lazily if needed
         self.ensure_heap_arrays_initialized();
 
@@ -248,6 +285,16 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// ENSURES: obj_valid[obj_id(ptr)] == false (SSA constraint emitted to solver)
     /// ENSURES: obj_size[obj_id(ptr)] unchanged (size metadata preserved for debugging)
     pub(in crate::codegen_ay) fn heap_dealloc(&mut self, ptr: Expr, size: Expr, _align: Expr) {
+        self.heap_dealloc_on_path(ptr, size, _align, None);
+    }
+
+    pub(in crate::codegen_ay) fn heap_dealloc_on_path(
+        &mut self,
+        ptr: Expr,
+        size: Expr,
+        _align: Expr,
+        guard: Option<Expr>,
+    ) {
         self.ensure_heap_arrays_initialized();
         let ptr_obj = self.heap_pointer_object(ptr.clone());
 
@@ -256,10 +303,12 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         if let Some(ref size_arr) = self.heap_state.obj_size {
             let recorded_size = size_arr.clone().select(ptr_obj);
             let size_mismatch = recorded_size.eq(size).not();
+            let size_mismatch =
+                guard.as_ref().map_or(size_mismatch.clone(), |g| g.clone().and(size_mismatch));
             self.record_property_violation(size_mismatch, "dealloc_size_mismatch");
         }
 
-        self.heap_dealloc_ptr_only(ptr);
+        self.heap_dealloc_ptr_only(ptr, guard);
     }
 
     /// Deallocate by pointer only — avoids requiring (and cloning) unused size/align.
@@ -270,7 +319,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// Fix for #2531: now emits SSA constraints so the solver can reason about
     /// deallocation (use-after-free / double-free detection). Previously, the
     /// validity update was internal-only and invisible to the solver.
-    fn heap_dealloc_ptr_only(&mut self, ptr: Expr) {
+    fn heap_dealloc_ptr_only(&mut self, ptr: Expr, guard: Option<Expr>) {
+        self.native_box_deallocation_event(&ptr, guard.clone());
         self.ensure_heap_arrays_initialized();
         let ptr_obj = self.heap_pointer_object(ptr.clone());
         let ptr_offset = self.heap_pointer_offset(ptr);
@@ -278,7 +328,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         // Part of #2725: Deallocation requires base pointer (offset == 0).
         // CHC parity: stubs_alloc_heap_ops.rs / codegen_rules_helpers.rs.
         let is_base_pointer = ptr_offset.eq(Expr::bitvec_const(0u128, POINTER_WIDTH));
-        self.record_property_violation(is_base_pointer.not(), "dealloc_base_pointer_check");
+        let violation = is_base_pointer.not();
+        let violation = guard.as_ref().map_or(violation.clone(), |g| g.clone().and(violation));
+        self.record_property_violation(violation, "dealloc_base_pointer_check");
 
         // Part of #2718: Double-free detection — assert obj_valid[obj_id(ptr)] == true before
         // invalidating.
@@ -286,13 +338,16 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         // The violation is satisfiable when ptr was already freed (obj_valid[obj_id(ptr)] == false).
         if let Some(ref valid_arr) = self.heap_state.obj_valid {
             let is_valid = Self::heap_valid_select(valid_arr, ptr_obj.clone());
-            self.record_property_violation(is_valid.not(), "double_free_check");
+            let violation = is_valid.not();
+            let violation = guard.as_ref().map_or(violation.clone(), |g| g.clone().and(violation));
+            self.record_property_violation(violation, "double_free_check");
         }
 
         // Mark allocation as invalid: obj_valid[obj_id(ptr)] = false
         // Emit SSA constraint so the solver sees the deallocation.
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
-            let new_valid = valid_arr.store(ptr_obj, Self::heap_valid_bit(false));
+            let freed = valid_arr.clone().store(ptr_obj, Self::heap_valid_bit(false));
+            let new_valid = guard.map_or(freed.clone(), |g| Expr::ite(g, freed, valid_arr));
             self.heap_state.obj_valid =
                 Some(self.declare_ssa_var_eq_expr("heap_dealloc_valid", new_valid));
         }
@@ -306,6 +361,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// (PointerWithExposedProvenance). These pointers were never allocated,
     /// so obj_valid should be false to prevent false proofs.
     pub(in crate::codegen_ay) fn heap_invalidate_no_provenance(&mut self, ptr: Expr) {
+        self.guard_native_box_numeric_invalidation(&ptr);
         self.ensure_heap_arrays_initialized();
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
             let obj_id = self.heap_pointer_object(ptr);
@@ -325,6 +381,9 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         ptr: Expr,
         condition: Expr,
     ) {
+        if !matches!(condition.value(), ay_bindings::ExprValue::BoolConst(false)) {
+            self.guard_native_box_numeric_invalidation(&ptr);
+        }
         self.ensure_heap_arrays_initialized();
         if let Some(valid_arr) = self.heap_state.obj_valid.take() {
             let obj_id = self.heap_pointer_object(ptr);
@@ -498,6 +557,51 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// ENSURES: Adds one assertion to the constraint set, unless the object is
     ///          larger than `HEAP_STRIDE`, in which case an
     ///          `unsupported_oversized_object` violation is recorded instead.
+    /// Keep the address-taken stack object `[addr, addr + size)` apart from every
+    /// heap object and every other stack object.
+    ///
+    /// Heap objects get concrete regions `id * HEAP_STRIDE`; a stack object gets a
+    /// symbolic address that nothing separated from those regions or from other
+    /// stack objects. The solver could place a stack slot on a box payload, and
+    /// the resulting counterexample was certified Genuine:
+    /// `let b = Box::into_raw(Box::new(2u8)); let pa = &mut a as *mut u8;
+    /// *pa = 7; assert!(*b == 2)` FAILED, and `ptr::eq(&a, &b)` held for two
+    /// distinct locals. The object must already be confined to one region
+    /// (`heap_constrain_within_region`, or a single byte). It is placed in region
+    /// 0, below the first heap base, or in a region no allocation has used yet;
+    /// `heap_alloc` excludes it from later regions. Relative order stays free.
+    pub(in crate::codegen_ay) fn register_stack_object(&mut self, addr: Expr, size: u64) {
+        if size == 0 || size > HEAP_STRIDE {
+            // Zero-sized objects may share an address; oversized ones are already
+            // reported as unsupported.
+            return;
+        }
+        let stride = HEAP_STRIDE as u128;
+        let below_heap = addr.clone().bvult(Expr::bitvec_const(stride, POINTER_WIDTH));
+        let placement = match (self.heap_state.next_alloc_id as u128).checked_mul(stride) {
+            Some(first_unused) if first_unused <= u64::MAX as u128 => {
+                below_heap.or(addr.clone().bvuge(Expr::bitvec_const(first_unused, POINTER_WIDTH)))
+            }
+            _ => below_heap,
+        };
+        self.assert(placement);
+        if self.heap_state.stack_objects.len() >= MAX_PAIRWISE_STACK_OBJECTS {
+            // Beyond the cap two stack objects may still overlap in a model, so a
+            // counterexample through them is not certified.
+            self.bmc_sound_havoc("stack_object_disjointness_capped");
+        } else {
+            let last = addr.clone().bvadd(Expr::bitvec_const((size - 1) as u128, POINTER_WIDTH));
+            for (other, other_size) in self.heap_state.stack_objects.clone() {
+                let other_last = other
+                    .clone()
+                    .bvadd(Expr::bitvec_const((other_size - 1) as u128, POINTER_WIDTH));
+                self.assert(last.clone().bvult(other).or(other_last.bvult(addr.clone())));
+            }
+        }
+        tracing::debug!(size, "register_stack_object: stack object kept apart from heap and stack");
+        self.heap_state.stack_objects.push((addr, size));
+    }
+
     pub(in crate::codegen_ay) fn heap_constrain_within_region(&mut self, addr: Expr, size: u64) {
         if size <= 1 {
             return; // Single-byte objects can never straddle a boundary.

@@ -151,6 +151,8 @@ impl<'a> TupleUsageVisitor<'a> {
                 }
             }
             Operand::Constant(_) => {}
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {}
         }
     }
 
@@ -158,6 +160,8 @@ impl<'a> TupleUsageVisitor<'a> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => place.ty(self.body.locals()).ok(),
             Operand::Constant(c) => Some(c.const_.ty()),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => Some(rustc_public::ty::Ty::bool_ty()),
         }
     }
 
@@ -191,7 +195,7 @@ impl MirVisitor for TupleUsageVisitor<'_> {
 
                 // Check RHS
                 match rvalue {
-                    Rvalue::Use(operand) => {
+                    Rvalue::Use(operand, ..) => {
                         // Copy/Move of a place - this is the tuple copy pattern.
                         // Don't mark as whole-use if it's a tuple-to-tuple copy, even when the
                         // destination is behind a deref (rust-call argument shims).

@@ -529,13 +529,21 @@ fn test_kani_any_mem_level_mirrors_value_to_memory_load() {
         let any_dest_local = any_dest_local.expect("kani::any destination local");
         let any_dest_output = format!("_probe_kani_any_mem_mirror_{}__out", any_dest_local);
 
-        let mem_vc = mir_to_chc(
+        let reg_vc = mir_to_chc(ctx.tcx, &body, "probe_kani_any_mem_mirror", ChcConfig::default());
+        // Pre-pass Mem VC, full frame as `mir_to_chc` encodes first: the constant-address load
+        // is scalarized (7faa74cf9) and the single-use `__out` pruned (6b811318f) in the
+        // translated VC, removing the `select` and destination output pinned below.
+        let mem_vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_kani_any_mem_mirror",
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
-        let reg_vc = mir_to_chc(ctx.tcx, &body, "probe_kani_any_mem_mirror", ChcConfig::default());
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
         assert_vc_structure(&mem_vc, "probe_kani_any_mem_mirror_mem", body.blocks.len());
         assert_vc_structure(&reg_vc, "probe_kani_any_mem_mirror_reg", body.blocks.len());
 

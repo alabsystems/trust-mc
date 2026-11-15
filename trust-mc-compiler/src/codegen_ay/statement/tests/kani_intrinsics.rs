@@ -142,7 +142,7 @@ pub fn char_probe(x: char) -> char { x }
         );
         assert_eq!(
             constraint_count(&codegen),
-            constraints_before + 1,
+            constraints_before + 4,
             "char any_raw should constrain the nondet value to valid Unicode scalar ranges"
         );
     });
@@ -383,7 +383,7 @@ pub fn char_array_probe(x: [char; 2]) -> [char; 2] { x }
         assert!(dest_expr.sort().is_array(), "char array any_raw should produce Array sort");
         assert_eq!(
             constraint_count(&codegen),
-            constraints_before + 2,
+            constraints_before + 8,
             "each char array element should get a Unicode scalar constraint"
         );
     });

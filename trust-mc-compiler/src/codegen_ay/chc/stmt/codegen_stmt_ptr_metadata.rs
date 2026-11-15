@@ -12,6 +12,7 @@
 //!
 //! Extracted from `codegen_stmt_arithmetic_ops.rs` per #3619 Phase 2.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -27,10 +28,7 @@ use crate::kani_middle::abi::LayoutOf;
 
 use super::codegen_decl_flatten::collect_leaf_sorts;
 use super::codegen_types::CodegenTypes;
-use super::{
-    ChcCtx, UnknownProjectionPolicy, chc_fresh_name, collect_field_projections, declare_pending_var,
-};
-use crate::codegen_ay::chc::codegen_ctx::diagnostics::CellCounter;
+use super::{ChcCtx, UnknownProjectionPolicy, chc_fresh_name, collect_field_projections};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Resolves `PtrMetadata(operand)` — the slice/str length or the vtable
@@ -52,6 +50,47 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn resolve_ptr_metadata_expr(
+        &self,
+        operand: &Operand,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        if let Some(known) = self.resolve_ptr_metadata_known(operand, modified_locals) {
+            return Some(known);
+        }
+        let ty = operand.ty(self.body.locals()).ok()?;
+        // Fallback: return a fresh symbolic variable. This is sound
+        // (over-approximation) but may cause false counterexamples.
+        // Part of #3447: track PtrMetadata unconstrained fallbacks.
+        //
+        // AUDIT (task #65): the fresh var replaces the program-computed DST
+        // metadata (slice/str length). Havoc direction: WIDENING ONLY — the
+        // fresh var is universally quantified in the Horn rule body, so the
+        // real metadata value is one admitted instantiation; every real
+        // execution stays representable and a PROOF over the widened system is
+        // valid. The residual risk is precision, not proof soundness: checks
+        // guarded by the same havoced length can be co-satisfied with values
+        // the program never produces (spurious CTREX), and a Success that
+        // leaned on the havoc proves the property for ALL lengths — stronger,
+        // never weaker. The counter is now plumbed through generate_metadata
+        // (codegen_units.rs) as a SOUND_APPROXIMATION category: the driver's
+        // Step-C fail-closes a Success carrying it (OverApproximation), which
+        // is the conservative read Step-C is designed to make.
+        let booked = self.diagnostics.book_ptr_metadata_unconstrained();
+        let name = chc_fresh_name("ptr_metadata");
+        debug!(?operand, ?ty, "CHC: PtrMetadata unresolved, using symbolic var {name}");
+        Some(Havoc::booked(booked, name, ptr_sort()))
+    }
+
+    /// The metadata of a pointer operand when some route KNOWS it — every
+    /// resolution route of [`Self::translate_ptr_metadata`] except the final
+    /// havoc. `None` means unresolved; the caller decides between a counted
+    /// havoc and failing closed. A thin pointer resolves to `0`.
+    ///
+    /// Consumers besides `PtrMetadata` itself: the byte-step stubs, which must
+    /// carry a wide operand's metadata into their wide destination
+    /// (`with_metadata_of(self)`), and the slice-extent obligation at a
+    /// raw-to-reference cast, which must not rest on a havoced length.
+    pub(in crate::codegen_ay::chc) fn resolve_ptr_metadata_known(
         &self,
         operand: &Operand,
         modified_locals: &HashSet<usize>,
@@ -93,7 +132,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Trace through Copy/Move assignments to find the original subslice local.
         if let Operand::Copy(place) | Operand::Move(place) = operand {
             // Direct lookup first.
-            if !self.local_has_multiple_whole_definitions(place.local)
+            if self.path_insensitive_metadata_is_stable(place.local)
                 && let Some(len_expr) = self.ref_resolution.subslice_len.get(&place.local)
             {
                 return Some(len_expr.clone());
@@ -238,6 +277,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `SOUND_APPROXIMATION` category the driver force-demotes.
         if let Operand::Copy(place) | Operand::Move(place) = operand
             && let Some(ptr_expr) = self.translate_place_with_modified(place, modified_locals)
+            && !super::codegen_stmt_slice_len_write::slice_slot_has_widened_leaf(&ptr_expr)
             && let Some(repr) = PtrRepr::classify(&ptr_expr)
         {
             match repr.into_metadata() {
@@ -252,27 +292,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // Fallback: return a fresh symbolic variable. This is sound
-        // (over-approximation) but may cause false counterexamples.
-        // Part of #3447: track PtrMetadata unconstrained fallbacks.
-        //
-        // AUDIT (task #65): the fresh var replaces the program-computed DST
-        // metadata (slice/str length). Havoc direction: WIDENING ONLY — the
-        // fresh var is universally quantified in the Horn rule body, so the
-        // real metadata value is one admitted instantiation; every real
-        // execution stays representable and a PROOF over the widened system is
-        // valid. The residual risk is precision, not proof soundness: checks
-        // guarded by the same havoced length can be co-satisfied with values
-        // the program never produces (spurious CTREX), and a Success that
-        // leaned on the havoc proves the property for ALL lengths — stronger,
-        // never weaker. The counter is now plumbed through generate_metadata
-        // (codegen_units.rs) as a SOUND_APPROXIMATION category: the driver's
-        // Step-C fail-closes a Success carrying it (OverApproximation), which
-        // is the conservative read Step-C is designed to make.
-        self.diagnostics.ptr_metadata_unconstrained.inc();
-        let name = chc_fresh_name("ptr_metadata");
-        debug!(?operand, ?ty, "CHC: PtrMetadata unresolved, using symbolic var {name}");
-        Some(declare_pending_var(name, ptr_sort()))
+        None
     }
 
     /// Trace through MIR assignments (AddressOf, Ref, CopyForDeref, Use, Cast)
@@ -284,6 +304,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `*const str` local doesn't inherit it. This trace follows the MIR chain
     /// back to the Box local and resolves its tracked length.
     fn resolve_len_state_through_mir_trace(&self, start_local: usize) -> Option<Expr> {
+        // A path-insensitive trace names ONE producer. For a local with several
+        // whole-local definitions (a loop-carried or joined slice), that is
+        // whichever assignment the scan below happened to see last, so the
+        // length it returns holds on some paths only (design 4).
+        if !self.path_insensitive_metadata_is_stable(start_local) {
+            return None;
+        }
         // Direct check first.
         if let Some(len_var) = self.collections.len_state.get_len_var(start_local).cloned() {
             let len_expr = self.collection_current_len(&len_var);
@@ -309,7 +336,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             Rvalue::CopyForDeref(place) if place.projection.is_empty() => {
                                 traced_local = Some(place.local);
                             }
-                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                                 if place.projection.is_empty() =>
                             {
                                 traced_local = Some(place.local);
@@ -327,6 +354,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             match traced_local {
                 Some(next) => {
+                    if !self.path_insensitive_metadata_is_stable(next) {
+                        return None;
+                    }
                     if let Some(len_var) = self.collections.len_state.get_len_var(next).cloned() {
                         let len_expr = self.collection_current_len(&len_var);
                         debug!(
@@ -356,6 +386,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `clause.literals().len()` where `literals()` returns `&self.0` from a
     /// struct wrapping `Vec<T>`).
     fn resolve_ptr_metadata_from_vec_backed_slice(&self, start_local: usize) -> Option<Expr> {
+        // Same refusal as the direct `subslice_len` lookup: the side table and
+        // the chain below name one producer of a local that may have several.
+        if !self.path_insensitive_metadata_is_stable(start_local) {
+            return None;
+        }
         // Direct lookup: is this local directly a VecAsSlice destination?
         if let Some(&vec_local) = self.ref_resolution.slice_to_vec_local.get(&start_local) {
             if let Some(len_expr) = self.resolve_vec_len_from_slice_mapping(start_local, vec_local)
@@ -376,7 +411,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         && lhs.local == current
                         && lhs.projection.is_empty()
                     {
-                        if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rvalue
+                        if let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) = rvalue
                             && place.projection.is_empty()
                         {
                             source_local = Some(place.local);
@@ -386,6 +421,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             match source_local {
                 Some(src) => {
+                    if !self.path_insensitive_metadata_is_stable(src) {
+                        return None;
+                    }
                     if let Some(&vec_local) = self.ref_resolution.slice_to_vec_local.get(&src) {
                         if let Some(len_expr) =
                             self.resolve_vec_len_from_slice_mapping(src, vec_local)
@@ -428,6 +466,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Part of #3348: fixes CnfClause newtype VecAsSlice → PtrMetadata ordering.
     fn resolve_vec_len_from_defining_call(&self, dest_local: usize) -> Option<Expr> {
+        // The scan stops at the FIRST defining call; with several definitions
+        // that call's length holds on its own path only.
+        if !self.path_insensitive_metadata_is_stable(dest_local) {
+            return None;
+        }
         for block in &self.body.blocks {
             if let TerminatorKind::Call { args, destination, .. } = &block.terminator.kind
                 && destination.local == dest_local
@@ -466,6 +509,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
         None
+    }
+
+    /// The current length of the `Vec` a slice local views, when the local's
+    /// one definition is the `VecAsSlice` model (`Vec::deref`, `deref_mut`,
+    /// `as_slice`, `as_mut_slice`, or a whole-field accessor): the view starts
+    /// at the buffer's first element and the `Vec` cannot change length while
+    /// it is borrowed. `None` for any other producer.
+    pub(in crate::codegen_ay::chc) fn vec_as_slice_len(&self, slice_local: usize) -> Option<Expr> {
+        if !self.path_insensitive_metadata_is_stable(slice_local) {
+            return None;
+        }
+        let owner_local = *self.ref_resolution.slice_to_vec_local.get(&slice_local)?;
+        self.resolve_vec_len_from_slice_mapping(slice_local, owner_local)
     }
 
     fn resolve_vec_len_from_slice_mapping(

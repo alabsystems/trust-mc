@@ -26,7 +26,7 @@ command exits zero when the inputs are readable and reports the measured proof
 numerator plus any missing proof inventory rows:
 
 ```bash
-cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked \
+targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --locked \
   --bin replacement-progress -- \
   --report reports/compiletest-per-harness-latest-trust-mc.json
 ```
@@ -34,7 +34,7 @@ cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked \
 Repeated `--report` arguments may be used for shards or focused lanes:
 
 ```bash
-cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked \
+targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --locked \
   --bin replacement-progress -- \
   --report reports/compiletest-per-harness-proof-latest-lane-a.json \
   --report reports/compiletest-per-harness-proof-latest-lane-b.json
@@ -86,7 +86,7 @@ python3 scripts/direct_driver_proof_report.py \
   reports/direct-driver-proof-latest.json \
   --inventory tests/trust-mc/replacement-harness-inventory.proof.json
 
-cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked \
+targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --locked \
   --bin replacement-progress -- \
   --report reports/direct-driver-proof-latest.json
 ```
@@ -129,7 +129,7 @@ replacement-quality proof rows and the non-proof closure covers every non-PROOF
 row in the mixed inventory:
 
 ```bash
-cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked \
+targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --locked \
   --bin replacement-progress -- \
   --require-complete \
   --report reports/compiletest-per-harness-latest-trust-mc.json

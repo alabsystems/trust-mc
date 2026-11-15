@@ -8,6 +8,7 @@
 
 use crate::args::cargo::CargoTestArgs;
 use crate::args::common::UnstableFeature;
+use crate::args::compiler_route::CompilerRouteArgs;
 use crate::args::{CommonArgs, ValidateArgs};
 use clap::error::ErrorKind;
 use clap::{Error, Parser};
@@ -40,6 +41,11 @@ pub(crate) struct PlaybackArgs {
     /// Common args always available to trust-mc subcommands.
     #[command(flatten)]
     pub common_opts: CommonArgs,
+
+    /// Which compiler builds the playback test. The backend dylib is never loaded,
+    /// so `--backend-dylib` is refused here.
+    #[command(flatten)]
+    pub compiler_route: CompilerRouteArgs,
 
     /// Compile but don't actually run the tests.
     #[arg(long)]
@@ -76,6 +82,15 @@ impl ValidateArgs for KaniPlaybackArgs {
 impl ValidateArgs for PlaybackArgs {
     fn validate(&self) -> Result<(), Error> {
         self.common_opts.validate()?;
+        self.compiler_route.validate()?;
+        if self.compiler_route.backend_dylib.is_some() {
+            return Err(Error::raw(
+                ErrorKind::ArgumentConflict,
+                "Invalid argument: `--backend-dylib` does not apply to `playback`: concrete \
+                 playback builds a real test executable with trustc's own codegen backend and \
+                 never loads the trust-mc backend",
+            ));
+        }
         if !self.common_opts.unstable_features.contains(UnstableFeature::ConcretePlayback) {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,

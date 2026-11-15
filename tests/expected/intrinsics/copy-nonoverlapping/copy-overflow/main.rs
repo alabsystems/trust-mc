@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Checks that `copy_nonoverlapping` triggers an overflow failure if the `count`
 //! argument can overflow a `usize`
+#![feature(core_intrinsics)]
+
 #[kani::proof]
 fn test_copy_nonoverlapping_unaligned() {
     let arr: [i32; 3] = [0, 1, 0];

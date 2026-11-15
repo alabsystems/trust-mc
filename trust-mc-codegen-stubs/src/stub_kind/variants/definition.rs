@@ -202,6 +202,10 @@ pub enum StubKind {
     /// <[T]>::into_vec / alloc::slice::hack::into_vec — Box<[T]> to Vec<T> (#2967)
     /// The vec![...] macro expansion path. Models data transfer from heap to abstract Vec.
     SliceIntoVec,
+    /// <[T]>::repeat(&self, n) -> Vec<T> — the buffer `str::repeat` builds
+    /// (`self.as_bytes().repeat(n)`). Exact for a constant `n` over a resolved
+    /// source; any other shape keeps a recorded fallback.
+    SliceRepeat,
     // RawVec stubs (Part of #1037) - low-level buffer management
     // RawVec is Vec's internal allocation layer - must be stubbed when MIR bodies unavailable
     /// RawVec::new_in(alloc) -> RawVec<T, A> - create empty buffer
@@ -530,6 +534,18 @@ pub enum StubKind {
     StringIsAscii,      // str::is_ascii(&self) -> bool (Part of #2125 Phase 2)
     StringAsStr,        // String::as_str(&self) -> &str (Part of #3582)
     StringIntoBoxedStr, // String::into_boxed_str(self) -> Box<str> (#3646)
+    /// String::from_utf8(Vec<u8>) -> Result<String, FromUtf8Error>.
+    /// Concrete bytes: exact Ok/Err decided at codegen time. Symbolic bytes:
+    /// nondeterministic Ok(String carrying the Vec's ptr/len/cap/data) | Err —
+    /// a sound over-approximation that never silently picks Ok. Keeps the
+    /// call out of the BMC mini-inliner, which otherwise descends into
+    /// `run_utf8_validation` (109 blocks, over the 64-block cap) and demotes
+    /// the whole harness to a "Call terminator" fallback.
+    StringFromUtf8,
+    /// String::into_bytes(self) -> Vec<u8>: layout identity (ptr, len, cap, data).
+    /// The mini-inlined `self.vec` projection lost the fields (unconstrained
+    /// Vec); the stub carries them across the String -> Vec<u8> sort change.
+    StringIntoBytes,
     /// kani_str_bytes_nth(source: &str, index: usize) -> Option<u8> (#4161)
     /// Intercepts MIR-rewritten str.bytes().nth(i) before fn_inline bails.
     StrBytesNth,

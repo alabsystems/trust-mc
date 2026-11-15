@@ -21,12 +21,6 @@ macro_rules! path_str {
     };
 }
 
-fn rustup_toolchain_lib() -> Option<String> {
-    let rustup_home = env::var("RUSTUP_HOME").ok()?;
-    let rustup_tc = env::var("RUSTUP_TOOLCHAIN").ok()?;
-    Some(path_str!([&rustup_home, "toolchains", &rustup_tc, "lib"]))
-}
-
 fn active_rustc_sysroot_lib() -> Option<String> {
     let rustc = env::var_os("RUSTC")?;
     let output = Command::new(rustc).args(["--print", "sysroot"]).output().ok()?;
@@ -41,24 +35,37 @@ fn active_rustc_sysroot_lib() -> Option<String> {
     Some(path_str!([sysroot, "lib"]))
 }
 
+/// `<sysroot>/lib` of the compiler cargo builds this crate with, which holds the
+/// `librustc_driver` it links: the Trust seal under `targo`. Not a rustup
+/// toolchain directory: that follows a moving channel link (and a targo build
+/// sets no `RUSTUP_TOOLCHAIN`), while the sysroot names the exact build.
 fn rustc_driver_rpath() -> String {
-    rustup_toolchain_lib()
-        .or_else(active_rustc_sysroot_lib)
-        .expect("RUSTUP_HOME/RUSTUP_TOOLCHAIN must be set, or RUSTC must print a sysroot")
+    active_rustc_sysroot_lib().expect("RUSTC must print a sysroot (`$RUSTC --print sysroot`)")
 }
 
-/// Configure the compiler to build the trust-mc-compiler binary. We currently support building
-/// trust-mc-compiler with nightly only. The rpath follows rustup in dev builds and
-/// falls back to the active RUSTC sysroot for self-contained toolchains.
-pub fn main() {
-    println!("cargo:rerun-if-env-changed=RUSTUP_HOME");
-    println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
-    println!("cargo:rerun-if-env-changed=RUSTC");
-    let rustc_lib = rustc_driver_rpath();
-    println!("cargo:rustc-link-arg-bin=trust-mc-compiler=-Wl,-rpath,{rustc_lib}");
+/// Set by `build-trust-mc bundle` (tools/build-trust-mc/src/release.rs) for the
+/// release build: the binary then carries no absolute path to the build seal.
+const RELEASE_BUNDLE_ENV: &str = "MC_RELEASE_BUNDLE";
 
-    // While we hard-code the above for development purposes, for a release/install we look
-    // in a relative location for a symlink to the local rust toolchain
+/// Configure the compiler to build the trust-mc-compiler binary: a rustc driver
+/// rpath'd to the `librustc_driver` of the compiler that builds it (the Trust
+/// seal; the frozen comparison nightly on that lane).
+pub fn main() {
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed={RELEASE_BUNDLE_ENV}");
+
+    // A development build runs from target/ against the seal that built it, so
+    // it is rpath'd to that seal's lib by absolute path. A release bundle is
+    // installed elsewhere and must not name the build host's seal (a $HOME path,
+    // and on the build host a driver dyld would load ahead of the installed
+    // link): it keeps only the relative rpath below.
+    if env::var_os(RELEASE_BUNDLE_ENV).is_none() {
+        let rustc_lib = rustc_driver_rpath();
+        println!("cargo:rustc-link-arg-bin=trust-mc-compiler=-Wl,-rpath,{rustc_lib}");
+    }
+
+    // An installed bundle (and the release build's own target/trust-mc) links the
+    // seal as `toolchain` beside `bin` (`trust-mc setup --use-local-toolchain`).
     let origin = if cfg!(target_os = "macos") { "@loader_path" } else { "$ORIGIN" };
     println!("cargo:rustc-link-arg-bin=trust-mc-compiler=-Wl,-rpath,{origin}/../toolchain/lib");
 
@@ -86,11 +93,60 @@ pub fn main() {
     println!("cargo:rustc-env=TRUST_MC_GIT_DIRTY={dirty}");
 
     // Only rebuild when HEAD changes, not on every `git add` (same tradeoff
-    // as trust_mc-driver/build.rs).
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head_content) = std::fs::read_to_string(".git/HEAD")
-        && let Some(ref_path) = head_content.trim().strip_prefix("ref: ")
-    {
-        println!("cargo:rerun-if-changed=.git/{ref_path}");
+    // as trust_mc-driver/build.rs). The engine's `cfg(trust_toolchain)` probe
+    // lives in trust-mc-engine/build.rs; nothing in this package reads it.
+    // Resolve the git paths through `git rev-parse --git-path`: this script
+    // runs in the package directory, where no `.git` exists (and in a worktree
+    // or submodule `.git` is a file). Cargo treats a missing rerun-if-changed
+    // path as always dirty, so a literal `.git/HEAD` reran this script and
+    // recompiled the crate on every invocation. Paths that do not resolve to an
+    // existing file (no git, a packed ref) are not registered. Same approach as
+    // trust-mc-driver/build.rs.
+    let git_path = |rel: &str| -> Option<String> {
+        let out = Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-path", rel])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!path.is_empty() && std::path::Path::new(&path).is_file()).then_some(path)
+    };
+    if let Some(head) = git_path("HEAD") {
+        println!("cargo:rerun-if-changed={head}");
+    }
+    let symbolic_ref = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|r| !r.is_empty());
+    if let Some(ref_path) = symbolic_ref {
+        if let Some(ref_file) = git_path(&ref_path) {
+            println!("cargo:rerun-if-changed={ref_file}");
+        } else {
+            // The branch ref is packed (`git pack-refs`, or an automatic gc
+            // run by any worktree of the repository), so it has no loose
+            // file, and in a linked worktree HEAD ("ref: refs/heads/<b>")
+            // does not change on a commit. A commit made after packing then
+            // left the embedded sha stale (measured 2026-09-27: a bundle
+            // built after commit 63fd640bf reported 70aecce71, dirty). Watch
+            // `packed-refs` and the directory the next commit writes the
+            // loose ref into; only existing paths are registered.
+            if let Some(packed) = git_path("packed-refs") {
+                println!("cargo:rerun-if-changed={packed}");
+            }
+            if let Some(dir) = Command::new("git")
+                .args(["rev-parse", "--path-format=absolute", "--git-path", &ref_path])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                .and_then(|loose| loose.parent().map(std::path::Path::to_path_buf))
+                .filter(|dir| dir.is_dir())
+            {
+                println!("cargo:rerun-if-changed={}", dir.display());
+            }
+        }
     }
 }

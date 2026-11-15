@@ -14,14 +14,48 @@ use super::codegen_expr_constant::ExprConstant;
 use crate::codegen_ay::chc::expr::codegen_expr_heap_bv_eval::const_bv_value;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Shift the constant element index a ref target ends in by `delta`
+    /// elements of the stepped pointer's pointee (`src_elem_bytes` bytes each),
+    /// converted to elements of the indexed array. A step in other units than
+    /// the array's (`(&a[0] as *const u8).byte_add(4)` into a `[u32; 3]`) was
+    /// added as array elements: the ref target became `a[4]`, and the read of
+    /// `a[1]` through it a certified false counterexample (self-review of round
+    /// 10 of fix/chc-false-certificates, `chc_byte_step_access_dual.rs`
+    /// `safe_read_array_elem_byte_step`; the same on main f5dfb8d48). A step
+    /// that is not a whole number of array elements is not shifted.
     pub(in crate::codegen_ay::chc) fn shift_ref_target_constant_index(
         &self,
         target_local: usize,
         projections: &mut [ProjectionElem],
         delta: i128,
+        src_elem_bytes: Option<u64>,
     ) -> bool {
         let Some(last_idx) = projections.len().checked_sub(1) else {
             return false;
+        };
+        let array_elem_bytes = {
+            let place = Place { local: target_local, projection: projections[..last_idx].to_vec() };
+            match place.ty(self.body.locals()).ok().map(|ty| ty.kind()) {
+                Some(TyKind::RigidTy(RigidTy::Array(elem, _) | RigidTy::Slice(elem))) => {
+                    self.get_type_size(elem).and_then(|s| u64::try_from(s).ok())
+                }
+                _ => None,
+            }
+        };
+        // Both sizes known: convert. Otherwise the step is taken in the
+        // indexed place's own elements, as before.
+        let delta = match (src_elem_bytes, array_elem_bytes) {
+            (Some(src), Some(elem)) if src != elem => {
+                if elem == 0 {
+                    return false;
+                }
+                let Some(bytes) = delta.checked_mul(i128::from(src)) else { return false };
+                if bytes % i128::from(elem) != 0 {
+                    return false;
+                }
+                bytes / i128::from(elem)
+            }
+            _ => delta,
         };
         match projections[last_idx].clone() {
             ProjectionElem::ConstantIndex { offset, min_length, from_end: false } => {
@@ -84,7 +118,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut values = Vec::new();
         for block in &self.body.blocks {
             for stmt in &block.statements {
-                let StatementKind::Assign(lhs, Rvalue::Use(Operand::Constant(const_op))) =
+                let StatementKind::Assign(lhs, Rvalue::Use(Operand::Constant(const_op), ..)) =
                     &stmt.kind
                 else {
                     continue;
@@ -180,5 +214,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // A stale allocation id on a reused local would feed the offset
         // alloc-bound check the WRONG allocation — clear provenance too.
         self.known_alloc_ids.remove(&dest_local);
+        // The exact (object, offset) record names an offset a symbolic step
+        // does not keep (`const_memory_provenance`, set by the caller, is the
+        // provenance that survives it).
+        self.ref_resolution.const_ref_objects.remove(&dest_local);
     }
 }

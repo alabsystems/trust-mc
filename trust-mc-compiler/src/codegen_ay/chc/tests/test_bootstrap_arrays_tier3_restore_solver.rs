@@ -257,7 +257,12 @@ fn assert_restore_run_well_formed(label: &str, diag: &RestoreRunDiagnostics) {
         diag.stderr
     );
     assert!(
-        !diag.stdout.contains("Some_Option_bool") && !diag.stderr.contains("Some_Option_bool"),
+        ![&diag.stdout, &diag.stderr].into_iter().any(|text| spells_variant_ctor(
+            text,
+            "Some",
+            names::known_adt::OPTION,
+            "_bool"
+        )),
         "[{label}] datatype constructor mismatch resurfaced.\nstdout:\n{}\nstderr:\n{}",
         diag.stdout,
         diag.stderr

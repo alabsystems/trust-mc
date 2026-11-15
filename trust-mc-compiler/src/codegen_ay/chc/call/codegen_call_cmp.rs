@@ -10,7 +10,13 @@
 
 use std::collections::HashSet;
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
+
 use ay_bindings::{Expr, ExprValue, Sort};
+
+use crate::codegen_ay::chc::codegen_expr_array_eq::sort_contains_array;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, Ty, TyKind};
 
@@ -67,6 +73,34 @@ impl<'tcx, 'body> CallCmp for ChcCtx<'tcx, 'body> {
         let dest_local: usize = cx.destination.local;
         if cx.args.len() < 2 {
             // Comparison needs 2 args — insufficient args is a translation failure (Part of #3123).
+            #[rustfmt::skip]
+            emit_sound_fallback_goto(self, cx.from_app, cx.target, cx.modified_locals, &[dest_local], cx.stmt_constraints);
+            return true;
+        }
+
+        // A compared value that holds a reference below its leading reference
+        // levels is compared by REFERENT: `(&o, 1u8) == (&c, 1u8)` ends in
+        // `*self.0 == *other.0`, `Some(&x) == Some(&5)` in `*l == *r`. The
+        // operands built below hold the reference VALUES, i.e. addresses, and
+        // SMT equality over them proved `!((&o, 1u8) == (&c, 1u8))` with
+        // `o == c` and `!(Some(&x) == Some(&5))` with `x == 5`
+        // (tools/soundness-duals/negative/review_r03_ref_in_aggregate.rs,
+        // option_ref_partial_eq_referents.rs). The result is left unconstrained
+        // — unless the other side is a constant FIELDLESS variant
+        // (`comparison_against_fieldless_variant_constant`: `first(&a) ==
+        // None`), which compares no referent at all.
+        if super::inline_ref_arg_binding::comparison_value_holds_nested_reference(
+            self,
+            &cx.args[0],
+            self.body.locals(),
+        ) && !super::inline_ref_arg_binding::comparison_against_fieldless_variant_constant(
+            self, &cx.args,
+        ) {
+            debug!(
+                fn_name = %self.fn_name,
+                "cmp_stub: compared value holds a reference; fail-closed fallback"
+            );
+            self.record_sound_fallback_reason("cmp_value_holds_reference");
             #[rustfmt::skip]
             emit_sound_fallback_goto(self, cx.from_app, cx.target, cx.modified_locals, &[dest_local], cx.stmt_constraints);
             return true;
@@ -173,6 +207,34 @@ impl<'tcx, 'body> CallCmp for ChcCtx<'tcx, 'body> {
         if !has_flattened {
             return false;
         }
+        // `PartialEq` on a type that holds a reference compares the REFERENTS:
+        // `(&o, 1u8) == (&c, 1u8)` ends in `*self.0 == *other.0`. The structural
+        // equality below compares the reference VALUES, i.e. addresses, and
+        // proved `!((&o, 1u8) == (&c, 1u8))` with `o == c`. Such a comparison is
+        // left to the inline walker and, failing that, the fail-closed fallback.
+        if self.compared_type_holds_address(&dcx.args[0]) {
+            debug!(
+                path = path.as_str(),
+                "CHC: flattened PartialEq pre-inline dispatch skipped: compared type holds an address"
+            );
+            return false;
+        }
+        // The operands below are a reconstruction of flattened state slots on one
+        // side and, typically, a decoded constant on the other. SMT equality over
+        // them is `PartialEq` only when every leaf is an integer or a bool, whose
+        // encodings agree bit for bit. A fieldless enum leaf (`Ordering`), a
+        // `char`, a float (NaN, signed zero) or an array does not: a joined
+        // `Option<Ordering>` reconstructed from its slots compared unequal to the
+        // decoded `Some(Less)` and --ay-chc proved `!(o == Some(Less))`
+        // (tools/soundness-duals/negative/review_r11a_other_payloads.rs). Such a
+        // comparison is left to the later lanes.
+        if !self.compared_type_has_only_integer_leaves(&dcx.args[0]) {
+            debug!(
+                path = path.as_str(),
+                "CHC: flattened PartialEq pre-inline dispatch skipped: a leaf is not an integer or bool"
+            );
+            return false;
+        }
         let modified_locals = dcx.modified_locals;
         let dest_local: usize = dcx.destination.local;
         // Resolve operands — may return mismatched sorts for flattened locals.
@@ -275,6 +337,69 @@ impl<'tcx, 'body> CallCmp for ChcCtx<'tcx, 'body> {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Does the type a `PartialEq::eq(&T, &T)` call compares hold an address
+    /// anywhere (see `inline_ref_arg_binding::ty_holds_address`)? A type that
+    /// cannot be classified counts as holding one.
+    pub(in crate::codegen_ay::chc) fn compared_type_holds_address(
+        &self,
+        first_arg: &Operand,
+    ) -> bool {
+        let Ok(arg_ty) = first_arg.ty(self.body.locals()) else {
+            return true;
+        };
+        let compared = match self.resolve_body_ty(arg_ty).kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => pointee,
+            _ => arg_ty,
+        };
+        super::inline_ref_arg_binding::ty_holds_address(
+            self,
+            compared,
+            super::inline_ref_arg_binding::SHAPE_DEPTH,
+        )
+    }
+
+    /// Is the type a `PartialEq::eq(&T, &T)` call compares built, through
+    /// tuples, structs and `Option`/`Result`-shaped enums, from integer and bool
+    /// leaves only?
+    fn compared_type_has_only_integer_leaves(&self, first_arg: &Operand) -> bool {
+        fn integer_leaves(ctx: &ChcCtx<'_, '_>, ty: Ty, depth: usize) -> bool {
+            if depth == 0 {
+                return false;
+            }
+            match ctx.resolve_body_ty(ty).kind() {
+                TyKind::RigidTy(RigidTy::Bool | RigidTy::Int(_) | RigidTy::Uint(_)) => true,
+                TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                    elems.iter().all(|elem| integer_leaves(ctx, *elem, depth - 1))
+                }
+                TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                    let fielded = def.variants_iter().any(|variant| !variant.fields().is_empty());
+                    match def.kind() {
+                        rustc_public::ty::AdtKind::Struct => {}
+                        // A fieldless enum is compared by its tag, whose slot and
+                        // constant encodings differ.
+                        rustc_public::ty::AdtKind::Enum if fielded => {}
+                        _ => return false,
+                    }
+                    def.variants_iter().all(|variant| {
+                        variant.fields().iter().all(|field| {
+                            mono_ty::field_ty(field, &args)
+                                .is_some_and(|t| integer_leaves(ctx, t, depth - 1))
+                        })
+                    })
+                }
+                _ => false,
+            }
+        }
+        let Ok(arg_ty) = first_arg.ty(self.body.locals()) else {
+            return false;
+        };
+        let compared = match self.resolve_body_ty(arg_ty).kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => pointee,
+            _ => arg_ty,
+        };
+        integer_leaves(self, compared, 8)
+    }
+
     /// Part of #4203: Check if an operand involves a flattened tuple local.
     ///
     /// Returns true if the operand references a local that is either directly
@@ -316,14 +441,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return true;
             }
             // #3270: deref pointer operands to pointee values.
-            self.deref_cmp_operands_if_needed(
+            let checks_before = self.heap_state.pending_checks.len();
+            if !self.deref_cmp_operands_if_needed(
                 lhs,
                 rhs,
                 &cx.args,
                 cx.modified_locals,
                 lhs_is_own_pointer,
                 rhs_is_own_pointer,
-            );
+            ) {
+                // An operand is still an address `PartialEq` compares through.
+                // Deciding the comparison from it compares pointers; the result
+                // is left unconstrained and the harness cannot come back clean.
+                self.heap_state.pending_checks.truncate(checks_before);
+                debug!(
+                    fn_name = %self.fn_name,
+                    "cmp_stub: reference level not loadable; fail-closed fallback"
+                );
+                self.record_sound_fallback_reason("cmp_reference_level_unresolved");
+                #[rustfmt::skip]
+                emit_sound_fallback_goto(self, cx.from_app, cx.target, cx.modified_locals, &[dest_local], cx.stmt_constraints);
+                return true;
+            }
         }
         // Part of #4030: Double-ref raw pointer case (`&&*const T`).
         self.resolve_double_ref_raw_ptr_cmp(lhs, rhs, &cx.args, cx.modified_locals);
@@ -439,6 +578,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         } else if lhs.sort().datatype_name().is_some()
             && rhs.sort().datatype_name().is_some()
             && lhs.sort() == rhs.sort()
+            && !sort_contains_array(lhs.sort())
         {
             // Part of #3208: Support PartialEq on Datatype sorts (Option<T>,
             // Result<T,E>, user-defined enums with derived PartialEq). SMT
@@ -692,6 +832,9 @@ enum OptionLikeView {
 
 fn try_option_like_datatype_partial_eq(lhs: &Expr, rhs: &Expr, is_eq: bool) -> Option<Expr> {
     if lhs.sort() != rhs.sort() || !is_option_like_sort(lhs.sort()) {
+        return None;
+    }
+    if sort_contains_array(lhs.sort()) {
         return None;
     }
     let lhs = option_like_view(lhs)?;

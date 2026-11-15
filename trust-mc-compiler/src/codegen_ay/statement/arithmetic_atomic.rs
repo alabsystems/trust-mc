@@ -18,8 +18,9 @@
 //! - `codegen_atomic_fetch_minmax`: Fetch-and-min/max
 //! - `codegen_typed_swap`: typed_swap_nonoverlapping / std::mem::swap (Part of #3477)
 
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
-use rustc_public::mir::{BasicBlockIdx, BinOp, Operand, Place};
+use rustc_public::mir::{BasicBlockIdx, BinOp, Operand, Place, Rvalue};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
@@ -27,7 +28,70 @@ use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::types::bv8_sort;
 use crate::kani_middle::abi::LayoutOf;
 
+/// The whole-byte width an atomic access of `bit_width` bits reads, or `None`
+/// when the byte-addressed memory model cannot place that access.
+///
+/// `bit_width / 8` on its own is a fail-open. A width that is zero, or not a
+/// whole number of bytes, truncates to a byte count describing a DIFFERENT
+/// access, and `load_memory_bytes(_, 0)` answers with a one-bit marker rather
+/// than a value. Combining that marker with the operand builds an ill-sorted
+/// term, and ay refuses an ill-sorted term with an assertion — a panic inside
+/// the compiler instead of a verdict.
+fn atomic_access_bytes(bit_width: u32) -> Option<u32> {
+    (bit_width > 0 && bit_width % 8 == 0).then(|| bit_width / 8)
+}
+
+/// Whether `loaded` carries exactly the BitVec sort `operand` does.
+///
+/// Every atomic read-modify-write below combines the value it loaded from byte
+/// memory with the operand it was handed. ay's `bvadd`, `bvsub`, `bvand`,
+/// `bvor`, `bvxor` and `eq` all require identical sorts and assert otherwise,
+/// so a mismatch has to stop codegen here, where it can be reported as an
+/// unsupported construct, rather than reach the solver bindings, where it
+/// aborts the process. Measured on the trustc route: six
+/// `Intrinsics/Atomic/Stable` units died on that assertion, five of them at
+/// parity on the dev-cli route (evidence `2026-09-14-t1-rows-2`, attribution
+/// cause "engine defect on Trust (panic in bv.rs: bv* requires same BitVec
+/// sorts)").
+fn loaded_matches_operand(loaded: &Expr, operand: &Expr) -> bool {
+    let loaded_sort = loaded.sort();
+    let operand_sort = operand.sort();
+    match (loaded_sort.bitvec_width(), operand_sort.bitvec_width()) {
+        (Some(loaded_width), Some(operand_width)) => loaded_width == operand_width,
+        _ => false,
+    }
+}
+
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    /// Keep the typed view of a stack local in step with an atomic write
+    /// through a pointer to it: the same write-back a `*p = v` store performs
+    /// (`write_back_to_stack_pointee`).
+    ///
+    /// Atomic intrinsics read and write byte `memory`, while ordinary reads of
+    /// the local (`*p`, or the local itself) resolve through the typed
+    /// environment. Without this, `atomic_xadd(p1, 1)` updated `memory` and
+    /// `*p1` still read the pre-store 0: every
+    /// kani/Intrinsics/Atomic/Unstable/* harness failed `*ptr_a1 == c`
+    /// certified Genuine (bmc_alloc_identity_dual.rs
+    /// `safe_atomic_add_through_two_locals`). A pointer with no tracked stack
+    /// pointee keeps the byte store only, exactly as before.
+    fn atomic_write_back(&mut self, ptr: &Operand, value: &Expr) {
+        let (Operand::Copy(place) | Operand::Move(place)) = ptr else {
+            return;
+        };
+        if !place.projection.is_empty() || !value.sort().is_bitvec() {
+            return;
+        }
+        let ptr_base: std::sync::Arc<str> = std::sync::Arc::from(self.root_ssa_base_name(place));
+        if !self.ref_pointees.contains_key(ptr_base.as_ref()) {
+            return;
+        }
+        // The stored value is computed, not an operand; a raw-pointer operand
+        // carries no flattened components, so the component copy is empty.
+        let rhs = rvalue_use!(Rvalue::Use(ptr.clone()));
+        self.write_back_to_stack_pointee(&ptr_base, value, place, &rhs);
+    }
+
     /// Codegen atomic_load - load value from memory through pointer.
     ///
     /// Models atomic_load as a regular memory read for single-threaded verification.
@@ -41,17 +105,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
         if args.is_empty() {
-            debug!("codegen_atomic_load: no arguments");
-            return None;
+            self.ctx.unsupported_with_fallback("atomic_load_arity", "no arguments");
+            self.codegen_symbolic_result(destination);
+            return target;
         }
 
         // Get pointer expression from args[0]
-        let ptr_expr = self.codegen_operand(&args[0])?;
+        let Some(ptr_expr) = self.codegen_operand(&args[0]) else {
+            self.ctx.unsupported_with_fallback(
+                "atomic_load_operand",
+                "pointer operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
         debug!("codegen_atomic_load: ptr_expr sort={:?}", ptr_expr.sort());
 
         // Get destination type to determine the size to load
-        let dest_ty = destination.ty(self.body.locals()).into_option()?;
+        let Some(dest_ty) = destination.ty(self.body.locals()).into_option() else {
+            self.ctx
+                .unsupported_with_fallback("atomic_load_operand", "destination type unavailable");
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
         let size = LayoutOf::new(dest_ty).size_of().unwrap_or(1);
         debug!("codegen_atomic_load: loading {} bytes for type {:?}", size, dest_ty);
 
@@ -82,17 +165,34 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         args: &[Operand],
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
+        // This function takes no `destination` (a store yields `()`), so there is
+        // no result to make symbolic — recording the gap and continuing is the fix.
         if args.len() < 2 {
-            debug!(
-                "codegen_atomic_store: insufficient args ({}) — fail-closed (#2497)",
-                args.len()
-            );
-            return None;
+            self.ctx.unsupported_with_fallback("atomic_store_arity", "fewer than 2 args");
+            return target;
         }
 
         // Get pointer and value expressions
-        let ptr_expr = self.codegen_operand(&args[0])?;
-        let val_expr = self.codegen_operand(&args[1])?;
+        let Some(ptr_expr) = self.codegen_operand(&args[0]) else {
+            self.ctx.unsupported_with_fallback(
+                "atomic_store_operand",
+                "pointer operand did not translate",
+            );
+            return target;
+        };
+        let Some(val_expr) = self.codegen_operand(&args[1]) else {
+            self.ctx.unsupported_with_fallback(
+                "atomic_store_operand",
+                "value operand did not translate",
+            );
+            return target;
+        };
         debug!(
             "codegen_atomic_store: ptr_sort={:?}, val_sort={:?}",
             ptr_expr.sort(),
@@ -100,7 +200,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         );
 
         // Store value to memory
-        self.ctx.store_memory_bytes(ptr_expr, val_expr);
+        self.store_memory_bytes_on_path(ptr_expr, val_expr.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &val_expr);
         target
     }
 
@@ -146,7 +247,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
 
         // Store new value to memory
-        self.ctx.store_memory_bytes(ptr_expr, new_val);
+        self.store_memory_bytes_on_path(ptr_expr, new_val.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &new_val);
 
         // Assign old value to destination
         self.bind_ssa_result(destination, result);
@@ -191,10 +293,27 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         };
-        let size = width / 8;
+        let Some(size) = atomic_access_bytes(width) else {
+            warn!(
+                width,
+                "codegen_atomic_cxchg: operand width is not a whole number of bytes; \
+                 skipping intrinsic"
+            );
+            return None;
+        };
 
         // Load old value from memory
         let old_val = self.ctx.load_memory_bytes(ptr_expr.clone(), size);
+        if !loaded_matches_operand(&old_val, &expected) {
+            warn!(
+                loaded = ?old_val.sort(),
+                expected = ?expected.sort(),
+                "codegen_atomic_cxchg: the value loaded from byte memory and the expected value \
+                 carry different BitVec sorts; skipping the intrinsic rather than \
+                 handing the solver an ill-sorted term"
+            );
+            return None;
+        }
 
         // Success if old == expected
         let success = old_val.clone().eq(expected);
@@ -221,7 +340,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Using ITE at memory level: mem' = ite(success, store(mem, ptr, new), mem)
         // Simplified: just do the conditional store
         let cond_new = Expr::ite(success, new_val, old_val);
-        self.ctx.store_memory_bytes(ptr_expr, cond_new);
+        self.store_memory_bytes_on_path(ptr_expr, cond_new.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &cond_new);
 
         target
     }
@@ -265,10 +385,51 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         };
-        let size = width / 8;
+        let Some(size) = atomic_access_bytes(width) else {
+            warn!(
+                width,
+                "codegen_atomic_compare_exchange: operand width is not a whole number of bytes; \
+                 skipping intrinsic"
+            );
+            return None;
+        };
+        // `expected` and `new` are both `T`. A `new` term of another width is
+        // not a `T` the encoder built (measured: an unconstrained `*mut i32`
+        // Option payload declared as a 32-bit value, kani/Intrinsics/Atomic/
+        // Stable/AtomicPtr `check_fetch_update`), and `Expr::ite` below PANICKED
+        // on it, which aborted the whole harness's codegen. Refuse it with a
+        // recorded fallback instead: the result and the stored cell become
+        // fresh values and the proof is demoted.
+        if new_val.sort().bitvec_width() != Some(width) {
+            warn!(
+                expected = ?expected_sort,
+                new = ?new_val.sort(),
+                "codegen_atomic_compare_exchange: `new` is not the width of `expected`"
+            );
+            self.ctx.unsupported_with_fallback(
+                "atomic_compare_exchange_width_mismatch",
+                format!("expected {:?}, new {:?}", expected_sort, new_val.sort()),
+            );
+            self.codegen_symbolic_result(destination);
+            let havoc_name = self.ctx.fresh_name("atomic_cxchg_havoc");
+            let havoc = self.ctx.declare_var(&havoc_name, expected_sort.clone());
+            self.ctx.store_memory_bytes(ptr_expr, havoc.clone());
+            self.atomic_write_back(&args[0], &havoc);
+            return target;
+        }
 
         // Load old value from memory.
         let old_val = self.ctx.load_memory_bytes(ptr_expr.clone(), size);
+        if !loaded_matches_operand(&old_val, &expected) {
+            warn!(
+                loaded = ?old_val.sort(),
+                expected = ?expected.sort(),
+                "codegen_atomic_compare_exchange: the value loaded from byte memory and the expected value \
+                 carry different BitVec sorts; skipping the intrinsic rather than \
+                 handing the solver an ill-sorted term"
+            );
+            return None;
+        }
 
         // Success if old == expected.
         let success = old_val.clone().eq(expected);
@@ -293,7 +454,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Conditional store: *self = ite(success, new, old).
         let cond_new = Expr::ite(success, new_val, old_val);
-        self.ctx.store_memory_bytes(ptr_expr, cond_new);
+        self.store_memory_bytes_on_path(ptr_expr, cond_new.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &cond_new);
 
         target
     }
@@ -329,7 +491,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         };
-        let size = width / 8;
+        let Some(size) = atomic_access_bytes(width) else {
+            warn!(
+                width,
+                "codegen_atomic_fetch_binop: operand width is not a whole number of bytes; \
+                 skipping intrinsic"
+            );
+            return None;
+        };
         debug!(
             "codegen_atomic_fetch_binop: ptr_sort={:?}, operand_sort={:?}, op={:?}",
             ptr_expr.sort(),
@@ -339,6 +508,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Load old value from memory
         let old_val = self.ctx.load_memory_bytes(ptr_expr.clone(), size);
+        if !loaded_matches_operand(&old_val, &operand) {
+            warn!(
+                loaded = ?old_val.sort(),
+                operand = ?operand.sort(),
+                "codegen_atomic_fetch_binop: the value loaded from byte memory and the operand \
+                 carry different BitVec sorts; skipping the intrinsic rather than \
+                 handing the solver an ill-sorted term"
+            );
+            return None;
+        }
 
         // Clone old_val once for the binary op; move the original into bind_ssa_result.
         let old_for_op = old_val.clone();
@@ -352,7 +531,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         };
 
         // Store new value to memory, then bind the old value as result (move last)
-        self.ctx.store_memory_bytes(ptr_expr, new_val);
+        self.store_memory_bytes_on_path(ptr_expr, new_val.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &new_val);
         self.bind_ssa_result(destination, old_val);
         target
     }
@@ -386,7 +566,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         };
-        let size = width / 8;
+        let Some(size) = atomic_access_bytes(width) else {
+            warn!(
+                width,
+                "codegen_atomic_fetch_nand: operand width is not a whole number of bytes; \
+                 skipping intrinsic"
+            );
+            return None;
+        };
         debug!(
             "codegen_atomic_fetch_nand: ptr_sort={:?}, operand_sort={:?}",
             ptr_expr.sort(),
@@ -395,12 +582,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Load old value from memory
         let old_val = self.ctx.load_memory_bytes(ptr_expr.clone(), size);
+        if !loaded_matches_operand(&old_val, &operand) {
+            warn!(
+                loaded = ?old_val.sort(),
+                operand = ?operand.sort(),
+                "codegen_atomic_fetch_nand: the value loaded from byte memory and the operand \
+                 carry different BitVec sorts; skipping the intrinsic rather than \
+                 handing the solver an ill-sorted term"
+            );
+            return None;
+        }
 
         // Compute NAND: !(old & operand)
         let new_val = old_val.clone().bvand(operand).bvnot();
 
         // Store new value to memory
-        self.ctx.store_memory_bytes(ptr_expr, new_val);
+        self.store_memory_bytes_on_path(ptr_expr, new_val.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &new_val);
 
         // Return the old value
         self.bind_ssa_result(destination, old_val);
@@ -441,7 +639,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return None;
         };
-        let size = width / 8;
+        let Some(size) = atomic_access_bytes(width) else {
+            warn!(
+                width,
+                "codegen_atomic_fetch_minmax: operand width is not a whole number of bytes; \
+                 skipping intrinsic"
+            );
+            return None;
+        };
         debug!(
             "codegen_atomic_fetch_minmax: ptr_sort={:?}, operand_sort={:?}, is_max={}, is_signed={}",
             ptr_expr.sort(),
@@ -452,6 +657,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Load old value from memory
         let old_val = self.ctx.load_memory_bytes(ptr_expr.clone(), size);
+        if !loaded_matches_operand(&old_val, &operand) {
+            warn!(
+                loaded = ?old_val.sort(),
+                operand = ?operand.sort(),
+                "codegen_atomic_fetch_minmax: the value loaded from byte memory and the operand \
+                 carry different BitVec sorts; skipping the intrinsic rather than \
+                 handing the solver an ill-sorted term"
+            );
+            return None;
+        }
 
         // Clone old_val once for comparison and once for ITE; move original into bind.
         // Clone operand once for comparison; move original into ITE else-branch.
@@ -468,7 +683,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.bind_ssa_result(destination, old_val);
 
         // Store new value to memory
-        self.ctx.store_memory_bytes(ptr_expr, new_val);
+        self.store_memory_bytes_on_path(ptr_expr, new_val.clone(), "atomic store");
+        self.atomic_write_back(&args[0], &new_val);
         target
     }
 
@@ -491,5 +707,62 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         debug!("codegen_atomic_new: init_val sort={:?}", init_val.sort());
         self.bind_ssa_result(destination, init_val);
         target
+    }
+}
+
+#[cfg(test)]
+mod atomic_width_guard_tests {
+    use super::{atomic_access_bytes, loaded_matches_operand};
+    use ay_bindings::Expr;
+
+    /// The widths Rust's atomic integers actually have.
+    #[test]
+    fn whole_byte_widths_give_their_byte_count() {
+        for (bits, bytes) in [(8, 1), (16, 2), (32, 4), (64, 8), (128, 16)] {
+            assert_eq!(atomic_access_bytes(bits), Some(bytes), "{bits} bits");
+        }
+    }
+
+    /// `width / 8` alone answered 0 here, and `load_memory_bytes(_, 0)` answers
+    /// a one-bit marker — the shape that reached ay as an ill-sorted term.
+    #[test]
+    fn sub_byte_and_zero_widths_are_refused() {
+        assert_eq!(atomic_access_bytes(0), None);
+        assert_eq!(atomic_access_bytes(1), None);
+        assert_eq!(atomic_access_bytes(7), None);
+    }
+
+    /// A width that is not a whole number of bytes truncates: 12 bits would
+    /// have read 1 byte and then been combined with a 12-bit operand.
+    #[test]
+    fn partial_byte_widths_are_refused_rather_than_truncated() {
+        assert_eq!(atomic_access_bytes(12), None);
+        assert_eq!(atomic_access_bytes(24), Some(3));
+        assert_eq!(atomic_access_bytes(33), None);
+    }
+
+    #[test]
+    fn equal_bitvec_widths_match() {
+        let a = Expr::bitvec_const(0, 32);
+        let b = Expr::bitvec_const(7, 32);
+        assert!(loaded_matches_operand(&a, &b));
+    }
+
+    #[test]
+    fn different_bitvec_widths_do_not_match() {
+        let loaded = Expr::bitvec_const(0, 8);
+        let operand = Expr::bitvec_const(0, 32);
+        assert!(!loaded_matches_operand(&loaded, &operand));
+        assert!(!loaded_matches_operand(&operand, &loaded));
+    }
+
+    /// The one-bit marker `load_memory_bytes` returns for a zero-byte load is
+    /// not a value of any atomic type, so it must never match an operand.
+    #[test]
+    fn the_zero_byte_load_marker_matches_nothing() {
+        let marker = Expr::bitvec_const(0, 1);
+        for width in [8, 16, 32, 64] {
+            assert!(!loaded_matches_operand(&marker, &Expr::bitvec_const(0, width)));
+        }
     }
 }

@@ -1081,7 +1081,7 @@ fn extract_slice_array_data(expr: &Expr) -> Option<Expr> {
         return None; // already array
     }
     let dt = expr.sort().datatype_sort()?;
-    if !dt.name.starts_with("Slice_") || dt.constructors.len() != 1 {
+    if !crate::codegen_ay::names::is_slice_sort_name(&dt.name) || dt.constructors.len() != 1 {
         return None;
     }
     let cons = &dt.constructors[0];

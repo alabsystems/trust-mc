@@ -8,6 +8,10 @@
 //! the 500-line limit while extending prediction coverage for Vec/iterator
 //! carrier types. Part of #3714.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -35,7 +39,7 @@ fn safe_instance_body(instance: &Instance) -> Option<rustc_public::mir::Body> {
     if matches!(instance.kind, InstanceKind::Virtual { .. } | InstanceKind::Intrinsic) {
         return None;
     }
-    instance.body()
+    instance.callee_body()
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -128,7 +132,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "u8",
                 "u64",
                 "alloc_raw_vec_RawVecInner_std_alloc_Global",
-                "std_ptr_Unique_u8",
+                // RawVecInner's `Unique<u8>`: keyed as `*const u8` (Rule C).
+                "ptr_u8",
                 "core_num_niche_types_UsizeNoHighBit",
                 "std_alloc_Global",
             ];
@@ -187,23 +192,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let rc_inner_key = format!("std_rc_RcInner_{elem_key}");
                 let phantom_rc_inner_key =
                     format!("std_marker_PhantomData_std_rc_RcInner_{elem_key}");
-                let nonnull_rc_inner_key = format!("std_ptr_NonNull_std_rc_RcInner_{elem_key}");
+                // The `NonNull<RcInner<T>>` inside Rc: keyed as
+                // `*const RcInner<T>` (Rule C).
+                let ptr_rc_inner_key = format!("ptr_std_rc_RcInner_{elem_key}");
                 self.predeclare_type_array_if_missing(&rc_inner_key);
                 self.predeclare_type_array_if_missing(&phantom_rc_inner_key);
-                self.predeclare_type_array_if_missing(&nonnull_rc_inner_key);
+                self.predeclare_type_array_if_missing(&ptr_rc_inner_key);
             }
         }
 
         // Part of #2982: predeclare slice iterator infrastructure type arrays.
-        // Iter<'_, T> and IterMut<'_, T> internally use NonNull<T>, *const T,
-        // and PhantomData<&T>. These are discovered late during inline encoding
-        // when stdlib MIR is unavailable. Predict them from body locals.
+        // Iter<'_, T> and IterMut<'_, T> internally use NonNull<T> and
+        // *const T (one key, `ptr_T`, Rule C) and PhantomData<&T>. These are
+        // discovered late during inline encoding when stdlib MIR is
+        // unavailable. Predict them from body locals.
         let iter_elem_keys = self.predict_slice_iter_elem_type_keys();
         for elem_key in &iter_elem_keys {
-            let nonnull_key = format!("std_ptr_NonNull_{elem_key}");
             let ptr_key = format!("ptr_{elem_key}");
             let phantom_ref_key = format!("std_marker_PhantomData_ref_{elem_key}");
-            self.predeclare_type_array_if_missing(&nonnull_key);
             self.predeclare_type_array_if_missing(&ptr_key);
             self.predeclare_type_array_if_missing(&phantom_ref_key);
         }
@@ -328,13 +334,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut keys = BTreeSet::new();
         for local in self.body.locals() {
             let ty = self.resolve_body_ty(local.ty);
-            let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else { continue };
+            let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else { continue };
             if skip.contains(&def.trimmed_name().as_str()) {
                 continue;
             }
             for variant in def.variants() {
                 for field in variant.fields() {
-                    let ft = self.resolve_body_ty(field.ty());
+                    // Rule A: the field's type at the ADT's own arguments.
+                    let Some(ft) = mono_ty::field_ty(&field, &args) else { continue };
                     let TyKind::RigidTy(RigidTy::Adt(fd, fa)) = ft.kind() else { continue };
                     if fd.trimmed_name() != "Vec" {
                         continue;
@@ -578,7 +585,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let ty = self.resolve_body_ty(ty);
-        let drop_instance = Instance::resolve_drop_in_place(ty);
+        let Some(drop_instance) = mono_ty::drop_in_place(ty) else {
+            return;
+        };
         let Some(drop_body) = safe_instance_body(&drop_instance) else {
             return;
         };
@@ -623,15 +632,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     self.collect_storage_marker_type_keys(inner, keys, depth + 1);
                 }
 
-                for arg in args.0 {
+                for arg in &args.0 {
                     if let GenericArgKind::Type(inner) = arg {
-                        self.collect_storage_marker_type_keys(inner, keys, depth + 1);
+                        self.collect_storage_marker_type_keys(*inner, keys, depth + 1);
                     }
                 }
 
                 for variant in def.variants() {
                     for field in variant.fields() {
-                        self.collect_storage_marker_type_keys(field.ty(), keys, depth + 1);
+                        // Rule A: the field's type at the ADT's own arguments.
+                        if let Some(field_ty) = mono_ty::field_ty(&field, &args) {
+                            self.collect_storage_marker_type_keys(field_ty, keys, depth + 1);
+                        }
                     }
                 }
             }

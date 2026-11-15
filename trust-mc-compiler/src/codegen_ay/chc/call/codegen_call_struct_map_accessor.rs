@@ -11,6 +11,10 @@ mod scan;
 #[path = "codegen_call_struct_map_store.rs"]
 mod store;
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -109,7 +113,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
         let fields = adt_def.variants().first()?.fields();
-        if !fields.iter().any(|field| Self::type_is_hashmap(&field.ty_with_args(&adt_args))) {
+        if !fields.iter().any(|field| {
+            mono_ty::field_ty(field, &adt_args).is_some_and(|t| Self::type_is_hashmap(&t))
+        }) {
             return None;
         }
 
@@ -117,7 +123,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         debug!(callee = %callee_name, "struct_map_accessor: struct has map field, scanning body");
         let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        let callee_body = instance.body()?;
+        let callee_body = instance.callee_body()?;
         Some((callee_name, inner_ty, callee_body, struct_local, adt_def.trimmed_name()))
     }
 

@@ -8,6 +8,10 @@
 //! Handles enums with exactly 2 variants where one is empty and one has
 //! a single field (e.g., Option<T>, NonZero<T>, Poll<T>).
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
@@ -26,9 +30,8 @@ use crate::codegen_ay::types::{
 
 use super::codegen_expr_signedness::ty_signedness;
 use super::codegen_types::CodegenTypes;
-use super::codegen_types_adt_sort::CodegenTypesAdtSort;
 use super::stubs_option_helpers::{option_empty_variant_name, option_payload_variant_name};
-use super::{ChcCtx, UNDEF_COUNTER, declare_pending_var};
+use super::{ChcCtx, UNDEF_COUNTER};
 use crate::codegen_ay::shared::signedness_fallback_for_cast_or_coerce;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -84,8 +87,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let some_variant = &variants[some_idx];
         let fields = some_variant.fields();
         let field = fields.first()?;
-        let field_ty = field.ty();
-        let concrete_ty = Self::resolve_generic_ty(field_ty, args)?;
+        let concrete_ty = mono_ty::field_ty(field, args)?;
         // Sized-only deref: Option<&str> / Option<&[T]> payloads keep the
         // BV128 fat-pointer representation, matching the declared sort.
         let (payload_ty, payload_is_ref) = Self::deref_ref_ty_sized_only(concrete_ty);
@@ -95,7 +97,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #788: Use enum-style Option (None | Some(value))
         let option_sort = enum_sort(
             &*option_name,
-            names::option_constructors(&option_name, payload_sort.clone()),
+            Self::option_like_constructors(def, &option_name, payload_sort.clone()),
         );
 
         // Part of #2980: Ensure the Option Datatype sort is declared
@@ -153,7 +155,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Handles BV width coercion, BV->DT reconstruction (#3984),
     /// concrete DT->Dyn_Trait coercion (#4099), and general sort mismatch.
-    fn coerce_option_payload_expr(
+    pub(in crate::codegen_ay::chc) fn coerce_option_payload_expr(
         &mut self,
         value_expr: Expr,
         payload_sort: &Sort,
@@ -166,6 +168,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let signed = ty_signedness(payload_ty)
             .unwrap_or_else(|| signedness_fallback_for_cast_or_coerce("adt_payload_coerce"));
+
+        // A WIDE pointer payload whose value arrives at the other width: the
+        // width coercion below would zero-extend a thin BV64 into the fat
+        // pointer's `[len | data]` layout (inventing `len == 0`) or truncate a
+        // fat one (dropping the length outright). `if let Some(s) = Some(&a) {
+        // s.len() == 2 && s[0] == 1 }` then FAILED with a Genuine counterexample
+        // (negative/wide_pointer_carriers.rs, main 31793ccc3). Nothing can
+        // reconstruct metadata that is not there, so fail closed.
+        const FAT_PTR_WIDTH: u32 = 128;
+        if let (Some(target), Some(current)) =
+            (payload_sort.bitvec_width(), value_expr.sort().bitvec_width())
+            && target != current
+            && (target == FAT_PTR_WIDTH || current == FAT_PTR_WIDTH)
+            && matches!(payload_ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
+        {
+            warn!(
+                option_name = %option_name,
+                target,
+                current,
+                "Option-like payload: wide-pointer metadata would be invented or dropped — fail closed"
+            );
+            let booked =
+                self.record_sound_fallback_reason("option_payload_wide_pointer_width_mismatch");
+            let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = crate::codegen_ay::names::undef_sym_name(option_name, undef_id);
+            return Havoc::booked(booked, name, payload_sort.clone());
+        }
 
         // BV->BV width coercion
         let coerced = payload_sort
@@ -211,7 +240,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.record_aggregate_gap("adt_option_payload_sort_mismatch_unflatten");
             let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = crate::codegen_ay::names::undef_sym_name(option_name, undef_id);
-            return declare_pending_var(name, payload_sort.clone());
+            let booked = self.record_sound_fallback_reason_identified(
+                "adt_option_payload_sort_mismatch",
+                Some(&name),
+            );
+            return Havoc::booked(booked, name, payload_sort.clone());
         }
 
         // Part of #4099: concrete DT -> Dyn_Trait coercion in Option payload.
@@ -246,7 +279,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // Cannot flatten -- use symbolic pointer
                 let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let name = crate::codegen_ay::names::undef_sym_name(option_name, undef_id);
-                declare_pending_var(name, Sort::bitvec(POINTER_WIDTH))
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
+                    name,
+                    Sort::bitvec(POINTER_WIDTH),
+                )
             };
             let vtable_expr = Expr::bitvec_const(0u64, POINTER_WIDTH);
             debug!(
@@ -272,7 +310,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.record_aggregate_gap("adt_option_payload_sort_mismatch");
         let undef_id = UNDEF_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = crate::codegen_ay::names::undef_sym_name(option_name, undef_id);
-        declare_pending_var(name, payload_sort.clone())
+        // A fresh payload admits the real one (sound for a proof), but a
+        // counterexample that reads it must not be certified Genuine.
+        let booked = self.record_sound_fallback_reason_identified(
+            "adt_option_payload_sort_mismatch",
+            Some(&name),
+        );
+        Havoc::booked(booked, name, payload_sort.clone())
     }
 }
 

@@ -10,6 +10,7 @@
 
 mod option_store;
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use tracing::warn;
 
@@ -21,7 +22,7 @@ use crate::codegen_ay::types::{
 use trust_mc_codegen_types::types::flattenable_datatype_sort_width;
 
 use super::super::codegen_ctx::diagnostics::{CellCounter, ChcDiagnostics};
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Coerce a value to match an array's element sort before `.store()`.
@@ -98,6 +99,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if val_sort.is_bitvec() && elem_sort.is_int() {
                 return if signed { value.bv2int_signed() } else { value.bv2int() };
             }
+            // Design 4 D: a slice view (`fld_ptr` + `fld_len`) stored into a
+            // wide slot packs its declared roles, `[fld_len : upper | fld_ptr :
+            // lower]`; the MSB-first flatten below would transpose them.
+            if let Some(target_width) = elem_sort.bitvec_width()
+                && let Some(packed) = crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::pack_declared_slice_roles(
+                    &value,
+                    target_width,
+                )
+            {
+                return packed;
+            }
             // Dyn_Trait DT → BV128 store coercion with correct fat-pointer field order.
             // Convention: [vtable:64 | data_ptr:64] (vtable upper, ptr lower).
             // Must intercept before general flatten which uses MSB-first field order.
@@ -163,7 +175,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && natural_width > target_width
             {
                 if let Some(dt_name) = val_sort.datatype_name()
-                    && dt_name.starts_with("Dyn_")
+                    && crate::codegen_ay::names::is_dyn_sort_name(&dt_name[..])
                     && target_width == 64
                 {
                     let dt_name = dt_name.to_owned();
@@ -218,8 +230,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 //
                 // Part of #2317: declare the fresh symbolic so Z3 doesn't report
                 // "unknown constant __store_val_N".
+                //
+                // Rule E: the value is booked as an audited sound havoc. This
+                // function holds only the counters, not the translation, so the
+                // booking carries no identity: the harness's approximations are
+                // then incomplete and none of its counterexamples is certified
+                // Genuine. `aggregate_encoding_gap` stays a diagnostic label.
                 diagnostics.aggregate_encoding_gap.inc();
-                return declare_pending_var(sym_name, elem_sort.clone());
+                let booked = diagnostics
+                    .book_sound_havoc_unattributed(sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE);
+                return Havoc::booked(booked, sym_name, elem_sort.clone());
             }
         }
         value

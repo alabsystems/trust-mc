@@ -16,11 +16,12 @@ use super::codegen_ctx::globals::{
 };
 use super::codegen_ctx::{
     ChcCtx, ChcDiagnostics, PENDING_FRESH_VAR_DECLS, chc_debug_enabled,
-    record_aggregate_encoding_gap_for_fn, record_fp_bitvector_encoding_for_fn,
-    record_kani_mem_overapprox_for_fn, record_offset_provenance_unresolved_for_fn,
-    record_ptr_metadata_unconstrained_for_fn, record_signedness_fallback_for_fn,
-    record_sound_havoc_drop_for_fn, record_static_init_incomplete_for_fn,
-    record_store_dropped_for_fn, record_stub_approximation_for_fn, record_translation_drop_for_fn,
+    record_aggregate_encoding_gap_for_fn, record_assert_untranslatable_for_fn,
+    record_fp_bitvector_encoding_for_fn, record_kani_mem_overapprox_for_fn,
+    record_offset_provenance_unresolved_for_fn, record_ptr_metadata_unconstrained_for_fn,
+    record_signedness_fallback_for_fn, record_sound_havoc_drop_for_fn,
+    record_static_init_incomplete_for_fn, record_store_dropped_for_fn,
+    record_stub_approximation_for_fn, record_translation_drop_for_fn,
     record_type_sort_fallback_for_fn, record_unhandled_call_for_fn, set_chc_fallback_count_for_fn,
     take_undef_counter,
 };
@@ -28,7 +29,7 @@ use super::codegen_ctx::{
 use super::codegen_rules::CodegenRules;
 use super::codegen_rules_entry::CodegenRulesEntry;
 use super::prune_relation_args::prune_dead_array_relation_args;
-use super::straightline_proof::{discharge_straightline_safety, straightline_discharge_disabled};
+use super::straightline_proof::discharge_straightline_safety;
 
 /// Whether `translate()` detected that memory promotion is needed.
 ///
@@ -57,18 +58,7 @@ pub(in crate::codegen_ay) fn reset_chc_session_counters() {
 struct CounterSnapshot {
     type_sort_fallback: usize,
     signedness_fallback: u64,
-    store_dropped: usize,
-    unhandled_call: usize,
-    place_translation_drop: usize,
-    sound_havoc_drop: usize,
-    const_translation_drop: usize,
-    unsupported_field_projection: usize,
-    kani_mem_overapprox: usize,
-    ptr_metadata_unconstrained: usize,
-    static_init_incomplete: usize,
     fp_bitvector_encoding: usize,
-    aggregate_encoding_gap: usize,
-    stub_approximation: usize,
 }
 
 impl CounterSnapshot {
@@ -76,24 +66,15 @@ impl CounterSnapshot {
         Self {
             type_sort_fallback: GLOBAL_COUNTERS.type_sort_fallback.load(Relaxed),
             signedness_fallback: crate::codegen_ay::shared::get_signedness_fallback_count() as u64,
-            store_dropped: GLOBAL_COUNTERS.store_dropped_transition.load(Relaxed),
-            unhandled_call: GLOBAL_COUNTERS.unhandled_call.load(Relaxed),
-            place_translation_drop: GLOBAL_COUNTERS.place_translation_drop.load(Relaxed),
-            sound_havoc_drop: GLOBAL_COUNTERS.sound_havoc_drop.load(Relaxed),
-            const_translation_drop: GLOBAL_COUNTERS.const_translation_drop.load(Relaxed),
-            unsupported_field_projection: GLOBAL_COUNTERS
-                .unsupported_field_projection
-                .load(Relaxed),
-            kani_mem_overapprox: GLOBAL_COUNTERS.kani_mem_overapprox.load(Relaxed),
-            ptr_metadata_unconstrained: GLOBAL_COUNTERS.ptr_metadata_unconstrained.load(Relaxed),
-            static_init_incomplete: GLOBAL_COUNTERS.static_init_incomplete.load(Relaxed),
             fp_bitvector_encoding: GLOBAL_COUNTERS.fp_bitvector_encoding.load(Relaxed),
-            aggregate_encoding_gap: GLOBAL_COUNTERS.aggregate_encoding_gap.load(Relaxed),
-            stub_approximation: GLOBAL_COUNTERS.stub_approximation.load(Relaxed),
         }
     }
 
     /// Compute deltas and record per-function diagnostics (Part of #2906, #2966).
+    /// Per-function maps come from this translation's own `MirroredUsizeCounter`s:
+    /// the process-global counters are shared by every concurrent translation
+    /// (parallel tests, parallel codegen), so a global delta also counts other
+    /// functions' drops. Counters with no per-context mirror keep the delta.
     fn record_deltas(self, fn_name: &str, diagnostics: &ChcDiagnostics) {
         let tsf_delta = GLOBAL_COUNTERS
             .type_sort_fallback
@@ -106,45 +87,18 @@ impl CounterSnapshot {
 
         record_type_sort_fallback_for_fn(fn_name, tsf_delta);
         record_signedness_fallback_for_fn(fn_name, sf_delta);
-        record_store_dropped_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS
-                .store_dropped_transition
-                .load(Relaxed)
-                .saturating_sub(self.store_dropped),
-        );
-        record_unhandled_call_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS.unhandled_call.load(Relaxed).saturating_sub(self.unhandled_call),
-        );
-        let td_delta = GLOBAL_COUNTERS
-            .place_translation_drop
-            .load(Relaxed)
-            .saturating_sub(self.place_translation_drop)
-            + GLOBAL_COUNTERS
-                .const_translation_drop
-                .load(Relaxed)
-                .saturating_sub(self.const_translation_drop)
-            + GLOBAL_COUNTERS
-                .unsupported_field_projection
-                .load(Relaxed)
-                .saturating_sub(self.unsupported_field_projection);
+        record_store_dropped_for_fn(fn_name, diagnostics.store_dropped_transition.get());
+        record_unhandled_call_for_fn(fn_name, diagnostics.unhandled_call.get());
+        let td_delta = diagnostics.place_translation_drop.get()
+            + diagnostics.const_translation_drop.get()
+            + diagnostics.unsupported_field_projection.get();
         record_translation_drop_for_fn(fn_name, td_delta);
         // Recognized-clean SoundHavoc drops are attributed with the identical
         // per-fn delta mechanism as `place_translation_drop`, so a proof's
         // SoundHavoc/fail-close split is internally consistent
         // (Part of #unsound-havoc-split).
-        record_sound_havoc_drop_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS.sound_havoc_drop.load(Relaxed).saturating_sub(self.sound_havoc_drop),
-        );
-        record_kani_mem_overapprox_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS
-                .kani_mem_overapprox
-                .load(Relaxed)
-                .saturating_sub(self.kani_mem_overapprox),
-        );
+        record_sound_havoc_drop_for_fn(fn_name, diagnostics.sound_havoc_drop.get());
+        record_kani_mem_overapprox_for_fn(fn_name, diagnostics.kani_mem_overapprox.get());
         // marker: offset_isize_overflow_precise. Attribute this context's
         // offset-provenance-unresolved demotion to `fn_name`, so the driver
         // (which falls back to the crate total for an EMPTY per-harness map)
@@ -157,20 +111,15 @@ impl CounterSnapshot {
             fn_name,
             diagnostics.offset_provenance_unresolved.get(),
         );
+        // Fail-closed assertion counts are charged PER HARNESS from this
+        // context's own local count, so one harness's untranslatable assert no
+        // longer demotes every sibling's counterexample in the same crate.
+        record_assert_untranslatable_for_fn(fn_name, diagnostics.assert_untranslatable.get());
         record_ptr_metadata_unconstrained_for_fn(
             fn_name,
-            GLOBAL_COUNTERS
-                .ptr_metadata_unconstrained
-                .load(Relaxed)
-                .saturating_sub(self.ptr_metadata_unconstrained),
+            diagnostics.ptr_metadata_unconstrained.get(),
         );
-        record_static_init_incomplete_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS
-                .static_init_incomplete
-                .load(Relaxed)
-                .saturating_sub(self.static_init_incomplete),
-        );
+        record_static_init_incomplete_for_fn(fn_name, diagnostics.static_init_incomplete.get());
         record_fp_bitvector_encoding_for_fn(
             fn_name,
             GLOBAL_COUNTERS
@@ -178,20 +127,8 @@ impl CounterSnapshot {
                 .load(Relaxed)
                 .saturating_sub(self.fp_bitvector_encoding),
         );
-        record_aggregate_encoding_gap_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS
-                .aggregate_encoding_gap
-                .load(Relaxed)
-                .saturating_sub(self.aggregate_encoding_gap),
-        );
-        record_stub_approximation_for_fn(
-            fn_name,
-            GLOBAL_COUNTERS
-                .stub_approximation
-                .load(Relaxed)
-                .saturating_sub(self.stub_approximation),
-        );
+        record_aggregate_encoding_gap_for_fn(fn_name, diagnostics.aggregate_encoding_gap.get());
+        record_stub_approximation_for_fn(fn_name, diagnostics.stub_approximation.get());
     }
 }
 
@@ -287,6 +224,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.declare_error_relation();
         self.emit_entry_rule();
         self.generate_transition_rules();
+        // D2: reads the translation noted after the seeding closed.
+        self.drain_deferred_object_reads();
+        // The static image sync is sound only if every store into an image
+        // was routed and left no cell the sync misses (`decl::static_path`).
+        self.fail_close_static_image_hazards();
+        self.book_escaping_index_value_refs();
+        self.book_far_pointer_prescan();
+        self.book_box_from_raw_of_stack_pointer();
+        self.book_vec_buffer_access_after_mutation();
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        self.book_unmodeled_native_maybe_memory();
+        self.account_unbound_heap_metadata_outputs();
         fixup_relation_app_arities(&mut self.vc);
         super::codegen_rules::lemma_hint::emit_loop_invariant_lemmas(&mut self);
         super::codegen_rules::lemma_linearize::apply_linearization(&mut self);
@@ -305,16 +254,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.vc.prune_orphan_block_rules();
         prune_dead_array_relation_args(&mut self.vc);
         fixup_relation_app_arities(&mut self.vc);
+        // Rule C's backstop: after scalarization names the cells.
+        self.book_cells_read_under_unwritten_key();
         self.fail_close_degenerate_system(false);
-        if !straightline_discharge_disabled() && discharge_straightline_safety(&mut self.vc) {
+        if self.straightline_discharge && discharge_straightline_safety(&mut self.vc) {
             tracing::debug!("CHC: bounded straight-line proof discharged scalarized VC");
         }
         self.vc.query = trust_mc_core::chc::ChcQuery::new().with_target("error");
 
         self.drain_pending_fresh_var_decls_into_vc();
 
-        snapshot.record_deltas(&self.fn_name, &self.diagnostics);
+        if self.record_per_fn_diagnostics && !self.far_retry_requested {
+            snapshot.record_deltas(&self.fn_name, &self.diagnostics);
+        }
 
+        self.partition_static_iterator_cursors();
         let action =
             if self.needs_mem_promote { MemPromoteAction::Promote } else { MemPromoteAction::Keep };
         (self.vc, action)
@@ -383,6 +337,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.record_fallback();
         }
 
+        // Trust: `Rvalue::Reborrow` has no CHC encoding. Fail closed for the
+        // whole body before any analysis or rule emission reads it.
+        #[cfg(trust_toolchain)]
+        self.fail_close_reborrow_body();
+
         self.declare_block_relations();
 
         tracing::debug!(
@@ -392,21 +351,54 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.body.blocks.len(),
             self.ref_resolution.bigint_ref_targets.len()
         );
+        // The body the encoder translates, after inlining: the MIR dump
+        // (`--emit=mir`) is taken before the CHC inliner composes callees in.
+        if tracing::enabled!(target: "trust_mc_chc_body", tracing::Level::DEBUG) {
+            let mut text = Vec::new();
+            if self.body.dump(&mut text, &self.fn_name).is_ok() {
+                tracing::debug!(
+                    target: "trust_mc_chc_body",
+                    "{}",
+                    String::from_utf8_lossy(&text)
+                );
+            }
+        }
 
+        use crate::codegen_ay::translation_deadline::timed_phase;
         self.declare_error_relation();
         self.emit_entry_rule();
-        self.generate_transition_rules();
-        fixup_relation_app_arities(&mut self.vc);
+        timed_phase("chc_transition_rules", || self.generate_transition_rules());
+        // D2: reads the translation noted after the seeding closed.
+        self.drain_deferred_object_reads();
+        // The static image sync is sound only if every store into an image
+        // was routed and left no cell the sync misses (`decl::static_path`).
+        self.fail_close_static_image_hazards();
+        self.restore_hidden_subslice_lens();
+        self.verify_kept_payload_value_facts();
+        self.book_escaping_index_value_refs();
+        self.book_far_pointer_prescan();
+        self.book_box_from_raw_of_stack_pointer();
+        self.book_vec_buffer_access_after_mutation();
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        self.book_unmodeled_native_maybe_memory();
+        self.account_unbound_heap_metadata_outputs();
+        timed_phase("chc_fixup_arities_1", || fixup_relation_app_arities(&mut self.vc));
 
-        super::codegen_rules::lemma_hint::emit_loop_invariant_lemmas(&mut self);
-        super::codegen_rules::lemma_linearize::apply_linearization(&mut self);
+        timed_phase("chc_lemmas", || {
+            super::codegen_rules::lemma_hint::emit_loop_invariant_lemmas(&mut self);
+            super::codegen_rules::lemma_linearize::apply_linearization(&mut self);
+        });
         // TIC: If candidate invariants are detected and verified via 3 SMT
         // checks (initiation, consecution, safety), replace the VC with a
         // trivially safe system. Part of #3258.
-        let tic_discharged = super::codegen_rules::template_check::apply_template_check(&mut self);
-        self.prune_vc_unused_type_arrays();
-        self.normalize_free_array_bases_before_scalarization();
-        self.scalarize_const_index_arrays();
+        let tic_discharged = timed_phase("chc_template_check", || {
+            super::codegen_rules::template_check::apply_template_check(&mut self)
+        });
+        timed_phase("chc_prune_type_arrays", || self.prune_vc_unused_type_arrays());
+        timed_phase("chc_normalize_free_arrays", || {
+            self.normalize_free_array_bases_before_scalarization()
+        });
+        timed_phase("chc_scalarize", || self.scalarize_const_index_arrays());
         // Part of #4286: `scalarize_const_index_arrays` (and its `apply_const_folding`
         // sub-pass) rebuild each relation's `arg_sorts` from the FIRST rule head
         // that mentions the relation. If another rule's *body* app for the same
@@ -414,12 +406,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // because only heads drive the rebuilt arity. Re-run the late-array
         // fixup so any body app that is now shorter than the decl is padded
         // with universally-quantified `__pad_*` vars.
-        fixup_relation_app_arities(&mut self.vc);
-        self.vc.prune_orphan_block_rules();
-        prune_dead_array_relation_args(&mut self.vc);
-        fixup_relation_app_arities(&mut self.vc);
+        timed_phase("chc_fixup_arities_2", || fixup_relation_app_arities(&mut self.vc));
+        timed_phase("chc_prune_orphans", || {
+            self.vc.prune_orphan_block_rules();
+            prune_dead_array_relation_args(&mut self.vc);
+        });
+        timed_phase("chc_fixup_arities_3", || fixup_relation_app_arities(&mut self.vc));
+        // Rule C's backstop: after scalarization names the cells.
+        self.book_cells_read_under_unwritten_key();
         self.fail_close_degenerate_system(tic_discharged);
-        if !straightline_discharge_disabled() && discharge_straightline_safety(&mut self.vc) {
+        // A lost-checks recovery re-encode (`keep_error_obligations`) is NOT
+        // discharged here. It carries the flag into the emit-time pipeline, whose
+        // passes keep the obligations and whose discharge runs after constant
+        // propagation.
+        if self.straightline_discharge
+            && !self.vc.keep_error_obligations
+            && timed_phase("chc_straightline", || discharge_straightline_safety(&mut self.vc))
+        {
             tracing::debug!("CHC: bounded straight-line proof discharged scalarized VC");
         }
         self.vc.query = trust_mc_core::chc::ChcQuery::new().with_target("error");
@@ -503,6 +506,42 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // checked.
         let offset_provenance_freed = self.diagnostics.offset_provenance_unresolved.get();
 
+        // A rule that READS a local's state column its own relation atoms do not
+        // carry reads a universally quantified free variable: the rule admits any
+        // value there, so a counterexample through it may not exist in the
+        // program. Relation frames are fixed at decl time, before the side tables
+        // rule generation fills and replays across blocks (`subslice_len`,
+        // `subslice_offset`, `const_ref_values`, ...), so a cached expression over
+        // a local that liveness later pruned escapes every MIR-level analysis.
+        // Measured on tests/expected/loop-contract/for_loop_for_slice.rs: the
+        // slice length replayed as `_129_fld1 - _129_fld0` in bb2, where `_129`
+        // (the `any_slice_of_array` range) is no longer in the frame, so the
+        // length was unbounded and `kani::index as u32 * 255` refuted with a
+        // counterexample certified Genuine against a SUCCESSFUL Kani oracle.
+        // Widening is sound for a proof, so count it as a sound havoc: the
+        // driver tags the counterexample OverApproximation and leaves a proof
+        // clean (`apply_sound_fallback_fail_close` excludes this category).
+        // That unit no longer reaches this path: `subslice_len` replays and
+        // traced Range lengths are withheld where they would read out of frame
+        // (`stmt/codegen_stmt/subslice_len_frame.rs`), and the read falls
+        // through to the slice local's own metadata. This detector stays the
+        // fallback for every other side table.
+        let unframed_reads = self.local_columns_read_outside_rule_frames();
+        if !unframed_reads.is_empty() {
+            tracing::warn!(
+                fn_name = %self.fn_name,
+                columns = unframed_reads.len(),
+                first = %unframed_reads[0],
+                "CHC: a rule reads a local's state column outside its relation frame; \
+                 its counterexamples are not certified"
+            );
+            for _ in &unframed_reads {
+                super::codegen_ctx::diagnostics::CellCounter::inc(
+                    &self.diagnostics.sound_havoc_drop,
+                );
+            }
+        }
+
         // Task #78: finalize approximation-identity plumbing. The freed-var
         // identities were pushed to `self.vc.approximated_vars` during codegen
         // (SoundFallback dest havoc). Compute the per-property dependence verdict
@@ -511,6 +550,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // it double-labels a `place_translation_drop` event from the same
         // SoundFallback site (the driver applies the same subtraction against its
         // own per-harness taint total, which is the authoritative gate).
+        self.account_escaped_assert_fallbacks();
         let sound_approx_freeing_total = self.diagnostics.place_translation_drop.get()
             + self.diagnostics.sound_havoc_drop.get()
             + self.diagnostics.static_init_incomplete.get()
@@ -519,22 +559,171 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             + self.diagnostics.stub_approximation.get()
             + self.diagnostics.kani_mem_overapprox.get()
             + offset_provenance_freed;
+        self.flush_deferred_approximation_identities();
+        tracing::debug!(
+            fn_name = %self.fn_name,
+            place_translation_drop = self.diagnostics.place_translation_drop.get(),
+            sound_havoc_drop = self.diagnostics.sound_havoc_drop.get(),
+            static_init_incomplete = self.diagnostics.static_init_incomplete.get(),
+            ptr_metadata_unconstrained = self.diagnostics.ptr_metadata_unconstrained.get(),
+            aggregate_encoding_gap = self.diagnostics.aggregate_encoding_gap.get(),
+            stub_approximation = self.diagnostics.stub_approximation.get(),
+            kani_mem_overapprox = self.diagnostics.kani_mem_overapprox.get(),
+            offset_provenance_freed,
+            accounted = self.vc.accounted_approximations,
+            "CHC: approximation identity accounting"
+        );
         self.vc.finalize_approximation_identity(sound_approx_freeing_total);
+        // A fail-closed far pointer observation's property is never certified,
+        // whatever later passes made of its guard (heap/stack_address.rs).
+        self.mark_far_observation_properties_dependent();
 
-        snapshot.record_deltas(&self.fn_name, &self.diagnostics);
+        if self.record_per_fn_diagnostics && !self.far_retry_requested {
+            snapshot.record_deltas(&self.fn_name, &self.diagnostics);
+        }
 
+        self.partition_static_iterator_cursors();
         let action =
             if self.needs_mem_promote { MemPromoteAction::Promote } else { MemPromoteAction::Keep };
         (self.vc, action, self.diagnostics)
     }
 
+    /// Account every panic-path fallback symbol (`__assert_fail_inline*`) that
+    /// reached a rule of this VC: an aggregate encoding gap each, with the
+    /// symbol as its freed-var identity.
+    ///
+    /// The inline walker and the known-call models return `ite(g, v, f)` for a
+    /// call that panics where `g` fails, `f` a fresh symbol of the result sort
+    /// (`execution_state.rs` `finish_return`, `virtual_panic_fallback`, the
+    /// `unwrap` and `clamp` models). Every consumer that knows the naming
+    /// contract (a nested walk, the dispatch hosts, the fn-inline emit)
+    /// extracts `g` as the call's panic condition, cuts the path where it
+    /// fails, and strips `f` from the value (`inline_body.rs`
+    /// `strip_inline_assert_fallback`): a stripped symbol is no approximation.
+    /// The walker used to count one gap per fallback it BUILT, so a walked
+    /// callee with an assertion left the harness's identity accounting
+    /// incomplete although no rule read the symbol, and no counterexample of it
+    /// could be certified (a walked loop bounded by the caller's assumption,
+    /// `walker_declared_unwind_dual.rs` `b_assume_bound_bug`, package round 2
+    /// item b). Counting here, over the finished rules, charges exactly the
+    /// symbols that escaped: a value that kept one ranges over every value of
+    /// its sort on that path, and a check reading it stays dependent.
+    fn account_escaped_assert_fallbacks(&mut self) {
+        let escaped = escaped_assert_fallbacks(&self.vc);
+        for name in &escaped {
+            tracing::debug!(
+                fn_name = %self.fn_name,
+                symbol = name.as_str(),
+                "CHC: a panic-path fallback reached a rule"
+            );
+            self.record_aggregate_gap("inline_assert_fail_fallback");
+            self.vc.record_approximation_identity(Some(name));
+        }
+    }
+
+    /// Record every transition rule that HAVOCS a heap metadata array without
+    /// saying so.
+    ///
+    /// A head argument no part of the rule's body mentions is universally
+    /// quantified: the rule admits every value of it, so a counterexample
+    /// through it may pick an `obj_valid` or `obj_size` the program never has.
+    /// No program makes allocation validity or size nondeterministic, so an
+    /// unbound `obj_valid__out` / `obj_size__out` (or its large-step
+    /// `__mid_bbN` spelling) is always an approximation. Sites that havoc on
+    /// purpose record their own reason; one that marks a lane modified and
+    /// writes nothing did not, and its counterexamples were certified Genuine
+    /// (`box_then_null_deref`: the `ptr::null()` call marked both lanes, its
+    /// update never reached the rule, and the Box's drop-time size check was
+    /// refuted against a SUCCESSFUL Kani). The per-lane markers fix the known
+    /// sites; this records the rest, once per offending rule, as a sound havoc:
+    /// a proof over it stays clean and a counterexample is never certified.
+    ///
+    /// It judges only the head's lanes. A large-step `__mid_bbN` value that a
+    /// middle block havocs and a later block of the same composed rule
+    /// redefines from is not caught here.
+    fn account_unbound_heap_metadata_outputs(&mut self) {
+        let offenders = unbound_heap_metadata_outputs(&self.vc);
+        for (head, lanes) in &offenders {
+            tracing::debug!(
+                fn_name = %self.fn_name,
+                head = head.as_str(),
+                ?lanes,
+                "CHC: a rule havocs heap metadata no site accounted for"
+            );
+            self.record_sound_fallback_reason("heap_metadata_output_unbound");
+        }
+    }
+
+    /// Input names of MIR-local state columns that some rule's constraints read
+    /// while neither of that rule's relation atoms carries the column.
+    ///
+    /// Only bare input names count: `X__out` and `X__mid_bbN` are defined by
+    /// the rule that mentions them, `__pad_*` slots are anonymous by design,
+    /// and ambient columns with no MIR local (type/region arrays, statics) are
+    /// legitimately unframed. Rules without a body relation (the entry rule)
+    /// quantify their whole state and are skipped.
+    fn local_columns_read_outside_rule_frames(&self) -> Vec<String> {
+        use ay_bindings::ExprValue;
+        use std::collections::HashSet;
+
+        let local_backed = self.mir_local_backed_state_indices();
+        let rel_names: HashSet<&str> = self.vc.relations.iter().map(|r| r.name.as_str()).collect();
+        let mut offenders: Vec<String> = Vec::new();
+        for rule in &self.vc.rules {
+            let Some(body_rel) = rule.body.relation.as_ref() else { continue };
+            let mut carried: HashSet<String> = HashSet::new();
+            for app in [body_rel, &rule.head] {
+                for arg in app.args.iter() {
+                    let mut stack = vec![arg.clone()];
+                    while let Some(node) = stack.pop() {
+                        if let ExprValue::Var { name } = node.value() {
+                            if let Some(base) = canonical_slot_name(name) {
+                                carried.insert(base);
+                            }
+                        }
+                        stack.extend(node.children().cloned());
+                    }
+                }
+            }
+            for constraint in rule.body.constraints.iter() {
+                let mut stack = vec![constraint.clone()];
+                while let Some(node) = stack.pop() {
+                    match node.value() {
+                        ExprValue::FuncApp { name, .. } if rel_names.contains(name.as_str()) => {}
+                        ExprValue::Var { name } => {
+                            if name.ends_with("__out")
+                                || name.contains("__mid_bb")
+                                || name.starts_with("__pad_")
+                                || carried.contains(name.as_str())
+                            {
+                                continue;
+                            }
+                            if self
+                                .state_var_mgr
+                                .state_var_index_by_name(name)
+                                .is_some_and(|idx| local_backed.contains(&idx))
+                            {
+                                offenders.push(name.clone());
+                            }
+                        }
+                        _ => stack.extend(node.children().cloned()),
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        offenders
+    }
+
     /// Emit-time normalization is too late once scalarization has rewritten
     /// the array selects needed to recover initialized lanes.
     fn normalize_free_array_bases_before_scalarization(&mut self) {
-        let normalized = self.vc.normalize_free_array_bases();
+        let (normalized, names) = self.vc.normalize_free_array_bases_named();
         if normalized > 0 {
             tracing::debug!(
                 normalized,
+                ?names,
                 "CHC: normalized free-var array bases before scalarization"
             );
         }
@@ -874,6 +1063,165 @@ fn pad_sort_tag(sort: &ay_bindings::Sort) -> String {
         }
     }
     tag.trim_matches('_').to_string()
+}
+
+/// Does `arg` occupy the same state slot as `template_arg`?
+///
+/// Templates are collected from EVERY full application, and a head carries
+/// a slot's output name (`x__out`) where a body carries its input name (`x`).
+/// Matching by exact expression made a short BODY application miss every
+/// head template, so it fell through to positional sort padding: inside a
+/// run of identically sorted columns that shifts every later slot left and
+/// pads at the tail, and the frame is misaligned
+/// (kani/UnsizedCoercion/box_outer_coercion.rs: `bb21` column 37 held `_29`
+/// in the producer and `_35` in the consumer). Slot identity is the
+/// canonical slot name, the same identity `block_relation_slot_names_consistent`
+/// checks; everything else (constants, compound terms) still matches only by
+/// exact equality, and pads never match.
+fn same_slot(arg: &ay_bindings::Expr, template_arg: &ay_bindings::Expr) -> bool {
+    if arg == template_arg {
+        return !matches!(arg.value(), ay_bindings::ExprValue::Var { name } if name.starts_with("__pad_") || name.starts_with("__cpad_"));
+    }
+    if arg.sort() != template_arg.sort() {
+        return false;
+    }
+    match (arg.value(), template_arg.value()) {
+        (ay_bindings::ExprValue::Var { name: a }, ay_bindings::ExprValue::Var { name: b }) => {
+            matches!((canonical_slot_name(a), canonical_slot_name(b)), (Some(x), Some(y)) if x == y)
+        }
+        _ => false,
+    }
+}
+
+/// A variable's canonical slot base, borrowed: [`canonical_slot_name`] without
+/// the allocation. `None` for non-variables and `__pad_` names.
+fn slot_key(expr: &ay_bindings::Expr) -> Option<&str> {
+    let ay_bindings::ExprValue::Var { name } = expr.value() else { return None };
+    let name = name.as_str();
+    if name.starts_with("__pad_") {
+        return None;
+    }
+    let mut base = name;
+    if let Some(pos) = base.find("__mid_bb") {
+        base = &base[..pos];
+    }
+    Some(base.strip_suffix("__out").unwrap_or(base))
+}
+
+/// [`same_slot`] with both sides' [`slot_key`]s precomputed: the same boolean,
+/// without allocating per comparison.
+fn same_slot_keyed(
+    arg: &ay_bindings::Expr,
+    arg_key: Option<&str>,
+    template_arg: &ay_bindings::Expr,
+    template_key: Option<&str>,
+) -> bool {
+    if arg == template_arg {
+        return !matches!(arg.value(), ay_bindings::ExprValue::Var { name } if name.starts_with("__pad_") || name.starts_with("__cpad_"));
+    }
+    if arg.sort() != template_arg.sort() {
+        return false;
+    }
+    matches!((arg_key, template_key), (Some(x), Some(y)) if x == y)
+}
+
+/// The transition rules whose head carries a heap metadata output
+/// (`obj_valid__out`, `obj_size__out`, or a large-step `__mid_bbN` spelling of
+/// either) that the rule does not DEFINE, as (head relation, the undefined
+/// lanes). A lane is defined when a conjunct equates it with an expression
+/// that does not mention it (`obj_valid__out = store(obj_valid, 0, false)`,
+/// an `ite` of stores, the identity `obj_size__out = obj_size`) or when the
+/// body relation carries it. Otherwise it is universally quantified in its
+/// rule, wholly (no conjunct mentions it) or partly: a self-referential
+/// `obj_valid__out = store(obj_valid__out, k, false)`, which is what a second
+/// invalidation in the same rule builds on `current_obj_valid_array()` once
+/// `filter_superseded_store_chains` has dropped the first definition, pins one
+/// element and leaves every other free. See
+/// `ChcCtx::account_unbound_heap_metadata_outputs`.
+pub(super) fn unbound_heap_metadata_outputs(
+    vc: &trust_mc_core::chc::ChcVc,
+) -> Vec<(String, Vec<String>)> {
+    use ay_bindings::ExprValue;
+    use std::collections::HashSet;
+
+    fn is_metadata_output(name: &str) -> bool {
+        ["obj_valid", "obj_size"].iter().any(|lane| {
+            name.strip_prefix(lane).is_some_and(|rest| {
+                rest == "__out"
+                    || rest
+                        .strip_prefix("__mid_bb")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+    }
+    fn collect_vars(expr: &ay_bindings::Expr, out: &mut HashSet<String>) {
+        let mut stack = vec![expr.clone()];
+        while let Some(node) = stack.pop() {
+            if let ExprValue::Var { name } = node.value() {
+                out.insert(name.clone());
+            }
+            stack.extend(node.children().cloned());
+        }
+    }
+    fn mentions(expr: &ay_bindings::Expr, lane: &str) -> bool {
+        let mut vars = HashSet::new();
+        collect_vars(expr, &mut vars);
+        vars.contains(lane)
+    }
+    /// Every lane a top-level conjunct defines: `(= lane e)` or `(= e lane)`
+    /// with `e` free of `lane`.
+    fn defined_lanes(constraint: &ay_bindings::Expr, out: &mut HashSet<String>) {
+        let mut stack = vec![constraint.clone()];
+        while let Some(node) = stack.pop() {
+            match node.value() {
+                ExprValue::And(conjuncts) => stack.extend(conjuncts.iter().cloned()),
+                ExprValue::Eq(lhs, rhs) => {
+                    for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+                        if let ExprValue::Var { name } = side.value()
+                            && is_metadata_output(name)
+                            && !mentions(other, name)
+                        {
+                            out.insert(name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut offenders = Vec::new();
+    for rule in &vc.rules {
+        let Some(body_rel) = rule.body.relation.as_ref() else { continue };
+        let head_lanes: Vec<&str> = rule
+            .head
+            .args
+            .iter()
+            .filter_map(|arg| match arg.value() {
+                ExprValue::Var { name } if is_metadata_output(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if head_lanes.is_empty() {
+            continue;
+        }
+        let mut defined: HashSet<String> = HashSet::new();
+        for arg in body_rel.args.iter() {
+            collect_vars(arg, &mut defined);
+        }
+        for constraint in rule.body.constraints.iter() {
+            defined_lanes(constraint, &mut defined);
+        }
+        let unbound: Vec<String> = head_lanes
+            .into_iter()
+            .filter(|lane| !defined.contains(*lane))
+            .map(str::to_string)
+            .collect();
+        if !unbound.is_empty() {
+            offenders.push((rule.head.name.as_str().to_string(), unbound));
+        }
+    }
+    offenders
 }
 
 fn canonical_slot_name(name: &str) -> Option<String> {
@@ -1552,9 +1900,22 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
         templates
     }
 
+    /// Does any node of `expr` apply a declared relation?
+    ///
+    /// Walks the expression as the DAG it is: a shared subterm (an `Arc`-shared
+    /// `ExprValue`, identified by address) is visited once. The answer is an
+    /// "any node matches" over the node set, so skipping a node already seen
+    /// cannot change it, and a heavily shared constraint no longer costs its
+    /// unshared tree size (derive-bounded-arbitrary/boxed_slice.rs spent its
+    /// samples here).
     fn expr_may_contain_relation_app(expr: &Expr, rel_sorts: &HashMap<&str, &[Sort]>) -> bool {
+        let mut seen: std::collections::HashSet<*const ExprValue> =
+            std::collections::HashSet::new();
         let mut stack = vec![expr];
         while let Some(node) = stack.pop() {
+            if !seen.insert(std::ptr::from_ref(node.value())) {
+                continue;
+            }
             if let ExprValue::FuncApp { name, .. } = node.value()
                 && rel_sorts.contains_key(name.as_str())
             {
@@ -1668,14 +2029,22 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
 
         let arg_len = args.len();
         let template_len = template.len();
+        // Slot keys once per side instead of two `String` allocations per DP
+        // cell: the DP is O(args x template) and runs for every template of the
+        // relation (expected/function-contract/modifies_fat_pointer/
+        // nondeterministic_size.rs was sampled here).
+        let arg_keys: Vec<Option<&str>> = args.iter().map(slot_key).collect();
+        let template_keys: Vec<Option<&str>> = template.iter().map(slot_key).collect();
+        let cell = |i: usize, j: usize| {
+            same_slot_keyed(&args[i], arg_keys[i], &template[j], template_keys[j])
+        };
         let mut can_match = vec![vec![false; template_len + 1]; arg_len + 1];
         for slot in &mut can_match[arg_len] {
             *slot = true;
         }
         for i in (0..arg_len).rev() {
             for j in (0..template_len).rev() {
-                can_match[i][j] =
-                    can_match[i][j + 1] || (args[i] == template[j] && can_match[i + 1][j + 1]);
+                can_match[i][j] = can_match[i][j + 1] || (cell(i, j) && can_match[i + 1][j + 1]);
             }
         }
         if !can_match[0][0] {
@@ -1686,7 +2055,7 @@ pub(in crate::codegen_ay) fn fixup_relation_app_arities(vc: &mut trust_mc_core::
         let mut j = 0;
         for i in 0..arg_len {
             while j < template_len {
-                if args[i] == template[j] && can_match[i + 1][j + 1] {
+                if cell(i, j) && can_match[i + 1][j + 1] {
                     matched[j] = Some(args[i].clone());
                     j += 1;
                     break;
@@ -2077,4 +2446,144 @@ mod tests {
             "final arg should preserve the original memory slot after trimming extras"
         );
     }
+}
+
+#[cfg(test)]
+mod slot_template_alignment_tests {
+    //! A short relation application is re-projected onto a full template by slot
+    //! IDENTITY, even when the template is a head (`x__out`) and the short
+    //! application is a body (`x`), instead of being padded positionally inside
+    //! a run of identically sorted columns.
+    use super::{
+        block_relation_slot_names_consistent, fixup_relation_app_arities, same_slot,
+        same_slot_keyed, slot_key,
+    };
+    use ay_bindings::{Expr, Sort};
+    use trust_mc_core::chc::{ChcVc, RelationApp, RelationDecl, Rule, RuleBody, VarDecl};
+
+    fn bv() -> Sort {
+        Sort::bitvec(32)
+    }
+
+    /// `f__bb1(a, b, c)` produced in full by bb0's rule, consumed SHORT, as
+    /// `f__bb1(a, c)`, by bb1's rule: `b` was not in bb1's frame when that
+    /// application was projected. Every column has the same sort.
+    fn short_consumer_vc() -> ChcVc {
+        let v = |n: &str| Expr::var(n, bv());
+        let mut vc = ChcVc::new();
+        for n in ["_f_1", "_f_1__out", "_f_2", "_f_2__out", "_f_3", "_f_3__out"] {
+            vc.add_var(VarDecl::new(n, bv()));
+        }
+        vc.add_relation(RelationDecl::new("f__bb0", vec![bv(), bv(), bv()]));
+        vc.add_relation(RelationDecl::new("f__bb1", vec![bv(), bv(), bv()]));
+        vc.add_relation(RelationDecl::new("f__bb2", vec![bv(), bv()]));
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("f__bb0", vec![v("_f_1"), v("_f_2"), v("_f_3")])),
+                vec![],
+            ),
+            RelationApp::new("f__bb1", vec![v("_f_1__out"), v("_f_2__out"), v("_f_3__out")]),
+        ));
+        vc.add_rule(Rule::new(
+            RuleBody::new(Some(RelationApp::new("f__bb1", vec![v("_f_1"), v("_f_3")])), vec![]),
+            RelationApp::new("f__bb2", vec![v("_f_1__out"), v("_f_3__out")]),
+        ));
+        vc
+    }
+
+    fn body_app(vc: &ChcVc, rule: usize) -> Vec<String> {
+        vc.rules[rule].body.relation.as_ref().unwrap().args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn short_body_is_realigned_by_slot_name_not_padded_at_the_tail() {
+        let mut vc = short_consumer_vc();
+        fixup_relation_app_arities(&mut vc);
+        let args = body_app(&vc, 1);
+        assert_eq!(args.len(), 3, "{args:?}");
+        assert_eq!(args[0], "_f_1", "{args:?}");
+        assert!(
+            args[1].starts_with("__pad_f__bb1_1"),
+            "the missing slot is padded in place: {args:?}"
+        );
+        assert_eq!(args[2], "_f_3", "{args:?}");
+        assert!(block_relation_slot_names_consistent(&vc), "frame must be slot-aligned");
+    }
+
+    #[test]
+    fn keyed_slot_match_equals_same_slot() {
+        let names = [
+            "_f_1",
+            "_f_1__out",
+            "_f_1__mid_bb3",
+            "_f_1__out__mid_bb3",
+            "_f_2",
+            "_f_2__out",
+            "__pad_f__bb1_1_bv32",
+            "__cpad_f_0",
+            "__cpad_f_0__out",
+            "__out",
+            "",
+        ];
+        let mut exprs: Vec<Expr> = names.iter().map(|n| Expr::var(*n, bv())).collect();
+        exprs.push(Expr::var("_f_1", Sort::bool()));
+        exprs.push(Expr::var("_f_1__out", Sort::bool()));
+        exprs.push(Expr::bitvec_const(7u32, 32));
+        exprs.push(Expr::bool_const(true));
+        for a in &exprs {
+            for b in &exprs {
+                assert_eq!(
+                    same_slot_keyed(a, slot_key(a), b, slot_key(b)),
+                    same_slot(a, b),
+                    "{a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_application_with_an_unknown_slot_does_not_match_the_template() {
+        // `_f_9` names no slot of the template, so the name-based template match
+        // must not claim it; whatever the fallback does, it must not bind `_f_9`
+        // into a column the template gives to a different slot by name.
+        let v = |n: &str| Expr::var(n, bv());
+        let mut vc = short_consumer_vc();
+        vc.add_var(VarDecl::new("_f_9", bv()));
+        vc.rules[1].body.relation = Some(RelationApp::new("f__bb1", vec![v("_f_9"), v("_f_3")]));
+        fixup_relation_app_arities(&mut vc);
+        let args = body_app(&vc, 1);
+        assert_eq!(args.len(), 3, "{args:?}");
+        assert_ne!(args[1], "_f_9", "{args:?}");
+    }
+}
+
+/// The distinct `__assert_fail_inline*` symbols the rules of `vc` read, in the
+/// body constraints and in either relation application's arguments
+/// ([`ChcCtx::account_escaped_assert_fallbacks`]). Shared subterms are visited
+/// once: an `Expr` clone shares its `Arc`-backed value, and `vc` keeps every
+/// node alive, so a node's address is a stable identity.
+fn escaped_assert_fallbacks(vc: &trust_mc_core::chc::ChcVc) -> std::collections::BTreeSet<String> {
+    use ay_bindings::{Expr, ExprValue};
+    let mut found = std::collections::BTreeSet::new();
+    let mut seen: std::collections::HashSet<*const ExprValue> = std::collections::HashSet::new();
+    let mut stack: Vec<&Expr> = Vec::new();
+    for rule in &vc.rules {
+        stack.extend(rule.body.constraints.iter());
+        stack.extend(rule.head.args.iter());
+        if let Some(relation) = &rule.body.relation {
+            stack.extend(relation.args.iter());
+        }
+    }
+    while let Some(expr) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(expr.value())) {
+            continue;
+        }
+        if let ExprValue::Var { name } = expr.value()
+            && name.starts_with("__assert_fail_inline")
+        {
+            found.insert(trust_mc_core::chc::normalize_approx_var(name).to_string());
+        }
+        stack.extend(expr.value().children());
+    }
+    found
 }

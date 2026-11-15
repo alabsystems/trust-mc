@@ -69,6 +69,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.state_var_mgr.local_to_state_idx.insert(local_idx, vec_idx);
             let (in_name, out_name) =
                 crate::codegen_ay::names::state_var_name_pair(&self.fn_name, local_idx);
+            // This closed borrowed iterator fragment carries a LOCATION in
+            // Some's payload, never a snapshot of the Atomic's scalar value.
+            if self.borrowed_static_next_sources(local_idx).is_some() {
+                self.flatten_local_2field(
+                    local_idx,
+                    &in_name,
+                    Sort::bool(),
+                    crate::codegen_ay::types::ptr_sort(),
+                    Some((1, 0)),
+                );
+                self.flatten.enum_bv_layouts.insert(
+                    local_idx,
+                    EnumBvLayout {
+                        num_constructors: 2,
+                        tag_bits: 1,
+                        ctor_field_slot: vec![vec![], vec![0]],
+                        max_payload_slots: 1,
+                        discriminants: vec![0, 1],
+                    },
+                );
+                continue;
+            }
             // Resolve through the shared body-local normalization helper which
             // handles coroutine-aware call-destination fallback (body_resolve.rs).
             let local_ty = self

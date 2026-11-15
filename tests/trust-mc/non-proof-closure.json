@@ -1,13 +1,13 @@
 {
-  "denominator": 314,
-  "row_sha256": "4e47d2dac3feb0c6835b2566a98f47d1388970ec6b58098a91c3b33138f39bbf",
+  "denominator": 333,
+  "row_sha256": "cd0d81801df6f0ceb4aad67818bd628991112966b455ab4772ace8629bbccaf6",
   "rows": [
     {
       "disposition": "expected-fail",
       "expected": "CTREX",
       "file": "tests/expected/MemPredicates/adt_with_metadata.rs",
       "harness": "check_invalid_dyn_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -15,7 +15,7 @@
       "expected": "CTREX",
       "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
       "harness": "check_invalid_dyn_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -23,7 +23,7 @@
       "expected": "CTREX",
       "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
       "harness": "check_invalid_slice_len",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -31,7 +31,7 @@
       "expected": "CTREX",
       "file": "tests/expected/MemPredicates/fat_ptr_validity.rs",
       "harness": "check_invalid_slice_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -39,15 +39,7 @@
       "expected": "CTREX",
       "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
       "harness": "check_invalid_array",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
-      "harness": "check_invalid_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -55,7 +47,7 @@
       "expected": "CTREX",
       "file": "tests/expected/abort/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -63,7 +55,7 @@
       "expected": "CTREX",
       "file": "tests/expected/any_vec/exact_length.rs",
       "harness": "check_access_length_17",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -71,7 +63,7 @@
       "expected": "CTREX",
       "file": "tests/expected/any_vec/exact_length.rs",
       "harness": "check_access_length_zero",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -79,7 +71,7 @@
       "expected": "CTREX",
       "file": "tests/expected/any_vec/out_bounds.rs",
       "harness": "check_always_out_bounds",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -87,7 +79,7 @@
       "expected": "CTREX",
       "file": "tests/expected/arbitrary/ptrs/pointer_generator.rs",
       "harness": "check_arbitrary_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -95,7 +87,7 @@
       "expected": "CTREX",
       "file": "tests/expected/arith-offset-i32-fail/main.rs",
       "harness": "test_arith_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -103,7 +95,7 @@
       "expected": "CTREX",
       "file": "tests/expected/arith-offset-u8-fail/main.rs",
       "harness": "test_arith_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -111,7 +103,7 @@
       "expected": "CTREX",
       "file": "tests/expected/arith_checks/check_arith_failures.rs",
       "harness": "check_arith_overflow",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -119,7 +111,7 @@
       "expected": "CTREX",
       "file": "tests/expected/array/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -127,7 +119,7 @@
       "expected": "CTREX",
       "file": "tests/expected/assert-eq-chained/main.rs",
       "harness": "check_chained_operators",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -135,7 +127,7 @@
       "expected": "CTREX",
       "file": "tests/expected/assert-eq/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -143,7 +135,7 @@
       "expected": "CTREX",
       "file": "tests/expected/assert-location/assert-false/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -151,7 +143,7 @@
       "expected": "CTREX",
       "file": "tests/expected/assert-location/debug-assert/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -159,15 +151,7 @@
       "expected": "CTREX",
       "file": "tests/expected/binop/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
-      "harness": "check_reverse_is_its_own_inverse",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -175,23 +159,7 @@
       "expected": "CTREX",
       "file": "tests/expected/bounded-arbitrary/reverse_vec/vec.rs",
       "harness": "check_reverse_is_its_own_inverse_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/coroutines/main.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/coroutines/pin/main.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -199,15 +167,7 @@
       "expected": "CTREX",
       "file": "tests/expected/cover/cover-undetermined/main.rs",
       "harness": "cover_undetermined",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/cover/cover-unreachable/main.rs",
-      "harness": "cover_unreachable",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -215,7 +175,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dangling-ptr-println/main.rs",
       "harness": "general_unsafe",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -223,7 +183,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dangling-ptr-println/main.rs",
       "harness": "local_unsafe",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -231,7 +191,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dangling-ptr-println/main.rs",
       "harness": "unsafe_block",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -239,7 +199,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dead-invalid-access-via-raw/main.rs",
       "harness": "check_invalid_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -247,7 +207,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dead-invalid-access-via-raw/value.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -255,7 +215,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dealloc/stack/test.rs",
       "harness": "check_dealloc_stack",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -263,7 +223,7 @@
       "expected": "CTREX",
       "file": "tests/expected/derive-arbitrary/safety_constraint_helper/safety_constraint_helper.rs",
       "harness": "check_invariant_helper_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -271,7 +231,7 @@
       "expected": "CTREX",
       "file": "tests/expected/derive-invariant/safety_constraint_helper/safety_constraint_helper.rs",
       "harness": "check_invariant_helper_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -279,7 +239,7 @@
       "expected": "CTREX",
       "file": "tests/expected/derive-invariant/safety_constraint_helper_funs/safety_constraint_helper_funs.rs",
       "harness": "check_invariant_helper_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -287,7 +247,7 @@
       "expected": "CTREX",
       "file": "tests/expected/derive-invariant/safety_invariant_fail/safety_invariant_fail.rs",
       "harness": "check_invariant_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -295,7 +255,7 @@
       "expected": "CTREX",
       "file": "tests/expected/derive-invariant/safety_invariant_fail_mut/safety_invariant_fail_mut.rs",
       "harness": "check_invariant_fail_mut",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -303,7 +263,7 @@
       "expected": "CTREX",
       "file": "tests/expected/dynamic-error-trait/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -311,7 +271,7 @@
       "expected": "CTREX",
       "file": "tests/expected/enum/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -319,7 +279,7 @@
       "expected": "CTREX",
       "file": "tests/expected/float-nan/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -327,7 +287,7 @@
       "expected": "CTREX",
       "file": "tests/expected/foreign-function/ffi_ptr.rs",
       "harness": "check_fn_ptr_called",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -335,7 +295,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/arbitrary_ensures_fail.rs",
       "harness": "max_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -343,7 +303,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/arbitrary_requires_fail.rs",
       "harness": "div_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -351,7 +311,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/as-assertions/assert-postconditions.rs",
       "harness": "prove_add_three",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -359,7 +319,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/as-assertions/assert-preconditions.rs",
       "harness": "prove_add_one",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -367,7 +327,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/as-assertions/assert-preconditions.rs",
       "harness": "prove_add_three",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -375,7 +335,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/const_generic_function.rs",
       "harness": "check_const_generic_function",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -383,7 +343,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/diverging_loop.rs",
       "harness": "check_foo",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -391,7 +351,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/fail_on_two.rs",
       "harness": "harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -399,7 +359,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/fail_on_two.rs",
       "harness": "harness2",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -407,7 +367,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/gcd_failure_code.rs",
       "harness": "gcd_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -415,7 +375,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/gcd_failure_contract.rs",
       "harness": "gcd_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -423,7 +383,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/gcd_rec_code_fail.rs",
       "harness": "simple_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -431,7 +391,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/gcd_rec_contract_fail.rs",
       "harness": "simple_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -439,7 +399,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/gcd_replacement_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -447,7 +407,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/history/side_effect.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -455,7 +415,15 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/history/simple_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/function-contract/modifies/check_only_verification.rs",
+      "harness": "modify_harness",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -463,7 +431,15 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/expr_replace_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
+      "harness": "modify_harness",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -471,7 +447,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/fail_missing_recursion_attr.rs",
       "harness": "harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -479,7 +455,15 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/field_replace_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
+      "harness": "modify_harness",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -487,7 +471,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/global_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -495,7 +479,15 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/global_replace_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
+      "harness": "check_modify",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -503,7 +495,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/mistake_condition_return.rs",
       "harness": "harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -511,15 +503,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/modifies/simple_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/function-contract/mutable-references/mut_ref_ensures_and_modifies.rs",
-      "harness": "divide_by_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -527,7 +511,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/pattern_use.rs",
       "harness": "div_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -535,7 +519,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/simple_ensures_fail.rs",
       "harness": "max_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -543,7 +527,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/simple_replace_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -551,7 +535,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/trait_impls/unsafe_trait_contract_fail.rs",
       "harness": "test_trait_contract_violation",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -559,7 +543,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/valid_ptr.rs",
       "harness": "harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -567,7 +551,7 @@
       "expected": "CTREX",
       "file": "tests/expected/function-contract/valid_ptr.rs",
       "harness": "harness_invalid_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -575,7 +559,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-overflow/main.rs",
       "harness": "test_copy_nonoverlapping_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -583,7 +567,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-overlapping/main.rs",
       "harness": "test_copy_nonoverlapping_with_overlap",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -591,7 +575,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-unaligned-dst/main.rs",
       "harness": "test_copy_nonoverlapping_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -599,7 +583,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-unaligned-src/main.rs",
       "harness": "test_copy_nonoverlapping_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -607,7 +591,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-unreadable-src/main.rs",
       "harness": "test_copy_nonoverlapping_invalid",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -615,7 +599,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy-nonoverlapping/copy-unwritable-dst/main.rs",
       "harness": "test_copy_nonoverlapping_invalid",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -623,7 +607,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy/copy-overflow/main.rs",
       "harness": "test_copy_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -631,7 +615,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy/copy-unaligned-dst/main.rs",
       "harness": "test_copy_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -639,7 +623,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy/copy-unaligned-src/main.rs",
       "harness": "test_copy_unaligned",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -647,7 +631,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy/copy-unreadable-src/main.rs",
       "harness": "test_copy_invalid",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -655,7 +639,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/copy/copy-unwritable-dst/main.rs",
       "harness": "test_copy_invalid",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -663,7 +647,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/non_finite.rs",
       "harness": "check_inf",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -671,7 +655,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/non_finite.rs",
       "harness": "check_nan",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -679,7 +663,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/non_finite.rs",
       "harness": "check_neg_inf",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -687,7 +671,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u128_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -695,7 +679,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u16_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -703,7 +687,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u16_upper",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -711,7 +695,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u32_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -719,7 +703,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u32_upper",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -727,7 +711,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u64_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -735,7 +719,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u64_upper",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -743,7 +727,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u8_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -751,7 +735,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_u8_upper",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -759,7 +743,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_usize_lower",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -767,7 +751,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob.rs",
       "harness": "check_usize_upper",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -775,7 +759,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_i128",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -783,7 +767,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_i16",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -791,7 +775,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_i32",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -799,7 +783,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_i64",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -807,7 +791,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_i8",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -815,7 +799,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_isize",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -823,7 +807,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_u128",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -831,7 +815,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_u16",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -839,7 +823,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_u32",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -847,7 +831,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_u64",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -855,7 +839,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_u8",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -863,7 +847,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/float-to-int/oob_f128.rs",
       "harness": "check_cast_usize",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -871,7 +855,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/offset-same-object/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -879,7 +863,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/ptr_offset_from_unsigned/check_invariant_violation.rs",
       "harness": "check_failure",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -887,7 +871,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-arith-overflows/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -895,7 +879,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-div-div-zero/main.rs",
       "harness": "test_simd_div",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -903,7 +887,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-div-rem-overflow/main.rs",
       "harness": "test_simd_div_overflow",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -911,7 +895,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-div-rem-overflow/main.rs",
       "harness": "test_simd_rem_overflow",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -919,7 +903,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-extract-out-of-bounds/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -927,7 +911,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-insert-out-of-bounds/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -935,7 +919,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-rem-div-zero/main.rs",
       "harness": "test_simd_rem",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -943,7 +927,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-shl-shift-negative/main.rs",
       "harness": "test_simd_shl",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -951,7 +935,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-shl-shift-too-large/main.rs",
       "harness": "test_simd_shl",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -959,7 +943,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-shr-shift-negative/main.rs",
       "harness": "test_simd_shr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -967,7 +951,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-shr-shift-too-large/main.rs",
       "harness": "test_simd_shr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -975,7 +959,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/simd-shuffle-indexes-out/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -983,7 +967,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/size_of_dst.rs",
       "harness": "check_size_of_adt_overflows",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -991,7 +975,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/size_of_dst.rs",
       "harness": "check_size_of_overflows",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -999,7 +983,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/transmute_unchecked_size.rs",
       "harness": "transmute_diff_size",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1007,7 +991,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/transmute_unchecked_size.rs",
       "harness": "transmute_wrapper_diff_size",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1015,7 +999,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/unreachable/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1023,7 +1007,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/volatile_load/unaligned/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1031,7 +1015,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/write_bytes/out-of-bounds/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1039,7 +1023,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/write_bytes/overflow/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1047,7 +1031,7 @@
       "expected": "CTREX",
       "file": "tests/expected/intrinsics/write_bytes/unaligned/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1055,7 +1039,7 @@
       "expected": "CTREX",
       "file": "tests/expected/issue-2239/issue_2239.rs",
       "harness": "test_trivial_bounds",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1063,7 +1047,7 @@
       "expected": "CTREX",
       "file": "tests/expected/issue-3571/issue_3571.rs",
       "harness": "rust_ub_fails",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1071,7 +1055,7 @@
       "expected": "CTREX",
       "file": "tests/expected/issue-3571/issue_3571.rs",
       "harness": "rust_ub_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1079,7 +1063,7 @@
       "expected": "CTREX",
       "file": "tests/expected/loop-contract/function_call_with_loop.rs",
       "harness": "call_has_loop",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1087,7 +1071,7 @@
       "expected": "CTREX",
       "file": "tests/expected/loop-contract/loop_assigns_for_fat_ptr_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1095,7 +1079,7 @@
       "expected": "CTREX",
       "file": "tests/expected/loop-contract/loop_assigns_for_ptr_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1103,7 +1087,7 @@
       "expected": "CTREX",
       "file": "tests/expected/loop-contract/loop_assigns_for_ref_fail.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1111,7 +1095,7 @@
       "expected": "CTREX",
       "file": "tests/expected/loop-contract/loop_with_prev_break_first_iter.rs",
       "harness": "loop_with_prev",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1119,23 +1103,7 @@
       "expected": "CTREX",
       "file": "tests/expected/never-return/check_never.rs",
       "harness": "check_never_return",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/niche/main.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/niche2/main.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1143,7 +1111,7 @@
       "expected": "CTREX",
       "file": "tests/expected/nondet-slice-i32-oob/main.rs",
       "harness": "check_out_of_bounds",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1151,7 +1119,7 @@
       "expected": "CTREX",
       "file": "tests/expected/nondet-slice-u8-oob/main.rs",
       "harness": "check_out_of_bounds",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1159,7 +1127,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from.rs",
       "harness": "check_offset_from_diff_alloc",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1167,7 +1135,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from.rs",
       "harness": "check_offset_from_oob_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1175,7 +1143,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from.rs",
       "harness": "check_offset_from_unit_panic",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1183,7 +1151,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
       "harness": "check_offset_from_unsigned_diff_alloc",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1191,7 +1159,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
       "harness": "check_offset_from_unsigned_negative_result",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1199,7 +1167,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
       "harness": "check_offset_from_unsigned_oob_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1207,7 +1175,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
       "harness": "check_offset_from_unsigned_self_oob",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1215,7 +1183,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_from_unsigned.rs",
       "harness": "check_offset_from_unsigned_unit_panic",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1223,7 +1191,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/offset_usize.rs",
       "harness": "check_intrinsic_args",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1231,7 +1199,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/out_of_bounds_ub_check.rs",
       "harness": "check_ptr_oob",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1239,7 +1207,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/out_of_bounds_ub_check.rs",
       "harness": "test_offset_overflow",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1247,7 +1215,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bounds-check/start_from_oob.rs",
       "harness": "check_add_to_oob",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1255,7 +1223,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-bytes-overflow/main.rs",
       "harness": "check_wrap_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1263,7 +1231,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-from-bytes-overflow/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1271,7 +1239,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-from-distance-check/main.rs",
       "harness": "check_offset_from_distance_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1279,7 +1247,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-i32-fail/main.rs",
       "harness": "test_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1287,7 +1255,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-overflows-isize/main.rs",
       "harness": "test_non_zst",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1295,7 +1263,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-u8-fail/main.rs",
       "harness": "test_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1303,7 +1271,7 @@
       "expected": "CTREX",
       "file": "tests/expected/offset-wraps-around/main.rs",
       "harness": "original_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1311,7 +1279,7 @@
       "expected": "CTREX",
       "file": "tests/expected/panic/panic-2018/messages.rs",
       "harness": "check_panic_2018",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1319,7 +1287,7 @@
       "expected": "CTREX",
       "file": "tests/expected/panic/panic-2018/messages.rs",
       "harness": "check_user_panic_macro",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1327,7 +1295,7 @@
       "expected": "CTREX",
       "file": "tests/expected/panic/panic-2021/messages.rs",
       "harness": "check_panic_2021",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1335,7 +1303,7 @@
       "expected": "CTREX",
       "file": "tests/expected/panic/panic-2021/messages.rs",
       "harness": "check_user_panic_macro",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1343,7 +1311,7 @@
       "expected": "CTREX",
       "file": "tests/expected/pointer-overflow/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1351,7 +1319,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/alignment/test.rs",
       "harness": "check_misaligned_ptr_cast_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1359,7 +1327,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/invalid/test.rs",
       "harness": "check_size_of_val",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1367,7 +1335,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/invalid/test.rs",
       "harness": "check_slice_my_str",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1375,7 +1343,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
       "harness": "check_larger_deref",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1383,7 +1351,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
       "harness": "check_larger_deref_into_ptr",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1391,7 +1359,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
       "harness": "check_larger_deref_struct",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1399,7 +1367,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
       "harness": "check_store",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1407,7 +1375,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/ptr_to_ref_cast.rs",
       "harness": "check_zst_deref",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1415,7 +1383,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/slice/test.rs",
       "harness": "check_with_byte_add_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1423,7 +1391,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/slice/test.rs",
       "harness": "check_with_metadata_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1431,7 +1399,7 @@
       "expected": "CTREX",
       "file": "tests/expected/ptr_to_ref_cast/str/test.rs",
       "harness": "check_with_metadata_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1439,7 +1407,7 @@
       "expected": "CTREX",
       "file": "tests/expected/quantifiers/assert_with_exists_fail.rs",
       "harness": "exists_assert_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1447,7 +1415,7 @@
       "expected": "CTREX",
       "file": "tests/expected/quantifiers/assert_with_forall_fail.rs",
       "harness": "forall_assert_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1455,7 +1423,7 @@
       "expected": "CTREX",
       "file": "tests/expected/quantifiers/assume_with_exists_fail.rs",
       "harness": "exists_assume_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1463,7 +1431,7 @@
       "expected": "CTREX",
       "file": "tests/expected/quantifiers/contracts_fail.rs",
       "harness": "copy_harness",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1471,7 +1439,7 @@
       "expected": "CTREX",
       "file": "tests/expected/raw_slice/slice.rs",
       "harness": "check_naive_iterator_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1479,7 +1447,7 @@
       "expected": "CTREX",
       "file": "tests/expected/raw_slice_c_repr/slice.rs",
       "harness": "check_naive_iterator_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1487,7 +1455,7 @@
       "expected": "CTREX",
       "file": "tests/expected/raw_slice_packed/slice.rs",
       "harness": "check_naive_iterator_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1495,7 +1463,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/assert/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1503,7 +1471,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/assert/unreachable/test.rs",
       "harness": "foo",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1511,7 +1479,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/assert_eq/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1519,7 +1487,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/assert_ne/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1527,7 +1495,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/bounds/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1535,7 +1503,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/bounds/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1543,7 +1511,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/check_id/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1551,7 +1519,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert-eq/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1559,7 +1527,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert-eq/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1567,7 +1535,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert-ne/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1575,7 +1543,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert-ne/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1583,7 +1551,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1591,7 +1559,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/debug-assert/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1599,7 +1567,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/div-zero/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1607,7 +1575,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/div-zero/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1615,7 +1583,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/overflow-neg/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1623,7 +1591,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/overflow-neg/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1631,7 +1599,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/overflow/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1639,7 +1607,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/overflow/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1647,7 +1615,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/rem-zero/reachable_fail/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1655,7 +1623,7 @@
       "expected": "CTREX",
       "file": "tests/expected/reach/rem-zero/unreachable/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1663,7 +1631,7 @@
       "expected": "CTREX",
       "file": "tests/expected/realloc/null/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1671,7 +1639,7 @@
       "expected": "CTREX",
       "file": "tests/expected/realloc/shrink/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1679,7 +1647,7 @@
       "expected": "CTREX",
       "file": "tests/expected/realloc/zero_size/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1687,7 +1655,7 @@
       "expected": "CTREX",
       "file": "tests/expected/report/uncolor/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1695,15 +1663,7 @@
       "expected": "CTREX",
       "file": "tests/expected/report/unsupported/failure/test.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/report/unsupported/reachable/test.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1711,7 +1671,7 @@
       "expected": "CTREX",
       "file": "tests/expected/safety-constraint-attribute/check-invariant/check-invariant.rs",
       "harness": "check_invariant",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1719,7 +1679,7 @@
       "expected": "CTREX",
       "file": "tests/expected/safety-debug_assert/prove_safety_only.rs",
       "harness": "debug_assert_does_not_hide_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1727,7 +1687,7 @@
       "expected": "CTREX",
       "file": "tests/expected/shadow/uninit_array/test.rs",
       "harness": "check_init_any",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1735,7 +1695,7 @@
       "expected": "CTREX",
       "file": "tests/expected/shadow/unsupported_num_objects/test.rs",
       "harness": "check_max_objects_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1743,23 +1703,7 @@
       "expected": "CTREX",
       "file": "tests/expected/shadow/unsupported_object_size/test.rs",
       "harness": "check_max_object_size_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/slice-pattern-array/main.rs",
-      "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/slice_c_str/c_str_unsupported.rs",
-      "harness": "check_c_str",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1767,7 +1711,7 @@
       "expected": "CTREX",
       "file": "tests/expected/static-mutable-struct/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1775,7 +1719,7 @@
       "expected": "CTREX",
       "file": "tests/expected/static-mutable/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1783,7 +1727,7 @@
       "expected": "CTREX",
       "file": "tests/expected/static/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1791,7 +1735,7 @@
       "expected": "CTREX",
       "file": "tests/expected/string-repeat/2235.rs",
       "harness": "repeat_panic",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1799,7 +1743,7 @@
       "expected": "CTREX",
       "file": "tests/expected/stubbing-trait-impls/unsafe_stub_fail.rs",
       "harness": "test_unsafe_stub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1807,7 +1751,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test1/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1815,7 +1759,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test2/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1823,7 +1767,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test3/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1831,7 +1775,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test4/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1839,7 +1783,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test5/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1847,15 +1791,7 @@
       "expected": "CTREX",
       "file": "tests/expected/test6/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-diverging-variants.rs",
-      "harness": "access_padding_unsupported",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1863,7 +1799,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-multiple-variants.rs",
       "harness": "access_padding_uninit_a",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1871,7 +1807,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-multiple-variants.rs",
       "harness": "access_padding_uninit_b",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1879,7 +1815,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-single-field.rs",
       "harness": "access_padding_uninit",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1887,7 +1823,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-enum-single-variant.rs",
       "harness": "access_padding_uninit",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1895,7 +1831,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-uninit/access-padding-uninit.rs",
       "harness": "check_uninit_padding",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1903,7 +1839,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-padding-via-cast/access-padding-via-cast.rs",
       "harness": "check_uninit_padding_after_cast",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1911,7 +1847,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-static-padding.rs",
       "harness": "check_read_assoc_const_padding_fails",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1919,7 +1855,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-static-padding.rs",
       "harness": "check_read_const_padding_fails",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1927,7 +1863,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/access-static-padding.rs",
       "harness": "check_read_static_padding_fails",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1935,7 +1871,15 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/alloc-to-slice/alloc-to-slice.rs",
       "harness": "check_uninit_slice",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/atomic/atomic.rs",
+      "harness": "local_atomic_uninit",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1943,7 +1887,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/copy/expose_padding_via_copy.rs",
       "harness": "expose_padding_via_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1951,7 +1895,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/copy/expose_padding_via_copy_convoluted.rs",
       "harness": "expose_padding_via_copy_convoluted",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1959,7 +1903,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/copy/expose_padding_via_non_byte_copy.rs",
       "harness": "expose_padding_via_non_byte_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1967,7 +1911,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/copy/read_after_copy.rs",
       "harness": "read_after_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1975,7 +1919,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1983,7 +1927,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_closure_capture_laundered",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1991,7 +1935,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_closure_laundered",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -1999,7 +1943,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2007,7 +1951,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_double_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2015,7 +1959,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_laundered",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2023,7 +1967,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_static",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2031,7 +1975,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_structs",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2039,7 +1983,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_transmute",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2047,7 +1991,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/delayed-ub.rs",
       "harness": "delayed_ub_trigger_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2055,7 +1999,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/delayed-ub/slices_delayed_ub.rs",
       "harness": "delayed_ub_slices",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2063,7 +2007,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_compare_bytes",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2071,7 +2015,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_copy_nonoverlapping_read",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2079,7 +2023,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_copy_read",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2087,15 +2031,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_typed_swap_nonoverlapping",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
-      "harness": "check_typed_swap_nonoverlapping_safe",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2103,7 +2039,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/intrinsics/intrinsics.rs",
       "harness": "check_volatile_load",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2111,7 +2047,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/multiple-instrumentations.rs",
       "harness": "multiple_instrumentations",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2119,7 +2055,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/multiple-instrumentations.rs",
       "harness": "multiple_instrumentations_different_vars",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2127,7 +2063,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/transmute-padding/transmute_padding.rs",
       "harness": "check_uninit_padding",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2135,7 +2071,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "basic_multifield_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2143,7 +2079,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "basic_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2151,7 +2087,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "cross_function_multi_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2159,7 +2095,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "cross_function_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2167,7 +2103,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "multi_cross_function_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2175,7 +2111,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "pointer_union_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2183,7 +2119,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "union_complex_subfields_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2191,7 +2127,47 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/unions.rs",
       "harness": "union_update_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "pointer_union_should_fail",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_into_union_should_fail",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "transmute_union_should_fail",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "uber_union_should_fail",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/expected/uninit/unions_uninit_unsupported.rs",
+      "harness": "union_as_subfields_should_fail",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2199,7 +2175,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/vec-read-bad-len/vec-read-bad-len.rs",
       "harness": "check_vec_read_bad_len",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2207,7 +2183,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/vec-read-semi-init/vec-read-semi-init.rs",
       "harness": "check_vec_read_semi_init",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2215,7 +2191,7 @@
       "expected": "CTREX",
       "file": "tests/expected/uninit/vec-read-uninit/vec-read-uninit.rs",
       "harness": "check_vec_read_uninit",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2223,7 +2199,7 @@
       "expected": "CTREX",
       "file": "tests/expected/union/static_union2.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2231,7 +2207,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unreachable/unreach_msg.rs",
       "harness": "check_unreachable",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2239,7 +2215,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_eq",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2247,7 +2223,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_ge",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2255,7 +2231,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_gt",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2263,7 +2239,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_le",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2271,7 +2247,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_lt",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2279,15 +2255,7 @@
       "expected": "CTREX",
       "file": "tests/expected/unsupported-fatptr-comparison/vtable_comparison.rs",
       "harness": "check_ne",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/valid-value-checks/char_validity.rs",
-      "harness": "check_char_ok",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2295,7 +2263,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/char_validity.rs",
       "harness": "check_invalid_char_nonzero_wrapper_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2303,7 +2271,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/char_validity.rs",
       "harness": "check_invalid_char_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2311,7 +2279,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/char_validity.rs",
       "harness": "check_invalid_char_unit_wrapper_should_fail",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2319,7 +2287,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/constants.rs",
       "harness": "cast_to_invalid_char",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2327,7 +2295,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/constants.rs",
       "harness": "cast_to_invalid_offset",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2335,23 +2303,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/constants.rs",
       "harness": "transmute_invalid_bool",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/valid-value-checks/custom_niche.rs",
-      "harness": "check_copy_nonoverlap",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/valid-value-checks/custom_niche.rs",
-      "harness": "check_copy_nonoverlap_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2359,7 +2311,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_invalid_dereference",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2367,7 +2319,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_invalid_increment",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2375,7 +2327,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_invalid_transmute",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2383,7 +2335,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_invalid_transmute_copy",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2391,7 +2343,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_new_with_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2399,7 +2351,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_new_with_ub_limits",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2407,7 +2359,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/custom_niche.rs",
       "harness": "check_unchecked_new_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2415,7 +2367,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/maybe_uninit.rs",
       "harness": "check_invalid_zeroed",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2423,7 +2375,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/non_null.rs",
       "harness": "check_invalid_value",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2431,7 +2383,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/non_null.rs",
       "harness": "check_invalid_value_cfg",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2439,7 +2391,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/write_bytes.rs",
       "harness": "check_invalid_write",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2447,23 +2399,7 @@
       "expected": "CTREX",
       "file": "tests/expected/valid-value-checks/write_invalid.rs",
       "harness": "read_invalid_is_ub",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/valid-value-checks/write_invalid.rs",
-      "harness": "write_invalid_bytes_no_ub_with_spurious_cex",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
-      "lane": "tests/expected"
-    },
-    {
-      "disposition": "expected-fail",
-      "expected": "CTREX",
-      "file": "tests/expected/valid-value-checks/write_invalid.rs",
-      "harness": "write_valid_before_read",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2471,7 +2407,7 @@
       "expected": "CTREX",
       "file": "tests/expected/vec/main.rs",
       "harness": "main",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
     },
     {
@@ -2479,15 +2415,23 @@
       "expected": "CTREX",
       "file": "tests/expected/zst/main.rs",
       "harness": "test_z",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/expected"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/prusti/Binary_search.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/prusti"
     },
     {
       "disposition": "expected-fail",
       "expected": "CTREX",
       "file": "tests/slow/tokio-proofs/src/tokio/io_read.rs",
       "harness": "read_buf_bad_async_read",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/slow"
     },
     {
@@ -2495,15 +2439,223 @@
       "expected": "CTREX",
       "file": "tests/slow/tokio-proofs/src/tokio/io_take.rs",
       "harness": "bad_reader_fails",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/slow"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/add.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/arith_assume3.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/div.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/mod.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/mul.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/basic/sub.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/functions/closure_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/functions/double_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/generics/generic_function1.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/generics/generic_function2.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/generics/generic_function3.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/generics/generic_function4.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/generics/generic_function5.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/loops/gauss_sum_nondet_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/loops/iterator_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/overflow/add_overflow.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/overflow/mul_overflow.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/overflow/sub_overflow.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/recursion/fac_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/recursion/fib_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/structures/option_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/structures/point_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/vector/vec11.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/vector/vec12.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/vector/vec13.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
+    },
+    {
+      "disposition": "expected-fail",
+      "expected": "CTREX",
+      "file": "tests/smack/vector/vec_resize_fail.rs",
+      "harness": "main",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
+      "lane": "tests/smack"
     },
     {
       "disposition": "expected-fail",
       "expected": "CTREX",
       "file": "tests/std-checks/core/src/ptr.rs",
       "harness": "check_as_ref_dangling",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/std-checks"
     },
     {
@@ -2511,7 +2663,7 @@
       "expected": "CTREX",
       "file": "tests/std-checks/core/src/ptr.rs",
       "harness": "check_replace_unit",
-      "justification": "expected non-PROOF verdict carried by the test's `expected` output file (survey disposition: CTREX)",
+      "justification": "expected non-PROOF verdict from the frozen source oracle (annotation or expected output; survey disposition: CTREX)",
       "lane": "tests/std-checks"
     }
   ],
@@ -2519,7 +2671,7 @@
   "source": {
     "denominator": 818,
     "inventory": "replacement-harness-inventory.json",
-    "row_sha256": "393e71e1f522142a880a86a03f8dfdd1362dd09855c09582f0a1e507fa365a30"
+    "row_sha256": "91e3425e3e1cb4339ced9bc99f5bb24caad671f147697d02c1b95293f5dfdd98"
   },
   "suite": "tests/trust-mc"
 }

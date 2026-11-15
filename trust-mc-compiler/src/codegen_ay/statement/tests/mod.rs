@@ -44,7 +44,9 @@ mod aggregate_adt;
 mod aggregate_struct;
 mod alloc;
 mod alloc_layout;
+mod alloc_layout_checked;
 mod alloc_ptr;
+mod alloc_view;
 mod arithmetic;
 mod arithmetic_checks;
 mod assign;
@@ -92,6 +94,8 @@ mod place_deref_first;
 mod place_pointee;
 mod place_post_deref;
 mod place_projection;
+mod playback_inputs;
+mod property_flags;
 mod result;
 mod rvalue;
 mod rvalue_address_of;
@@ -106,6 +110,7 @@ mod sort_inference;
 mod sort_inference_adt;
 mod sort_stubs;
 mod ssa;
+mod stack_lifetime;
 mod stub_dispatch_memory;
 mod stub_dispatch_option_result;
 mod stub_dispatch_simple;
@@ -199,7 +204,6 @@ const AY_TEST_TIMEOUT_SECS: u64 = 5;
 
 fn ay_test_timeout_secs_or(default_secs: u64) -> u64 {
     std::env::var("TRUST_MC_AY_TEST_TIMEOUT_SECS")
-        .or_else(|_| std::env::var("TRUST_MC_Z3_TEST_TIMEOUT_SECS"))
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default_secs)

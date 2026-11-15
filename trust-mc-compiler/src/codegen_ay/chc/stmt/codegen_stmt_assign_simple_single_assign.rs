@@ -39,22 +39,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         rhs: &Rvalue,
     ) -> bool {
         match rhs {
-            Rvalue::Use(op)
+            Rvalue::Use(op, ..)
             | Rvalue::Repeat(op, _)
             | Rvalue::Cast(_, op, _)
-            | Rvalue::UnaryOp(_, op)
-            | Rvalue::ShallowInitBox(op, _) => self.operand_has_single_assign_source(op),
+            | Rvalue::UnaryOp(_, op) => self.operand_has_single_assign_source(op),
+            #[cfg(not(trust_toolchain))]
+            Rvalue::ShallowInitBox(op, _) => self.operand_has_single_assign_source(op),
             Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
                 self.operand_has_single_assign_source(lhs)
                     && self.operand_has_single_assign_source(rhs)
             }
             Rvalue::Aggregate(_, operands) => self.operands_have_single_assign_sources(operands),
-            Rvalue::NullaryOp(_) | Rvalue::ThreadLocalRef(_) => true,
+            Rvalue::ThreadLocalRef(_) => true,
+            #[cfg(not(trust_toolchain))]
+            Rvalue::NullaryOp(_) => true,
             Rvalue::Ref(_, _, _)
             | Rvalue::AddressOf(_, _)
             | Rvalue::Len(_)
             | Rvalue::Discriminant(_)
             | Rvalue::CopyForDeref(_) => false,
+            // Trust: `Reborrow` translation fails closed, so it is never a
+            // cacheable single-assign scalar source.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(..) => false,
         }
     }
 
@@ -65,6 +72,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 place.projection.is_empty()
                     && self.encode.single_assign_locals.contains(&place.local)
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => true,
         }
     }
 }

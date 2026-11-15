@@ -24,6 +24,10 @@ use trust_mc_core::chc::{ChcVc, RelationApp, RelationDecl, Rule, RuleBody};
 // verification time, with zero verdicts gained. The reach these caps withhold
 // is not there to be had; they stay where they are.
 const MAX_RULES: usize = 256;
+
+/// Wall-clock ceiling on one straightline attempt. The enumeration is a fast
+/// path for queries a solver would decide anyway; past this it declines.
+const STRAIGHTLINE_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_FRAMES_PER_RELATION: usize = 64;
 const MAX_TOTAL_FRAMES: usize = 512;
 
@@ -84,6 +88,12 @@ thread_local! {
     /// Re-armed at the top of every [`prove_straightline_safety`] call.
     static STRAIGHTLINE_NODE_BUDGET: std::cell::Cell<usize> =
         const { std::cell::Cell::new(MAX_STRAIGHTLINE_NODE_VISITS) };
+}
+
+thread_local! {
+    /// Rule firings the last [`prove_straightline_safety_detailed`] applied
+    /// (read by the saturation test).
+    static STRAIGHTLINE_FIRINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Re-arm the per-attempt node budget.
@@ -289,6 +299,7 @@ pub(in crate::codegen_ay) fn prove_straightline_safety(vc: &ChcVc) -> bool {
 
 pub(in crate::codegen_ay) fn prove_straightline_safety_detailed(vc: &ChcVc) -> StraightlineOutcome {
     reset_straightline_node_budget();
+    STRAIGHTLINE_FIRINGS.with(|n| n.set(0));
     if vc.rules.len() > MAX_RULES {
         tracing::debug!(
             rules = vc.rules.len(),
@@ -341,22 +352,54 @@ pub(in crate::codegen_ay) fn prove_straightline_safety_detailed(vc: &ChcVc) -> S
     // untrustworthy. We check this after saturation and fail closed to the
     // real solver. See `loop_relations`.
     let loop_rels = loop_relations(vc);
-    let mut reachable: HashMap<String, HashSet<Frame>> = HashMap::new();
+    // Every frame a relation reaches, numbered in the order it was found. The number
+    // identifies the body frame a firing consumed, which is what names the firing's
+    // fresh variables (`freshen_rule_locals`).
+    let mut reachable: HashMap<String, HashMap<Frame, usize>> = HashMap::new();
     let mut worklist: VecDeque<String> = VecDeque::new();
     let mut total_frames = 0usize;
+    // Every (rule, body frame) firing already applied. A firing's outcome
+    // depends on nothing else, so applying it again finds the head frame it
+    // found the first time; every saturation round used to re-apply every
+    // firing so far, quadratic in the frames, and a harness loop pushing
+    // through `ManuallyDrop::deref_mut` spent minutes re-pruning the same
+    // infeasible edges after its translation had finished: a CompileTimeout
+    // that took the file's other harnesses with it (walker fail-closed
+    // review 6 round 2, finding 5, `rp10b_m15_nounwind.rs`).
+    let mut applied: HashSet<(usize, usize)> = HashSet::new();
+    let started = std::time::Instant::now();
 
     loop {
         let mut changed = false;
-        for rule in &vc.rules {
+        for (rule_idx, rule) in vc.rules.iter().enumerate() {
+            // A fast path, not a decision procedure: past its own wall budget,
+            // or once the translation deadline has passed, it leaves the
+            // query to the solver instead of spending the harness's time.
+            if started.elapsed() > STRAIGHTLINE_WALL_BUDGET
+                || crate::codegen_ay::translation_deadline::expired()
+            {
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "straightline proof bailed: wall budget exhausted"
+                );
+                return StraightlineOutcome::NotProven;
+            }
             let body_frames = match &rule.body.relation {
                 Some(body) => match reachable.get(body.name.as_str()) {
-                    Some(frames) => frames.iter().cloned().collect::<Vec<_>>(),
+                    Some(frames) => frames
+                        .iter()
+                        .filter(|(_, id)| !applied.contains(&(rule_idx, **id)))
+                        .map(|(frame, id)| (frame.clone(), *id))
+                        .collect::<Vec<_>>(),
                     None => continue,
                 },
-                None => vec![Frame { args: Vec::new(), facts: PathFacts::default() }],
+                None if applied.contains(&(rule_idx, 0)) => continue,
+                None => vec![(Frame { args: Vec::new(), facts: PathFacts::default() }, 0)],
             };
 
-            for frame in body_frames {
+            for (frame, body_frame_id) in body_frames {
+                applied.insert((rule_idx, body_frame_id));
+                STRAIGHTLINE_FIRINGS.with(|n| n.set(n.get() + 1));
                 let Some(mut env) = initial_env(rule.body.relation.as_ref(), &frame) else {
                     tracing::debug!(
                         head = %rule.head.name,
@@ -421,9 +464,25 @@ pub(in crate::codegen_ay) fn prove_straightline_safety_detailed(vc: &ChcVc) -> S
                     );
                     return StraightlineOutcome::NotProven;
                 }
+                let firing = FiringId {
+                    rule_idx,
+                    body_relation: rule.body.relation.as_ref().map(|r| r.name.as_str()),
+                    body_frame_id,
+                };
+                let Some((head_args, facts)) =
+                    freshen_rule_locals(head_args, facts, &frame, &firing)
+                else {
+                    tracing::debug!(
+                        head = %rule.head.name,
+                        "straightline proof bailed: unsupported fresh-variable renaming"
+                    );
+                    return StraightlineOutcome::NotProven;
+                };
                 let head_frame = Frame { args: head_args, facts };
                 let frames = reachable.entry(rule.head.name.to_string()).or_default();
-                if frames.insert(head_frame) {
+                if !frames.contains_key(&head_frame) {
+                    let id = frames.len();
+                    frames.insert(head_frame, id);
                     if frames.len() > MAX_FRAMES_PER_RELATION {
                         tracing::debug!(
                             relation = %rule.head.name,
@@ -594,42 +653,17 @@ fn relation_args_match_decl(
         && args.iter().zip(*decl_sorts).all(|(arg, decl_sort)| arg.sort() == decl_sort)
 }
 
-/// Process-global flag (test-only) gating the straight-line discharge at the
-/// MIR→CHC translation call sites.
+/// The `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE=1` diagnostic lever: a triage run
+/// can observe the full pre-discharge VC. Read once per harness compilation,
+/// into `AYConfig::chc_straightline_discharge`; the translation reads the
+/// switch from the configuration of the compilation it belongs to, never from
+/// process-global state.
 ///
-/// When set, translation skips [`discharge_straightline_safety`] so that
-/// encoding-inspection tests can observe the full pre-discharge VC (e.g. to
-/// confirm the realloc-grow memory model retains a written heap value).
-///
-/// Soundness: the discharge only ever *replaces* a system it has already
-/// proven UNSAT with another trivially-UNSAT system, so skipping it leaves an
-/// equisatisfiable VC for the solver — it NEVER changes a verdict. A process
-/// global (rather than a thread-local) is required because the rustc driver
-/// runs codegen on a worker thread distinct from the test thread. The
-/// inspection helper serializes via a dedicated mutex so a concurrent test
-/// never observes the disabled state; even if it did, the only effect is a
-/// richer-but-equisatisfiable encoding.
-#[cfg(test)]
-static SKIP_STRAIGHTLINE_DISCHARGE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Set/clear the process-global straight-line discharge skip flag (test-only).
-/// Returns the previous value so callers can restore it.
-#[cfg(test)]
-pub(in crate::codegen_ay) fn set_straightline_discharge_disabled(disabled: bool) -> bool {
-    SKIP_STRAIGHTLINE_DISCHARGE.swap(disabled, std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Whether the MIR→CHC translation should skip the straight-line discharge.
-#[cfg(test)]
-pub(in crate::codegen_ay) fn straightline_discharge_disabled() -> bool {
-    SKIP_STRAIGHTLINE_DISCHARGE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-#[cfg(not(test))]
-pub(in crate::codegen_ay) fn straightline_discharge_disabled() -> bool {
-    // Diagnostic lever: lets a triage run observe the full pre-discharge VC.
-    // Skipping the discharge is always sound (see the doc comment above).
+/// Skipping the discharge is always sound: the discharge only ever *replaces*
+/// a system it has already proven UNSAT with another trivially-UNSAT system,
+/// so skipping it leaves an equisatisfiable VC for the solver and never
+/// changes a verdict.
+pub(in crate::codegen_ay) fn straightline_discharge_env_disabled() -> bool {
     std::env::var("TRUST_MC_NO_STRAIGHTLINE_DISCHARGE").map(|v| v == "1").unwrap_or(false)
 }
 
@@ -700,7 +734,7 @@ fn has_error_rule(vc: &ChcVc) -> bool {
     vc.rules.iter().any(|rule| rule.head.name.as_str() == "error")
 }
 
-fn replace_with_unsat_error_obligation(vc: &mut ChcVc) {
+pub(in crate::codegen_ay) fn replace_with_unsat_error_obligation(vc: &mut ChcVc) {
     if !vc.relations.iter().any(|rel| rel.name == "error") {
         vc.relations.push(RelationDecl::nullary("error"));
     }
@@ -709,6 +743,132 @@ fn replace_with_unsat_error_obligation(vc: &mut ChcVc) {
         RuleBody::new(None, vec![Expr::bool_const(false)]),
         RelationApp::new("error", Vec::new()),
     ));
+}
+
+/// Which firing of which rule produced a frame: the rule, and the frame it consumed.
+struct FiringId<'a> {
+    rule_idx: usize,
+    body_relation: Option<&'a str>,
+    body_frame_id: usize,
+}
+
+/// Give every rule-local variable a firing's constraints left unbound a name unique to that
+/// firing, in the head arguments and in the facts the firing recorded.
+///
+/// A `declare-var` is universally quantified PER RULE: `_9__out` in a rule that fires twice
+/// along one path denotes two independent values. The enumeration substitutes bound
+/// variables but leaves an unbound one as itself, so the frame it builds carries the raw
+/// name, and the next firing of the same rule — the loop body's, or a later rule that
+/// writes the same local — carries the same raw name for a different value. Measured:
+/// `r[i] = a.min(-0.0)` in a two-iteration loop, where the `minnum` relation leaves the
+/// destination's `__out` variable free, gave `r[0]` and `r[1]` one name, so
+/// `r[0].to_bits() == r[1].to_bits()` simplified to `true` and the error edge was "proved"
+/// unreachable — a sign Rust leaves nondeterministic, proved equal across iterations. The
+/// straight-line twin `let m1 = a.min(b); let m2 = a.min(b);` was correct only because the
+/// two destinations are different locals.
+///
+/// The fresh name is a function of the firing (rule index, body relation, body frame
+/// number): re-firing the same rule from the same frame on a later saturation pass yields
+/// the same names and the same frame, so the enumeration still reaches its fixpoint; a
+/// second iteration of a loop consumes a different frame and gets different names, so its
+/// values stay independent. A variable inherited from the body frame (a symbolic input the
+/// path already carries) keeps its name: the identity of a value along a path is what the
+/// enumeration's proofs rest on.
+///
+/// Facts are renamed with the same map so a fact about a rule-local never outlives the
+/// firing under a name a later firing can reuse. `None` when a substitution fails its sort
+/// check; the caller bails.
+fn freshen_rule_locals(
+    head_args: Vec<Expr>,
+    facts: PathFacts,
+    body_frame: &Frame,
+    firing: &FiringId<'_>,
+) -> Option<(Vec<Expr>, PathFacts)> {
+    let mut inherited: HashSet<String> = HashSet::new();
+    let mut inherited_seen: HashSet<*const ExprValue> = HashSet::new();
+    for arg in &body_frame.args {
+        collect_var_names(arg, &mut inherited, &mut inherited_seen);
+    }
+    let mut mentioned: Vec<Expr> = Vec::new();
+    let mut mentioned_seen: HashSet<*const ExprValue> = HashSet::new();
+    for arg in &head_args {
+        collect_vars(arg, &mut mentioned, &mut mentioned_seen);
+    }
+    for (lhs, rhs) in &facts.disequalities {
+        collect_vars(lhs, &mut mentioned, &mut mentioned_seen);
+        collect_vars(rhs, &mut mentioned, &mut mentioned_seen);
+    }
+    for (expr, _, _) in facts.unsigned_upper_bounds.iter().chain(&facts.unsigned_lower_bounds) {
+        collect_vars(expr, &mut mentioned, &mut mentioned_seen);
+    }
+    let mut renames: HashMap<String, Expr> = HashMap::new();
+    for var in mentioned {
+        let ExprValue::Var { name } = var.value() else { continue };
+        if inherited.contains(name) || renames.contains_key(name) {
+            continue;
+        }
+        let fresh = format!(
+            "{name}#s{}.{}.{}",
+            firing.rule_idx,
+            firing.body_relation.unwrap_or("entry"),
+            firing.body_frame_id
+        );
+        renames.insert(name.clone(), Expr::var(fresh, var.sort().clone()));
+    }
+    if renames.is_empty() {
+        return Some((head_args, facts));
+    }
+    let mut renamed_args = Vec::with_capacity(head_args.len());
+    for arg in &head_args {
+        renamed_args.push(substitute(arg, &renames)?);
+    }
+    let mut renamed_facts = PathFacts::default();
+    for (lhs, rhs) in &facts.disequalities {
+        renamed_facts.disequalities.push((substitute(lhs, &renames)?, substitute(rhs, &renames)?));
+    }
+    for (expr, bound, width) in &facts.unsigned_upper_bounds {
+        renamed_facts.unsigned_upper_bounds.push((substitute(expr, &renames)?, *bound, *width));
+    }
+    for (expr, bound, width) in &facts.unsigned_lower_bounds {
+        renamed_facts.unsigned_lower_bounds.push((substitute(expr, &renames)?, *bound, *width));
+    }
+    Some((renamed_args, renamed_facts))
+}
+
+/// Every `Var` node in `expr`, in first-seen order (duplicates included).
+fn collect_vars(expr: &Expr, out: &mut Vec<Expr>, seen: &mut HashSet<*const ExprValue>) {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        // Frames carry `Arc`-shared subterms; a shared node (identified by
+        // address) is walked once. The only consumer (`freshen_rule_locals`)
+        // keys its renames by variable name and skips names it has seen, so a
+        // repeated occurrence adds nothing (kani/ArithOperators/rem_float.rs
+        // spent its translation budget in these two walks).
+        if !seen.insert(std::ptr::from_ref(e.value())) {
+            continue;
+        }
+        if let ExprValue::Var { .. } = e.value() {
+            out.push(e.clone());
+        }
+        stack.extend(e.value().children());
+    }
+}
+
+/// The names of every variable in `expr`. `seen` is shared across calls that
+/// fill the same `out`, so a subterm shared between them is walked once.
+fn collect_var_names(expr: &Expr, out: &mut HashSet<String>, seen: &mut HashSet<*const ExprValue>) {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        if !seen.insert(std::ptr::from_ref(e.value())) {
+            continue;
+        }
+        if let ExprValue::Var { name } = e.value()
+            && !out.contains(name.as_str())
+        {
+            out.insert(name.clone());
+        }
+        stack.extend(e.value().children());
+    }
 }
 
 fn initial_env(body: Option<&RelationApp>, frame: &Frame) -> Option<HashMap<String, Expr>> {
@@ -2105,6 +2265,55 @@ mod tests {
         assert!(prove_straightline_safety(&vc));
     }
 
+    /// A chain of 40 blocks whose rules are listed last block first, so each
+    /// saturation round reaches one more block. Every (rule, body frame)
+    /// firing is applied once: before, every round re-applied every firing
+    /// so far, 40 * 41 / 2 of them, the quadratic re-pruning that kept a
+    /// `ManuallyDrop` push loop past its translation deadline (walker
+    /// fail-closed review 6 round 2, finding 5).
+    #[test]
+    fn saturation_applies_each_firing_once() {
+        let sort = Sort::bitvec(32);
+        let x = Expr::var("x", sort.clone());
+        let depth = 40usize;
+        let mut vc = ChcVc::new();
+        for k in 0..=depth {
+            vc.add_relation(RelationDecl::new(format!("bb{k}"), vec![sort.clone()]));
+        }
+        vc.add_relation(RelationDecl::nullary("error"));
+        // error :- bb{depth}(x), x = 2.   (x is pinned to 1)
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new(format!("bb{depth}"), vec![x.clone()])),
+                vec![x.clone().eq(Expr::bitvec_const(2u64, 32))],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+        // bb{k}(x) :- bb{k-1}(x).   listed from the last block back
+        for k in (1..=depth).rev() {
+            vc.add_rule(Rule::new(
+                RuleBody::new(
+                    Some(RelationApp::new(format!("bb{}", k - 1), vec![x.clone()])),
+                    vec![],
+                ),
+                RelationApp::new(format!("bb{k}"), vec![x.clone()]),
+            ));
+        }
+        // bb0(x) :- x = 1.
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, vec![x.clone().eq(Expr::bitvec_const(1u64, 32))]),
+            RelationApp::new("bb0", vec![x]),
+        ));
+
+        assert!(prove_straightline_safety(&vc));
+        let firings = STRAIGHTLINE_FIRINGS.with(std::cell::Cell::get);
+        assert!(
+            firings <= depth + 2,
+            "each firing applied once: {firings} firings for {} rules",
+            depth + 2
+        );
+    }
+
     /// `assume(x < 10)` records `x <u 10`; the error guard `!(x < 20)` must then
     /// fold to `false` instead of staying residual.
     #[test]
@@ -2388,7 +2597,6 @@ mod tests {
         assert!(prove_straightline_safety(&vc));
     }
 
-    #[test]
     #[test]
     fn a_lower_bound_contradicts_only_at_or_above_the_exclusive_upper() {
         // Off-by-one here is a FALSE PROOF, not a missed one: an unsound
@@ -2704,5 +2912,169 @@ mod tests {
         assert_eq!(vc.rules.len(), 1);
         assert_eq!(vc.rules[0].head.name, "error");
         assert_eq!(vc.rules[0].body.constraints.first(), Some(&Expr::bool_const(false)));
+    }
+
+    /// A rule-local the constraints leave unbound is a fresh value at every firing: a
+    /// loop body whose `minnum` relation admits either zero must not give both iterations'
+    /// results one name. Before the freshening this VC was "proved" safe: `r0` and `r1`
+    /// both carried `Var d`, so `not (r0 == r1)` folded to `false`.
+    #[test]
+    fn loop_body_fresh_variable_is_not_one_value_across_iterations() {
+        let bv32 = Sort::bitvec(32);
+        let i = Expr::var("i", bv32.clone());
+        let r0 = Expr::var("r0", bv32.clone());
+        let r1 = Expr::var("r1", bv32.clone());
+        let i_out = Expr::var("i__out", bv32.clone());
+        let r0_out = Expr::var("r0__out", bv32.clone());
+        let r1_out = Expr::var("r1__out", bv32.clone());
+        // The relation's destination: either zero.
+        let d = Expr::var("d", bv32.clone());
+        let pos_zero = Expr::bitvec_const(0u64, 32);
+        let neg_zero = Expr::bitvec_const(0x8000_0000u64, 32);
+        let one = Expr::bitvec_const(1u64, 32);
+        let two = Expr::bitvec_const(2u64, 32);
+
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::new("head", vec![bv32.clone(), bv32.clone(), bv32.clone()]));
+        vc.add_relation(RelationDecl::new("body", vec![bv32.clone(), bv32.clone(), bv32.clone()]));
+        vc.add_relation(RelationDecl::nullary("error"));
+        // head(0, 0, 0).
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, Vec::new()),
+            RelationApp::new("head", vec![pos_zero.clone(), pos_zero.clone(), pos_zero.clone()]),
+        ));
+        // body(i+1, r0', r1') :- head(i, r0, r1), i <u 2, d ∈ {+0, -0},
+        //                        r0' = ite(i == 0, d, r0), r1' = ite(i == 0, r1, d).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("head", vec![i.clone(), r0.clone(), r1.clone()])),
+                vec![
+                    i.clone().bvult(two.clone()),
+                    d.clone().eq(pos_zero.clone()).or(d.clone().eq(neg_zero.clone())),
+                    i_out.clone().eq(i.clone().bvadd(one.clone())),
+                    r0_out.clone().eq(Expr::ite(
+                        i.clone().eq(pos_zero.clone()),
+                        d.clone(),
+                        r0.clone(),
+                    )),
+                    r1_out.clone().eq(Expr::ite(
+                        i.clone().eq(pos_zero.clone()),
+                        r1.clone(),
+                        d.clone(),
+                    )),
+                ],
+            ),
+            RelationApp::new("body", vec![i_out.clone(), r0_out.clone(), r1_out.clone()]),
+        ));
+        // head(i, r0, r1) :- body(i, r0, r1).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("body", vec![i.clone(), r0.clone(), r1.clone()])),
+                Vec::new(),
+            ),
+            RelationApp::new("head", vec![i.clone(), r0.clone(), r1.clone()]),
+        ));
+        // error :- head(i, r0, r1), not (i <u 2), not (r0 == r1).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("head", vec![i.clone(), r0.clone(), r1.clone()])),
+                vec![i.clone().bvult(two.clone()).not(), r0.clone().eq(r1.clone()).not()],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+
+        assert_eq!(prove_straightline_safety_detailed(&vc), StraightlineOutcome::NotProven);
+    }
+
+    /// Straight-line code that writes the same local twice: `x = any(); y = x; x = any();
+    /// assert x == y`. Both assignments leave `x__out` unbound; the second must not inherit
+    /// the first's value.
+    #[test]
+    fn reintroduced_unbound_local_is_fresh_in_straight_line_code() {
+        let bv32 = Sort::bitvec(32);
+        let x = Expr::var("x", bv32.clone());
+        let y = Expr::var("y", bv32.clone());
+        let x_out = Expr::var("x__out", bv32.clone());
+        let y_out = Expr::var("y__out", bv32.clone());
+        let zero = Expr::bitvec_const(0u64, 32);
+
+        let mut vc = ChcVc::new();
+        for name in ["bb0", "bb1", "bb2", "bb3"] {
+            vc.add_relation(RelationDecl::new(name, vec![bv32.clone(), bv32.clone()]));
+        }
+        vc.add_relation(RelationDecl::nullary("error"));
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, Vec::new()),
+            RelationApp::new("bb0", vec![zero.clone(), zero.clone()]),
+        ));
+        // bb1(x', y) :- bb0(x, y).                    x = any(): x__out free
+        vc.add_rule(Rule::new(
+            RuleBody::new(Some(RelationApp::new("bb0", vec![x.clone(), y.clone()])), Vec::new()),
+            RelationApp::new("bb1", vec![x_out.clone(), y.clone()]),
+        ));
+        // bb2(x, y') :- bb1(x, y), y' = x.             y = x
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb1", vec![x.clone(), y.clone()])),
+                vec![y_out.clone().eq(x.clone())],
+            ),
+            RelationApp::new("bb2", vec![x.clone(), y_out.clone()]),
+        ));
+        // bb3(x', y) :- bb2(x, y).                    x = any(): x__out free again
+        vc.add_rule(Rule::new(
+            RuleBody::new(Some(RelationApp::new("bb2", vec![x.clone(), y.clone()])), Vec::new()),
+            RelationApp::new("bb3", vec![x_out.clone(), y.clone()]),
+        ));
+        // error :- bb3(x, y), not (x == y).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb3", vec![x.clone(), y.clone()])),
+                vec![x.clone().eq(y.clone()).not()],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+
+        assert_eq!(prove_straightline_safety_detailed(&vc), StraightlineOutcome::NotProven);
+    }
+
+    /// The renaming is a function of the firing, so re-firing a rule from the same frame
+    /// on a later saturation pass reproduces the frame and the enumeration still converges:
+    /// a symbolic input left free by the entry rule keeps one identity along the path, and
+    /// `x == x` over it is still a proof.
+    #[test]
+    fn free_symbolic_input_keeps_one_identity_along_a_path() {
+        let bv32 = Sort::bitvec(32);
+        let x = Expr::var("x", bv32.clone());
+        let y = Expr::var("y", bv32.clone());
+        let y_out = Expr::var("y__out", bv32.clone());
+        let zero = Expr::bitvec_const(0u64, 32);
+
+        let mut vc = ChcVc::new();
+        vc.add_relation(RelationDecl::new("bb0", vec![bv32.clone(), bv32.clone()]));
+        vc.add_relation(RelationDecl::new("bb1", vec![bv32.clone(), bv32.clone()]));
+        vc.add_relation(RelationDecl::nullary("error"));
+        // bb0(x, 0).                                   x = any(): free in the entry rule
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, Vec::new()),
+            RelationApp::new("bb0", vec![x.clone(), zero.clone()]),
+        ));
+        // bb1(x, y') :- bb0(x, y), y' = x.
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb0", vec![x.clone(), y.clone()])),
+                vec![y_out.clone().eq(x.clone())],
+            ),
+            RelationApp::new("bb1", vec![x.clone(), y_out.clone()]),
+        ));
+        // error :- bb1(x, y), not (x == y).
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb1", vec![x.clone(), y.clone()])),
+                vec![x.clone().eq(y.clone()).not()],
+            ),
+            RelationApp::new("error", Vec::new()),
+        ));
+
+        assert_eq!(prove_straightline_safety_detailed(&vc), StraightlineOutcome::Safe);
     }
 }

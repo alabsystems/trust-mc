@@ -127,7 +127,7 @@ fn test_vec_new_dangling_add_extra_checks_emits_provenance_error_rule() {
         );
 
         let has_obj_valid_error_rule =
-            vc.rules.iter().filter(|r| r.head.name == "error").any(|rule| {
+            vc.rules.iter().filter(|r| is_error_check_rule(r)).any(|rule| {
                 rule_contains_expr(rule, |expr| match expr.value() {
                     ExprValue::Select { array, .. } => matches!(
                         array.value(),

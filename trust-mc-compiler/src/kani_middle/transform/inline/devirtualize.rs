@@ -180,6 +180,8 @@ fn trace_receiver_concrete_type(receiver: &Operand, body: &MutableBody) -> Optio
     let mut current_local = match receiver {
         Operand::Copy(p) | Operand::Move(p) => p.local,
         Operand::Constant(_) => return None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
 
     let blocks = body.blocks();
@@ -194,10 +196,12 @@ fn trace_receiver_concrete_type(receiver: &Operand, body: &MutableBody) -> Optio
                 let source_ty = match operand {
                     Operand::Copy(p) | Operand::Move(p) => locals[p.local].ty,
                     Operand::Constant(c) => c.ty(),
+                    #[cfg(trust_toolchain)]
+                    Operand::RuntimeChecks(_) => rustc_public::ty::Ty::bool_ty(),
                 };
                 return extract_self_type(source_ty);
             }
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => {
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => {
                 current_local = p.local;
             }
             Rvalue::Ref(_, _, p) => {

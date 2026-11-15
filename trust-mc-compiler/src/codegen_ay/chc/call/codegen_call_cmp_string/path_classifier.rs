@@ -8,9 +8,12 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::BinOp;
+use rustc_public::ty::{RigidTy, TyKind};
 
 use super::super::ChcCtx;
+use super::super::chc_call_context::DispatchCallContext;
 use super::div_euclid;
+use crate::codegen_ay::shared::is_primitive_integer_ty;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn max_bitvec_width(lhs: &Expr, rhs: &Expr) -> Option<u32> {
@@ -107,6 +110,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Some("rem_euclid") => Some(div_euclid::EuclidOp::Rem),
             _ => None,
         }
+    }
+
+    /// Whether both operands of a `div_euclid` / `rem_euclid` call are primitive
+    /// integers, by value or behind one reference (`num_traits::Euclid` takes
+    /// `&Self`; [`div_euclid::codegen_euclid`] resolves the referent). The
+    /// handler is integer bitvector division only: `f32`/`f64` share the method
+    /// names, and a float here is its IEEE bit pattern, so claiming one computed
+    /// `bvurem` over the bits and proved the false
+    /// `x == 5.0 => x.rem_euclid(3.0) != 2.0` (TRUST-MC-FREM-2). Anything else
+    /// is left to the ordinary call path.
+    pub(in crate::codegen_ay::chc) fn euclid_operands_are_integers(
+        &self,
+        dcx: &DispatchCallContext<'_>,
+    ) -> bool {
+        dcx.args.iter().take(2).all(|arg| {
+            arg.ty(self.body.locals()).is_ok_and(|ty| {
+                let referent = match ty.kind() {
+                    TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
+                    _ => ty,
+                };
+                is_primitive_integer_ty(referent)
+            })
+        })
     }
 
     /// Detect `wrapping_abs` / `abs` integer method calls (Part of #3293).

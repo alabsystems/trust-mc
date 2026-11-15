@@ -22,7 +22,7 @@ detect_report_tree_state() {
                 found = 1
                 exit 0
             }
-            if (path ~ /^(scripts\/compiletest_report_contract\.py|scripts\/compiletest_report_paths\.py|scripts\/compiletest_proof_accounting\.py|scripts\/driver_binary_attestation\.py|scripts\/direct_driver_proof_core\.py|scripts\/direct_driver_proof_report\.py|scripts\/extract_proof_harnesses\.py|scripts\/extract_replacement_proof_report\.py|scripts\/generate_non_proof_closure\.py|scripts\/replacement_harness_dispositions\.py|scripts\/replacement_public_runner\.py|scripts\/lane_policy_query\.py|scripts\/ay-bump-canary\.sh|scripts\/ay-compiletest\.sh|scripts\/ay-replacement-proof\.sh|scripts\/ay-soundness-gate\.sh|scripts\/ay_compiletest_expectations\.sh|scripts\/ay_compiletest_lane_policy\.sh|scripts\/ay_compiletest_report_authority\.sh|scripts\/ay_compiletest_reports\.sh|scripts\/ay_compiletest_runner\.sh|scripts\/ay_manifest_pin\.py|scripts\/zero_fallback_canary\.sh|scripts\/zero_fallback_proof_gate\.py|tools\/replacement-inventory\/generate_inventory\.py|tools\/replacement-inventory\/public-corpus\.json|tests\/ay\/lane_policy\.toml|tests\/trust-mc\/non-proof-closure\.json|tests\/trust-mc\/replacement-harness-inventory\.json|tests\/trust-mc\/replacement-harness-inventory\.proof\.json|tests\/trust-mc\/replacement-harness-dispositions\.json)$/) {
+            if (path ~ /^(scripts\/compiletest_report_contract\.py|scripts\/compiletest_report_paths\.py|scripts\/compiletest_proof_accounting\.py|scripts\/driver_binary_attestation\.py|scripts\/direct_driver_proof_core\.py|scripts\/direct_driver_proof_report\.py|scripts\/extract_proof_harnesses\.py|scripts\/extract_replacement_proof_report\.py|scripts\/generate_non_proof_closure\.py|scripts\/generate_upstream_inactive_authority\.py|scripts\/replacement_harness_dispositions\.py|scripts\/replacement_public_runner\.py|scripts\/lane_policy_query\.py|scripts\/ay-bump-canary\.sh|scripts\/ay-compiletest\.sh|scripts\/ay-replacement-proof\.sh|scripts\/ay-soundness-gate\.sh|scripts\/ay_compiletest_expectations\.sh|scripts\/ay_compiletest_lane_policy\.sh|scripts\/ay_compiletest_report_authority\.sh|scripts\/ay_compiletest_reports\.sh|scripts\/ay_compiletest_runner\.sh|scripts\/ay_manifest_pin\.py|scripts\/zero_fallback_canary\.sh|scripts\/zero_fallback_proof_gate\.py|tools\/replacement-inventory\/generate_inventory\.py|tools\/replacement-inventory\/public-corpus\.json|tests\/ay\/lane_policy\.toml|tests\/trust-mc\/non-proof-closure\.json|tests\/trust-mc\/replacement-harness-inventory\.json|tests\/trust-mc\/replacement-harness-inventory\.proof\.json|tests\/trust-mc\/replacement-harness-dispositions\.json|tests\/trust-mc\/replacement-upstream-inactive\.json)$/) {
                 found = 1
                 exit 0
             }
@@ -57,6 +57,7 @@ detect_report_tree_fingerprint() {
             'scripts/extract_proof_harnesses.py' \
             'scripts/extract_replacement_proof_report.py' \
             'scripts/generate_non_proof_closure.py' \
+            'scripts/generate_upstream_inactive_authority.py' \
             'scripts/replacement_harness_dispositions.py' \
             'scripts/replacement_public_runner.py' \
             'scripts/lane_policy_query.py' \
@@ -79,6 +80,7 @@ detect_report_tree_fingerprint() {
             'tests/trust-mc/replacement-harness-inventory.json' \
             'tests/trust-mc/replacement-harness-inventory.proof.json' \
             'tests/trust-mc/replacement-harness-dispositions.json' \
+            'tests/trust-mc/replacement-upstream-inactive.json' \
             | shasum -a 256 | awk '{print $1}'
     )"
     printf '%s\n' "$fingerprint"

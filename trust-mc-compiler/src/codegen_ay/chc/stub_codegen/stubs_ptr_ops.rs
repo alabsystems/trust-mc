@@ -7,6 +7,7 @@
 //!
 //! Extracted from `stubs_util_intrinsics.rs` — Part of #4206.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -21,9 +22,46 @@ use super::ChcCtx;
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use super::pointer_step::{step_split_pointer, step_split_pointer_sub, step_wrapping_pointer};
+use super::codegen_types::CodegenTypes;
+use super::pointer_step::{
+    step_pointer_data_keep_metadata, step_split_pointer, step_split_pointer_sub,
+};
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
+
+/// Which address model an element-scaled pointer step uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtrStepModel {
+    /// In-bounds `add` / `sub`: the split-pointer lane step. Leaving the
+    /// allocation is UB, and the lane result is exact exactly when the step's
+    /// `same_object_ok` holds.
+    Lane,
+    /// `wrapping_add` / `wrapping_sub` / `wrapping_offset`: defined out of
+    /// bounds, so the step is exact address arithmetic mod 2^64.
+    Wrapping,
+}
+
+impl PtrStepModel {
+    /// `base_t64` is the wrapping step's accumulated offset of `ptr`
+    /// (`ChcCtx::wrapping_operand_t64`), unused by the lane model.
+    fn step(
+        self,
+        ctx: &ChcCtx<'_, '_>,
+        ptr: Expr,
+        byte_offset: Expr,
+        is_sub: bool,
+        base_t64: Option<Expr>,
+    ) -> Expr {
+        match (self, is_sub) {
+            // Part of #3921: split-pointer step preserves obj_id.
+            (PtrStepModel::Lane, false) => step_split_pointer(ptr, byte_offset).result,
+            (PtrStepModel::Lane, true) => step_split_pointer_sub(ptr, byte_offset).result,
+            (PtrStepModel::Wrapping, _) => {
+                ctx.step_wrapping_address_from(ptr, byte_offset, is_sub, base_t64)
+            }
+        }
+    }
+}
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Translate ptr.add(count) -> *mut T: compute ptr + count * sizeof(T).
@@ -35,6 +73,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         args: &[Operand],
         modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        self.translate_ptr_elem_add_call(args, modified_locals, PtrStepModel::Lane)
+    }
+
+    /// `ptr.add(count)` under the given step model. `PtrStepModel::Lane` is
+    /// the in-bounds `add` (leaving the allocation is UB);
+    /// `PtrStepModel::Wrapping` is `wrapping_add` / `wrapping_offset`, exact
+    /// mod 2^64.
+    fn translate_ptr_elem_add_call(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        model: PtrStepModel,
     ) -> Option<Expr> {
         if args.len() < 2 {
             return None;
@@ -94,10 +145,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let elem_size_expr = Expr::bitvec_const(elem_size as u128, POINTER_WIDTH);
         let offset_bytes = count.bvmul(elem_size_expr);
 
-        // Part of #3921: split-pointer step preserves obj_id.
-        let new_ptr = step_split_pointer(ptr, offset_bytes).result;
+        let base_t64 = if model == PtrStepModel::Wrapping {
+            self.wrapping_operand_t64(&args[0], &ptr, modified_locals)
+        } else {
+            None
+        };
+        let new_ptr = model.step(self, ptr, offset_bytes, /* is_sub = */ false, base_t64);
 
-        debug!(elem_size, "CHC: translate_ptr_add_call - ptr + count * sizeof(T)");
+        debug!(elem_size, ?model, "CHC: translate_ptr_add_call - ptr + count * sizeof(T)");
 
         Some(new_ptr)
     }
@@ -110,6 +165,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &mut self,
         args: &[Operand],
         modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        self.translate_ptr_elem_sub_call(args, modified_locals, PtrStepModel::Lane)
+    }
+
+    /// `ptr.sub(count)` under the given step model (see
+    /// `translate_ptr_elem_add_call`).
+    fn translate_ptr_elem_sub_call(
+        &mut self,
+        args: &[Operand],
+        modified_locals: &HashSet<usize>,
+        model: PtrStepModel,
     ) -> Option<Expr> {
         if args.len() < 2 {
             return None;
@@ -149,10 +215,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let elem_size_expr = Expr::bitvec_const(elem_size as u128, POINTER_WIDTH);
         let offset_bytes = count.bvmul(elem_size_expr);
-        // Part of #3921: split-pointer step preserves obj_id.
-        let new_ptr = step_split_pointer_sub(ptr, offset_bytes).result;
+        let base_t64 = if model == PtrStepModel::Wrapping {
+            self.wrapping_operand_t64(&args[0], &ptr, modified_locals)
+        } else {
+            None
+        };
+        let new_ptr = model.step(self, ptr, offset_bytes, /* is_sub = */ true, base_t64);
 
-        debug!(elem_size, "CHC: translate_ptr_sub_call - ptr - count * sizeof(T)");
+        debug!(elem_size, ?model, "CHC: translate_ptr_sub_call - ptr - count * sizeof(T)");
 
         Some(new_ptr)
     }
@@ -162,6 +232,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Uses `sizeof(T)` scaling via `translate_ptr_add_call` / `translate_ptr_sub_call`.
     /// Part of #3518: split from byte-level `emit_ptr_wrapping_byte_transition`.
+    ///
+    /// The step is EXACT mod 2^64 (`PtrStepModel::Wrapping`). It used the
+    /// in-bounds lane step, which keeps only the low 32 bits of the byte
+    /// offset: after `v.wrapping_add(usize::MAX / 64)` on a `*const u128` the
+    /// address distance read `0xFFFF_FFF0` instead of `0x3FFF_FFFF_FFFF_FFF0`,
+    /// a clean proof of the false claim and a counterexample to the true one
+    /// (tools/soundness-duals/ptr_offset_lane_truncation_dual.rs,
+    /// tests/expected/offset-wraps-around `harness_without_ub`).
     pub(in crate::codegen_ay::chc) fn emit_ptr_wrapping_element_transition(
         &mut self,
         cx: &ChcCallContext<'_>,
@@ -170,9 +248,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let is_sub = cx.stub == StubKind::PtrWrappingSub;
 
         let result_opt = if is_sub {
-            self.translate_ptr_sub_call(cx.args, cx.modified_locals)
+            self.translate_ptr_elem_sub_call(cx.args, cx.modified_locals, PtrStepModel::Wrapping)
         } else {
-            self.translate_ptr_add_call(cx.args, cx.modified_locals)
+            self.translate_ptr_elem_add_call(cx.args, cx.modified_locals, PtrStepModel::Wrapping)
         };
 
         let Some(result_expr) = result_opt else {
@@ -236,7 +314,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         let ptr = self.translate_operand_with_modified(&args[0], modified_locals)?;
-        let ptr = coerce_bitvec_width_safe(ptr, POINTER_WIDTH, SignExtension::ZeroExtend);
+        // The step's accumulated offset of a thin operand (a far round trip
+        // comes back exactly: heap/stack_address.rs `wrapping_operand_t64`).
+        let base_t64 = self.wrapping_operand_t64(&args[0], &ptr, modified_locals);
 
         let byte_count = self.translate_operand_with_modified(&args[1], modified_locals)?;
         // `wrapping_byte_offset` takes an ISIZE. Zero-extending a narrow
@@ -255,7 +335,70 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // no-op — `p.wrapping_byte_offset(1 << 32) == p` became derivable, and
         // the encoder statically discharged that false assertion. An OOB deref
         // of the result is still caught by heap_access_checks.
-        Some(step_wrapping_pointer(ptr, byte_count, is_sub))
+        // A `*const [T]` / `*const str` / `*const dyn Trait` operand keeps its
+        // metadata half: only the data word moves (`with_metadata_of(self)`).
+        let stepped = step_pointer_data_keep_metadata(ptr, |data| {
+            let data = coerce_bitvec_width_safe(data, POINTER_WIDTH, SignExtension::ZeroExtend);
+            Some(self.step_wrapping_address_from(data, byte_count, is_sub, base_t64))
+        })?;
+        Some(self.wide_byte_step_result(&args[0], stepped, modified_locals))
+    }
+
+    /// Give a byte-step result the operand's metadata when the pointer TYPE is
+    /// wide but the operand's bit value carried none. Also used by the
+    /// `with_metadata_of` stub, with the METADATA operand as `ptr_arg`.
+    ///
+    /// An array-to-slice `Unsize` (`&data as *const [u8]`) reaches the stubs as
+    /// a WIDENED THIN value — the length lives in side tables (`subslice_len`,
+    /// the MIR trace), not in the high half. Returning the 64-bit step then
+    /// zero-extends into the `bv128` destination, and a later `PtrMetadata` of
+    /// that state variable reads the padding as a length of `0`: a fabricated
+    /// value that refuted a true `val.len() == data.len()` and would prove a
+    /// false `val.len() != data.len()`. Here the metadata is taken from the
+    /// known-metadata resolver on the operand (`with_metadata_of(self)`), and
+    /// when nothing knows it, from a COUNTED fresh variable — a havoc, never a
+    /// zero pad.
+    pub(in crate::codegen_ay::chc) fn wide_byte_step_result(
+        &mut self,
+        ptr_arg: &Operand,
+        stepped: Expr,
+        modified_locals: &HashSet<usize>,
+    ) -> Expr {
+        use crate::codegen_ay::provenance::{Loc, Val};
+        use crate::codegen_ay::ptr_repr::PtrRepr;
+        use crate::codegen_ay::types::ptr_sort;
+
+        if stepped.sort().bitvec_width() != Some(POINTER_WIDTH) {
+            return stepped; // already wide: metadata kept structurally
+        }
+        let Ok(arg_ty) = ptr_arg.ty(self.body.locals()) else {
+            return stepped;
+        };
+        let pointee = match arg_ty.kind() {
+            TyKind::RigidTy(RigidTy::RawPtr(pointee, _) | RigidTy::Ref(_, pointee, _)) => pointee,
+            _ => return stepped,
+        };
+        let is_wide = matches!(
+            pointee.kind(),
+            TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..))
+        ) || pointee.layout().ok().is_some_and(|l| l.shape().is_unsized());
+        if !is_wide || Self::translate_ty(arg_ty).and_then(|s| s.bitvec_width())
+            != Some(2 * POINTER_WIDTH)
+        {
+            return stepped;
+        }
+        let meta = match self.resolve_ptr_metadata_known(ptr_arg, modified_locals) {
+            Some(meta) => coerce_bitvec_width_safe(meta, POINTER_WIDTH, SignExtension::ZeroExtend),
+            None => {
+                let booked = self.diagnostics.book_ptr_metadata_unconstrained();
+                let name = super::chc_fresh_name("byte_step_metadata");
+                debug!(%name, "CHC: byte-step metadata unresolved, havoc (counted)");
+                Havoc::booked(booked, name, ptr_sort())
+            }
+        };
+        PtrRepr::from_declared_roles(Loc::of_address(stepped.clone()), Val::of_value(meta))
+            .into_packed()
+            .unwrap_or(stepped)
     }
 
     /// Emit transition for wrapping byte pointer arithmetic (`wrapping_byte_add/sub/offset`).

@@ -12,6 +12,9 @@
 //! - RawVec: (ptr: Unique<T>, cap)
 //! - BigInt/BigUint/Ratio: fresh symbolic Int (sound over-approximation)
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
@@ -23,7 +26,10 @@ use crate::codegen_ay::types::int_sort;
 
 use super::StatementCodegen;
 use crate::codegen_ay::names::{RUST_STRING_CONS, RUST_STRING_SORT};
-use crate::codegen_ay::types::{POINTER_WIDTH, bv8_sort, flatten_dt_array_element, ptr_sort};
+use crate::codegen_ay::types::{
+    POINTER_WIDTH, SignExtension, bv8_sort, coerce_bitvec_width_safe, flatten_dt_array_element,
+    ptr_sort,
+};
 
 /// Non-null placeholder pointer value used when actual pointer cannot be extracted.
 const FALLBACK_POINTER: u128 = 0x1000;
@@ -75,7 +81,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // #918, #926: BigInt/BigUint/Ratio types return Int sort - handle specially
         if sort.is_int() {
-            return self.codegen_bigint_aggregate(adt_name, &sort);
+            return self.codegen_bigint_aggregate(def, &sort);
         }
         if !sort.is_datatype() {
             if sort.is_bool() && operands.is_empty() {
@@ -115,13 +121,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if base_name == "RawVec" && operands.len() == 2 {
             return self.codegen_rawvec_aggregate(operands, sort);
         }
+        // The value is built in `sort`, which may be a model sort named apart
+        // from the ADT's path-derived name.
+        let adt_name = &crate::codegen_ay::names::constructor_datatype_name(&sort, adt_name);
 
-        // The constructor's DECLARED field sorts (from `infer_adt_sort`, which
-        // uses `field.ty_with_args` — the recursive substitution). The
-        // per-field coercion below targets the weaker `resolve_generic_ty`
-        // sort, which can disagree with the declaration for nested generics;
-        // the final guard reconciles each field against THESE authoritative
-        // sorts so the emitted datatype constructor is always well-typed.
+        // The constructor's DECLARED field sorts (from `infer_adt_sort`). The
+        // per-field coercion below targets the same field type
+        // (`shared::mono_ty::field_ty`); the final guard still reconciles each
+        // field against THESE sorts so the emitted datatype constructor is
+        // always well-typed.
         let declared_field_sorts: Vec<Sort> = sort
             .datatype_sort()
             .and_then(|dt| dt.constructors.first())
@@ -134,7 +142,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         for (i, op) in operands.iter().enumerate() {
             if let Some(expr) = self.codegen_operand(op) {
                 let expr = if let Some(field_def) = variant_fields.get(i) {
-                    let expected_sort = Self::resolve_generic_ty(field_def.ty(), &args_for_fields)
+                    let expected_sort = mono_ty::field_ty(field_def, &args_for_fields)
                         .and_then(Self::infer_sort_from_ty);
                     if let Some(target_sort) = expected_sort {
                         self.coerce_struct_field_to_sort(op, expr, &target_sort)
@@ -161,6 +169,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let expr = match declared_field_sorts.get(i) {
                     Some(declared) if expr.sort() != declared => {
                         let fresh = self.ctx.fresh_name("field_sort_mismatch");
+                        self.ctx.bmc_sound_havoc("struct_field_sort_mismatch");
                         self.ctx.declare_var(&fresh, declared.clone())
                     }
                     _ => expr,
@@ -242,13 +251,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Codegen BigInt/BigUint/Ratio aggregate as fresh symbolic Int.
     /// Sound over-approximation: "some Int value was constructed".
-    pub(super) fn codegen_bigint_aggregate(
-        &mut self,
-        adt_name: &str,
-        _sort: &Sort,
-    ) -> Option<Expr> {
+    ///
+    /// `def` is read the way `infer_adt_sort` chose the Int sort for it (its
+    /// item name), not through its sort name, which carries the definition path.
+    pub(super) fn codegen_bigint_aggregate(&mut self, def: AdtDef, _sort: &Sort) -> Option<Expr> {
+        let adt_name = def.trimmed_name();
         let fresh_name = self.ctx.fresh_name("bigint_aggregate");
         let symbolic_int = self.ctx.declare_var(&fresh_name, int_sort());
+        self.ctx.bmc_sound_havoc("bigint_aggregate");
         if adt_name == "BigUint" {
             self.ctx.assert(symbolic_int.clone().int_ge(Expr::int_const(0)));
             debug!(
@@ -275,7 +285,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let len_expr = self.codegen_operand(&operands[1])?;
 
         let (ptr_expr, cap_expr) = if let Some(dt_name) = buf_expr.sort().datatype_name()
-            && dt_name == "RawVec"
+            && dt_name == crate::codegen_ay::names::RAWVEC_MODEL_SORT
         {
             let ptr = buf_expr.clone().field_select("RawVec", "fld_ptr", ptr_sort());
             let cap = buf_expr.field_select("RawVec", "fld_cap", ptr_sort());
@@ -304,6 +314,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let data_name = self.ctx.fresh_name("vec_data");
         let data = self.ctx.declare_var(&data_name, array_sort);
+        self.ctx.bmc_sound_havoc("vec_aggregate_data");
 
         debug!("  Constructing Vec with fld_data from actual layout");
         let sort_name = crate::codegen_ay::names::vec_sort_name(&elem_sort_name);
@@ -324,7 +335,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let vec_sort_ref = vec_expr.sort().clone();
         let vec_dt_name: Option<&str> = vec_sort_ref.datatype_name();
         let (ptr_expr, len_expr, cap_expr, data_expr) = if let Some(dt_name) = vec_dt_name
-            && dt_name.starts_with("Vec")
+            && crate::codegen_ay::names::is_vec_family_sort_name(dt_name)
         {
             let ptr = vec_expr.clone().field_select(dt_name, "fld_ptr", ptr_sort());
             let len = vec_expr.clone().field_select(dt_name, "fld_len", ptr_sort());
@@ -339,6 +350,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let array_sort = Sort::array(ptr_sort(), u8_sort);
             let data_name = self.ctx.fresh_name("string_data");
             let data = self.ctx.declare_var(&data_name, array_sort);
+            self.ctx.bmc_sound_havoc("string_aggregate_data");
             (
                 Expr::bitvec_const(FALLBACK_POINTER, POINTER_WIDTH),
                 Expr::bitvec_const(0, POINTER_WIDTH),
@@ -357,18 +369,65 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     }
 
     /// Codegen RawVec aggregate from actual layout (ptr: Unique<T>, cap: usize).
+    ///
+    /// The model is `(ptr, cap)` (`names::rawvec_fields`). The library's
+    /// `RawVec<T, A>` is `{ inner: RawVecInner<A>, _marker: PhantomData<T> }`
+    /// with `RawVecInner { ptr: Unique<u8>, cap: Cap, alloc: A }`, so its two
+    /// operands are the inner value and a marker, and `ptr` and `cap` are read
+    /// through the inner value's `fld_ptr` and `fld_cap`. The operands were
+    /// taken as `(ptr, cap)` themselves, which handed the marker to the model's
+    /// `cap` and built an ill-sorted `RawVec_mk` that ay refuses
+    /// (`datatype_constructor requires a matching datatype constructor
+    /// signature`): every `Vec` built in a BMC body panicked there. An older
+    /// layout whose operands ARE `(ptr, cap)` is still read directly; any other
+    /// shape returns `None` (the caller's unsupported path).
     fn codegen_rawvec_aggregate(&mut self, operands: &[Operand], sort: Sort) -> Option<Expr> {
-        let ptr_expr = self.codegen_operand(&operands[0])?;
-        let cap_expr = self.codegen_operand(&operands[1])?;
+        let first = self.codegen_operand(&operands[0])?;
+        let (ptr_expr, cap_expr) = if first.sort().is_datatype() {
+            let ptr = Self::struct_field_value(&first, "ptr")?;
+            let cap = Self::struct_field_value(&first, "cap")?;
+            (ptr, Self::newtype_scalar(cap))
+        } else {
+            (first, self.codegen_operand(&operands[1])?)
+        };
 
         let ptr_val = if ptr_expr.sort().is_bitvec() {
-            ptr_expr
+            coerce_bitvec_width_safe(ptr_expr, POINTER_WIDTH, SignExtension::ZeroExtend)
         } else {
             debug!("RawVec aggregate: ptr is {:?}, coercing", ptr_expr.sort());
             Expr::bitvec_const(FALLBACK_POINTER, POINTER_WIDTH)
         };
+        if !cap_expr.sort().is_bitvec() {
+            debug!("RawVec aggregate: cap is {:?}, not a scalar", cap_expr.sort());
+            return None;
+        }
+        let cap_val = coerce_bitvec_width_safe(cap_expr, POINTER_WIDTH, SignExtension::ZeroExtend);
 
         debug!("  Constructing simplified RawVec from actual layout");
-        Some(Expr::datatype_constructor("RawVec", "RawVec_mk", vec![ptr_val, cap_expr], sort))
+        Some(Expr::datatype_constructor("RawVec", "RawVec_mk", vec![ptr_val, cap_val], sort))
+    }
+
+    /// The value of the named field of a single-constructor struct datatype
+    /// value (`names::adt_struct_field_name`), or `None`.
+    fn struct_field_value(value: &Expr, rust_field: &str) -> Option<Expr> {
+        let dt = value.sort().datatype_sort()?;
+        let [ctor] = dt.constructors.as_slice() else { return None };
+        let wanted = crate::codegen_ay::names::adt_struct_field_name(rust_field);
+        let field = ctor.fields.iter().find(|f| f.name == wanted)?;
+        Some(value.clone().field_select(dt.name.clone(), field.name.clone(), field.sort.clone()))
+    }
+
+    /// A single-field struct value down to its scalar (`Cap`, a niche newtype
+    /// over `usize`); any other value as it is.
+    fn newtype_scalar(mut value: Expr) -> Expr {
+        for _ in 0..4 {
+            let Some(dt) = value.sort().datatype_sort() else { break };
+            let [ctor] = dt.constructors.as_slice() else { break };
+            let [field] = ctor.fields.as_slice() else { break };
+            let (dt_name, field_name, field_sort) =
+                (dt.name.clone(), field.name.clone(), field.sort.clone());
+            value = value.field_select(dt_name, field_name, field_sort);
+        }
+        value
     }
 }

@@ -6,6 +6,7 @@
 //! Implements `AlignOfDynObject` and `SizeOfDynObject` via vtable_type_metadata
 //! ITE chains. Part of #3210 Phase 2.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use tracing::{debug, warn};
 
@@ -200,7 +201,9 @@ pub(in crate::codegen_ay::chc) fn build_vtable_metadata_ite(
     // Part of #3447: Record that vtable metadata ITE default is unconstrained
     // (fires when vtable ID doesn't match any registered concrete type).
     ctx.record_aggregate_gap("dyn_vtable_metadata_default_unconstrained");
-    let mut result = super::declare_pending_var(
+    let mut result = Havoc::mint_deferred(
+        ctx,
+        sound_havoc::UNTRACKED_VTABLE_METADATA,
         super::chc_fresh_name("__dyn_meta"),
         Sort::bitvec(POINTER_WIDTH),
     );

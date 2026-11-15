@@ -21,8 +21,8 @@ use crate::property_model::{CheckStatus, Property};
 use crate::session::KaniSession;
 use crate::verification_provenance::SolverUnknownReason;
 use crate::verification_result::{
-    CtrexCategory, FailedProperties, VacuityShape, ValidationStatus, VerificationResult,
-    VerificationStatus, classify_vacuity, has_decided_check,
+    CtrexCategory, FailedProperties, OBLIGATION_FREE_CERTIFIED_QUALIFIER, VacuityShape,
+    ValidationStatus, VerificationResult, VerificationStatus, classify_vacuity, has_decided_check,
 };
 
 /// What actually happened to a harness, at the granularity the CONSOLE channel
@@ -54,6 +54,10 @@ pub(crate) enum HarnessVerdict {
     Successful,
     /// Proved, but on an unvalidated solver tier — provisional.
     SuccessfulUnvalidated,
+    /// Zero obligations, and the compiler certified that no obligation site is
+    /// reachable from the harness: exit 0 as under Kani, never a clean proof
+    /// (D16; `OBLIGATION_FREE_CERTIFIED_QUALIFIER`).
+    SuccessfulNoChecks,
     /// Every check is provably UNREACHABLE: contradictory assumptions.
     Vacuous,
     /// Every check is provably UNREACHABLE, but the harness itself is reachable
@@ -82,6 +86,7 @@ impl HarnessVerdict {
         match self {
             Self::Successful => "successful",
             Self::SuccessfulUnvalidated => "successful_unvalidated",
+            Self::SuccessfulNoChecks => "successful_no_checks",
             Self::Vacuous => "vacuous",
             Self::InconclusiveDeadChecks => "inconclusive_dead_checks",
             Self::InconclusiveUndecided => "inconclusive_undecided",
@@ -104,6 +109,13 @@ impl HarnessVerdict {
             Self::SuccessfulUnvalidated => {
                 "every check was proved, but on an unvalidated solver tier -- \
                  treat the proof as provisional"
+            }
+            Self::SuccessfulNoChecks => {
+                "the harness produced no verification conditions, and the compiler \
+                 certified that no obligation site is reachable from it -- nothing \
+                 was proved because there was nothing to prove; Kani reports this \
+                 shape SUCCESSFUL, and so does this run, with a non-clean proof \
+                 qualifier"
             }
             Self::Vacuous => {
                 "every check is provably UNREACHABLE -- the proof is vacuous \
@@ -136,9 +148,10 @@ impl HarnessVerdict {
         }
     }
 
-    /// Proved, in either of the two shapes a proof can take.
+    /// Exits 0: a proof in either of its two shapes, or the certified
+    /// obligation-free harness that had nothing to prove.
     pub(crate) fn is_success(self) -> bool {
-        matches!(self, Self::Successful | Self::SuccessfulUnvalidated)
+        matches!(self, Self::Successful | Self::SuccessfulUnvalidated | Self::SuccessfulNoChecks)
     }
 
     /// Neither proved nor refuted — the class that says "ask again with a
@@ -184,7 +197,13 @@ pub(crate) fn classify_harness_verdict(
     let unvalidated = result.validation_status == ValidationStatus::Unvalidated;
 
     if effective_success {
-        return if unvalidated {
+        // The certified empty obligation set first: `harness_runner`'s
+        // no-checks gate settled it with the qualifier, and it is neither a
+        // proof nor provisional — it is a success with nothing behind it,
+        // and every channel must say so.
+        return if result.is_certified_obligation_free() {
+            HarnessVerdict::SuccessfulNoChecks
+        } else if unvalidated {
             HarnessVerdict::SuccessfulUnvalidated
         } else {
             HarnessVerdict::Successful
@@ -226,8 +245,10 @@ pub(crate) fn classify_harness_verdict(
             Some(
                 SolverUnknownReason::UndecidedModel
                     | SolverUnknownReason::Timeout
+                    | SolverUnknownReason::TranslationTimeout
                     | SolverUnknownReason::SmtParseError
                     | SolverUnknownReason::Memout
+                    | SolverUnknownReason::LostErrorRules
             )
         )
     {
@@ -306,6 +327,10 @@ struct ProofSummaryCounts {
     manual_harnesses: usize,
     automatic_harnesses: usize,
     effective_successes: usize,
+    /// How many of `effective_successes` are compiler-certified obligation-free
+    /// harnesses (`successful_no_checks`): they exit 0 with nothing proved, so
+    /// a reader of the count must be able to subtract them.
+    successful_no_checks_harnesses: usize,
     failures: usize,
     /// `failures` split by WHAT went wrong, because the three classes need
     /// three different responses from whoever reads the artifact. The four
@@ -443,6 +468,9 @@ impl ProofSummaryArtifact {
                 );
                 if effective_success {
                     summary.effective_successes += 1;
+                    if verdict == HarnessVerdict::SuccessfulNoChecks {
+                        summary.successful_no_checks_harnesses += 1;
+                    }
                 } else {
                     summary.failures += 1;
                     match verdict {
@@ -468,7 +496,9 @@ impl ProofSummaryArtifact {
                     effective_success,
                     property_counts: property_counts(&result.result),
                     failed_checks: failed_checks(&result.result),
-                    proof_qualifiers: result.result.proof_qualifiers.clone(),
+                    proof_qualifiers: crate::harness_runner::reported_proof_qualifiers(
+                        &result.result,
+                    ),
                     has_proof_transcript_metadata: result
                         .result
                         .proof_transcript_metadata
@@ -604,6 +634,34 @@ mod tests {
         assert_eq!(json["harnesses"][0]["has_proof_transcript_metadata"], true);
     }
 
+    #[test]
+    fn proof_summary_names_a_success_resting_only_on_the_anonymous_chc_check() {
+        use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation};
+        use std::borrow::Cow;
+
+        let harness = test_harness("crate::proof", "crate");
+        let mut result = test_result(VerificationStatus::Success, FailedProperties::None);
+        result.results = vec![Property {
+            description: Cow::Borrowed("CHC verification: error unreachable (ay-chc)"),
+            property_id: PropertyId { fn_name: None, class: Cow::Borrowed("chc"), id: 0 },
+            source_location: RawSourceLocation {
+                column: None,
+                file: None,
+                function: None,
+                line: None,
+            },
+            status: CheckStatus::Success,
+            trace: None,
+        }];
+        let harness_result = HarnessResult { harness: &harness, result };
+
+        let artifact = ProofSummaryArtifact::from_results(&[harness_result]);
+        let json = serde_json::to_value(&artifact).unwrap();
+
+        assert_eq!(json["harnesses"][0]["status"], "success");
+        assert_eq!(json["harnesses"][0]["proof_qualifiers"][0], "unattributed_check=chc.0");
+    }
+
     // ─── verdict classification ───
 
     use crate::property_model::{Property, PropertyId, RawSourceLocation};
@@ -658,6 +716,14 @@ mod tests {
         // A proof is a proof, in both tiers.
         let ok = test_result(VerificationStatus::Success, FailedProperties::None);
         assert_eq!(verdict_of(&ok), "successful");
+
+        // A certified empty obligation set exits 0 but is its own verdict: a
+        // consumer summing successes can subtract it, and a SARIF reader gets
+        // the note.
+        let mut certified = test_result(VerificationStatus::Success, FailedProperties::None);
+        certified.proof_qualifiers.push(OBLIGATION_FREE_CERTIFIED_QUALIFIER.to_string());
+        assert_eq!(verdict_of(&certified), "successful_no_checks");
+        assert!(classify_harness_verdict(&certified, false).is_success());
         let mut ok_unvalidated = test_result(VerificationStatus::Success, FailedProperties::None);
         ok_unvalidated.validation_status = ValidationStatus::Unvalidated;
         assert_eq!(verdict_of(&ok_unvalidated), "successful_unvalidated");
@@ -692,7 +758,11 @@ mod tests {
         // of memory on both list their obligations UNDETERMINED and print an
         // INCONCLUSIVE console verdict; the JSON channel must agree, and must
         // not read the populated table as `failed`.
-        for reason in [SolverUnknownReason::SmtParseError, SolverUnknownReason::Memout] {
+        for reason in [
+            SolverUnknownReason::SmtParseError,
+            SolverUnknownReason::Memout,
+            SolverUnknownReason::LostErrorRules,
+        ] {
             let mut rejected = test_result(VerificationStatus::Failure, FailedProperties::Other);
             rejected.solver_unknown_reason = Some(reason);
             rejected.results = vec![check(CheckStatus::Undetermined)];
@@ -736,6 +806,19 @@ mod tests {
         assert_eq!(verdict_of(&result), "failed");
     }
 
+    /// A harness whose translation ran out of budget was never decided: it
+    /// must land in the same verdict as a solver timeout, never `failed`.
+    #[test]
+    fn a_translation_timeout_is_undecided_like_a_solver_timeout() {
+        let mut solver_timeout = test_result(VerificationStatus::Failure, FailedProperties::Other);
+        solver_timeout.solver_unknown_reason = Some(SolverUnknownReason::Timeout);
+        let mut translation_timeout =
+            test_result(VerificationStatus::Failure, FailedProperties::Other);
+        translation_timeout.solver_unknown_reason = Some(SolverUnknownReason::TranslationTimeout);
+        assert_eq!(verdict_of(&translation_timeout), verdict_of(&solver_timeout));
+        assert_ne!(verdict_of(&translation_timeout), "failed");
+    }
+
     /// The added counts are a partition of `failures`, which itself is left
     /// exactly as it was for consumers that already gate on it.
     #[test]
@@ -765,6 +848,7 @@ mod tests {
 
         assert_eq!(summary["failures"], 4, "the pre-existing count must not move");
         assert_eq!(summary["effective_successes"], 1);
+        assert_eq!(summary["successful_no_checks_harnesses"], 0);
         assert_eq!(summary["vacuous_harnesses"], 1);
         assert_eq!(summary["inconclusive_harnesses"], 1);
         assert_eq!(summary["uncertified_harnesses"], 1);

@@ -133,6 +133,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let keys_name = self.ctx.fresh_name("set_iter_keys");
         let keys_sort = Sort::array(ptr_sort(), key_sort.clone());
         let keys = self.ctx.declare_var(&keys_name, keys_sort.clone());
+        self.ctx.bmc_sound_havoc("set_iter_keys");
 
         // Use tracked length if available, otherwise create symbolic >= 0
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);

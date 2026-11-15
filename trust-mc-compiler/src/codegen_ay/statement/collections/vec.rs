@@ -25,6 +25,41 @@ use super::super::StatementCodegen;
 // extraction helpers moved to vec_fields.rs per #4206.
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    /// The capacity a reservation for `required` elements in all leaves the
+    /// Vec `vec_arg` refers to (`&mut Vec<T>`, `&mut String`), whose
+    /// capacity was `old_cap`: `RawVec`'s amortized or exact growth
+    /// (`shared::vec_capacity`), the BMC half of the CHC lane's
+    /// `vec_reserved_cap`. A zero-sized element keeps `max(cap, required)`.
+    /// When the element's size is unknown the grown capacity is a fresh value
+    /// of at least `required`, a recorded sound havoc.
+    pub(in crate::codegen_ay::statement) fn bmc_vec_reserved_cap(
+        &mut self,
+        vec_arg: &Operand,
+        old_cap: &Expr,
+        required: &Expr,
+        growth: crate::codegen_ay::shared::vec_capacity::VecGrowth,
+    ) -> Expr {
+        use crate::codegen_ay::shared::vec_capacity::reserved_capacity;
+        let elem_size = vec_arg.ty(self.body.locals()).ok().and_then(bmc_vec_elem_size);
+        let grow_needed = old_cap.clone().bvult(required.clone());
+        match elem_size {
+            Some(size) => reserved_capacity(old_cap, required, size, growth)
+                .unwrap_or_else(|| Expr::ite(grow_needed, required.clone(), old_cap.clone())),
+            None => self.bmc_vec_fresh_grown_cap(old_cap, required),
+        }
+    }
+
+    /// A grown capacity the BMC model does not compute: `old_cap` when it
+    /// covers `required`, else a fresh value of at least `required` (a
+    /// recorded sound havoc).
+    fn bmc_vec_fresh_grown_cap(&mut self, old_cap: &Expr, required: &Expr) -> Expr {
+        let name = self.ctx.fresh_name("vec_grown_cap");
+        self.ctx.bmc_sound_havoc("vec_grown_capacity_unmodelled");
+        let fresh = self.ctx.declare_var(&name, ptr_sort());
+        self.ctx.assert(fresh.clone().bvuge(required.clone()));
+        Expr::ite(old_cap.clone().bvult(required.clone()), fresh, old_cap.clone())
+    }
+
     /// Dangling-pointer + provenance constraints for `Vec::new` /
     /// `Vec::with_capacity`.
     ///
@@ -158,20 +193,26 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 };
 
                 if let Some(fields) = Self::extract_all_vec_fields(&vec) {
+                    let cur_len = self.deep_resolve_value(&fields.len);
                     let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
-                    let new_len = fields.len.clone().bvadd(one);
+                    let new_len = self.deep_resolve_value(&cur_len.clone().bvadd(one));
 
-                    // Deterministic cap updates: cap+1 before comparison to avoid clone
-                    let cap_if_grow =
-                        fields.cap.clone().bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-                    let grow_needed = fields.cap.clone().bvult(new_len.clone());
-                    // Last use of `fields.cap` — move into ite else-branch
-                    let new_cap = Expr::ite(grow_needed, cap_if_grow, fields.cap);
+                    // `grow_one` when full: RawVec's amortized growth. It was
+                    // `cap + 1`, so `Vec::<u8>::new(); v.push(1);
+                    // v.capacity() == 1` verified clean where Kani fails (std
+                    // gives 8; walker fail-closed review, round 2 of the
+                    // repair after the merge with main).
+                    let new_cap = self.bmc_vec_reserved_cap(
+                        &args[0],
+                        &fields.cap,
+                        &new_len,
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                    );
 
                     // Store the pushed value into the data array at index = len
                     let value = self.codegen_operand(&args[1]);
                     let new_data = if let Some(mut val) = value {
-                        val = crate::codegen_ay::chc::call::codegen_call_vec_ops::coerce_array_element(val, &fields.data.sort());
+                        val = crate::codegen_ay::chc::call::codegen_call_vec_ops::coerce_array_element_exact(val, &fields.data.sort());
                         // Last-resort: fresh symbolic if sorts still mismatch (Part of dterm#6841).
                         if let Some(arr) = fields.data.sort().array_sort() {
                             if *val.sort() != arr.element_sort {
@@ -180,7 +221,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                                 val = self.ctx.declare_var(&sym_name, arr.element_sort.clone());
                             }
                         }
-                        fields.data.store(fields.len, val)
+                        fields.data.store(cur_len, val)
                     } else {
                         fields.data
                     };
@@ -218,7 +259,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Store element at index position
                     let value = self.codegen_operand(&args[2]);
                     let new_data = if let Some(mut val) = value {
-                        val = crate::codegen_ay::chc::call::codegen_call_vec_ops::coerce_array_element(val, &fields.data.sort());
+                        val = crate::codegen_ay::chc::call::codegen_call_vec_ops::coerce_array_element_exact(val, &fields.data.sort());
                         if let Some(arr) = fields.data.sort().array_sort() {
                             if *val.sort() != arr.element_sort {
                                 let sym_name =
@@ -235,10 +276,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
                     let new_len = fields.len.bvadd(one);
 
-                    let cap_if_grow =
-                        fields.cap.clone().bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-                    let grow_needed = fields.cap.clone().bvult(new_len.clone());
-                    let new_cap = Expr::ite(grow_needed, cap_if_grow, fields.cap);
+                    let new_cap = self.bmc_vec_reserved_cap(
+                        &args[0],
+                        &fields.cap,
+                        &new_len,
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+                    );
 
                     let new_vec = Expr::datatype_constructor(
                         fields.dt_name,
@@ -274,8 +317,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     // Part of #3409: guard against unsigned overflow on len+additional.
                     // Rust's Vec::reserve panics on capacity overflow (checked_add).
                     self.ctx.assert(required_cap.clone().bvuge(fields.len.clone()));
-                    let grow_needed = fields.cap.clone().bvult(required_cap.clone());
-                    let new_cap = Expr::ite(grow_needed, required_cap, fields.cap);
+                    let growth = if stub_kind == VecReserveExact {
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Exact
+                    } else {
+                        crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized
+                    };
+                    let new_cap =
+                        self.bmc_vec_reserved_cap(&args[0], &fields.cap, &required_cap, growth);
 
                     let new_vec = Expr::datatype_constructor(
                         fields.dt_name,
@@ -318,13 +366,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
                 if let Some((base, vec)) = self.resolve_collection_base(&args[0]) {
                     if let Some(fields) = Self::extract_all_vec_fields(&vec) {
+                        let cur_len = self.deep_resolve_value(&fields.len);
                         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
                         let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
-                        let len_gt_zero = fields.len.clone().bvugt(zero.clone());
+                        let len_gt_zero =
+                            self.deep_resolve_value(&cur_len.clone().bvugt(zero.clone()));
 
                         // Get element at len-1 BEFORE decrementing
-                        let last_idx = fields.len.clone().bvsub(one.clone());
-                        let popped_elem = fields.data.clone().select(last_idx);
+                        let last_idx = self.deep_resolve_value(&cur_len.clone().bvsub(one.clone()));
+                        let popped_elem =
+                            self.deep_resolve_value(&fields.data.clone().select(last_idx));
 
                         // Get element sort from the data array
                         let elem_sort = fields
@@ -339,11 +390,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         let some = self.make_option_some(&option_sort, popped_elem);
 
                         // Return Some(elem) if len > 0, None otherwise
-                        let result = Expr::ite(len_gt_zero.clone(), some, none);
+                        let result = match len_gt_zero.value() {
+                            ExprValue::BoolConst(true) => some,
+                            ExprValue::BoolConst(false) => none,
+                            _ => Expr::ite(len_gt_zero.clone(), some, none),
+                        };
                         self.assign_value_to_place(destination, result);
 
-                        // Update len (decrement if > 0); last use of fields.len — move
-                        let new_len = Expr::ite(len_gt_zero, fields.len.bvsub(one), zero);
+                        // Update len (decrement if > 0); last use of cur_len — move
+                        let new_len = self.deep_resolve_value(&Expr::ite(
+                            len_gt_zero,
+                            cur_len.bvsub(one),
+                            zero,
+                        ));
                         let new_vec = Expr::datatype_constructor(
                             fields.dt_name,
                             fields.ctor_name,
@@ -422,6 +481,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     let name = self.ctx.fresh_name("vec_len");
                     let len = self.ctx.declare_var(&name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("vec_len_untracked");
                     self.assign_value_to_place(destination, len);
                 }
                 target
@@ -433,13 +493,30 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return None;
                 }
 
-                if let Some((_base, vec)) = self.resolve_collection_base(&args[0]) {
+                let zero_sized_elem = args[0]
+                    .ty(self.body.locals())
+                    .ok()
+                    .and_then(bmc_vec_elem_size)
+                    .is_some_and(|size| size == 0);
+                if zero_sized_elem {
+                    // A zero-sized element's capacity is `usize::MAX`
+                    // (`RawVec::capacity`), whatever was reserved. The model
+                    // tracked 0 for `Vec::<()>::new()`, so
+                    // `v.capacity() == usize::MAX`, which Kani proves, failed
+                    // (walker fail-closed review, round 2 of the repair after
+                    // the merge with main, `vec_capacity_growth_dual.rs`).
+                    self.assign_value_to_place(
+                        destination,
+                        Expr::bitvec_const(u64::MAX, POINTER_WIDTH),
+                    );
+                } else if let Some((_base, vec)) = self.resolve_collection_base(&args[0]) {
                     // Part of #1632: Use typed Vec datatype names
                     let cap = self.vec_field_select_declared(&vec, "fld_cap", ptr_sort());
                     self.assign_value_to_place(destination, cap);
                 } else {
                     let name = self.ctx.fresh_name("vec_cap");
                     let cap = self.ctx.declare_var(&name, ptr_sort());
+                    self.ctx.bmc_sound_havoc("vec_capacity_untracked");
                     self.assign_value_to_place(destination, cap);
                 }
                 target
@@ -460,6 +537,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     let name = self.ctx.fresh_name("vec_is_empty");
                     let is_empty = self.ctx.declare_var(&name, bool_sort());
+                    self.ctx.bmc_sound_havoc("vec_is_empty_untracked");
                     self.assign_value_to_place(destination, is_empty);
                 }
                 target
@@ -472,6 +550,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let prefix = if stub_kind == VecEq { "vec_eq" } else { "vec_contains" };
                 let name = self.ctx.fresh_name(prefix);
                 let result = self.ctx.declare_var(&name, bool_sort());
+                self.ctx.bmc_sound_havoc("vec_contains_or_eq");
                 self.assign_value_to_place(destination, result);
                 target
             }
@@ -555,10 +634,25 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     return None;
                 }
 
-                if let Some((_base, vec)) = self.resolve_collection_base(&args[0]) {
-                    self.assign_value_to_place(destination, vec);
-                } else {
-                    self.codegen_symbolic_result(destination);
+                // `<[T]>::to_vec_in` allocates exactly the length: the clone's
+                // capacity is its length, whatever the source's (a copied
+                // capacity verified `w.capacity() == 10` clean where Kani
+                // fails; walker fail-closed review, round 3 of the repair
+                // after the merge with main, `vec_capacity_elem_layout_dual.rs`).
+                match self
+                    .resolve_collection_base(&args[0])
+                    .and_then(|(_base, vec)| Self::extract_all_vec_fields(&vec))
+                {
+                    Some(fields) => {
+                        let clone = Expr::datatype_constructor(
+                            fields.dt_name,
+                            fields.ctor_name,
+                            vec![fields.ptr, fields.len.clone(), fields.len, fields.data],
+                            fields.sort,
+                        );
+                        self.assign_value_to_place(destination, clone);
+                    }
+                    None => self.codegen_symbolic_result(destination),
                 }
                 target
             }
@@ -625,13 +719,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         .array_sort()
                         .map(|a| a.element_sort.clone())
                         .unwrap_or_else(ptr_sort);
+                    // A fresh ARRAY. `const_array(one fresh element)` made every
+                    // index EQUAL, the untouched elements included: an
+                    // under-approximation (a false-proof shape), not the
+                    // over-approximation this comment has always claimed.
+                    let _ = elem_sort;
                     let sym_data_name = self.ctx.fresh_name("ay_vec_splice_data");
-                    let new_default = self.ctx.declare_var(&sym_data_name, elem_sort);
-                    let new_data = Expr::const_array(ptr_sort(), new_default);
+                    let new_data = self.ctx.declare_var(&sym_data_name, fields.data.sort().clone());
+                    self.ctx.bmc_sound_havoc("vec_splice_data");
 
-                    // Capacity grows if needed: cap = max(old_cap, new_len).
-                    let grow_needed = fields.cap.clone().bvult(new_len.clone());
-                    let new_cap = Expr::ite(grow_needed, new_len.clone(), fields.cap);
+                    // Capacity grows if needed, by one or two amortized steps
+                    // (`Splice::drop`'s `move_tail`): a fresh value.
+                    let new_cap = self.bmc_vec_fresh_grown_cap(&fields.cap, &new_len);
 
                     let new_vec = Expr::datatype_constructor(
                         fields.dt_name,
@@ -659,4 +758,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     // infer_vec_elem_sort, extract_all_vec_fields, vec_field_select, extract_vec_data
     // moved to vec_fields.rs per #4206.
+}
+
+/// The size of the element of the Vec `ty` names, from its own layout
+/// (`shared::vec_capacity::vec_elem_layout_size`).
+fn bmc_vec_elem_size(ty: rustc_public::ty::Ty) -> Option<u64> {
+    crate::codegen_ay::shared::vec_capacity::vec_elem_layout_size(ty)
 }

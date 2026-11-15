@@ -135,6 +135,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let source_local = match arg {
             Operand::Copy(place) | Operand::Move(place) => Some(place.local),
             Operand::Constant(_) => None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         };
         if self.local_has_multiple_whole_definitions(dest_local)
             || source_local.is_some_and(|source| {

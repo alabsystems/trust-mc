@@ -8,6 +8,9 @@
 //! transparent wrappers, allocator infra, iterator types).
 //! Extracted from include!() via extension trait. Part of #2306.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_public::CrateDef;
 use rustc_public::ty::{AdtDef, GenericArgKind, GenericArgs, RigidTy, TyKind};
@@ -116,6 +119,18 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         let name = def.trimmed_name();
         debug!(adt_name = ?name, "matched ADT arm");
 
+        // UnsafeCell has no datatype layer in this encoding. Its diagnostic
+        // name is context-dependent (and a user type can have the same name),
+        // so only rustc's lang-item identity authorizes that representation.
+        // Use Rule A's instantiated, normalized storage type: a generic
+        // atomic's field may name <T as AtomicPrimitive>::Storage.
+        let is_unsafe_cell = rustc_middle::ty::tls::with(|tcx| {
+            rustc_public::rustc_internal::internal(tcx, def).is_unsafe_cell()
+        });
+        if is_unsafe_cell {
+            return Self::translate_ty(mono_ty::single_field_storage_ty(def, &args)?);
+        }
+
         // BigRational/Ratio → SMT Real (#911, #3814: exact match only)
         if name == "BigRational" || name == "Ratio" {
             return Some(Sort::real());
@@ -152,6 +167,15 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
 
             debug!(?key_sort, adt_name = ?name, "Set translated to Array<K, Bool>");
             return Some(Sort::array(key_sort, bool_sort()));
+        }
+
+        // The current native Box carrier is a transparent NonNull + marker.
+        // Authenticate its definition and actual thin layout before granting
+        // its field's pointer sort; a user BoxRaw retains its ordinary ADT.
+        if let Some((_, pointer_ty)) = rustc_middle::ty::tls::with(|tcx| {
+            crate::codegen_ay::shared::native_box_raw::native_box_raw_pointer_field(tcx, def, &args)
+        }) {
+            return Self::translate_ty(pointer_ty);
         }
 
         // NonNull/Unique: transparent pointer wrappers (Part of #912)
@@ -286,8 +310,6 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 | "std::mem::ManuallyDrop"
                 | "MaybeUninit"
                 | "std::mem::MaybeUninit"
-                | "UnsafeCell"
-                | "std::cell::UnsafeCell"
                 | "Cell"
                 | "std::cell::Cell"
         ) || (!args.0.is_empty()
@@ -355,8 +377,10 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Previously gated on name.contains("simd") which missed user-defined
         // #[repr(simd)] types like `i64x2` — the structural check (1 variant,
         // 1 field, field is [T; N]) is sufficient.
-        if def.variants().len() == 1 && def.variants()[0].fields().len() == 1 {
-            let field_ty = def.variants()[0].fields()[0].ty_with_args(&args);
+        if def.variants().len() == 1
+            && def.variants()[0].fields().len() == 1
+            && let Some(field_ty) = mono_ty::field_ty(&def.variants()[0].fields()[0], &args)
+        {
             if matches!(field_ty.kind(), TyKind::RigidTy(RigidTy::Array(..))) {
                 debug!(adt_name = ?name, "single-field array wrapper -> delegate to inner array type");
                 return Self::translate_ty(field_ty);
@@ -385,6 +409,18 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         if is_bool_adt_name(&name, &full_name, &args) {
             return Some(bool_sort());
         }
+        // These small core adapters are executed through their real MIR bodies.
+        // Their iterator/count/closure fields must survive calls and moves:
+        // an opaque BV64 handle makes the walker invent every later field read.
+        // Ownership is checked before the name, so a user Map/Take/Rev keeps its
+        // ordinary ADT translation. Untranslatable fields refuse the sort.
+        if matches!(def.krate().name.as_str(), "core" | "std")
+            && full_name.contains("::iter::")
+            && matches!(name.as_str(), "Map" | "Take" | "Rev" | "Copied" | "Cloned")
+        {
+            return Self::translate_adt_sort(def, args);
+        }
+
         // #4112 FlatMap/FlattenCompat, #4160 Chain/Fuse — opaque iterator adapters.
         // Part of #4251: Enumerate/Zip/Map/Rev/Skip/Take/Peekable/StepBy/FilterMap
         // — additional opaque iterator adapters. These contain complex internal
@@ -412,18 +448,19 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
                 | "Cloned"
                 | "Copied"
         ) && (full_name.contains("iter") || full_name.contains("slice"))
+            && !def.krate().is_local
         {
             debug!(adt_name = ?name, "iterator adapter -> bv64 (opaque)");
             return Some(ptr_sort());
         }
         // Part of #4251: Map — only when it's an iterator adapter (core::iter::adapters::Map),
         // not std::collections maps. Disambiguate via full path.
-        if name == "Map" && full_name.contains("iter") {
+        if name == "Map" && full_name.contains("iter") && !def.krate().is_local {
             debug!(adt_name = ?name, "iter::Map adapter -> bv64 (opaque)");
             return Some(ptr_sort());
         }
         // Part of #4251: Filter — only when it's an iterator adapter, not str::pattern::Filter.
-        if name == "Filter" && full_name.contains("iter::adapters") {
+        if name == "Filter" && full_name.contains("iter::adapters") && !def.krate().is_local {
             debug!(adt_name = ?name, "iter::Filter adapter -> bv64 (opaque)");
             return Some(ptr_sort());
         }

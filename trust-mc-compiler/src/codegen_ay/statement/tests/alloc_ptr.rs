@@ -743,7 +743,7 @@ fn test_nonnull_cast_empty_args_fails_closed() {
 // ─── codegen_layout_from_size_align (#2671) ─────────────────────────────
 
 #[test]
-fn test_layout_from_size_align_delegates_to_unchecked() {
+fn test_layout_from_size_align_rejects_pointer_destination() {
     with_test_ay_ctx_for_source(ALLOC_PTR_PROBE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "ptr_probe");
         let body = instance.body().expect("body");
@@ -758,12 +758,12 @@ fn test_layout_from_size_align_delegates_to_unchecked() {
             &destination,
             Some(55),
         );
-        assert_eq!(result, Some(55));
+        assert_eq!(result, None, "a checked Layout result cannot inhabit a pointer destination");
 
         let dest_base = codegen.ssa_base_name(&destination);
         assert!(
-            codegen.env_lookup(&dest_base).is_some(),
-            "from_size_align should assign Layout to destination"
+            codegen.env_lookup(&dest_base).is_none(),
+            "a refused checked constructor must not assign the pointer destination"
         );
     });
 }

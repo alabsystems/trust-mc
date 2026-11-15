@@ -168,15 +168,15 @@ pub(super) fn propagate_alloc_id_with_obj(
     src_local: Option<usize>,
     ptr_obj_id: Option<u32>,
 ) {
-    if let Some(obj_id) = src_local
-        .and_then(|sl| ctx.known_alloc_ids.get(&sl).copied())
-        .or_else(|| src_local.and_then(|sl| ctx.trace_deref_store_alloc_id(sl)))
-        .or(ptr_obj_id)
+    // The trace checks every source for multiple producers and follows only
+    // value-preserving, zero-offset edges. A direct table copy skips that guard.
+    if let Some(obj_id) = src_local.and_then(|sl| ctx.trace_deref_store_alloc_id(sl)).or(ptr_obj_id)
     {
         ctx.known_alloc_ids.insert(dest_local, obj_id);
         ctx.ref_resolution.alloc_result_locals.insert(dest_local);
     } else {
         ctx.known_alloc_ids.remove(&dest_local);
+        ctx.ref_resolution.alloc_result_locals.remove(&dest_local);
     }
 }
 
@@ -189,22 +189,28 @@ pub(super) fn propagate_alloc_id_with_obj(
 // carrying it, so they pass `as_expr()` instead. The fat-pointer guard that
 // used to live in the body is gone either way — that is the defect.
 pub(super) fn try_extract_data_obj_id(ptr: &Expr) -> Option<u32> {
+    // Every caller writes base-only metadata or reconstructs a whole owner.
+    // Keep an interior pointer's expression, but never erase its byte offset.
     // obj_id 0 is the null/invalid sentinel: allocations use obj_id >= 2 and
     // the promoted-const region uses obj_id == 1. Refuse to propagate obj_id 0
     // as a "known allocation" — otherwise `propagate_alloc_id_with_obj` records
     // null-pointer-derived locals in `alloc_result_locals`, which makes the
     // `NullPointerDereference` MIR assert suppression (#3094) silently elide
     // the check, producing a false PROOF for `unsafe { *ptr::null::<T>() }`.
-    ChcCtx::try_extract_obj_id(ptr)
+    ChcCtx::try_extract_base_obj_id(ptr)
         .or_else(|| {
             // Wave 4: the `width == 2 * POINTER_WIDTH` gate is deleted —
             // `PtrRepr` names the data half structurally and `into_data` is
             // total, so a thin pointer decodes to itself (this retry is then a
             // no-op) and a packed one decodes to its address half.
             let data = PtrRepr::classify(ptr)?.into_data();
-            ChcCtx::try_extract_obj_id(data.as_expr())
+            ChcCtx::try_extract_base_obj_id(data.as_expr())
         })
-        .filter(|&obj_id| obj_id != 0)
+        // Nor an id at or past OBJECT_ID_LIMIT, which no allocation has (Kani's
+        // address layout, heap/stack_address.rs).
+        .filter(|&obj_id| {
+            obj_id != 0 && obj_id < crate::codegen_ay::chc::heap::stack_address::OBJECT_ID_LIMIT
+        })
 }
 
 impl<'tcx, 'body> CallPtrIdentity for ChcCtx<'tcx, 'body> {
@@ -348,7 +354,7 @@ impl<'tcx, 'body> CallPtrIdentity for ChcCtx<'tcx, 'body> {
                         let current_valid = self.current_obj_valid_array();
                         let invalidated = current_valid.store(obj_id, Expr::bool_const(false));
                         extra.push(super::codegen_expr_heap::obj_valid_out().eq(invalidated));
-                        self.mark_heap_metadata_modified();
+                        self.mark_obj_valid_modified();
                         debug!(
                             "#3176: invalidated obj_valid for NonNull::dangling (extra_pointer_checks)"
                         );
@@ -413,4 +419,23 @@ fn from_raw_vtable_constraint(
                 Expr::bitvec_const(vtable_id as u128, crate::codegen_ay::types::POINTER_WIDTH);
             ctx.capture_known_vtable_constraint(dest_local, vtable_expr)
         })
+}
+
+#[cfg(test)]
+mod base_identity_tests {
+    use super::*;
+
+    #[test]
+    fn test_fixed_array_base_identity_preserves_pointer_offsets() {
+        let base = Expr::bitvec_const(7u64, 32).concat(Expr::bitvec_const(0u64, 32));
+        let interior = Expr::bitvec_const(7u64, 32).concat(Expr::bitvec_const(8u64, 32));
+        assert_eq!(ChcCtx::try_extract_obj_id(&interior), Some(7));
+        assert_eq!(ChcCtx::try_extract_base_obj_id(&base), Some(7));
+        assert_eq!(ChcCtx::try_extract_base_obj_id(&interior), None);
+        assert_eq!(try_extract_data_obj_id(&base), Some(7));
+        assert_eq!(try_extract_data_obj_id(&interior), None);
+        let metadata = Expr::bitvec_const(2u64, 64);
+        assert_eq!(try_extract_data_obj_id(&metadata.clone().concat(base)), Some(7));
+        assert_eq!(try_extract_data_obj_id(&metadata.concat(interior)), None);
+    }
 }

@@ -60,6 +60,8 @@ impl InitialTargetVisitor {
                     }
                 }
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {}
         }
     }
 }

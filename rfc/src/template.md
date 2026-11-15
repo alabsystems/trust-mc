@@ -83,4 +83,3 @@ Feel free to add as many items as you want, but please refrain from adding too m
 If you want to capture your thoughts or start a discussion, please create a feature request.
 You are welcome to add a link to the new issue here.
 
-[^unstable_feature]: This unique ident should be used to enable features proposed in the RFC using `-Z <ident>` until the feature has been stabilized.

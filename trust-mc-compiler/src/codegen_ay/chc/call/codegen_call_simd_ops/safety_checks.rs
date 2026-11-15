@@ -30,7 +30,11 @@ use crate::codegen_ay::types::POINTER_WIDTH;
 /// overflow") when any lane of a SIMD add/sub/mul overflows its lane width.
 /// This mirrors the scalar unchecked-overflow predicate ([`ChcCtx::
 /// unchecked_overflow_condition`]) applied lane-by-lane, so the SIMD and scalar
-/// paths cannot drift. Gated by `overflow_checks` exactly like the scalar path.
+/// paths cannot drift. Not gated by `--no-overflow-checks`: Kani's compiler
+/// writes this assertion itself and keeps it whatever that flag says (the flag
+/// takes only CBMC's instrumentation off), as the BMC lane's
+/// `overflow_check_simd_arith` does. Gated, the flag dropped it while the lane
+/// value wraps: the harness verified where Kani fails it.
 /// Integer lanes only — floating-point add/sub/mul do not have overflow UB.
 pub(super) fn emit_simd_arith_overflow_checks(
     ctx: &mut ChcCtx<'_, '_>,
@@ -40,7 +44,7 @@ pub(super) fn emit_simd_arith_overflow_checks(
     layout: &SimdLayoutInfo,
     kind: SimdIntrinsicKind,
 ) {
-    if !ctx.overflow_checks || layout.is_float {
+    if layout.is_float {
         return;
     }
     let op = match kind {
@@ -72,8 +76,9 @@ pub(super) fn emit_simd_arith_overflow_checks(
 /// distance") when any lane's shift amount is `>=` the lane bit-width or, for a
 /// signed shift amount, is negative. For `simd_shl`/`simd_shr` both operands
 /// share the lane type `T`, so the shift-amount signedness equals
-/// `layout.is_signed`. Reuses the scalar shift-distance predicate and is gated
-/// by `overflow_checks` to match the scalar `ShlUnchecked`/`ShrUnchecked` path.
+/// `layout.is_signed`. Reuses the scalar shift-distance predicate. Such a shift
+/// is UB of the intrinsic, which Kani asserts whatever `--no-overflow-checks`
+/// says, and so does the scalar `ShlUnchecked`/`ShrUnchecked` path: ungated.
 pub(super) fn emit_simd_shift_safety_checks(
     ctx: &mut ChcCtx<'_, '_>,
     dcx: &DispatchCallContext<'_>,
@@ -81,9 +86,6 @@ pub(super) fn emit_simd_shift_safety_checks(
     rhs: &Expr,
     layout: &SimdLayoutInfo,
 ) {
-    if !ctx.overflow_checks {
-        return;
-    }
     for i in 0..layout.lane_count {
         let idx = Expr::bitvec_const(i as u64, POINTER_WIDTH);
         let a = lhs.clone().select(idx.clone());

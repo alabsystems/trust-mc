@@ -26,6 +26,7 @@ pub(in crate::codegen_ay::chc) fn test_try_construct_coroutine_state_expr(
         yield_is_zst,
         complete_is_zst,
         allow_complete_branch,
+        &mut |prefix, sort| ay_bindings::Expr::var(&*super::chc_fresh_name(prefix), sort),
     )
 }
 
@@ -40,6 +41,7 @@ pub(in crate::codegen_ay::chc) fn test_try_construct_coroutine_state_yielded_exp
         CoroutineStateBranch::Yielded,
         yield_is_zst,
         complete_is_zst,
+        &mut |prefix, sort| ay_bindings::Expr::var(&*super::chc_fresh_name(prefix), sort),
     )
 }
 
@@ -54,6 +56,7 @@ pub(in crate::codegen_ay::chc) fn test_try_construct_coroutine_state_complete_ex
         CoroutineStateBranch::Complete,
         yield_is_zst,
         complete_is_zst,
+        &mut |prefix, sort| ay_bindings::Expr::var(&*super::chc_fresh_name(prefix), sort),
     )
 }
 

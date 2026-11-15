@@ -4,12 +4,13 @@
 //
 // Copy/copy_nonoverlapping intrinsics (converted from include!() per #2595).
 
+use super::copy_shadow::CopyFamilySource;
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::types::POINTER_WIDTH;
 use crate::kani_middle::abi::LayoutOf;
 use ay_bindings::{Expr, ExprValue};
 use rustc_public::mir::Operand;
-use rustc_public::ty::{Allocation, ConstantKind, RigidTy, Span, TyConstKind, TyKind};
+use rustc_public::ty::{RigidTy, Span, TyKind};
 use tracing::{debug, warn};
 
 /// Bound on how far pointer expressions are peeled when resolving a root.
@@ -639,7 +640,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             });
 
         // Try to get constant count
-        let count_const = self.try_eval_const_operand(count);
+        let count_const = self.copy_count_const(count);
 
         debug!(
             "codegen_copy_nonoverlapping: element_size={}, span={:?}, count_const={:?}, count={:?}",
@@ -669,19 +670,47 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // copy_nonoverlapping only: memmove (`codegen_copy`) permits overlap.
         self.emit_copy_nonoverlapping_overlap_check(src, dst, count, element_size);
 
+        // A copy that writes nothing leaves the memory image and the ssa
+        // environment in agreement (`mark_byte_copy_into_stack_local`).
+        let writes_nothing = count_const == Some(0) || element_size == 0;
+
         // Defer location formatting until an error path needs it (Part of #2267).
         let location = || format!("{:?}", span);
 
         // Get src and dst pointer expressions
         let (Some(src_val), Some(dst_val)) = (self.codegen_operand(src), self.codegen_operand(dst))
         else {
-            self.ctx.unsupported("CopyNonOverlapping: failed to codegen pointers", location());
+            // The write is dropped here, and `unsupported` alone demotes nothing.
+            self.ctx.unsupported_with_fallback(
+                "CopyNonOverlapping: failed to codegen pointers",
+                location(),
+            );
+            self.mark_byte_copy_into_stack_local(dst, writes_nothing, "copy_nonoverlapping_into_stack_local");
             return;
         };
 
         // Coerce to pointer width
         let src_ptr = self.coerce_to_ptr_width(src_val);
         let dst_ptr = self.coerce_to_ptr_width(dst_val);
+
+        // The byte unroll below reaches `memory` only, which no typed read of
+        // an address-taken local consults: encode the write exactly, or demote
+        // (copy_shadow.rs).
+        if self.encode_copy_family_write(
+            "copy_nonoverlapping",
+            dst,
+            &dst_ptr,
+            CopyFamilySource::Pointer(&src_ptr),
+            count,
+            element_size,
+            true,
+        ) {
+            return;
+        }
+
+        // Not encoded exactly (the encoder demoted it): the unroll below writes
+        // the memory image only.
+        self.mark_byte_copy_into_stack_local(dst, writes_nothing, "copy_nonoverlapping_into_stack_local");
 
         // Maximum bytes to unroll (avoid explosion for large copies)
         const MAX_UNROLL_BYTES: usize = 128;
@@ -707,7 +736,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
                         // Load byte from src, store to dst
                         let byte = self.ctx.load_memory(src_addr);
-                        self.ctx.store_memory(dst_addr, byte);
+                        self.store_memory_byte_on_path(dst_addr, byte, "copy store");
                     }
                 } else {
                     // Too large to unroll - treat as unsupported with warning
@@ -770,7 +799,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         let dst_byte = self.ctx.load_memory(dst_addr.clone());
                         // If guard: copy src byte; else: preserve dst byte
                         let value = Expr::ite(guard, src_byte, dst_byte);
-                        self.ctx.store_memory(dst_addr, value);
+                        self.store_memory_byte_on_path(dst_addr, value, "copy store");
                     }
                 } else {
                     // Count operand failed to codegen - fall back to unsupported
@@ -818,12 +847,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             });
 
         // Try to get constant count
-        let count_const = self.try_eval_const_operand(count);
+        let count_const = self.copy_count_const(count);
 
         debug!(
             "codegen_copy: element_size={}, span={:?}, count_const={:?}, count={:?}",
             element_size, span, count_const, count
         );
+
+        // A copy that writes nothing leaves the memory image and the ssa
+        // environment in agreement (`mark_byte_copy_into_stack_local`).
+        let writes_nothing = count_const == Some(0) || element_size == 0;
 
         // UB when count * size_of::<T>() overflows a usize, regardless of what
         // the unroll below decides to do with the copy itself.
@@ -851,12 +884,31 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Get src and dst pointer expressions
         let (Some(src_val), Some(dst_val)) = (self.codegen_operand(src), self.codegen_operand(dst))
         else {
-            self.ctx.unsupported("Copy: failed to codegen pointers", location());
+            // The write is dropped here, and `unsupported` alone demotes nothing.
+            self.ctx.unsupported_with_fallback("Copy: failed to codegen pointers", location());
+            self.mark_byte_copy_into_stack_local(dst, writes_nothing, "copy_into_stack_local");
             return;
         };
 
         let src_ptr = self.coerce_to_ptr_width(src_val);
         let dst_ptr = self.coerce_to_ptr_width(dst_val);
+
+        // As in `codegen_copy_nonoverlapping`: exact typed encoding, or demote.
+        if self.encode_copy_family_write(
+            "copy",
+            dst,
+            &dst_ptr,
+            CopyFamilySource::Pointer(&src_ptr),
+            count,
+            element_size,
+            false,
+        ) {
+            return;
+        }
+
+        // Not encoded exactly (the encoder demoted it): the unroll below writes
+        // the memory image only.
+        self.mark_byte_copy_into_stack_local(dst, writes_nothing, "copy_into_stack_local");
 
         // Maximum bytes to unroll (avoid explosion for large copies)
         const MAX_UNROLL_BYTES: usize = 128;
@@ -884,7 +936,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     for (i, byte) in temp_bytes.into_iter().enumerate() {
                         let offset = Expr::bitvec_const(i as u128, POINTER_WIDTH);
                         let dst_addr = dst_ptr.clone().bvadd(offset);
-                        self.ctx.store_memory(dst_addr, byte);
+                        self.store_memory_byte_on_path(dst_addr, byte, "copy store");
                     }
                 } else {
                     self.ctx.unsupported_with_fallback(
@@ -945,7 +997,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         let dst_addr = dst_ptr.clone().bvadd(offset);
                         let dst_byte = self.ctx.load_memory(dst_addr.clone());
                         let value = Expr::ite(guard, src_byte, dst_byte);
-                        self.ctx.store_memory(dst_addr, value);
+                        self.store_memory_byte_on_path(dst_addr, value, "copy store");
                     }
                 } else {
                     self.ctx.unsupported_with_fallback(
@@ -958,42 +1010,57 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     }
 
     /// Try to evaluate an operand as a constant usize.
+    /// `try_eval_const_operand`, or the constant a local count operand folds to
+    /// on the current path.
+    ///
+    /// `ptr::swap` and copies made through a helper pass the count as a local
+    /// (`count = 1`), which sent the unroll down the symbolic-count route: 128
+    /// guarded byte stores, each reading both buffers. ay ran out of memory on
+    /// `if c { ptr::swap(p, q) }` over two boxes. Every store of the unroll is
+    /// guarded by the current path, so a count that is constant on that path
+    /// gives the same stores as the symbolic route.
+    pub(super) fn copy_count_const(&mut self, count: &Operand) -> Option<usize> {
+        if let Some(value) = self.try_eval_const_operand(count) {
+            return Some(value);
+        }
+        let (Operand::Copy(place) | Operand::Move(place)) = count else {
+            return None;
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let expr = self.codegen_place(place)?;
+        match self.fold_memory_reads_on_path(&expr).value() {
+            ExprValue::BitVecConst { value, .. } => usize::try_from(value).ok(),
+            _ => None,
+        }
+    }
+
     pub(super) fn try_eval_const_operand(&self, operand: &Operand) -> Option<usize> {
         match operand {
             Operand::Constant(const_op) => {
                 let mir_const = &const_op.const_;
                 let ty = mir_const.ty();
 
-                // Helper to extract value from allocation based on type
-                let extract_from_alloc =
-                    |alloc: &Allocation, ty: rustc_public::ty::Ty| -> Option<usize> {
-                        match ty.kind() {
-                            TyKind::RigidTy(RigidTy::Uint(_)) => {
-                                alloc.read_uint().into_option().and_then(|v| v.try_into().ok())
-                            }
-                            TyKind::RigidTy(RigidTy::Int(_)) => {
-                                // Also handle signed integers (for completeness)
-                                let v = alloc.read_int().into_option()?;
-                                if v >= 0 { usize::try_from(v).ok() } else { None }
-                            }
-                            _ => None, // external enum: TyKind
-                        }
-                    };
-
-                // Extract value from constant
-                match mir_const.kind() {
-                    ConstantKind::Allocated(alloc) => extract_from_alloc(alloc, ty),
-                    ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                        TyConstKind::Value(value_ty, alloc) => extract_from_alloc(alloc, *value_ty),
-                        _ => None, // external enum: TyConstKind
-                    },
-                    _ => None, // external enum: ConstantKind
+                use crate::codegen_ay::shared::const_pointer;
+                match ty.kind() {
+                    TyKind::RigidTy(RigidTy::Uint(_)) => {
+                        const_pointer::const_uint(mir_const).and_then(|v| v.try_into().ok())
+                    }
+                    TyKind::RigidTy(RigidTy::Int(_)) => {
+                        // Also handle signed integers (for completeness)
+                        let v = const_pointer::const_int(mir_const)?;
+                        if v >= 0 { usize::try_from(v).ok() } else { None }
+                    }
+                    _ => None, // external enum: TyKind
                 }
             }
             Operand::Copy(_) | Operand::Move(_) => {
                 // Copy/Move operands are not constants
                 None
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 }

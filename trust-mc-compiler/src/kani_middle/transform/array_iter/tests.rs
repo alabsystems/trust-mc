@@ -114,7 +114,9 @@ fn has_constant_indexed_array_read(body: &Body, array_place: &Place, expected_of
                 return false;
             };
             let place = match rvalue {
-                Rvalue::Use(Operand::Copy(place)) | Rvalue::Use(Operand::Move(place)) => place,
+                Rvalue::Use(Operand::Copy(place), ..) | Rvalue::Use(Operand::Move(place), ..) => {
+                    place
+                }
                 _ => return false,
             };
             place.local == array_place.local
@@ -199,5 +201,57 @@ fn test_transform_uses_constant_indexed_array_reads_for_noncopy_probe() {
                 && has_constant_indexed_array_read(&transformed, &array_place, 2),
             "transformed non-Copy array loop should read from the original array place via ConstantIndex projections"
         );
+    });
+}
+
+/// Under a declared unwind bound the loop is straight-lined only where it
+/// stays within the bound: the three-element loop passes its header four
+/// times, so `unwind(4)` keeps the chain of constant-indexed reads and
+/// `unwind(3)` keeps a loop (an indexed one, whose unwinding assertion the
+/// bounded unroll checks). Before, the chain was used under any bound and a
+/// harness whose `for x in array` exceeds its `#[kani::unwind]` verified clean
+/// where Kani fails (walker fail-closed review 6 round 2,
+/// `ai_for_n4_u4_assert_bug`).
+#[test]
+fn test_finite_unroll_respects_the_declared_unwind() {
+    with_test_tcx_for_source(ARRAY_ITER_NONCOPY_SOURCE, |tcx| {
+        let transformed_with = |declared_unwind: Option<u32>| {
+            let instance = find_instance_by_suffix(tcx, "probe_noncopy_array");
+            let body = instance.body().expect("probe_noncopy_array should have a body");
+            let array_place = find_array_for_loops(&body).pop().expect("an array loop").array_place;
+            let mut pass = ArrayIterUnrollPass::with_declared_unwind(declared_unwind);
+            let (changed, transformed) = pass.transform(tcx, body, instance);
+            assert!(changed, "the loop is transformed either way");
+            (transformed, array_place)
+        };
+        let chain = |(body, place): (Body, Place)| {
+            (0..3).all(|offset| has_constant_indexed_array_read(&body, &place, offset))
+        };
+        assert!(chain(transformed_with(None)), "no bound: the straight-line chain");
+        assert!(chain(transformed_with(Some(4))), "N = 3 < U = 4: the chain");
+        assert!(!chain(transformed_with(Some(3))), "N = 3 >= U = 3: the loop stays");
+    });
+}
+
+/// The array pass is re-keyed per harness like the string pass
+/// (`BodyTransformation::set_harness_declared_unwind`): the unit's smallest
+/// bound 3 keeps a 3-element loop, a harness declaring `unwind(4)` gets the
+/// chain, and the next `unwind(3)` harness keeps the loop again.
+#[test]
+fn test_finite_unroll_follows_the_harness_bound() {
+    with_test_tcx_for_source(ARRAY_ITER_NONCOPY_SOURCE, |tcx| {
+        let instance = find_instance_by_suffix(tcx, "probe_noncopy_array");
+        let mut pass = ArrayIterUnrollPass::with_declared_unwind(Some(3));
+        let mut chain = |pass: &mut ArrayIterUnrollPass| {
+            let body = instance.body().expect("probe_noncopy_array should have a body");
+            let place = find_array_for_loops(&body).pop().expect("an array loop").array_place;
+            let (_, transformed) = pass.transform(tcx, body, instance);
+            (0..3).all(|offset| has_constant_indexed_array_read(&transformed, &place, offset))
+        };
+        assert!(!chain(&mut pass), "the unit's bound 3: the loop stays");
+        pass.set_harness_declared_unwind(Some(4));
+        assert!(chain(&mut pass), "a harness with unwind(4): the chain");
+        pass.set_harness_declared_unwind(Some(3));
+        assert!(!chain(&mut pass), "the next harness with unwind(3): the loop stays");
     });
 }

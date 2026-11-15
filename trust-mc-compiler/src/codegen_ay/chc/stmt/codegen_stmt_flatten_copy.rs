@@ -68,10 +68,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             })
             .collect();
 
+        // A shared reference to a scalar in a VALUE-semantic payload slot
+        // (`Option<&u8>` is flattened as `(is_some, u8)`) stores the POINTEE's
+        // value, not the reference (codegen_stmt_value_ref_payload.rs).
+        let value_ref_enum = vec_idx_opt.and_then(|vi| self.value_semantic_ref_enum(local_idx, vi));
         if ctor_idx < layout.ctor_field_slot.len() {
             let ctor_slots = &layout.ctor_field_slot[ctor_idx];
             for (field_idx, operand) in operands.iter().enumerate() {
-                if let Some(expr) = self.translate_operand_with_modified(operand, acc.modified) {
+                let value_payload = match (value_ref_enum, vec_idx_opt) {
+                    (Some(value_ctor), Some(vi)) if value_ctor == ctor_idx && field_idx == 0 => {
+                        self.value_semantic_ref_payload(local_idx, operand, vi + 1, acc.modified)
+                    }
+                    _ => None,
+                };
+                if let Some(expr) = value_payload
+                    .or_else(|| self.translate_operand_with_modified(operand, acc.modified))
+                {
                     if field_idx < ctor_slots.len() {
                         let slot = ctor_slots[field_idx];
                         if slot == usize::MAX {
@@ -136,7 +148,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         field_count: usize,
     ) -> bool {
         // Pattern 4: Use(Copy/Move(src)) where src is also flattened → copy N fields
-        if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rhs {
+        if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rhs {
             let src_idx: usize = src.local;
             if src.projection.is_empty() && self.flatten.flattened_tuple_locals.contains(&src_idx) {
                 // Part of #3768: graceful fallback instead of panic
@@ -224,7 +236,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // decompose into leaf values matching the destination's flattened layout.
         // Part of #3048: Without this, `_6 = Copy(_5.0)` where _5 is a flattened
         // struct and _6 is a flattened newtype leaves _6 unconstrained (spurious CTREX).
-        if let Rvalue::Use(operand @ (Operand::Copy(_) | Operand::Move(_))) = rhs {
+        if let Rvalue::Use(operand @ (Operand::Copy(_) | Operand::Move(_)), ..) = rhs {
             if let Some(rhs_expr) = self.translate_operand_with_modified(operand, acc.modified) {
                 let mut leaf_values = Vec::with_capacity(field_count);
                 collect_leaf_exprs(&rhs_expr, &mut leaf_values);
@@ -351,12 +363,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// ghost vars, but `Bits(vec_local)` only constrains the flattened leaf fields.
     /// The wrapper local's auxiliary len/cap vars would otherwise remain
     /// unconstrained and later `Bits::width()`-style queries lose the source length.
+    ///
+    /// The wrapper's one length (capacity) var stands for one collection: an
+    /// aggregate with two collection operands equated it with both, which
+    /// made the path infeasible wherever their lengths differ (walker
+    /// fail-closed repair round 5, `two_collection_fields_dual.rs`). A kind
+    /// that two operands carry is not propagated
+    /// (`propagate_collection_presence_from_aggregate`).
     pub(in crate::codegen_ay::chc) fn propagate_collection_len_cap_from_flattened_aggregate(
         &mut self,
         dest_local: usize,
         operands: &[Operand],
         constraints: &mut Vec<Expr>,
     ) {
+        let carriers = self.aggregate_side_state_carriers(operands);
         for operand in operands {
             let src_local = match operand {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
@@ -365,7 +385,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 _ => continue,
             };
 
-            if let Some(src_var) = self.collections.len_state.get_len_var(src_local).cloned()
+            if carriers.len <= 1
+                && let Some(src_var) = self.collections.len_state.get_len_var(src_local).cloned()
                 && let Some(dst_var) = self.collections.len_state.get_len_var(dest_local).cloned()
             {
                 let sort = ptr_sort();
@@ -379,7 +400,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.mark_collection_len_modified(&dst_var);
             }
 
-            if let Some(src_var) = self.collections.len_state.get_cap_var(src_local).cloned()
+            if carriers.cap <= 1
+                && let Some(src_var) = self.collections.len_state.get_cap_var(src_local).cloned()
                 && let Some(dst_var) = self.collections.len_state.get_cap_var(dest_local).cloned()
             {
                 let sort = ptr_sort();
@@ -409,6 +431,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 /// Part of #2970, #3037: enables recursively flattened struct aggregate
 /// assignment where operands (e.g., `Point_mk(5, 6)`) need to be split into
 /// individual leaf values (`[5, 6]`) matching the leaf state var layout.
+/// Number of leaf slots `collect_leaf_exprs` produces for a value of `sort`: a
+/// single-constructor datatype contributes its fields' slots, anything else one.
+fn leaf_slot_count(sort: &ay_bindings::Sort) -> usize {
+    match sort.datatype_sort() {
+        Some(dt) if dt.constructors.len() == 1 => {
+            dt.constructors[0].fields.iter().map(|f| leaf_slot_count(&f.sort)).sum()
+        }
+        _ => 1,
+    }
+}
+
 pub(in crate::codegen_ay::chc) fn collect_leaf_exprs(expr: &Expr, out: &mut Vec<Option<Expr>>) {
     use ay_bindings::ExprValue;
 
@@ -426,9 +459,13 @@ pub(in crate::codegen_ay::chc) fn collect_leaf_exprs(expr: &Expr, out: &mut Vec<
         if dt.constructors.len() == 1 {
             let cons = &dt.constructors[0];
             for field in &cons.fields {
-                let field_expr =
-                    expr.clone().field_select(&dt.name, &field.name, field.sort.clone());
-                collect_leaf_exprs(&field_expr, out);
+                // ay refuses a selection it cannot authenticate (for a very large
+                // datatype its signature-check budget is exhausted). Keep the leaf
+                // slots aligned with `None`: callers leave a `None` slot unconstrained.
+                match expr.clone().try_field_select(&dt.name, &field.name, field.sort.clone()) {
+                    Ok(field_expr) => collect_leaf_exprs(&field_expr, out),
+                    Err(_) => out.extend(std::iter::repeat_n(None, leaf_slot_count(&field.sort))),
+                }
             }
             return;
         }

@@ -66,6 +66,7 @@ pub enum UnsoundnessCategory {
     StaticInitIncomplete,
     AggregateEncodingGap,
     StubApproximation,
+    UnstubbedAbstraction,
 }
 
 /// Classification of an unsoundness category (#3715).
@@ -134,7 +135,15 @@ impl UnsoundnessCategory {
             | PtrMetadataUnconstrained
             | StaticInitIncomplete
             | AggregateEncodingGap
-            | StubApproximation => SoundApproximation,
+            | StubApproximation
+            // An abstracted stdlib function with no stub and no handler:
+            // reachability drops the body and the call's result is a fresh
+            // unconstrained symbolic. Sound for the aggregate verdict in the
+            // direction that matters here -- it can invent a counterexample the
+            // real program cannot produce -- so a counterexample raised over one
+            // is an OverApproximation, never `Genuine`. See
+            // `Boundary::abstracts` (kani_middle/reachability.rs).
+            | UnstubbedAbstraction => SoundApproximation,
         }
     }
 
@@ -177,6 +186,7 @@ impl UnsoundnessCategory {
             AggregateEncodingGap => "aggregate_encoding_gap",
             StubApproximation => "stub_approximation",
             RoundingAssertionBypass => "rounding_assertion_bypass",
+            UnstubbedAbstraction => "unstubbed_abstraction",
         }
     }
 }
@@ -481,6 +491,15 @@ pub struct InferablePredicateInfo {
 pub struct AssertUntranslatableInfo {
     /// Number of untranslatable assertion operands.
     pub count: usize,
+    /// Per-harness counts. Without them the driver charged the whole CRATE's
+    /// count to every harness in it, so ONE harness's untranslatable assert
+    /// demoted every other harness's counterexample in the same file — which is
+    /// what hid the CHC slice-footprint false certificate in
+    /// negative/modifies_frame_slice_params.rs (`assert_untranslatable=10` on
+    /// all ten harnesses) while negative/modifies_frame_interior_raw.rs showed
+    /// the same accusation as Genuine.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_harness: BTreeMap<String, usize>,
 }
 
 impl AssertUntranslatableInfo {
@@ -615,6 +634,36 @@ pub struct AbstractedFallbackInfo {
 impl AbstractedFallbackInfo {
     /// Returns true if any abstracted fallbacks were used.
     pub fn has_fallbacks(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// Unstubbed abstraction information (D1, 2026-09-14).
+///
+/// Non-zero count indicates reachability ABSTRACTED a stdlib function away
+/// (the standard-library abstraction set, `kani_middle/std_abstraction.rs`)
+/// with neither an explicit stub nor a CHC handler, so its body was never
+/// collected and its result is a fresh unconstrained symbolic ("result will be
+/// unconstrained", the warning `Boundary::abstracts` prints).
+///
+/// Counted as a SoundApproximation: the aggregate verdict stays fail-closed,
+/// but a COUNTEREXAMPLE raised over such a call may be one the real program
+/// cannot produce, so `classify_ctrex` must not certify it `Genuine`. That is
+/// the whole reason this counter exists — before it, the abstraction was only
+/// a compile-time warning and a harness whose counterexample came entirely
+/// from one certified clean.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnstubbedAbstractionInfo {
+    /// Total count of unstubbed-abstraction encounters.
+    pub count: usize,
+    /// Per-harness attribution, keyed as every other per-harness map is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_harness: BTreeMap<String, usize>,
+}
+
+impl UnstubbedAbstractionInfo {
+    /// Returns true if any unstubbed abstraction was encountered.
+    pub fn has_abstractions(&self) -> bool {
         !self.is_empty()
     }
 }
@@ -871,6 +920,7 @@ impl_diagnostic_counters_from_field!(
     IntoOptionDropInfo => count,
     InternalWorkaroundInfo => count,
     AbstractedFallbackInfo => count,
+    UnstubbedAbstractionInfo => count,
     VecFieldFallbackInfo => count,
     PointeeSynthesisFallbackInfo => count,
     UnsupportedConstructFallbackInfo => count,
@@ -987,6 +1037,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1041,6 +1092,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1146,6 +1198,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1196,6 +1249,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1283,6 +1337,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1366,6 +1421,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1439,6 +1495,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1528,6 +1585,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1598,6 +1656,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1667,6 +1726,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1698,10 +1758,10 @@ mod tests {
 
     #[test]
     fn test_assert_untranslatable_info_has_untranslatable() {
-        let zero = AssertUntranslatableInfo { count: 0 };
+        let zero = AssertUntranslatableInfo { count: 0, ..Default::default() };
         assert!(!zero.has_untranslatable());
 
-        let with_count = AssertUntranslatableInfo { count: 2 };
+        let with_count = AssertUntranslatableInfo { count: 2, ..Default::default() };
         assert!(with_count.has_untranslatable());
     }
 
@@ -1759,6 +1819,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -1808,7 +1869,7 @@ mod tests {
             constant_zero_fallbacks: None,
             unhandled_calls: None,
             diverging_call_drops: None,
-            assert_untranslatable: Some(AssertUntranslatableInfo { count: 7 }),
+            assert_untranslatable: Some(AssertUntranslatableInfo { count: 7, ..Default::default() }),
             heap_check_untranslatable: Some(HeapCheckUntranslatableInfo { count: 8 }),
             heap_check_unknown_layout: Some(HeapCheckUnknownLayoutInfo { count: 9 }),
             type_sort_fallbacks: None,
@@ -1816,6 +1877,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,

@@ -16,6 +16,7 @@ use crate::verification_result::{FailedProperties, ProofCrosscheck, Verification
 
 use super::ChcSolverResult;
 use super::model_eval::constraints_are_constant_refuted;
+use super::row_export::RowExport;
 use super::smt_analysis::smt_has_recursive_unwind_assertion;
 use super::verdict_policy::{ChcOutcomeKind, apply_recursion_unwind_verdict};
 
@@ -186,6 +187,16 @@ pub(super) fn satisfiable_acyclic_error_derivation_witness(
     problem: &ChcProblem,
     deadline: crate::deadline::Deadline,
 ) -> Option<AcyclicErrorWitness> {
+    satisfiable_acyclic_error_derivation_witness_exported(problem, deadline, None)
+}
+
+/// [`satisfiable_acyclic_error_derivation_witness`], recording every query it
+/// puts to AY in `export` (`TRUST_MC_CHC_ROW_EXPORT_DIR`) when one is given.
+pub(super) fn satisfiable_acyclic_error_derivation_witness_exported(
+    problem: &ChcProblem,
+    deadline: crate::deadline::Deadline,
+    export: Option<&RowExport>,
+) -> Option<AcyclicErrorWitness> {
     const MAX_FACTS_PER_PREDICATE: usize = 128;
     const MAX_COMBINATIONS_PER_CLAUSE: usize = 1024;
 
@@ -195,7 +206,7 @@ pub(super) fn satisfiable_acyclic_error_derivation_witness(
     for _ in 0..=problem.predicates().len().saturating_add(problem.clauses().len()) {
         let mut changed = false;
 
-        for clause in problem.clauses() {
+        for (clause_index, clause) in problem.clauses().iter().enumerate() {
             let Some(body_fact_options) = body_fact_options(clause, &facts) else {
                 continue;
             };
@@ -203,9 +214,13 @@ pub(super) fn satisfiable_acyclic_error_derivation_witness(
             let mut checked = 0usize;
             for combo in FactCombinationIter::new(body_fact_options) {
                 if deadline.remaining().is_zero() {
+                    // `deadline` is the SLICE the caller carved for this
+                    // shortcut (native.rs: min(remaining / 5, 3s)), not the
+                    // harness deadline — say so, or a log reads as if the
+                    // harness were out of time before its first solve.
                     solver_stdout!(
-                        "[AY-chc] acyclic-witness search aborted: per-harness deadline \
-                         exhausted (no witness claimed)"
+                        "[AY-chc] acyclic-witness search aborted: its slice of the per-harness \
+                         deadline is spent (no witness claimed; the decision lanes keep the rest)"
                     );
                     return None;
                 }
@@ -226,7 +241,18 @@ pub(super) fn satisfiable_acyclic_error_derivation_witness(
                     constraints.push(constraint.clone());
                 }
 
-                if !constraints_are_sat(&mut smt, &constraints) {
+                let sat = match export {
+                    None => constraints_are_sat(&mut smt, &constraints),
+                    Some(export) => {
+                        let formula = ChcExpr::and_all(constraints.iter().cloned());
+                        let seq = export.witness_query(clause_index, "is-sat", &formula, problem);
+                        smt.reset();
+                        let result = smt.check_sat(&formula);
+                        export.witness_result(seq, smt_result_label(&result));
+                        matches!(result, SmtResult::Sat(_))
+                    }
+                };
+                if !sat {
                     continue;
                 }
 
@@ -315,6 +341,15 @@ fn body_fact_options(
         options.push(pred_facts.clone());
     }
     Some(options)
+}
+
+fn smt_result_label(result: &SmtResult) -> &'static str {
+    match result {
+        SmtResult::Sat(_) => "sat",
+        SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => "unsat",
+        SmtResult::Unknown => "unknown",
+        _ => "other",
+    }
 }
 
 fn constraints_are_sat(smt: &mut ay::chc::SmtContext, constraints: &[ChcExpr]) -> bool {
@@ -480,8 +515,10 @@ impl KaniSession {
             // of the reachable per-property check(s), not a hard-coded
             // PanicsOnly. A reachable memory_safety / pointer-deref / UB
             // `error_p` ⇒ Other (→ FAILED under #[should_panic]); a reachable
-            // assertion/panic `error_p` — or a direct `error` head with no
-            // per-property relation at all (a panic call) — ⇒ PanicsOnly.
+            // assertion/panic `error_p` ⇒ PanicsOnly. A direct `error` head with no
+            // per-property relation is the anonymous `chc.0` check: ⇒ PanicsOnly, as in
+            // `interpret_chc_unsafe`, and `harness_runner`'s V7 gate keeps it from ever
+            // standing as a `should_panic` harness's expected panic.
             let reachable = forward_reachable_relation_names(problem);
             let failed_class =
                 match super::property_report::chc_failure_properties(smt_file, harness, &reachable)
@@ -517,6 +554,7 @@ impl KaniSession {
         );
 
         Ok(ChcSolverResult {
+            solver_unknown_reason: None,
             status,
             failed_properties: failed_props,
             properties,
@@ -524,6 +562,13 @@ impl KaniSession {
             proof_qualifiers: Vec::new(),
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
+            // Both callers hold an EXACT derivation of `error` (the
+            // constraint-free zero-arity closure, or an SMT-model-backed
+            // acyclic witness), which is why this function prints
+            // "(exact CHC derivation)". Saying so in the result is what stops
+            // `harness_runner` reading a non-panic failure class off the
+            // legacy aggregate `chc.0` property as "solver undecided".
+            exact_counterexample: true,
         })
     }
 }

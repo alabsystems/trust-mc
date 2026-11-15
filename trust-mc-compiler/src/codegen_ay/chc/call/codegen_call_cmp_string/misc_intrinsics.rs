@@ -94,6 +94,15 @@ pub(in crate::codegen_ay::chc) enum MiscIntrinsicKind {
     /// that break `<dyn Error>::is::<T>()` and similar dynamic type checks.
     /// Part of #4273.
     TypeIdOf,
+    /// A compiler intrinsic upstream Kani has no codegen arm for, so it lowers
+    /// to `Intrinsic::Unimplemented`: `unaligned_volatile_store` and
+    /// `volatile_set_memory`. Kani FAILS a harness that reaches one with
+    /// "`<name>` is not currently supported by Kani"
+    /// (`kani/VolatileIntrinsics/core_intrinsics.rs` is `kani-verify-fail`).
+    /// Modelling the store exactly would PROVE that harness, a verdict Kani
+    /// does not give; the call is emitted as Kani's own check instead, which
+    /// never certifies Genuine.
+    KaniUnimplemented(&'static str),
 }
 
 /// Detect miscellaneous intrinsic from callee path.
@@ -192,6 +201,12 @@ pub(in crate::codegen_ay::chc) fn detect_misc_intrinsic(path: &str) -> Option<Mi
             Some(MiscIntrinsicKind::TypeIdOf)
         }
         "type_id" if path.contains("intrinsics") => Some(MiscIntrinsicKind::TypeIdOf),
+        "unaligned_volatile_store" if is_compiler_intrinsic => {
+            Some(MiscIntrinsicKind::KaniUnimplemented("unaligned_volatile_store"))
+        }
+        "volatile_set_memory" if is_compiler_intrinsic => {
+            Some(MiscIntrinsicKind::KaniUnimplemented("volatile_set_memory"))
+        }
         _ => None,
     }
 }
@@ -226,12 +241,14 @@ pub(in crate::codegen_ay::chc) fn codegen_misc_intrinsic(
                 "codegen_misc_intrinsic::PtrOffsetFromUnsigned",
             )
         }
+        // `check_language_ub()` / `check_library_ub()` / `ub_checks()`: false, as
+        // Kani (see `rustc_compat::runtime_checks_value`).
         MiscIntrinsicKind::UbChecksEnabled => {
             misc_intrinsics_pointer::codegen_bool_const_intrinsic(
                 ctx,
                 dcx,
                 target,
-                true,
+                false,
                 "codegen_misc_intrinsic::UbChecksEnabled",
             )
         }
@@ -280,6 +297,18 @@ pub(in crate::codegen_ay::chc) fn codegen_misc_intrinsic(
         }
         // Part of #4273: TypeId::of::<T>() — deterministic bv128 constant.
         MiscIntrinsicKind::TypeIdOf => codegen_type_id_of(ctx, dcx, target),
+        // Kani lowers these to `Intrinsic::Unimplemented`: reproduce its failing
+        // check, gated on reaching the call, with no successor edge.
+        MiscIntrinsicKind::KaniUnimplemented(name) => {
+            let _ = target;
+            super::super::codegen_call_coerce::emit_kani_unsupported_check(
+                ctx,
+                dcx.from_app,
+                dcx.stmt_constraints,
+                dcx.bb_idx,
+                super::super::codegen_call_coerce::kani_unsupported_message(name),
+            );
+        }
         // Compile-time type-validity assertions: fire a block-reachability-gated
         // error rule when rustc proves the type is invalid for the requirement,
         // then continue as a no-op transition.
@@ -856,6 +885,31 @@ mod tests {
             detect_misc_intrinsic("my_crate::intrinsics::assert_zero_valid::<&u8>").is_none(),
             "a user-defined lookalike must not be treated as a compiler intrinsic"
         );
+    }
+
+    #[test]
+    fn test_detect_kani_unimplemented_volatile_intrinsics() {
+        assert!(matches!(
+            detect_misc_intrinsic("std::intrinsics::unaligned_volatile_store::<u8>"),
+            Some(MiscIntrinsicKind::KaniUnimplemented("unaligned_volatile_store"))
+        ));
+        assert!(matches!(
+            detect_misc_intrinsic("core::intrinsics::volatile_set_memory::<u8>"),
+            Some(MiscIntrinsicKind::KaniUnimplemented("volatile_set_memory"))
+        ));
+        assert!(
+            detect_misc_intrinsic("my_crate::volatile::volatile_set_memory::<u8>").is_none(),
+            "a user-defined lookalike must not be treated as a Kani-unimplemented intrinsic"
+        );
+        // The intrinsics Kani DOES implement keep their exact models.
+        assert!(matches!(
+            detect_misc_intrinsic("std::intrinsics::volatile_store::<u8>"),
+            Some(MiscIntrinsicKind::VolatileStore)
+        ));
+        assert!(matches!(
+            detect_misc_intrinsic("std::intrinsics::volatile_load::<u8>"),
+            Some(MiscIntrinsicKind::VolatileLoad)
+        ));
     }
 
     #[test]

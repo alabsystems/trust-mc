@@ -8,6 +8,9 @@
 //! Contains: reconstruct_option_like_enum, reconstruct_result_like_enum,
 //! reconstruct_nested_datatype_from_slots.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -23,10 +26,53 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Self::sort_default_expr(sort)
     }
 
+    /// The variant index `fld0 == true` names in a flattened 2-variant enum
+    /// local whose tag is a Bool, by the convention of the flattening that
+    /// declared it: an `EnumBvLayout` writes `variant == 1`
+    /// (`try_encode_bv_flattened_enum`, the layout discriminant read), a
+    /// `flattened_enum_discr` entry names its true variant (`Option` (1, 0),
+    /// `Result` (0, 1)), and any other flattened local follows
+    /// `infer_flattened_discr`'s structural rule (the payload variant of an
+    /// Option-like ADT, else variant 0). `None` when the local's type is not
+    /// a 2-variant ADT and it has neither entry.
+    pub(in crate::codegen_ay::chc) fn flattened_bool_tag_true_variant(
+        &self,
+        local_idx: usize,
+    ) -> Option<usize> {
+        if self.flatten.enum_bv_layouts.get(&local_idx).is_some_and(|l| l.num_constructors == 2) {
+            return Some(1);
+        }
+        if let Some(&(true_variant, _)) = self.flatten.flattened_enum_discr.get(&local_idx) {
+            return usize::try_from(true_variant).ok();
+        }
+        let ty = self.body.locals().get(local_idx)?.ty;
+        let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _)) = ty.kind()
+        else {
+            return None;
+        };
+        let variants = def.variants();
+        if variants.len() != 2 {
+            return None;
+        }
+        let swap = variants[0].fields().is_empty() && !variants[1].fields().is_empty();
+        Some(usize::from(swap))
+    }
+
     /// Reconstruct a flattened Option/Result-like enum (2 constructors) as an ITE.
     ///
     /// Flattened Option<T>: fld0 = Bool (is_some), fld1.. = payload leaf slots.
     /// Produces: `ITE(fld0, Some_ctor(payload), None_ctor())`.
+    ///
+    /// Which variant `fld0 == true` names is the local's flattening's own
+    /// convention ([`Self::flattened_bool_tag_true_variant`]); an Option-like
+    /// sort lists its constructors in variant order
+    /// (`option_like_constructors`). For a payload-first enum (`Poll`,
+    /// `enum Rev { Has(Box<u16>), Empty }`) flattened by its `EnumBvLayout`,
+    /// `fld0` is "variant 1", the EMPTY variant: reading it as is_some turned
+    /// a flattened `Poll::Ready` into `Pending` whenever the local was read
+    /// whole (stored into a `Vec`, a tuple, a struct field), on main too
+    /// (review of fix/chc-lost-writes, lostwrite track round 2, findings 1
+    /// and 5).
     ///
     /// Part of #2876: recover test_option_array_simple where `[Some(4u8); 2]`
     /// requires bare-reading a flattened Option<u8> local for `Rvalue::Repeat`.
@@ -95,12 +141,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Some(payload_expr)
         };
 
+        // Does `fld0 == true` name the payload variant (see above)?
+        let some_position = usize::from(std::ptr::eq(some_ctor, &dt.constructors[1]));
+        let tag_is_some =
+            self.flattened_bool_tag_true_variant(local_idx).unwrap_or(1) == some_position;
+
         // Part of #3507: When the discriminant is a concrete boolean constant,
-        // return the active branch constructor directly. For None (false), skip
-        // reading fld1 (payload may be unconstrained). For Some (true), skip
+        // return the active branch constructor directly. For None, skip
+        // reading fld1 (payload may be unconstrained). For Some, skip
         // the ITE wrapper. Same rationale as the Result-like optimization.
         if let ExprValue::BoolConst(discr_val) = discr_expr.value() {
-            if *discr_val {
+            if *discr_val == tag_is_some {
                 // Some variant — need the payload.
                 let payload_expr = reconstruct_payload()?;
                 if *payload_expr.sort() != *payload_sort {
@@ -156,9 +207,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         debug!(
             local_idx,
-            dt_name, "translate_place: reconstructed flattened Option-like enum as ITE"
+            dt_name, tag_is_some, "translate_place: reconstructed flattened Option-like enum as ITE"
         );
-        Some(Expr::ite(discr_expr, some_expr, none_expr))
+        Some(if tag_is_some {
+            Expr::ite(discr_expr, some_expr, none_expr)
+        } else {
+            Expr::ite(discr_expr, none_expr, some_expr)
+        })
     }
 
     /// Reconstruct a flattened Result-like enum as an ITE expression.
@@ -380,6 +435,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         }
 
+        // The layout omitted exactly the fields whose Rust type is zero-sized
+        // (`unit_aware_multi_ctor_enum_layout`), so an omitted field's value is
+        // the type's one value. A Datatype or Array sort has no scalar default,
+        // and reading it from the field's TYPE is what lets `enum Foo { A(i32),
+        // B([i32; 0]) }` rebuild as a Datatype: declining here sent the read to
+        // the raw tag|payload concat, whose unflatten could not rebuild B
+        // (`expected/niche2/main.rs`).
+        let variant_field_tys: Option<Vec<Vec<rustc_public::ty::Ty>>> =
+            self.body.locals().get(local_idx).and_then(|decl| match decl.ty.kind() {
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, args)) => def
+                    .variants()
+                    .iter()
+                    .map(|v| {
+                        v.fields()
+                            .iter()
+                            .map(|f| mono_ty::field_ty(f, &args))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .collect::<Option<Vec<_>>>(),
+                _ => None,
+            });
         let mut ctor_exprs = Vec::with_capacity(layout.num_constructors);
         for (ctor_idx, ctor) in dt.constructors.iter().enumerate() {
             let mut ctor_args = Vec::with_capacity(ctor.fields.len());
@@ -393,7 +469,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     )?;
                     ctor_args.push(field_expr);
                 } else {
-                    ctor_args.push(Self::omitted_flattened_enum_field_expr(&field.sort)?);
+                    let omitted =
+                        Self::omitted_flattened_enum_field_expr(&field.sort).or_else(|| {
+                            let field_ty =
+                                *variant_field_tys.as_ref()?.get(ctor_idx)?.get(field_idx)?;
+                            Self::omitted_zst_datatype_expr(field_ty, &field.sort)
+                        })?;
+                    ctor_args.push(omitted);
                 }
             }
             ctor_exprs.push(Expr::datatype_constructor(

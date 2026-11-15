@@ -61,7 +61,18 @@ fn test_vec_push_store_sort_invariants() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_vec_push_sort");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_vec_push_sort", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the pushed Vec is never read, so
+        // write-only array elimination (85da41dad) removes every Store these sort checks inspect.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_vec_push_sort",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_vec_push_sort", body.blocks.len());
 
@@ -279,7 +290,18 @@ fn test_hashmap_insert_store_array_sort_structure() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_hashmap_insert_sort");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_hashmap_insert_sort", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the map is never read, so
+        // write-only array elimination (85da41dad) removes the insert Store and its Array columns.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_hashmap_insert_sort",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_hashmap_insert_sort", body.blocks.len());
 
@@ -657,7 +679,19 @@ fn test_array_index_select_bv_sorted_index() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_array_select");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_array_select", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the read result is never used
+        // after return, so dead-scalar pruning (6b811318f) and orphan pruning remove the Select and
+        // array column.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_array_select",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_array_select", body.blocks.len());
 

@@ -53,9 +53,14 @@ fn test_const_ref_discriminant_ordering_pipeline() {
         let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, "compare_to_ten", ChcConfig::default());
         chc_ctx.declare_block_relations();
 
-        assert_mir_pattern_found(
-            !chc_ctx.ref_resolution.const_ref_discriminants.is_empty(),
-            "const-ref discriminant local in compare_to_ten MIR",
+        // `ord_ref` is assigned GREATER_REF, EQUAL_REF and LESS_REF on three paths.
+        // f1f2079d1 clears path-insensitive const-ref metadata for a local with several
+        // producers: keeping any one entry would decode `*ord_ref` wrongly on the other
+        // paths. So no discriminant may be recorded for it.
+        assert!(
+            chc_ctx.ref_resolution.const_ref_discriminants.is_empty(),
+            "multi-producer const-ref local must not keep a path-insensitive discriminant: {:?}",
+            chc_ctx.ref_resolution.const_ref_discriminants
         );
 
         // Pipeline exercises collect_const_ref_discriminants and should produce valid state.

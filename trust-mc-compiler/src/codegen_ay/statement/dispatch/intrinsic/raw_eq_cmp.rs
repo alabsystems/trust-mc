@@ -24,7 +24,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // raw_eq intrinsic - byte-wise equality comparison (#408)
         if fn_name.contains("raw_eq") {
             debug!("AY codegen: handling raw_eq intrinsic");
-            return self.codegen_raw_eq(args, destination, target);
+            let next = self.codegen_raw_eq(args, destination, target);
+            if next.is_some() {
+                self.bmc_compare_unwinding_check(fn_name, args);
+            }
+            return next;
         }
         // Ord::cmp / Ord::{min,max,clamp}
         if fn_name.contains("cmp::Ord") {
@@ -51,12 +55,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // PartialEq::eq
         if fn_name.contains("PartialEq") && method == Some("eq") {
             debug!("AY codegen: handling PartialEq::eq method");
-            return self.codegen_partial_eq(args, destination, target);
+            let next = self.codegen_partial_eq(args, destination, target);
+            if next.is_some() {
+                self.bmc_compare_unwinding_check(fn_name, args);
+            }
+            return next;
         }
         // PartialEq::ne
         if fn_name.contains("PartialEq") && method == Some("ne") {
             debug!("AY codegen: handling PartialEq::ne method");
-            return self.codegen_partial_ne(args, destination, target);
+            let next = self.codegen_partial_ne(args, destination, target);
+            if next.is_some() {
+                self.bmc_compare_unwinding_check(fn_name, args);
+            }
+            return next;
         }
         // SpecArrayEq::spec_eq for ZST arrays (#408)
         if fn_name.contains("SpecArrayEq") && method == Some("spec_eq") {
@@ -78,6 +90,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 if let (Some(a), Some(b)) =
                     (self.codegen_operand(&args[0]), self.codegen_operand(&args[1]))
                 {
+                    self.guard_box_pointer_comparison(
+                        rustc_public::mir::BinOp::Eq,
+                        &args[0],
+                        &a,
+                        &b,
+                    );
                     let one = Expr::bitvec_const(1u128, 8);
                     let zero = Expr::bitvec_const(0u128, 8);
                     let result = Expr::ite(a.eq(b), one, zero);

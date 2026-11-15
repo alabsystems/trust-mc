@@ -9,7 +9,138 @@
 
 use super::common::*;
 use crate::codegen_ay::emit_chc;
-use ay_bindings::{Expr, Sort};
+use ay_bindings::{Expr, ExprValue, Sort};
+
+const KANI_MEM_STORAGE_SOURCE: &str = r#"
+    mod kani {
+        pub mod mem {
+            #[inline(never)]
+            pub fn can_dereference<T>(_ptr: *const T) -> bool { true }
+        }
+    }
+    pub fn nonzero_storage() {
+        let value = [1u8, 2];
+        let ptr = &value as *const [u8; 2];
+        let _ = kani::mem::can_dereference(ptr);
+    }
+    pub fn zero_storage() {
+        let value = [0u8; 0];
+        let ptr = &value as *const [u8; 0];
+        let _ = kani::mem::can_dereference(ptr);
+    }
+"#;
+
+#[test]
+fn test_kani_mem_storage_lifetime_live_dead_and_unknown() {
+    with_test_ay_ctx_for_source(KANI_MEM_STORAGE_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "nonzero_storage");
+        let body = instance.body().expect("nonzero storage body");
+        for (mode, expected, expected_overapprox) in
+            [("live", true, false), ("dead", false, false), ("unknown", true, true)]
+        {
+            let mut chc = ChcCtx::new(
+                ctx.tcx,
+                &body,
+                "nonzero_storage",
+                ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+            );
+            let (bb, _func, args) = body
+                .blocks
+                .iter()
+                .enumerate()
+                .find_map(|(bb, block)| {
+                    let rustc_public::mir::TerminatorKind::Call { func, args, .. } =
+                        &block.terminator.kind
+                    else {
+                        return None;
+                    };
+                    matches!(chc.detect_stub(func), Some(StubKind::KaniMemCanDereference))
+                        .then(|| (bb, func.clone(), args.clone()))
+                })
+                .expect("can_dereference call");
+            let Operand::Copy(ptr) = &args[0] else {
+                panic!("pointer local");
+            };
+            let owner = body
+                .locals()
+                .iter()
+                .position(|local| matches!(local.ty.kind(), TyKind::RigidTy(RigidTy::Array(..))))
+                .expect("array storage");
+            let obj_id = 17;
+            chc.heap_state.insert_local_address(owner, obj_id, "__storage".to_string());
+            chc.known_alloc_ids.insert(ptr.local, obj_id);
+            chc.current_encode_bb = bb;
+            chc.liveness.dead_locals.remove(&owner);
+            if mode == "dead" {
+                chc.liveness.dead_locals.insert(owner);
+            }
+            if mode == "unknown" {
+                chc.current_encode_bb = usize::MAX;
+            }
+            // Exercise the access predicate directly: this fixture supplies a
+            // concrete address, not an uninitialized operand-translation state.
+            let address =
+                Expr::bitvec_const(obj_id as u64, 32).concat(Expr::bitvec_const(0u64, 32));
+            let (result, overapprox) =
+                chc.compute_kani_mem_access_predicate(address, body.locals()[owner].ty, true);
+            assert_eq!(overapprox, expected_overapprox, "{mode}: {result:?}");
+            let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&result)
+                .expect("fixture access predicate must be a constant");
+            assert!(
+                matches!(folded.value(), ExprValue::BoolConst(value) if *value == expected),
+                "{mode}: {result:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_kani_mem_storage_lifetime_zero_sized_pointee_stays_valid() {
+    with_test_ay_ctx_for_source(KANI_MEM_STORAGE_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "zero_storage");
+        let body = instance.body().expect("zero storage body");
+        let mut chc = ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "zero_storage",
+            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+        );
+        let (bb, _func, args) = body
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(bb, block)| {
+                let rustc_public::mir::TerminatorKind::Call { func, args, .. } =
+                    &block.terminator.kind
+                else {
+                    return None;
+                };
+                matches!(chc.detect_stub(func), Some(StubKind::KaniMemCanDereference))
+                    .then(|| (bb, func.clone(), args.clone()))
+            })
+            .expect("can_dereference call");
+        let Operand::Copy(ptr) = &args[0] else {
+            panic!("pointer local");
+        };
+        let owner = body
+            .locals()
+            .iter()
+            .position(|local| matches!(local.ty.kind(), TyKind::RigidTy(RigidTy::Array(..))))
+            .expect("zero-sized array storage");
+        let obj_id = 17;
+        chc.heap_state.insert_local_address(owner, obj_id, "__zst_storage".to_string());
+        chc.known_alloc_ids.insert(ptr.local, obj_id);
+        chc.current_encode_bb = bb;
+        chc.liveness.dead_locals.insert(owner);
+        let address = Expr::bitvec_const(obj_id as u64, 32).concat(Expr::bitvec_const(0u64, 32));
+        let (result, overapprox) =
+            chc.compute_kani_mem_access_predicate(address, body.locals()[owner].ty, true);
+        assert!(!overapprox, "{result:?}");
+        let folded = trust_mc_core::chc_const_prop::eval::try_eval_to_const(&result)
+            .expect("zero-sized fixture access must be constant");
+        assert!(matches!(folded.value(), ExprValue::BoolConst(true)), "{result:?}");
+    });
+}
 
 fn mir_to_chc_mem(
     tcx: TyCtxt<'_>,

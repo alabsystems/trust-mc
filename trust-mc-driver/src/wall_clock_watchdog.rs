@@ -32,7 +32,7 @@
 //!
 //! ## Arming
 //!
-//! The watchdog is armed in two stages:
+//! The watchdog is armed in three stages:
 //!
 //! 1. [`install_from_argv`] very early in `main()`, parsing
 //!    `--harness-timeout` from raw argv (before clap or any TOML merge —
@@ -42,6 +42,14 @@
 //!    `add_default_bounds`). This catches `--harness-timeout` values that
 //!    come from `Cargo.toml` config or autoharness defaults — those never
 //!    appear in argv and previously left the watchdog unarmed.
+//! 3. [`rearm_after_codegen`] once the project is built and the harness
+//!    count is known, restarting the clock so compilation does not eat the
+//!    solve budget: until then a slow compile left the harnesses whatever
+//!    was left of a budget sized for solving alone, and the watchdog fired
+//!    mid-solve on files that would have finished. The restart is capped
+//!    (see [`DEFAULT_COMPILE_ALLOWANCE_SECS`]) so the process still ends
+//!    before the outer runners' SIGKILL. The phase also selects the fire
+//!    marker: `CompileTimeout` before this call, `DriverTimeout` after.
 //!
 //! Budget formula:
 //!   driver_wall_clock = harness_timeout * 5 + grace
@@ -69,12 +77,13 @@
 //! undercount (macro-generated harnesses, cargo units).
 //!
 //! Tunable via env vars:
-//!   TRUST_MC_DRIVER_WATCHDOG_MULT     (default: 5)
-//!   TRUST_MC_DRIVER_WATCHDOG_GRACE_S  (default: 5)
-//!   TRUST_MC_DRIVER_WATCHDOG_DISABLE  (any non-empty value disables)
+//!   TRUST_MC_DRIVER_WATCHDOG_MULT                (default: 5)
+//!   TRUST_MC_DRIVER_WATCHDOG_GRACE_S             (default: 5)
+//!   TRUST_MC_DRIVER_WATCHDOG_COMPILE_ALLOWANCE_S (default: 20)
+//!   TRUST_MC_DRIVER_WATCHDOG_DISABLE             (any non-empty value disables)
 
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,6 +97,25 @@ const DEFAULT_MULT: u64 = 5;
 
 /// Default grace period in seconds (fire before shell-level SIGKILL).
 const DEFAULT_GRACE_SECS: u64 = 5;
+
+/// How much wall clock the post-codegen restart ([`rearm_after_codegen`])
+/// may add on top of the budget armed at session start, in seconds.
+///
+/// The restart gives the solve phase its full budget only while compilation
+/// stayed inside this allowance; a longer compile still eats the difference,
+/// because the process as a whole must keep ending before the outer runners
+/// kill it. `tools/kani-domination` allows `harness_timeout * 5 + 30s`
+/// against this watchdog's `* 5 + 5s`, so 20s keeps a 5s margin under it;
+/// a runner with a tighter cap must lower
+/// `TRUST_MC_DRIVER_WATCHDOG_COMPILE_ALLOWANCE_S` to match.
+const DEFAULT_COMPILE_ALLOWANCE_SECS: u64 = 20;
+
+/// What the watchdog is guarding, for the fire marker: before
+/// [`rearm_after_codegen`] a fire means compilation never finished
+/// (`CompileTimeout`); after it, a harness overran (`DriverTimeout`).
+const PHASE_COMPILE: u8 = 0;
+const PHASE_SOLVE: u8 = 1;
+static PHASE: AtomicU8 = AtomicU8::new(PHASE_COMPILE);
 
 /// Exit code for verification failure (matches `result_summary::print_final_summary`).
 const EXIT_VERIFICATION_FAIL: i32 = 1;
@@ -244,6 +272,172 @@ pub(crate) fn extend_for_extra_harnesses(per_harness: Option<Duration>, harness_
     );
 }
 
+/// Restart the budget clock once codegen is complete, so the solve phase
+/// gets the budget [`budget_for`] describes instead of what compilation
+/// left of it, and record that the process is now solving.
+///
+/// Two steps. First the authoritative `harness_count` is credited exactly as
+/// [`extend_for_extra_harnesses`] credits it (idempotent against the
+/// pre-codegen scan credit: only not-yet-credited extras extend the
+/// deadline, and a scan overcount is never taken back), so a multi-harness
+/// file keeps the per-extra-harness budget the outer runners also grant.
+/// Then the clock restarts: the new deadline is `now + budget_for(per_harness)
+/// + per_harness * (harness_count - 1)` — the shape a fresh session arm plus
+/// the credit would produce — capped at that credited deadline plus the
+/// compile allowance (see [`DEFAULT_COMPILE_ALLOWANCE_SECS`]), and never
+/// earlier than it. So a compile inside the allowance costs the harnesses
+/// nothing, a longer one costs exactly the overrun, and the process still
+/// ends inside the outer runners' budget.
+///
+/// Timing-only, like every arm: verdicts still come from the solver and the
+/// demotion nets. No-op on an unarmed or disabled watchdog, except that the
+/// phase still moves to "solving" so a later fire is labelled correctly.
+pub(crate) fn rearm_after_codegen(per_harness: Option<Duration>, harness_count: usize) {
+    PHASE.store(PHASE_SOLVE, Ordering::SeqCst);
+    if watchdog_disabled() {
+        return;
+    }
+    let Some(per_harness) = per_harness.filter(|t| !t.is_zero()) else {
+        return;
+    };
+    if DEADLINE_MS.load(Ordering::SeqCst) == 0 {
+        return; // unarmed — no harness timeout is in effect
+    }
+    // Step 1: the harness-count credit, through the one idempotent path.
+    extend_for_extra_harnesses(Some(per_harness), harness_count);
+    let credited = DEADLINE_MS.load(Ordering::SeqCst);
+    // Step 2: restart the clock, capped at the credited deadline plus the
+    // compile allowance.
+    let extras = u64::try_from(harness_count.saturating_sub(1)).unwrap_or(u64::MAX);
+    let per_ms = u64::try_from(per_harness.as_millis()).unwrap_or(u64::MAX);
+    let solve_budget_ms = u64::try_from(budget_for(per_harness).as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(per_ms.saturating_mul(extras));
+    let now = anchor_elapsed_ms();
+    let fresh = now.saturating_add(solve_budget_ms);
+    let cap = credited.saturating_add(compile_allowance_ms());
+    let deadline_ms = fresh.min(cap).max(credited).max(1);
+    DEADLINE_MS.store(deadline_ms, Ordering::SeqCst);
+    BUDGET_SECS.store(deadline_ms.saturating_sub(now) / 1000, Ordering::SeqCst);
+}
+
+fn compile_allowance_ms() -> u64 {
+    env_u64("TRUST_MC_DRIVER_WATCHDOG_COMPILE_ALLOWANCE_S")
+        .unwrap_or(DEFAULT_COMPILE_ALLOWANCE_SECS)
+        .saturating_mul(1000)
+}
+
+/// The harnesses this process intends to check, with a "started" flag each.
+///
+/// Registered ONCE before the harness pool starts and never reallocated, so the
+/// fire path can NAME the harnesses that never ran while keeping this module's
+/// async-signal-safety discipline: `OnceLock::get` is lock-free after
+/// initialisation, an `AtomicBool` load takes no lock, and the names are already
+/// allocated by the time the watchdog can fire.
+static PENDING_HARNESSES: std::sync::OnceLock<
+    Vec<(Box<str>, std::sync::atomic::AtomicBool)>,
+> = std::sync::OnceLock::new();
+
+/// Record this run's harnesses, in schedule order. Idempotent: a later call is
+/// ignored, so a retry lane cannot discard the flags of the first registration.
+pub(crate) fn register_harnesses<'a>(names: impl IntoIterator<Item = &'a str>) {
+    let _ = PENDING_HARNESSES.set(
+        names
+            .into_iter()
+            .map(|name| (Box::from(name), std::sync::atomic::AtomicBool::new(false)))
+            .collect(),
+    );
+}
+
+/// Mark `name` STARTED, so a fire does not report it as never attempted.
+pub(crate) fn mark_harness_started(name: &str) {
+    if let Some(pending) = PENDING_HARNESSES.get() {
+        for (registered, started) in pending {
+            if &**registered == name {
+                started.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Name every harness that never started — one `write_stdout_parts` call per
+/// harness, because that writer truncates past [`STACK_BUF_LEN`].
+///
+/// WHY: on a fire the harnesses that never ran vanish from the transcript while
+/// the file still prints a verdict, so a consumer cannot tell "not attempted"
+/// from "not reported". The dual gate scored exactly that as
+/// `error/harness-not-run` on `negative/cover_probe_starved.rs`, where the
+/// process budget (5T+5 + T*(N-1) = 125s at T=15) ran out during the third of
+/// four harnesses and the fourth was silently lost.
+///
+/// The verdict token is deliberately NOT `FAILED`. A harness that never ran has
+/// no verdict, and a consumer whose expectation is `FAILED` would read `FAILED`
+/// here as AGREEMENT — a false match minted by a timeout. `UNDETERMINED` is what
+/// it is, and consumers normalise it to inconclusive.
+fn write_unattempted_harnesses() {
+    let Some(pending) = PENDING_HARNESSES.get() else {
+        return;
+    };
+    for (name, started) in pending {
+        if started.load(Ordering::SeqCst) {
+            continue;
+        }
+        raw_io::write_stdout_parts(&[b"Checking harness ", name.as_bytes(), b"...\n"]);
+        raw_io::write_stdout_parts(&[
+            b"[AY:UNKNOWN_REASON:",
+            fire_reason().label().as_bytes(),
+            b"]\n[AY:UNKNOWN] not attempted: the driver wall clock expired before this harness started\nVERIFICATION:- UNDETERMINED (not attempted)\n",
+        ]);
+    }
+}
+
+/// The reason label the watchdog would print if it fired now.
+fn fire_reason() -> crate::verification_provenance::SolverUnknownReason {
+    use crate::verification_provenance::SolverUnknownReason;
+    if PHASE.load(Ordering::SeqCst) == PHASE_SOLVE {
+        SolverUnknownReason::DriverTimeout
+    } else {
+        SolverUnknownReason::CompileTimeout
+    }
+}
+
+/// If `error` is a compilation that the watchdog clamp cut short — the
+/// process is still in the compile phase and a timeout-guarded subprocess
+/// (rustc, cargo, trust-mc-compiler) reported `timed out after` — print the
+/// same typed block the watchdog's own fire prints, with `CompileTimeout`,
+/// and return `true`. `main()` calls this on its error path so a compile
+/// that outlives the budget ends as ONE typed UNKNOWN rather than a bare
+/// `error:` line: since `session::process` keeps a headroom under the
+/// watchdog, the child is killed ~1s BEFORE the watchdog would fire, and the
+/// error path — not `fire` — is what reports it.
+///
+/// Returns `false`, printing nothing, for every other error (a compile error
+/// proper, a missing harness, ...) and for a timeout after codegen, which is
+/// a harness's own affair and already typed through the result pipeline.
+pub(crate) fn report_compile_timeout(error: &anyhow::Error) -> bool {
+    if PHASE.load(Ordering::SeqCst) != PHASE_COMPILE {
+        return false;
+    }
+    if !error.chain().any(|cause| cause.to_string().contains(" timed out after ")) {
+        return false;
+    }
+    let budget_secs = BUDGET_SECS.load(Ordering::SeqCst);
+    eprintln!(
+        "[trust_mc] compilation did not finish inside the driver's wall-clock budget \
+         ({budget_secs}s): no harness was solved — emitting UNKNOWN"
+    );
+    if !crate::args::common::quiet_output() {
+        // Same lines as `fire`, so every consumer reads them the same way.
+        println!(
+            "[AY:UNKNOWN_REASON:{}]",
+            crate::verification_provenance::SolverUnknownReason::CompileTimeout.label()
+        );
+        println!("[AY:UNKNOWN] compilation timed out after {budget_secs}s");
+        println!("VERIFICATION:- FAILED");
+    }
+    true
+}
+
 /// Remaining time before the watchdog fires, or `None` when unarmed.
 ///
 /// Subprocess timeout chokepoints (`session::process`) clamp their budgets
@@ -322,17 +516,28 @@ fn watchdog_loop() -> ! {
 fn fire(budget_secs: u64) -> ! {
     let mut digits_buf = [0u8; 20];
     let secs = raw_io::u64_decimal(budget_secs, &mut digits_buf);
+    // `label()` is a match over `&'static str`s: no allocation.
+    let reason = fire_reason();
+    let phase_text: &[u8] = if PHASE.load(Ordering::SeqCst) == PHASE_SOLVE {
+        "s during verification: a harness overran its deadline and the watchdog headroom \
+         (hang suspected) \u{2014} emitting UNKNOWN and exiting\n"
+            .as_bytes()
+    } else {
+        "s before codegen completed: compilation did not finish inside the process budget \
+         \u{2014} emitting UNKNOWN and exiting\n"
+            .as_bytes()
+    };
 
     raw_io::write_stderr_parts(&[
         b"[trust_mc] driver wall-clock watchdog fired after ",
         secs,
-        "s: translation/cleanup hang suspected \u{2014} emitting UNKNOWN and exiting\n".as_bytes(),
+        phase_text,
     ]);
 
-    // Markers consumed by scripts/ay-compiletest.sh:
-    //   - `[AY:UNKNOWN_REASON:DriverTimeout]` makes
-    //     `has_unknown_result_markers` true and supplies an
-    //     `execution_details=unknown_marker=DriverTimeout` provenance.
+    // Markers consumed by scripts/ay-compiletest.sh and tools/kani-domination:
+    //   - `[AY:UNKNOWN_REASON:DriverTimeout]` (or `CompileTimeout` before
+    //     codegen completed) makes `has_unknown_result_markers` true and
+    //     supplies an `execution_details=unknown_marker=...` provenance.
     //   - `[AY:UNKNOWN]` is the explicit final-marker form parsed by
     //     `extract_final_verification_outcome`. Emitting both keeps the
     //     parser happy regardless of which path it takes.
@@ -340,11 +545,18 @@ fn fire(budget_secs: u64) -> ! {
     //     when an UNKNOWN result causes verification to be reported as
     //     "not successful" (see `verification_result::write_final`).
     raw_io::write_stdout_parts(&[
-        b"[AY:UNKNOWN_REASON:DriverTimeout]\n",
-        b"[AY:UNKNOWN] driver wall-clock timeout after ",
+        b"[AY:UNKNOWN_REASON:",
+        reason.label().as_bytes(),
+        b"]\n[AY:UNKNOWN] driver wall-clock timeout after ",
         secs,
         b"s\nVERIFICATION:- FAILED\n",
     ]);
+
+    // Name the harnesses that never started, AFTER the process-level markers:
+    // consumers take the first verdict following each `Checking harness` line,
+    // so the harness that WAS running keeps the verdict above and only the
+    // never-started ones gain one of their own.
+    write_unattempted_harnesses();
 
     // Clean up any tracked subprocesses (rustc, trust-mc-compiler, ay).
     // This avoids leaking child processes that would otherwise survive
@@ -562,5 +774,115 @@ mod tests {
         assert!(remaining().is_some());
         rearm(None);
         assert_eq!(remaining(), None, "rearm(None) must disarm");
+
+        // ── Post-codegen restart ─────────────────────────────────────────
+        // Unarmed: the restart arms nothing, but the phase still moves to
+        // solving so a later fire is labelled DriverTimeout.
+        PHASE.store(PHASE_COMPILE, Ordering::SeqCst);
+        assert_eq!(fire_reason().label(), "CompileTimeout");
+        rearm_after_codegen(Some(Duration::from_secs(3600)), 4);
+        assert_eq!(remaining(), None, "restart must not arm an unarmed watchdog");
+        assert_eq!(fire_reason().label(), "DriverTimeout");
+
+        // Armed with a 1h timeout (~5h budget), then "compiled" for no time:
+        // the restart moves the deadline forward by at most the compile
+        // allowance (20s default) and re-credits the harness count in full.
+        rearm(Some(Duration::from_secs(3600)));
+        let armed = remaining().expect("armed");
+        rearm_after_codegen(Some(Duration::from_secs(3600)), 1);
+        let restarted = remaining().expect("still armed");
+        assert!(restarted >= armed.saturating_sub(Duration::from_secs(1)), "never shrinks");
+        assert!(
+            restarted <= armed + Duration::from_secs(DEFAULT_COMPILE_ALLOWANCE_SECS),
+            "restart is capped at the old deadline plus the compile allowance: \
+             {restarted:?} vs {armed:?}"
+        );
+        // Three harnesses after a one-harness arm: the two extras are
+        // credited by the restart itself (through the idempotent top-up
+        // path, so a later top-up with the same count adds nothing)...
+        rearm(Some(Duration::from_secs(3600)));
+        let before = remaining().expect("armed");
+        rearm_after_codegen(Some(Duration::from_secs(3600)), 3);
+        let after = remaining().expect("still armed");
+        let gained = after.saturating_sub(before);
+        assert!(
+            gained > Duration::from_secs(2 * 3600 - 60)
+                && gained <= Duration::from_secs(2 * 3600 + DEFAULT_COMPILE_ALLOWANCE_SECS),
+            "restart must credit the metadata harness count, gained {gained:?}"
+        );
+        // ...and the same count is then a no-op for the top-up path.
+        let before = remaining().expect("still armed");
+        extend_for_extra_harnesses(Some(Duration::from_secs(3600)), 3);
+        let after = remaining().expect("still armed");
+        assert!(after.saturating_sub(before) < Duration::from_secs(60));
+        // A pre-codegen scan credit is not credited TWICE: scan said 3,
+        // metadata says 3 — the restart lands within the allowance of the
+        // scan-extended deadline, not two harness-timeouts past it.
+        rearm(Some(Duration::from_secs(3600)));
+        extend_for_extra_harnesses(Some(Duration::from_secs(3600)), 3);
+        let scanned = remaining().expect("armed");
+        rearm_after_codegen(Some(Duration::from_secs(3600)), 3);
+        let restarted = remaining().expect("still armed");
+        assert!(
+            restarted <= scanned + Duration::from_secs(DEFAULT_COMPILE_ALLOWANCE_SECS)
+                && restarted >= scanned.saturating_sub(Duration::from_secs(1)),
+            "scan credit not re-credited by the metadata count: {restarted:?} vs {scanned:?}"
+        );
+        // Zero/absent timeout: no arm change.
+        let before = remaining().expect("still armed");
+        rearm_after_codegen(None, 5);
+        rearm_after_codegen(Some(Duration::ZERO), 5);
+        let after = remaining().expect("still armed");
+        assert!(before.saturating_sub(after) < Duration::from_secs(60));
+
+        rearm(None);
+        assert_eq!(remaining(), None);
+    }
+
+    /// The compile-phase timeout report fires only for a timeout error while
+    /// codegen is still pending: after codegen the harness pipeline owns the
+    /// reason, and a non-timeout error is a real error either way.
+    #[test]
+    fn compile_timeout_report_is_phase_and_shape_gated() {
+        let timeout = anyhow::anyhow!(
+            "/x/trust-mc-compiler timed out after 79.0s. Use --tool-timeout to increase the limit."
+        );
+        let other = anyhow::anyhow!("error[E0425]: cannot find value `x` in this scope");
+        PHASE.store(PHASE_COMPILE, Ordering::SeqCst);
+        assert!(report_compile_timeout(&timeout));
+        assert!(!report_compile_timeout(&other));
+        PHASE.store(PHASE_SOLVE, Ordering::SeqCst);
+        assert!(!report_compile_timeout(&timeout));
+        PHASE.store(PHASE_COMPILE, Ordering::SeqCst);
+    }
+
+    /// The fire path prints the enum's own label, so the marker a corpus
+    /// runner greps for and the label the reason table documents cannot
+    /// drift apart.
+        /// A harness that never starts must be nameable by the fire path, and the
+    /// registration must survive a second call.
+    #[test]
+    fn unattempted_harnesses_are_the_ones_never_marked_started() {
+        register_harnesses(["a_first", "b_second", "c_third"]);
+        mark_harness_started("b_second");
+        let pending = PENDING_HARNESSES.get().expect("registered");
+        let unattempted: Vec<&str> = pending
+            .iter()
+            .filter(|(_, started)| !started.load(Ordering::SeqCst))
+            .map(|(name, _)| &**name)
+            .collect();
+        assert_eq!(unattempted, vec!["a_first", "c_third"]);
+        // Idempotent: a second registration cannot drop the flags already set.
+        register_harnesses(["x_other"]);
+        let pending = PENDING_HARNESSES.get().expect("registered");
+        assert!(pending.iter().any(|(name, _)| &**name == "b_second"));
+        assert!(pending.iter().all(|(name, _)| &**name != "x_other"));
+    }
+
+#[test]
+    fn fire_marker_labels_are_the_enum_labels() {
+        use crate::verification_provenance::SolverUnknownReason;
+        assert_eq!(SolverUnknownReason::DriverTimeout.label(), "DriverTimeout");
+        assert_eq!(SolverUnknownReason::CompileTimeout.label(), "CompileTimeout");
     }
 }

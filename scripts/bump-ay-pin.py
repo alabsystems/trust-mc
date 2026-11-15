@@ -2,7 +2,7 @@
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
-"""Atomically update trust-mc's uniform AY revision and package version."""
+"""Transactionally update trust-mc's AY declarations, lockfile and tuple."""
 
 from __future__ import annotations
 
@@ -45,11 +45,38 @@ def restore_file(path: Path, existed: bool, contents: bytes) -> None:
         path.unlink()
 
 
-def resolve_trust_cargo(root: Path) -> str:
+def updated_ay_tuple(original: str, old_revision: str, revision: str) -> str:
+    document = toml_loads(original)
+    ay = document.get("ay")
+    if not isinstance(ay, dict) or ay.get("rev") != old_revision:
+        fail("tools/tuple.toml [ay].rev must match the existing manifest pin")
+    header = re.search(r"(?m)^[ \t]*\[ay\][ \t]*(?:#[^\r\n]*)?\r?$", original)
+    if header is None:
+        fail("cannot locate the exact [ay] table in tools/tuple.toml")
+    following = re.search(r"(?m)^[ \t]*\[", original[header.end():])
+    end = header.end() + following.start() if following else len(original)
+    body, count = re.subn(
+        rf'(?m)^(?P<prefix>[ \t]*rev[ \t]*=[ \t]*)"{re.escape(old_revision)}"'
+        r'(?P<suffix>[ \t]*(?:#[^\r\n]*)?\r?)$',
+        lambda match: f'{match.group("prefix")}"{revision}"{match.group("suffix")}',
+        original[header.end():end],
+    )
+    if count != 1:
+        fail("cannot rewrite the exact [ay].rev in tools/tuple.toml")
+    updated = original[:header.end()] + body + original[end:]
+    expected = {**document, "ay": {**ay, "rev": revision}}
+    if toml_loads(updated) != expected:
+        fail("tuple rewrite must change only [ay].rev")
+    return updated
+
+
+def resolve_trust_targo(root: Path) -> str:
+    # The Trust driver, never the sysroot's stock-cargo frontend: `metadata`
+    # is not a compilation command, so targo needs no lane argument for it.
     resolver = root / "scripts/resolve-trust-tool.sh"
     try:
         result = subprocess.run(
-            [str(resolver), "cargo"],
+            [str(resolver), "targo"],
             cwd=root,
             check=False,
             text=True,
@@ -60,11 +87,11 @@ def resolve_trust_cargo(root: Path) -> str:
         fail(f"cannot execute pinned Trust toolchain resolver: {error}")
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit {result.returncode}"
-        fail(f"cannot resolve pinned Trust cargo: {detail}")
-    cargo = result.stdout.strip()
-    if not cargo or not Path(cargo).is_file() or not os.access(cargo, os.X_OK):
-        fail(f"resolver returned a missing Cargo executable: {cargo or '<none>'}")
-    return cargo
+        fail(f"cannot resolve pinned Trust targo: {detail}")
+    targo = result.stdout.strip()
+    if not targo or not Path(targo).is_file() or not os.access(targo, os.X_OK):
+        fail(f"resolver returned a missing targo executable: {targo or '<none>'}")
+    return targo
 
 
 def main() -> int:
@@ -81,8 +108,9 @@ def main() -> int:
     root = args.root.resolve()
     manifest = root / "Cargo.toml"
     lockfile = root / "Cargo.lock"
-    cargo = resolve_trust_cargo(root)
-    original = manifest.read_text(encoding="utf-8")
+    tuple_path = root / "tools/tuple.toml"
+    original_manifest = manifest.read_bytes()
+    original = original_manifest.decode("utf-8")
     lock_existed = lockfile.exists()
     original_lock = lockfile.read_bytes() if lock_existed else b""
     document = toml_loads(original)
@@ -109,6 +137,13 @@ def main() -> int:
     old_version = next(iter(versions))
     assert isinstance(old_revision, str)
     assert isinstance(old_version, str)
+    try:
+        original_tuple = tuple_path.read_bytes()
+        updated_tuple = updated_ay_tuple(
+            original_tuple.decode("utf-8"), old_revision, args.revision
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        fail(f"cannot read tools/tuple.toml: {error}")
 
     updated = original
     for alias, spec in specs:
@@ -141,12 +176,14 @@ def main() -> int:
         if count != 1:
             fail(f"cannot locate workspace.dependencies.{alias}")
 
-    if updated == original:
+    if updated == original and updated_tuple.encode("utf-8") == original_tuple:
         print(f"bump-ay-pin: already at {args.revision} ({args.version})")
         return 0
 
-    manifest.write_text(updated, encoding="utf-8")
+    targo = resolve_trust_targo(root)
     try:
+        manifest.write_bytes(updated.encode("utf-8"))
+        tuple_path.write_bytes(updated_tuple.encode("utf-8"))
         subprocess.run(
             [sys.executable, str(root / "scripts/check_first_party_git_pins.py"), str(root), "ay"],
             cwd=root,
@@ -158,7 +195,7 @@ def main() -> int:
         # the original lockfile is restored below if any subsequent authority
         # check rejects the result.
         subprocess.run(
-            [cargo, "metadata", "--format-version", "1"],
+            [targo, "metadata", "--format-version", "1"],
             cwd=root,
             check=True,
             stdout=subprocess.DEVNULL,
@@ -175,18 +212,28 @@ def main() -> int:
             stdout=subprocess.DEVNULL,
         )
         subprocess.run(
-            [cargo, "metadata", "--locked", "--format-version", "1"],
+            [targo, "metadata", "--locked", "--format-version", "1"],
             cwd=root,
             check=True,
             stdout=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):
-        manifest.write_text(original, encoding="utf-8")
-        restore_file(lockfile, lock_existed, original_lock)
-        fail("validation failed; restored Cargo.toml and Cargo.lock")
+        failures = []
+        for path, existed, contents in (
+            (manifest, True, original_manifest),
+            (lockfile, lock_existed, original_lock),
+            (tuple_path, True, original_tuple),
+        ):
+            try:
+                restore_file(path, existed, contents)
+            except OSError as error:
+                failures.append(f"{path}: {error}")
+        if failures:
+            fail("validation failed; rollback incomplete: " + "; ".join(failures))
+        fail("validation failed; restored Cargo.toml, Cargo.lock and tools/tuple.toml")
 
     print(
-        f"bump-ay-pin: updated {len(specs)} declarations: "
+        f"bump-ay-pin: updated {len(specs)} declarations and [ay] tuple: "
         f"{old_revision} ({old_version}) -> {args.revision} ({args.version})"
     )
     return 0

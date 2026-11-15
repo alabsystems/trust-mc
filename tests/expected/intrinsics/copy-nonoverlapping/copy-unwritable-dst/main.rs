@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 // Checks that `copy_nonoverlapping` fails when `dst` is not valid for writes.
+#![feature(core_intrinsics)]
+
 #[kani::proof]
 fn test_copy_nonoverlapping_invalid() {
     let arr: [i32; 3] = [0, 1, 0];

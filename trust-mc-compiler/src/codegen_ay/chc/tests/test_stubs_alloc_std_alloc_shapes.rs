@@ -63,12 +63,27 @@ fn test_mir_std_alloc_alloc_array_roundtrip_has_no_chc_fallbacks() {
         let name = "probe_std_alloc_alloc_array_roundtrip";
         let instance = find_instance_by_suffix(ctx.tcx, name);
         let body = instance.body().expect("function body");
-        let vc = mir_to_chc(
+        // `translate()` records the fallback and translation-drop counters asserted below.
+        let _translated_vc = mir_to_chc(
             ctx.tcx,
             &body,
             name,
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: writes and reads at constant
+        // offsets are scalarized (7faa74cf9) and write-only arrays eliminated (85da41dad),
+        // removing the `__out` arrays and literal stores from the translated VC.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            name,
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, name, body.blocks.len());
         assert!(vc_rules_contain_var(&vc, "obj_valid__out"), "should update obj_valid__out");

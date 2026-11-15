@@ -16,7 +16,7 @@
 //! Part of #3173: batch fix for zero-pass Kani regression categories.
 //!
 //! Sub-modules:
-//! - `codegen_call_fn_inline_specialization`: any_where dispatch, copy-swap, captures
+//! - `codegen_call_fn_inline_specialization`: copy-swap body recognition
 //! - `codegen_call_fn_inline_emit`: result emission, assert guards, fat-pointer widening
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -42,6 +42,7 @@ use super::inline_bool_return::try_inline_simple_bool_return_helper;
 use super::inline_budget::chc_inline_effective_block_limit;
 use super::inline_field_map::populate_inline_self_field_hints;
 use super::inline_known_calls::inline_known_call_expr_for_callee_path;
+use super::inline_ref_arg_binding::InlineArgBinding;
 fn callee_uses_special_arithmetic_handler(callee_name: &str, last_seg: &str) -> bool {
     let is_primitive_impl =
         callee_name.starts_with("core::num::<impl ") || callee_name.starts_with("std::num::<impl ");
@@ -134,27 +135,42 @@ fn propagate_raw_ptr_from_raw_parts_inline_identity(
         _ => None,
     });
 
-    if let Some(obj_id) = src_local
-        .and_then(|src| ctx.known_alloc_ids.get(&src).copied())
-        .or_else(|| src_local.and_then(|src| ctx.trace_deref_store_alloc_id(src)))
-        .or_else(|| ChcCtx::try_extract_obj_id(data_expr))
-    {
+    let interior =
+        ChcCtx::try_extract_constant_addr(data_expr).is_some_and(|(_, offset)| offset != 0);
+    let source = src_local.filter(|src| !ctx.local_has_multiple_whole_definitions(*src));
+    let base_obj_id = if interior {
+        None
+    } else {
+        source
+            .and_then(|src| ctx.trace_deref_store_alloc_id(src))
+            .or_else(|| ChcCtx::try_extract_base_obj_id(data_expr))
+    };
+    if let Some(obj_id) = base_obj_id {
         ctx.known_alloc_ids.insert(dest_local, obj_id);
+    } else {
+        ctx.known_alloc_ids.remove(&dest_local);
     }
 
-    if let Some(ref_target) = src_local
+    let ref_target = source
         .and_then(|src| ctx.ref_resolution.ref_targets.get(&src).cloned())
-        .or_else(|| src_local.and_then(|src| trace_pointer_identity_ref_target(ctx, src)))
         .or_else(|| {
-            ChcCtx::try_extract_obj_id(data_expr).and_then(|obj_id| {
+            base_obj_id
+                .and_then(|_| source.and_then(|src| trace_pointer_identity_ref_target(ctx, src)))
+        })
+        .filter(|target| !interior || !target.projections.is_empty())
+        .or_else(|| {
+            ChcCtx::try_extract_base_obj_id(data_expr).and_then(|obj_id| {
                 ctx.heap_state.local_idx_for_obj_id(obj_id).map(|local| {
                     super::codegen_ctx::types::RefTarget::with_projections(local, vec![])
                 })
             })
-        })
-    {
+        });
+    if let Some(ref_target) = ref_target {
         ctx.ref_resolution.ref_targets.insert(dest_local, ref_target);
         ctx.ref_resolution.call_forwarded_raw_ptrs.insert(dest_local);
+    } else {
+        ctx.ref_resolution.ref_targets.remove(&dest_local);
+        ctx.ref_resolution.call_forwarded_raw_ptrs.remove(&dest_local);
     }
 }
 
@@ -238,9 +254,6 @@ pub(in crate::codegen_ay::chc) trait CallDispatchFnInline {
 impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
     fn try_dispatch_call_fn_inline(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
         let Some(target) = dcx.target else { return false };
-        if self.try_dispatch_call_any_where(dcx, *target) {
-            return true;
-        }
         // Resolve the callee to a concrete Instance.
         let func_ty = match dcx.func.ty(self.body.locals()) {
             Ok(ty) => ty,
@@ -259,12 +272,51 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
         if matches!(instance.kind, InstanceKind::Virtual { .. }) {
             return false;
         }
+        // A renamed float intrinsic reaches its model, never Trust's fallback body
+        // (`intrinsics::is_modelled_renamed_intrinsic`).
+        if crate::intrinsics::is_modelled_renamed_intrinsic(&instance) {
+            return false;
+        }
 
         // Get the TRANSFORMED MIR body (contract mode dispatch, stubs,
         // rewrites) — raw `instance.body()` bypasses the kani_middle transform
         // pipeline and leaves walked contract checks vacuous (mode dummy 0).
         let callee_name =
             self.tcx.def_path_str(rustc_internal::internal(self.tcx, instance.def.def_id()));
+        if matches!(
+            crate::codegen_ay::shared::compare_loops::comparison_call(&callee_name),
+            Some(crate::codegen_ay::shared::compare_loops::ComparisonCall::Eq { .. })
+        ) && self.has_heterogeneous_sequence_elements(dcx.func, self.body.locals())
+        {
+            self.record_sound_fallback_reason("heterogeneous_sequence_comparison");
+            return false;
+        }
+        // A comparison of a type holding references compares referents; the
+        // walker compares the addresses it holds for them
+        // (`inline_ref_arg_binding::comparison_referent_holds_reference`).
+        // Against a constant fieldless variant (`first(&a) == None`) no
+        // referent is compared, and the walk of the derived body is exact
+        // (`comparison_against_fieldless_variant_constant`).
+        if super::inline_ref_arg_binding::is_comparison_callee_path(&callee_name)
+            && dcx.args.first().is_some_and(|arg| {
+                super::inline_ref_arg_binding::comparison_referent_holds_reference(
+                    self,
+                    arg,
+                    self.body.locals(),
+                )
+            })
+            && !super::inline_ref_arg_binding::comparison_against_fieldless_variant_constant(
+                self, &dcx.args,
+            )
+        {
+            debug!(
+                %callee_name,
+                fn_name = %self.fn_name,
+                "fn_inline: skip (comparison of a type holding references)"
+            );
+            self.note_gap_reason("inline_cmp_referent_holds_reference");
+            return false;
+        }
         let body = match crate::kani_middle::transform::walker_transformed_body(self.tcx, instance)
         {
             Some(b) => b,
@@ -292,14 +344,20 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
             );
             self.record_fallback();
         }
-        // Soundness: unchecked arithmetic (unchecked_add/sub/mul) wrappers in
-        // core::num have MIR bodies containing assert_unsafe_precondition! UB checks.
-        // The inline walker records those Assert terminators as ite-fallback guards
-        // (execution_state.rs:82-92) instead of error() rules, so overflow is NOT
-        // detected — producing false PROOF. Block these from fn_inline so they fall
-        // through to codegen_wrapping_arithmetic (step_wrapping.rs:238) which emits
-        // correct error() rules for overflow detection. Mirrors Kani's MIR-level
+        // Unchecked arithmetic wrappers in core::num (unchecked_add/sub/mul/div/rem/
+        // shl/shr) are not inlined here: they fall through to
+        // codegen_wrapping_arithmetic (step_wrapping.rs), which emits the overflow
+        // and shift-distance error rules at the call. Mirrors Kani's MIR-level
         // FunctionInlinePass::has_special_codegen_handler (inline/mod.rs:269).
+        //
+        // The wrapper's assert_unsafe_precondition! is NOT the obligation: its
+        // branch is dead (check_language_ub() folds to false, as Kani compiles
+        // RuntimeChecks). What Kani reports is the wrapper's own AddUnchecked /
+        // ShlUnchecked / ... BinOp. A walk that reaches the wrapper another way (dyn
+        // dispatch, a nested helper) records that BinOp's check itself
+        // (inline_shared/rvalue_ub.rs); it records Assert terminators as real
+        // deferred checks too, not only as ite guards. A walk that havocs the
+        // wrapper instead books the lost effect (Rule D: the wrapper is not inert).
         //
         // Part of #3768: Also block checked_shl/checked_shr. fn_inline produces a
         // Datatype(Option_u32) result that cannot be decomposed by
@@ -322,7 +380,7 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
         // Part of #3875: SpecArrayEq::spec_eq body uses loop-based slice comparison
         // that the inline walker can't handle. Reject early so it falls through to
         // tail_dispatch which produces correct element-wise array comparison.
-        if callee_name.contains("SpecArrayEq") && callee_name.contains("spec_eq") {
+        if self.authenticated_spec_array_comparison_is_ne(instance.def.def_id()).is_some() {
             self.inline_self_field_hints = None;
             return false;
         }
@@ -333,11 +391,172 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
 
         // Part of #3830: Pre-populate field hints before arg translation.
         populate_inline_self_field_hints(self, dcx);
+        let comparison_callee =
+            super::inline_ref_arg_binding::is_comparison_callee_path(&callee_name);
         // Translate arguments (needed by known-call fast path AND body walk).
         let mut params: Vec<Expr> = Vec::with_capacity(dcx.args.len());
         let mut used_self_placeholder = false;
+        // F2 (inline_walk_guard.rs): parameters bound to an address the walker
+        // would read as the referent.
+        let mut address_seeds: Vec<usize> = Vec::new();
+        let mut referent_seeds: Vec<usize> = Vec::new();
+        let mut readonly_ref_seeds = Vec::new();
+        let mut mut_owner_seeds = Vec::new();
+        let mut rustcall_mut_owner_seeds = Vec::new();
+        let mut native_dyn_seeds = Vec::new();
+        let native_box_protocol =
+            crate::codegen_ay::shared::native_box_call::native_global_dyn_box_call(
+                self.tcx, &instance,
+            );
         for (i, arg) in dcx.args.iter().enumerate() {
-            if let Some(expr) = self.translate_call_arg_for_inline(arg, dcx.modified_locals) {
+            let actual_ty = arg.ty(self.body.locals()).ok().map(|ty| self.resolve_body_ty(ty));
+            let formal_ty = body.locals().get(i + 1).map(|decl| self.resolve_body_ty(decl.ty));
+            let rustcall = i == 1
+                && func_ty.kind().fn_sig().is_some_and(|signature| {
+                    signature.skip_binder().abi == rustc_public::ty::Abi::RustCall
+                });
+            let reference_field = actual_ty.and_then(|actual| match actual.kind() {
+                TyKind::RigidTy(RigidTy::Tuple(fields))
+                    if fields.len() == 1 && self.readonly_scalar_pointee(fields[0]).is_some() =>
+                {
+                    Some(fields[0])
+                }
+                _ => None,
+            });
+            let spread_reference =
+                rustcall && reference_field.is_some() && formal_ty == reference_field;
+            let packed_reference = rustcall && reference_field.is_some() && formal_ty == actual_ty;
+            if rustcall
+                && !spread_reference
+                && !packed_reference
+                && actual_ty.is_some_and(|actual| {
+                    matches!(actual.kind(), TyKind::RigidTy(RigidTy::Tuple(fields))
+                    if fields.iter().any(|field| self.readonly_scalar_pointee(*field).is_some()))
+                })
+            {
+                self.record_sound_fallback_reason("inline_rustcall_reference_binding_unmodeled");
+                return false;
+            }
+            // A closed protocol borrow supplies the actual Box VALUE as the
+            // shim receiver's referent. Its owner-storage address stays distinct.
+            let native_receiver = (i == 0 && native_box_protocol.is_some())
+                .then(|| self.host_native_dyn_callable_receiver(arg))
+                .flatten();
+            let binding = if let Some((owner, origin)) = &native_receiver {
+                let Some(value) = self.translate_operand_with_modified(
+                    &Operand::Copy(owner.clone()),
+                    dcx.modified_locals,
+                ) else {
+                    return false;
+                };
+                native_dyn_seeds.push((i + 1, origin.clone()));
+                InlineArgBinding::BoundReferent(value)
+            } else if spread_reference || packed_reference {
+                match self.bind_rustcall_single_reference(arg, dcx.modified_locals) {
+                    Some((binding, read)) => {
+                        // The real shim can retain the tuple formal rather
+                        // than spread it. Its field is a logical scalar only
+                        // when this actual typed host binding read the value.
+                        if packed_reference && read.is_none() {
+                            self.record_sound_fallback_reason(
+                                "inline_rustcall_reference_tuple_value_unmodeled",
+                            );
+                            return false;
+                        }
+                        if let Some(mut read) = read {
+                            let Some(formal) = formal_ty else { return false };
+                            read.ty = formal;
+                            readonly_ref_seeds.push((i + 1, read));
+                        }
+                        if packed_reference {
+                            // Keep the actual tuple carrier intact. Its field
+                            // read travels separately; it is not the tuple's
+                            // pointer or native memory image.
+                            let Some(carrier) =
+                                self.translate_operand_with_modified(arg, dcx.modified_locals)
+                            else {
+                                self.record_sound_fallback_reason(
+                                    "inline_rustcall_reference_tuple_carrier_unmodeled",
+                                );
+                                return false;
+                            };
+                            InlineArgBinding::Bound(carrier)
+                        } else {
+                            binding
+                        }
+                    }
+                    None => {
+                        self.record_sound_fallback_reason(
+                            "inline_rustcall_reference_binding_unmodeled",
+                        );
+                        self.inline_self_field_hints = None;
+                        return false;
+                    }
+                }
+            } else {
+                self.bind_call_arg_for_inline(arg, dcx.modified_locals, comparison_callee)
+            };
+            let bound = match binding {
+                InlineArgBinding::Bound(expr) => Some(expr),
+                InlineArgBinding::BoundReferent(expr) => {
+                    referent_seeds.push(i + 1);
+                    Some(expr)
+                }
+                InlineArgBinding::BoundAddress(expr) => {
+                    address_seeds.push(i + 1);
+                    Some(expr)
+                }
+                InlineArgBinding::ReadThrough(expr) => {
+                    referent_seeds.push(i + 1);
+                    // The referent was read through the reference's address.
+                    // Receiver hints come from a pointer-identity trace of the
+                    // SAME reference, the fact the cascade could not establish;
+                    // the value just read is the whole receiver.
+                    if i == 0 {
+                        self.inline_self_field_hints = None;
+                    }
+                    Some(expr)
+                }
+                InlineArgBinding::Refused(reason) => {
+                    // The reference's own term is an address the walker would
+                    // decode as its referent, and no sound read replaces it
+                    // (inline_ref_arg_binding.rs). Walking the body with it is
+                    // how `!(a == b)` on a joined Option was proved.
+                    debug!(
+                        i,
+                        fn_name = %self.fn_name,
+                        %callee_name,
+                        reason,
+                        "fn_inline: skip (reference argument without a readable referent)"
+                    );
+                    self.note_gap_reason(reason);
+                    self.inline_self_field_hints = None;
+                    return false;
+                }
+                InlineArgBinding::Unresolved => None,
+            };
+            if let Some(expr) = bound {
+                // A fresh typed host read supplies its own epoch-bearing
+                // fact; a transported legacy tag cannot supply this.
+                if referent_seeds.contains(&(i + 1))
+                    && let Some(ty) = if spread_reference { formal_ty } else { actual_ty }
+                    && let Some(seed) = self.readonly_ref_seed_for_value(ty, &expr)
+                {
+                    readonly_ref_seeds.push((i + 1, seed));
+                }
+                if let Some(seed) = self.host_readonly_capture_seed(arg, dcx.modified_locals) {
+                    readonly_ref_seeds.push((i + 1, seed));
+                }
+                if let Some(origin) = self.host_native_dyn_origin(arg) {
+                    native_dyn_seeds.push((i + 1, origin));
+                }
+                if let Some(owner) = self.host_mut_ref_owner(arg) {
+                    mut_owner_seeds.push((i + 1, owner));
+                }
+                let owners = self.host_rustcall_mut_ref_args(arg);
+                if !owners.is_empty() {
+                    rustcall_mut_owner_seeds.push((i + 1, owners));
+                }
                 // Part of #55 piece 4: when the translated arg is symbolic
                 // (host state var — e.g. the MIR inliner folded the callee's
                 // first level into the harness, leaving checked-arithmetic
@@ -355,24 +574,44 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // would clobber the datatype referent with a pointer, which the
                 // callee then mis-decodes (e.g. `Some(4)` read as `None` because
                 // the address bits unflatten with the enum tag at the wrong bit).
-                // The sort guard keeps the scalar recursion-folding win while
-                // preserving referent values for derived `PartialEq::eq` inlines.
-                let expr =
-                    if trust_mc_core::chc_const_prop::eval::try_eval_to_const(&expr).is_none() {
-                        match self.unique_def_const_operand(arg, 32) {
-                            Some(lit) if lit.sort() == expr.sort() => lit,
-                            _ => expr,
-                        }
-                    } else {
-                        expr
-                    };
+                // Logical referents never enter this address recovery: u64
+                // and f64 values can have the same sort as an address.
+                let expr = if !referent_seeds.contains(&(i + 1))
+                    && trust_mc_core::chc_const_prop::eval::try_eval_to_const(&expr).is_none()
+                {
+                    match self.unique_def_const_operand(arg, 32) {
+                        Some(lit) if lit.sort() == expr.sort() => lit,
+                        _ => expr,
+                    }
+                } else {
+                    expr
+                };
                 params.push(expr);
             } else if i == 0 && self.inline_self_field_hints.is_some() {
                 // Fresh symbolic BV64 avoids obj_valid[0] collision (W3:4021).
                 let placeholder_name = chc_fresh_name("inline_self_placeholder");
                 let placeholder_var = Expr::var(&placeholder_name, Sort::bitvec(POINTER_WIDTH));
+                // A by-value flattened argument with no whole-value term (an
+                // Int-lifted Range): remember its slots, so a body that returns
+                // the placeholder unchanged returns them. Only the values this
+                // block already holds for them: its `__out` variables are the
+                // moved-out placeholder's after the call.
+                if let Operand::Copy(place) | Operand::Move(place) = arg
+                    && place.projection.is_empty()
+                    && self.flatten.flattened_tuple_locals.contains(&place.local)
+                    && let Some(slots) = (0..self.flattened_field_count(place.local))
+                        .map(|slot| {
+                            self.encode.flattened_field_env.get(&(place.local, slot)).cloned()
+                        })
+                        .collect::<Option<Vec<_>>>()
+                {
+                    self.inline_placeholder_slots.insert(placeholder_name.clone(), slots);
+                }
                 debug!(fn_name = %self.fn_name, %callee_name, %placeholder_name, "fn_inline: placeholder");
                 used_self_placeholder = true;
+                // A fresh bitvector, not the receiver: only the hint map may
+                // answer a read through it.
+                address_seeds.push(1);
                 params.push(placeholder_var);
             } else {
                 debug!(i, fn_name = %self.fn_name, %callee_name, "fn_inline: skip (arg)");
@@ -403,6 +642,28 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // locals to callee parameter locals (i+1 = MIR arg numbering).
                 if let Some(len_expr) = self.ref_resolution.subslice_len.get(&local_idx) {
                     caller_subslice_lens.insert(i + 1, len_expr.clone());
+                } else if arg.ty(self.body.locals()).ok().is_some_and(|ty| {
+                    matches!(self.resolve_body_ty(ty).kind(),
+                        TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _))
+                            if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str)))
+                }) && let Some(len_expr) = self.resolve_ptr_metadata_known(arg, dcx.modified_locals)
+                    && len_expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                {
+                    // A cleared historical side table does not erase the
+                    // current wide pointer's metadata. Carry the same known
+                    // value that PtrMetadata reads into the callee; never seed
+                    // a fabricated or unconstrained length.
+                    caller_subslice_lens.insert(i + 1, len_expr);
+                } else if let Some(len_expr) = self.vec_as_slice_len(local_idx)
+                    && len_expr.sort().bitvec_width() == Some(POINTER_WIDTH)
+                {
+                    // A `Vec`'s slice view (`v.contains(&x)` derefs `v`): the
+                    // walked callee reads its length from the seed, as the host
+                    // reads `PtrMetadata` of the view, where it read a fresh
+                    // one and could not bound the `memchr` loop it havocs
+                    // under a declared unwind (walker fail-closed repair round
+                    // 5, `model_call_unwind_dual.rs` `u6`).
+                    caller_subslice_lens.insert(i + 1, len_expr);
                 }
                 if let Some(off_expr) = self.ref_resolution.subslice_offset.get(&local_idx) {
                     caller_subslice_offsets.insert(i + 1, off_expr.clone());
@@ -435,7 +696,10 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
             .or_else(|| self.resolve_fn_def_name(dcx.func));
         let instance_callee_path = {
             let internal_def_id = rustc_internal::internal(self.tcx, instance.def.def_id());
-            self.tcx.def_path_str(internal_def_id)
+            crate::intrinsics::instance_path_model_spelling(
+                self.tcx.def_path_str(internal_def_id),
+                &instance,
+            )
         };
         // Part of #3875: Try known-call fast paths BEFORE the body size limit.
         // Pure expression handlers (SpecArrayEq::spec_eq, float predicates, etc.)
@@ -453,7 +717,7 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                         dcx.func,
                         path,
                         &params,
-                        dcx.args.first(),
+                        dcx.args,
                         self.body.locals(),
                     )
                 })
@@ -466,7 +730,7 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                             dcx.func,
                             &instance_callee_path,
                             &params,
-                            dcx.args.first(),
+                            dcx.args,
                             self.body.locals(),
                         )
                     }
@@ -522,9 +786,28 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
         let (result_expr, inline_vtable, alias_updates, deferred_checks, used_pure_fast_path) =
             if let Some(expr) = pure_fast_path {
                 (expr, None, std::collections::BTreeMap::new(), Vec::new(), true)
-            } else if let Some(expr) =
-                try_inline_simple_bool_return_helper(self, &body, &params, callee_path.as_deref())
-            {
+            } else if let Some(expr) = {
+                self.inline_walk_param_address_seeds = Some(address_seeds.clone());
+                self.inline_walk_param_referent_seeds = Some(referent_seeds.clone());
+                self.inline_walk_param_mut_owner_seeds = Some(mut_owner_seeds.clone());
+                self.inline_walk_param_rustcall_mut_owner_seeds =
+                    Some(rustcall_mut_owner_seeds.clone());
+                self.inline_walk_param_native_dyn_seeds = Some(native_dyn_seeds.clone());
+                self.inline_walk_param_readonly_ref_seeds = Some(readonly_ref_seeds.clone());
+                let expr = try_inline_simple_bool_return_helper(
+                    self,
+                    &body,
+                    &params,
+                    callee_path.as_deref(),
+                );
+                self.inline_walk_param_address_seeds = None;
+                self.inline_walk_param_referent_seeds = None;
+                self.inline_walk_param_mut_owner_seeds = None;
+                self.inline_walk_param_rustcall_mut_owner_seeds = None;
+                self.inline_walk_param_native_dyn_seeds = None;
+                self.inline_walk_param_readonly_ref_seeds = None;
+                expr
+            } {
                 (expr, None, std::collections::BTreeMap::new(), Vec::new(), true)
             } else {
                 // Part of #3875: Skip body inline for SpecArrayEq::spec_eq.
@@ -532,10 +815,7 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // SMT extensional equality (forall i. select(a,i)==select(b,i)) including
                 // uninitialized indices beyond N. Fall through to tail_dispatch which
                 // does element-wise comparison over 0..N only.
-                if let Some(ref path) = callee_path
-                    && path.contains("SpecArrayEq")
-                    && path.contains("spec_eq")
-                {
+                if self.authenticated_spec_array_comparison_is_ne(instance.def.def_id()).is_some() {
                     self.inline_self_field_hints = None;
                     return false;
                 }
@@ -564,12 +844,12 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 let saved_offs: Vec<(usize, Option<Expr>)> = (0..local_count)
                     .map(|local| (local, self.ref_resolution.subslice_offset.get(&local).cloned()))
                     .collect();
-                for (callee_local, len_expr) in &caller_subslice_lens {
-                    self.ref_resolution.subslice_len.insert(*callee_local, len_expr.clone());
-                }
-                for (callee_local, off_expr) in &caller_subslice_offsets {
-                    self.ref_resolution.subslice_offset.insert(*callee_local, off_expr.clone());
-                }
+                // The walk clears its body's entries on entry and applies
+                // these to its argument locals (`walker.rs`,
+                // `enter_body_subslice_scope`).
+                self.ref_resolution.inline_arg_subslice_seeds =
+                    Some((caller_subslice_lens.clone(), caller_subslice_offsets.clone()));
+                self.ref_resolution.inline_return_subslice = (None, None);
                 // Part of #4185: Snapshot heap state before speculative inline walk.
                 // If the walk bails (returns None), orphaned heap mutations from
                 // partial translation (build_memory_store, pending_updates) must be
@@ -579,6 +859,13 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // On bail-out, leaked indices cause unconstrained state vars in output.
                 let modified_snapshot = self.encode.modified_state_indices.clone();
                 // Try inline translation.
+                self.inline_walk_param_address_seeds = Some(address_seeds.clone());
+                self.inline_walk_param_referent_seeds = Some(referent_seeds.clone());
+                self.inline_walk_param_mut_owner_seeds = Some(mut_owner_seeds.clone());
+                self.inline_walk_param_rustcall_mut_owner_seeds =
+                    Some(rustcall_mut_owner_seeds.clone());
+                self.inline_walk_param_native_dyn_seeds = Some(native_dyn_seeds.clone());
+                self.inline_walk_param_readonly_ref_seeds = Some(readonly_ref_seeds.clone());
                 let result = translate_inline_body(
                     self,
                     &body,
@@ -588,6 +875,13 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                     Some(instance),
                     0,
                 );
+                self.inline_walk_param_address_seeds = None;
+                self.inline_walk_param_referent_seeds = None;
+                self.inline_walk_param_mut_owner_seeds = None;
+                self.inline_walk_param_rustcall_mut_owner_seeds = None;
+                self.inline_walk_param_native_dyn_seeds = None;
+                self.inline_walk_param_readonly_ref_seeds = None;
+                self.ref_resolution.inline_arg_subslice_seeds = None;
                 // Part of #4163: Propagate subslice_len from the inlined
                 // function's return local (0) to the caller's destination.
                 // The inline walker may have seeded subslice_len[0] via
@@ -595,8 +889,10 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                 // Part of #4163 D0: Capture return-local metadata BEFORE restore,
                 // but insert into caller dest AFTER restore. Without this ordering,
                 // the restore loop wipes dest when dest < callee_local_count.
-                let return_len = self.ref_resolution.subslice_len.get(&0).cloned();
-                let return_offset = self.ref_resolution.subslice_offset.get(&0).cloned();
+                // The walk restores the caller's entries when it ends, so its
+                // return local's entries are the ones it captured then.
+                let (return_len, return_offset) =
+                    std::mem::take(&mut self.ref_resolution.inline_return_subslice);
                 // Part of #4166: Restore ref_resolution to pre-seed state.
                 for (k, saved) in saved_lens {
                     match saved {
@@ -702,12 +998,20 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
                     let resolved = self.resolve_provenance_local(src_local);
                     let stack_local = ChcCtx::try_extract_obj_id(&params[0])
                         .and_then(|obj_id| self.heap_state.local_idx_for_obj_id(obj_id));
-                    let ref_target = self
-                        .ref_resolution
-                        .ref_targets
-                        .get(&src_local)
-                        .cloned()
-                        .or_else(|| trace_pointer_identity_ref_target(self, src_local));
+                    let interior = Self::try_extract_constant_addr(&params[0])
+                        .is_some_and(|(_, offset)| offset != 0);
+                    let base_known =
+                        !interior && self.trace_deref_store_alloc_id(src_local).is_some();
+                    let ref_target = (!self.local_has_multiple_whole_definitions(src_local))
+                        .then(|| {
+                            self.ref_resolution.ref_targets.get(&src_local).cloned().or_else(|| {
+                                base_known
+                                    .then(|| trace_pointer_identity_ref_target(self, src_local))
+                                    .flatten()
+                            })
+                        })
+                        .flatten()
+                        .filter(|target| !interior || !target.projections.is_empty());
                     let backing_local = ref_target
                         .as_ref()
                         .map(|target| target.local)
@@ -787,6 +1091,11 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
             pure_fast_path = used_pure_fast_path,
             "fn_inline: successfully handled function call"
         );
+        // A known-call fast path or the simple bool-return helper is a model
+        // of the callee, not a replay of its body: the dispatch spine states
+        // Kani's unwinding assertion for a loop it skips
+        // (`codegen_call.rs`, `model_call_unwinding_check`).
+        self.call_replays_body = !used_pure_fast_path;
         // Task #69: an inlined callee that takes a `&mut` reference to a
         // sidecar-tracked collection mutates the collection through its real
         // MIR (raw memory / SetLenOnDrop) and never syncs the sidecar length
@@ -855,6 +1164,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         arg: &Operand,
         modified_locals: &std::collections::HashSet<usize>,
     ) -> Option<Expr> {
+        match self.bind_call_arg_for_inline(arg, modified_locals, false) {
+            InlineArgBinding::Bound(expr)
+            | InlineArgBinding::BoundReferent(expr)
+            | InlineArgBinding::BoundAddress(expr)
+            | InlineArgBinding::ReadThrough(expr) => Some(expr),
+            InlineArgBinding::Unresolved | InlineArgBinding::Refused(_) => None,
+        }
+    }
+
+    /// Decide what the inline walker's parameter for `arg` binds to.
+    ///
+    /// Raw pointers keep their pointer value. Everything else goes through the
+    /// referent cascade, and `bind_inline_referent_arg` decides what a
+    /// reference whose referent the cascade did not resolve may bind to.
+    pub(super) fn bind_call_arg_for_inline(
+        &mut self,
+        arg: &Operand,
+        modified_locals: &std::collections::HashSet<usize>,
+        comparison_callee: bool,
+    ) -> InlineArgBinding {
+        // A native selected reference FIELD is its own address. The legacy
+        // ref-target cascade can report it as a Value after following a copy;
+        // neither that tag nor matching scalar/address sorts is a fresh read.
+        if arg.ty(self.body.locals()).ok().is_some_and(|ty| self.readonly_ref_seed(ty).is_some())
+            && !self.closure_reference_producer_is_tracked(
+                arg,
+                &mut std::collections::HashSet::new(),
+                &mut 16_384,
+            )
+        {
+            self.record_sound_fallback_reason("inline_shared_ref_value_producer_unproven");
+            return InlineArgBinding::Refused("inline_shared_ref_value_producer_unproven");
+        }
         // Part of #4030: by-value raw-pointer arguments must preserve the
         // pointer value when seeding inline callee locals. Routing them through
         // resolve_ref_or_const_referent can chase `ref_targets` metadata from
@@ -869,9 +1211,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ) {
             return self
                 .translate_operand_with_modified(arg, modified_locals)
-                .or_else(|| self.resolve_ref_or_const_referent(arg, modified_locals));
+                .or_else(|| self.resolve_ref_or_const_referent(arg, modified_locals))
+                .map_or(InlineArgBinding::Unresolved, InlineArgBinding::Bound);
         }
-        self.resolve_ref_or_const_referent(arg, modified_locals)
+        // A by-value `Option<&u64>`-like argument an aggregate built keeps the
+        // reference's ADDRESS in its payload, which the walker would read as
+        // the pointee's value (stmt/codegen_stmt_value_ref_payload.rs).
+        if let Operand::Copy(place) | Operand::Move(place) = arg
+            && place.projection.is_empty()
+            && self.wide_ref_option_may_hold_address(place.local)
+        {
+            return InlineArgBinding::Refused("inline_option_ref_payload_holds_address");
+        }
+        match self.resolve_ref_or_const_referent_tagged(arg, modified_locals) {
+            Some(referent) => self.bind_inline_referent_arg(arg, referent, comparison_callee),
+            None => InlineArgBinding::Unresolved,
+        }
     }
 }
 
@@ -906,6 +1261,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let lit = self.translate_call_arg_for_inline(operand, &HashSet::new())?;
                 return try_eval_to_const(&lit);
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {
+                let lit = self.translate_call_arg_for_inline(operand, &HashSet::new())?;
+                return try_eval_to_const(&lit);
+            }
         };
         // Unique whole-local definition; fail closed on partial writes and
         // call destinations.
@@ -934,7 +1294,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
         match (rv, field_idx) {
-            (Rvalue::Use(inner), None) => self.unique_def_const_operand(inner, depth - 1),
+            (Rvalue::Use(inner, ..), None) => self.unique_def_const_operand(inner, depth - 1),
             (Rvalue::BinaryOp(op, a, b), None) => {
                 let ca = self.unique_def_const_operand(a, depth - 1)?;
                 let cb = self.unique_def_const_operand(b, depth - 1)?;

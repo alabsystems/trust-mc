@@ -170,7 +170,7 @@ fn test_state_var_mgr_multiple_local_mappings() {
 fn test_liveness_state_new_initializes_fields() {
     let entry: Vec<HashSet<usize>> =
         vec![HashSet::from([1, 2]), HashSet::from([3]), HashSet::new()];
-    let state = LivenessState::new(entry);
+    let state = LivenessState::new(entry.clone(), entry);
 
     assert_eq!(state.dead_locals_at_entry.len(), 3);
     assert!(state.dead_locals_at_entry[0].contains(&1));

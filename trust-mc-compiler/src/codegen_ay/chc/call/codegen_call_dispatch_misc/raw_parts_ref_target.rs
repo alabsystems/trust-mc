@@ -19,44 +19,37 @@ fn is_nonnull_raw_parts_ref_target_identity_call(path: &str) -> bool {
         || (path.contains("Option") && (path.ends_with("::unwrap") || path.ends_with("::expect")))
 }
 
-fn nonnull_from_raw_parts_source_local(
-    ctx: &ChcCtx<'_, '_>,
-    src_local: Option<usize>,
-    ptr_expr: &Expr,
-) -> Option<usize> {
-    src_local.map(|local| ctx.resolve_provenance_local(local)).or_else(|| {
-        ChcCtx::try_extract_obj_id(ptr_expr)
-            .and_then(|obj_id| ctx.heap_state.local_idx_for_obj_id(obj_id))
-    })
-}
-
 pub(super) fn propagate_nonnull_from_raw_parts_identity(
     ctx: &mut ChcCtx<'_, '_>,
     dest_local: usize,
     src_local: Option<usize>,
     ptr_expr: &Expr,
 ) {
-    let source_local = nonnull_from_raw_parts_source_local(ctx, src_local, ptr_expr);
-    let ptr_obj_id = ChcCtx::try_extract_obj_id(ptr_expr);
-
-    if let Some(obj_id) = source_local
-        .and_then(|sl| ctx.known_alloc_ids.get(&sl).copied())
-        .or_else(|| source_local.and_then(|sl| ctx.trace_deref_store_alloc_id(sl)))
-        .or_else(|| src_local.and_then(|sl| ctx.known_alloc_ids.get(&sl).copied()))
-        .or_else(|| src_local.and_then(|sl| ctx.trace_deref_store_alloc_id(sl)))
-        .or(ptr_obj_id)
-    {
+    let interior =
+        ChcCtx::try_extract_constant_addr(ptr_expr).is_some_and(|(_, offset)| offset != 0);
+    let source = src_local.filter(|sl| !ctx.local_has_multiple_whole_definitions(*sl));
+    let base_obj_id = if interior {
+        None
+    } else {
+        source
+            .and_then(|sl| ctx.trace_deref_store_alloc_id(sl))
+            .or_else(|| ChcCtx::try_extract_base_obj_id(ptr_expr))
+    };
+    if let Some(obj_id) = base_obj_id {
         ctx.known_alloc_ids.insert(dest_local, obj_id);
     } else {
         ctx.known_alloc_ids.remove(&dest_local);
     }
 
-    let ref_target = source_local
+    let ref_target = source
         .and_then(|sl| ctx.ref_resolution.ref_targets.get(&sl).cloned())
-        .or_else(|| src_local.and_then(|sl| ctx.ref_resolution.ref_targets.get(&sl).cloned()))
-        .or_else(|| src_local.and_then(|sl| trace_nonnull_raw_parts_ref_target(ctx, sl)))
         .or_else(|| {
-            ptr_obj_id.and_then(|obj_id| {
+            base_obj_id
+                .and_then(|_| source.and_then(|sl| trace_nonnull_raw_parts_ref_target(ctx, sl)))
+        })
+        .filter(|target| !interior || !target.projections.is_empty())
+        .or_else(|| {
+            ChcCtx::try_extract_base_obj_id(ptr_expr).and_then(|obj_id| {
                 ctx.heap_state
                     .local_idx_for_obj_id(obj_id)
                     .map(|local| RefTarget::with_projections(local, vec![]))
@@ -141,7 +134,7 @@ fn trace_nonnull_raw_parts_stmt_ref_target(
     use rustc_public::mir::{ProjectionElem, Rvalue};
 
     match rhs {
-        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
         | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _)
             if place.projection.is_empty() =>
         {

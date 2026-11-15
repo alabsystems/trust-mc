@@ -6,6 +6,8 @@
 
 use super::{IntoOption, StatementCodegen};
 use crate::codegen_ay::types::ptr_sort;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::{Operand, Place, ProjectionElem};
@@ -52,6 +54,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Assign a value to a place, creating a new SSA variable.
     /// Made pub(super) for heap allocation handlers (#1100).
     pub(super) fn assign_value_to_place(&mut self, destination: &Place, value: Expr) {
+        self.guard_box_pointer_store(destination);
         let value_for_tracking = value.clone();
         self.bind_ssa_result(destination, value);
 
@@ -270,6 +273,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // not claim to have dereferenced anything.
                 self.codegen_operand(operand).map(|expr| (expr, RefValueSource::Unreported))
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => {
+                self.codegen_operand(operand).map(|expr| (expr, RefValueSource::Unreported))
+            }
         }
     }
 
@@ -313,6 +320,45 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => inner,
             _ => return None,
         };
+        self.reconstruct_flattened_option_value(pointee_ty, pointee_base, pointee_expr)
+    }
+
+    /// Element value recorded for `[operand; N]` in `repeat_array_values`.
+    ///
+    /// A flattened Option-like operand (#2076) codegens to its bare payload
+    /// bitvec; its variant lives only under `{base}.0`. Recording that payload as
+    /// the repeated element dropped the variant, and the #3133 comparison bridge
+    /// then read every element as `Some(payload)`: `[None::<u8>; 5][i] == Some(0)`
+    /// PROVED (soundness dual `dual_enum_array_elem_variant::check_none_ne_some`).
+    /// Rebuild the Option datatype from the discriminant exactly as a read through
+    /// a reference does; any other operand is returned as resolved.
+    pub(super) fn repeat_element_value(&mut self, operand: &Operand, elem_expr: &Expr) -> Expr {
+        let elem_expr = self.resolve_concrete_expr(elem_expr);
+        if let Operand::Copy(src) | Operand::Move(src) = operand
+            && let Some(src_ty) = src.ty(self.body.locals()).into_option()
+        {
+            let src_base = self.ssa_base_name(src);
+            if let Some(option_value) =
+                self.reconstruct_flattened_option_value(src_ty, &src_base, &elem_expr)
+            {
+                return option_value;
+            }
+        }
+        elem_expr
+    }
+
+    /// [`Self::reconstruct_flattened_option_through_ref`] for a value of type
+    /// `pointee_ty` whose flattened payload `pointee_expr` lives under
+    /// `pointee_base`.
+    fn reconstruct_flattened_option_value(
+        &mut self,
+        pointee_ty: rustc_public::ty::Ty,
+        pointee_base: &str,
+        pointee_expr: &Expr,
+    ) -> Option<Expr> {
+        if !pointee_expr.sort().is_bitvec() {
+            return None;
+        }
 
         // Require an Option-like enum: exactly 2 variants, one empty + one with a
         // single field (matching try_codegen_flattened_option_aggregate's guard).
@@ -410,15 +456,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let is_ref_type = match operand {
             Operand::Copy(place) | Operand::Move(place) => {
                 if let Some(ty) = place.ty(self.body.locals()).into_option() {
-                    matches!(
-                        ty.kind(),
-                        TyKind::RigidTy(RigidTy::Ref(..)) | TyKind::RigidTy(RigidTy::RawPtr(..))
-                    )
+                    // A raw pointer payload is the address, never the pointee
+                    // (bmc_option_rawptr_payload_dual.rs).
+                    matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..)))
                 } else {
                     false
                 }
             }
             Operand::Constant(_) => false,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => false,
         };
 
         if is_ref_type {

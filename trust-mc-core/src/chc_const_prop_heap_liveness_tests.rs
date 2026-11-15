@@ -103,6 +103,83 @@ fn test_scalarized_obj_size_bounds_requires_const_address_cell() {
     assert!(!has_scalarized_obj_size_bounds(&vc));
 }
 
+/// A VC with the heap metadata arrays, one scalarized cell of `cell_width`
+/// bits at `cell_addr`, entry-rule `facts`, and `stores` on a bb0 -> bb1 edge.
+fn heap_cell_vc(cell_addr: u64, cell_width: u32, facts: Vec<Expr>, stores: Vec<Expr>) -> ChcVc {
+    let size_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(32));
+    let mut vc = ChcVc::new();
+    let obj_size = vc.declare_var("obj_size", size_sort.clone());
+    vc.declare_var("obj_size__out", size_sort.clone());
+    vc.declare_var("obj_valid", Sort::array(Sort::bitvec(32), Sort::bool()));
+    vc.declare_var(format!("_main_mem_u8_at_0x{cell_addr:x}_bv64"), Sort::bitvec(cell_width));
+    vc.add_relation(RelationDecl::new("bb0", vec![size_sort.clone()]));
+    vc.add_relation(RelationDecl::new("bb1", vec![size_sort.clone()]));
+    vc.add_rule(Rule::new(RuleBody::new(None, facts), RelationApp::new("bb0", vec![obj_size.clone()])));
+    vc.add_rule(Rule::new(
+        RuleBody::new(Some(RelationApp::new("bb0", vec![obj_size])), stores),
+        RelationApp::new("bb1", vec![Expr::var("obj_size__out", size_sort)]),
+    ));
+    vc
+}
+
+fn size_store(obj: u64, size: Expr) -> Expr {
+    let size_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(32));
+    Expr::var("obj_size__out", size_sort.clone())
+        .eq(Expr::var("obj_size", size_sort).store(Expr::bitvec_const(obj, 32), size))
+}
+
+fn size_fact(obj: u64, size: u64) -> Expr {
+    Expr::var("obj_size", Sort::array(Sort::bitvec(32), Sort::bitvec(32)))
+        .select(Expr::bitvec_const(obj, 32))
+        .eq(Expr::bitvec_const(size, 32))
+}
+
+#[test]
+fn test_obj_size_guard_off_when_every_cell_is_inside_a_constant_size() {
+    // `Box::new(DV { a, b })` (obj 0x34, size 2) with both bytes scalarized: no
+    // cell is out of bounds, so constant propagation may run
+    // (fix/chc-lost-writes: the drop's obligations stayed symbolic otherwise).
+    let heap = heap_cell_vc(0x34_0000_0001, 8, vec![], vec![size_store(0x34, Expr::bitvec_const(2u64, 32))]);
+    assert!(!has_scalarized_obj_size_bounds(&heap));
+    // A stack object sized by an entry-rule fact counts the same way.
+    let stack = heap_cell_vc(0x5_0000_0001, 8, vec![size_fact(5, 2)], vec![]);
+    assert!(!has_scalarized_obj_size_bounds(&stack));
+}
+
+#[test]
+fn test_obj_size_guard_fires_on_a_cell_past_its_object() {
+    // offset 2 of a 2-byte object: the out-of-bounds cell the guard protects.
+    let past = heap_cell_vc(0x34_0000_0002, 8, vec![], vec![size_store(0x34, Expr::bitvec_const(2u64, 32))]);
+    assert!(has_scalarized_obj_size_bounds(&past));
+    // A 16-bit cell at offset 1 of a 2-byte object ends past it too.
+    let straddle = heap_cell_vc(0x34_0000_0001, 16, vec![], vec![size_store(0x34, Expr::bitvec_const(2u64, 32))]);
+    assert!(has_scalarized_obj_size_bounds(&straddle));
+}
+
+#[test]
+fn test_obj_size_guard_fires_without_one_constant_size() {
+    // A symbolic size (`realloc/shrink`: the layout's size).
+    let symbolic = heap_cell_vc(0x34_0000_0000, 8, vec![], vec![size_store(0x34, Expr::var("n", Sort::bitvec(32)))]);
+    assert!(has_scalarized_obj_size_bounds(&symbolic));
+    // Two sizes for one object (a resize).
+    let resized = heap_cell_vc(
+        0x34_0000_0000,
+        8,
+        vec![size_fact(0x34, 8)],
+        vec![size_store(0x34, Expr::bitvec_const(2u64, 32))],
+    );
+    assert!(has_scalarized_obj_size_bounds(&resized));
+    // A store into obj_size at a symbolic index may resize any object.
+    let size_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(32));
+    let symbolic_index = Expr::var("obj_size__out", size_sort.clone()).eq(Expr::var("obj_size", size_sort)
+        .store(Expr::var("o", Sort::bitvec(32)), Expr::bitvec_const(4u64, 32)));
+    let any = heap_cell_vc(0x5_0000_0000, 8, vec![size_fact(5, 2)], vec![symbolic_index]);
+    assert!(has_scalarized_obj_size_bounds(&any));
+    // An object with no size at all.
+    let no_size = heap_cell_vc(0x34_0000_0000, 8, vec![], vec![]);
+    assert!(has_scalarized_obj_size_bounds(&no_size));
+}
+
 #[test]
 fn test_signed_overflow_error_edge_detected() {
     // error :- bb0, not(bvsdiv(bvmul(count, 16), 16) == count)  — the byte-offset

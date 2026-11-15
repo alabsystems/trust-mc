@@ -20,6 +20,30 @@ use rustc_public::mir::{
 use rustc_public::rustc_internal;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Classify only projections whose alias effect the object-level graph models.
+/// StableMIR cannot construct PhantomDeref: borrow checking synthesizes it for
+/// Reborrow's indirect lifetime place. Refuse an unexpected occurrence here
+/// instead of attributing it an ordinary pointee set or ignoring it.
+fn projection_is_dereference(
+    projection: &rustc_middle::mir::PlaceElem<'_>,
+) -> Result<bool, &'static str> {
+    match projection {
+        ProjectionElem::Deref => Ok(true),
+        ProjectionElem::Field(..)
+        | ProjectionElem::Index(..)
+        | ProjectionElem::ConstantIndex { .. }
+        | ProjectionElem::Subslice { .. }
+        | ProjectionElem::Downcast(..)
+        | ProjectionElem::OpaqueCast(..)
+        | ProjectionElem::UnwrapUnsafeBinder(..) => Ok(false),
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        ProjectionElem::PhantomDeref => {
+            Err("trust-mc points-to analysis does not support the symbolic Reborrow PhantomDeref \
+             projection; it is not an ordinary pointer dereference")
+        }
+    }
+}
+
 /// A node in the points-to graph, which could be a place on the stack, a heap allocation, or a static.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum MemLoc<'tcx> {
@@ -161,19 +185,14 @@ impl<'tcx> PointsToGraph<'tcx> {
         let mut node_set =
             HashSet::from([MemLoc::new_stack_allocation(instance, place_without_projections)]);
         for projection in place.projection {
-            match projection {
-                ProjectionElem::Deref => {
+            match projection_is_dereference(&projection) {
+                Ok(true) => {
                     node_set = self.successors(&node_set);
                 }
-                ProjectionElem::Field(..)
-                | ProjectionElem::Index(..)
-                | ProjectionElem::ConstantIndex { .. }
-                | ProjectionElem::Subslice { .. }
-                | ProjectionElem::Downcast(..)
-                | ProjectionElem::OpaqueCast(..)
-                | ProjectionElem::UnwrapUnsafeBinder(..) => {
+                Ok(false) => {
                     /* There operations are no-ops w.r.t aliasing since we are tracking it on per-object basis. */
                 }
+                Err(refusal) => rustc_middle::ty::tls::with(|tcx| tcx.dcx().fatal(refusal)),
             }
         }
         node_set
@@ -263,6 +282,19 @@ mod tests {
     use super::*;
     use rustc_hir::def_id::{DefId, DefIndex, LOCAL_CRATE};
     use rustc_mir_dataflow::JoinSemiLattice;
+
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    #[test]
+    fn phantom_deref_cannot_be_an_alias_noop_or_ordinary_deref() {
+        assert!(projection_is_dereference(&ProjectionElem::PhantomDeref).is_err());
+        assert_eq!(projection_is_dereference(&ProjectionElem::Deref), Ok(true));
+        assert_eq!(
+            projection_is_dereference(&ProjectionElem::Index(
+                rustc_middle::mir::Local::from_usize(0)
+            )),
+            Ok(false),
+        );
+    }
 
     /// Helper: create a distinct `MemLoc::Static` for testing.
     fn static_loc(index: u32) -> MemLoc<'static> {

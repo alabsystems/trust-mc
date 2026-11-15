@@ -45,6 +45,21 @@ pub(super) struct ConstFoldInfo {
 /// 1. All Select/Store operations use constant indices (or no selects at all)
 /// 2. The output var appears ONLY in identity constraints (`out = in`)
 ///    or not at all in transition rules (rules with a body relation)
+/// 3. No transition rule HAVOCS it: a rule whose head carries the bare output
+///    var must also define it (store chain, const-array init or identity).
+///    A head `X__out` that no constraint of its rule defines is universally
+///    quantified over that rule, so the array takes ANY value on that edge;
+///    folding its reads to the entry constants would undo the havoc (see
+///    [`havocking_rules_by_output`]). Such an array is treated like one with
+///    a non-identity store: eliminated only when nothing reads it.
+/// 4. The same judgement made by POSITION, for heads criterion 3 cannot see
+///    by name: at a relation slot whose readers carry the array `X`, every
+///    head must carry `X` itself (bound by its body relation) or `X__out`
+///    (criteria 2 and 3). A `__mid_bbN` spelling that survived the alias
+///    collapse (unbound, or defined by a store), a constant emit-time
+///    propagation substituted, a `__pad_*` or another variable sets the slot
+///    to something the entry constants do not describe
+///    ([`arrays_set_positionally`]).
 ///
 /// Three sub-cases:
 /// - **Constant folding**: entry rule has pointwise or bulk const_array constraints
@@ -71,12 +86,23 @@ pub(super) fn identify_const_foldable_arrays(vc: &ChcVc) -> Vec<ConstFoldInfo> {
     let uniform_defaults = extract_uniform_defaults(vc, &input_vars);
     let select_usage = collect_select_usage(vc);
     let constraint_var_sets = collect_constraint_var_sets(vc);
+    // Both indexes are built in ONE pass over the VC. The per-array loop below
+    // used to rescan every transition constraint (and rebuild the live-output
+    // set) once per array variable, and to hash-probe every constraint's
+    // variable set for every array: O(arrays x constraints). A coroutine
+    // holding `[u8; 128]` state has hundreds of array columns and thousands of
+    // constraints, and spent the whole 80 s watchdog here
+    // (kani/Coroutines/rustc-coroutine-tests/moved-locals.rs).
+    let escaping_inputs = inputs_escaping_to_live_output_copies(vc);
+    let transition_occurrences = transition_constraint_occurrences(vc, &constraint_var_sets);
+    let head_rules = transition_rules_carrying_array_output(vc);
+    let positional_writes = arrays_set_positionally(vc, &input_vars);
 
     let mut result = Vec::new();
     for (input_name, _sort) in &input_vars {
         let output_name = format!("{input_name}__out");
 
-        if whole_input_escapes_to_live_output_copy(vc, input_name, &output_name) {
+        if escaping_inputs.contains(input_name.as_str()) {
             continue;
         }
 
@@ -90,14 +116,14 @@ pub(super) fn identify_const_foldable_arrays(vc: &ChcVc) -> Vec<ConstFoldInfo> {
         }
         let mut has_non_identity_store = false;
 
-        for (rule_idx, rule) in vc.rules.iter().enumerate() {
-            let is_transition = rule.body.relation.is_some();
-
-            for (constraint_idx, constraint) in rule.body.constraints.iter().enumerate() {
-                let vars = &constraint_var_sets[rule_idx][constraint_idx];
-
-                // For transition rules, check if output is used non-trivially
-                if is_transition && vars.contains(output_name.as_str()) {
+        // Only the transition constraints that mention this array's output can
+        // set the flag, and the flag is only ever set, so visiting exactly those
+        // (in rule order) is the same boolean as the full scan.
+        let occurrences =
+            transition_occurrences.get(output_name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+        for &(_rule_idx, _constraint_idx, constraint) in occurrences {
+            {
+                {
                     let classification = classify_constraint_for_array(
                         constraint,
                         input_name,
@@ -152,6 +178,22 @@ pub(super) fn identify_const_foldable_arrays(vc: &ChcVc) -> Vec<ConstFoldInfo> {
             }
         }
 
+        // Criterion 3: a transition rule that carries the bare output in its
+        // head without defining it havocs the array.
+        if !has_non_identity_store
+            && let Some(rules) = head_rules.get(output_name.as_str())
+            && !havocking_rules_by_output(rules, occurrences, input_name, &output_name, &input_vars)
+                .is_empty()
+        {
+            has_non_identity_store = true;
+        }
+
+        // Criterion 4: a head sets the array's slot to something other than
+        // the array itself or its `__out`.
+        if !has_non_identity_store && positional_writes.contains(input_name.as_str()) {
+            has_non_identity_store = true;
+        }
+
         // Write-only arrays: stores but zero selects. Values are written
         // but never read — safe to eliminate entirely. Must check for ANY
         // select (including symbolic-index) — collect_all_select_indices
@@ -194,6 +236,140 @@ pub(super) fn identify_const_foldable_arrays(vc: &ChcVc) -> Vec<ConstFoldInfo> {
     result
 }
 
+/// Per array output name: the transition rules whose HEAD carries that bare
+/// output variable (`X__out`), in rule order.
+fn transition_rules_carrying_array_output(vc: &ChcVc) -> HashMap<&str, Vec<usize>> {
+    let mut carrying: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (rule_idx, rule) in vc.rules.iter().enumerate() {
+        if rule.body.relation.is_none() {
+            continue;
+        }
+        for arg in rule.head.args.iter() {
+            if let ExprValue::Var { name } = arg.value()
+                && arg.sort().is_array()
+                && name.ends_with("__out")
+            {
+                let rules = carrying.entry(name.as_str()).or_default();
+                if rules.last() != Some(&rule_idx) {
+                    rules.push(rule_idx);
+                }
+            }
+        }
+    }
+    carrying
+}
+
+/// The array inputs some transition rule's HEAD sets to something other than
+/// the array itself or its `__out`, judged by relation slot.
+///
+/// A relation slot's name comes from the rules that READ the relation: a body
+/// application carries the canonical input variable at each slot (`X`), and
+/// only those rules can read the value the slot holds. A head that writes the
+/// slot must then carry `X` (an unchanged frame, which needs `X` bound by the
+/// rule's own body relation: an `X` the body does not carry is a free clause
+/// variable, a havoc) or `X__out` (defined or havocked; criteria 2 and 3 judge
+/// that by name). Anything else sets the array on that edge to a value the
+/// entry rule does not describe: a `__mid_bbN` intermediate the alias collapse
+/// left in place (unbound, or defined by a store in a composed middle block),
+/// an array constant that emit-time propagation substituted for the output, a
+/// `__pad_*` slot, or another array. A rule-local identity `(= mid X)` still
+/// counts as an unchanged frame. A slot whose readers disagree on the name is
+/// judged against each name, which only ever refuses more.
+fn arrays_set_positionally(vc: &ChcVc, input_vars: &HashMap<String, Sort>) -> HashSet<String> {
+    let mut slot_names: HashMap<&str, Vec<HashSet<&str>>> = HashMap::new();
+    for rule in &vc.rules {
+        let Some(body_rel) = rule.body.relation.as_ref() else { continue };
+        let slots = slot_names.entry(body_rel.name.as_str()).or_default();
+        if slots.len() < body_rel.args.len() {
+            slots.resize_with(body_rel.args.len(), HashSet::new);
+        }
+        for (pos, arg) in body_rel.args.iter().enumerate() {
+            if let ExprValue::Var { name } = arg.value()
+                && input_vars.contains_key(name.as_str())
+            {
+                slots[pos].insert(name.as_str());
+            }
+        }
+    }
+
+    let mut set: HashSet<String> = HashSet::new();
+    for rule in &vc.rules {
+        let Some(body_rel) = rule.body.relation.as_ref() else { continue };
+        let Some(slots) = slot_names.get(rule.head.name.as_str()) else { continue };
+        for (pos, arg) in rule.head.args.iter().enumerate() {
+            let Some(names) = slots.get(pos) else { continue };
+            for &array in names {
+                if set.contains(array) || head_slot_keeps_array(rule, body_rel, arg, array) {
+                    continue;
+                }
+                set.insert(array.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// Whether head argument `arg` at a slot the readers call `array` leaves the
+/// array to criteria 1-3: `array` itself bound by the body relation, its
+/// `__out`, or a `__mid_bbN` that the rule equates with `array`.
+fn head_slot_keeps_array(
+    rule: &trust_mc_core::chc::Rule,
+    body_rel: &trust_mc_core::chc::RelationApp,
+    arg: &Expr,
+    array: &str,
+) -> bool {
+    let ExprValue::Var { name } = arg.value() else { return false };
+    let is_var = |expr: &Expr, want: &str| match expr.value() {
+        ExprValue::Var { name } => name.as_str() == want,
+        _ => false,
+    };
+    if name == array {
+        return body_rel.args.iter().any(|body_arg| is_var(body_arg, array));
+    }
+    if name.strip_prefix(array) == Some("__out") {
+        return true;
+    }
+    if name.strip_prefix(array).is_some_and(|rest| rest.starts_with("__mid_bb")) {
+        return rule.body.constraints.iter().any(|c| match c.value() {
+            ExprValue::Eq(lhs, rhs) => {
+                (is_var(lhs, name) && is_var(rhs, array))
+                    || (is_var(lhs, array) && is_var(rhs, name))
+            }
+            _ => false,
+        });
+    }
+    false
+}
+
+/// The rules among `head_rules` (transition rules whose head carries
+/// `output_name`) in which no constraint DEFINES the output: no store chain,
+/// const-array initialization or whole-array copy has it on the left. There the
+/// output is a free clause variable, a havoc of the array on that edge, which
+/// is never the identity `X__out = X`. A constraint that only reads the output
+/// (a `select` pinning one element, say) leaves every other element free, so it
+/// does not count as a definition either.
+pub(super) fn havocking_rules_by_output(
+    head_rules: &[usize],
+    occurrences: &[(usize, usize, &Expr)],
+    input_name: &str,
+    output_name: &str,
+    input_vars: &HashMap<String, Sort>,
+) -> Vec<usize> {
+    let defined: HashSet<usize> = occurrences
+        .iter()
+        .filter(|(_, _, constraint)| {
+            matches!(
+                classify_constraint_for_array(constraint, input_name, output_name, input_vars),
+                ArrayUse::StoreChain { .. }
+                    | ArrayUse::ConstArrayInit
+                    | ArrayUse::ExplicitIdentity { .. }
+            )
+        })
+        .map(|(rule_idx, _, _)| *rule_idx)
+        .collect();
+    head_rules.iter().copied().filter(|rule_idx| !defined.contains(rule_idx)).collect()
+}
+
 fn collect_constraint_var_sets(vc: &ChcVc) -> Vec<Vec<HashSet<String>>> {
     vc.rules
         .iter()
@@ -215,6 +391,82 @@ fn collect_expr_vars(expr: &Expr) -> HashSet<String> {
     vars
 }
 
+/// Per variable name: the TRANSITION constraints whose variable set contains
+/// it, as `(rule, constraint position, constraint)`, in rule order.
+fn transition_constraint_occurrences<'a, 'v>(
+    vc: &'v ChcVc,
+    constraint_var_sets: &'a [Vec<HashSet<String>>],
+) -> HashMap<&'a str, Vec<(usize, usize, &'v Expr)>> {
+    let mut occurrences: HashMap<&str, Vec<(usize, usize, &Expr)>> = HashMap::new();
+    for (rule_idx, rule) in vc.rules.iter().enumerate() {
+        if rule.body.relation.is_none() {
+            continue;
+        }
+        for (constraint_idx, (vars, constraint)) in
+            constraint_var_sets[rule_idx].iter().zip(rule.body.constraints.iter()).enumerate()
+        {
+            for var in vars {
+                occurrences.entry(var.as_str()).or_default().push((
+                    rule_idx,
+                    constraint_idx,
+                    constraint,
+                ));
+            }
+        }
+    }
+    occurrences
+}
+
+/// Input arrays whose WHOLE value is copied into a different, live output
+/// array by some transition constraint (`(= other__out input)` inside a
+/// top-level conjunction). Such an input escapes: folding it would lose the
+/// copy. One pass over the VC answers the question for every array at once.
+fn inputs_escaping_to_live_output_copies(vc: &ChcVc) -> HashSet<String> {
+    let live_outputs = live_output_array_args(vc);
+    let mut escaping = HashSet::new();
+    for constraint in vc
+        .rules
+        .iter()
+        .filter(|rule| rule.body.relation.is_some())
+        .flat_map(|rule| rule.body.constraints.iter())
+    {
+        let mut stack = vec![constraint];
+        while let Some(expr) = stack.pop() {
+            match expr.value() {
+                ExprValue::And(conjuncts) => stack.extend(conjuncts.iter()),
+                ExprValue::Eq(lhs, rhs) => {
+                    for (maybe_output, maybe_input) in [(lhs, rhs), (rhs, lhs)] {
+                        if let Some(input) = live_cross_array_copy_input(maybe_output, maybe_input, &live_outputs) {
+                            escaping.insert(input.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    escaping
+}
+
+/// `(= copied_output copied_input)` where both sides are variables and the
+/// output is live and is not the input's own `__out`: returns the input name.
+fn live_cross_array_copy_input<'e>(
+    maybe_output: &'e Expr,
+    maybe_input: &'e Expr,
+    live_outputs: &HashSet<String>,
+) -> Option<&'e str> {
+    let ExprValue::Var { name: copied_input } = maybe_input.value() else {
+        return None;
+    };
+    let ExprValue::Var { name: copied_output } = maybe_output.value() else {
+        return None;
+    };
+    let own_output = format!("{copied_input}__out");
+    (*copied_output != own_output && live_outputs.contains(copied_output.as_str()))
+        .then_some(copied_input.as_str())
+}
+
+#[cfg(test)]
 fn whole_input_escapes_to_live_output_copy(vc: &ChcVc, input: &str, output: &str) -> bool {
     let live_outputs = live_output_array_args(vc);
     vc.rules
@@ -253,6 +505,7 @@ fn live_output_array_args(vc: &ChcVc) -> HashSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn is_live_cross_array_copy(
     maybe_output: &Expr,
     maybe_input: &Expr,
@@ -682,4 +935,93 @@ fn try_select_const_pair(
     }
     let idx = try_extract_const_idx(index)?;
     Some((idx, value_side.clone()))
+}
+
+#[cfg(test)]
+mod linear_identification_tests {
+    //! The one-pass escape set and occurrence index must answer exactly what the
+    //! per-array scans they replaced answered.
+    use super::*;
+    use trust_mc_core::chc::{RelationApp, RelationDecl, Rule, RuleBody, VarDecl};
+
+    fn arr() -> Sort {
+        Sort::array(Sort::bitvec(64), Sort::bitvec(32))
+    }
+
+    /// `a` is copied whole into the live `b__out` (escapes); `c` is copied into
+    /// the NON-live `dead__out` (does not escape); `d` is copied into its own
+    /// `d__out` (identity, does not escape); `e` hides its copy inside an `and`.
+    fn vc() -> ChcVc {
+        let v = |n: &str| Expr::var(n, arr());
+        let mut vc = ChcVc::new();
+        for n in ["a", "a__out", "b__out", "c", "c__out", "dead__out", "d", "d__out", "e", "e__out", "f__out"] {
+            vc.add_var(VarDecl::new(n, arr()));
+        }
+        vc.add_relation(RelationDecl::new("bb0", vec![arr(), arr(), arr(), arr()]));
+        vc.add_relation(RelationDecl::new("bb1", vec![arr(), arr(), arr(), arr(), arr()]));
+        let init = Expr::const_array(Sort::bitvec(64), Expr::bitvec_const(0, 32));
+        vc.add_rule(Rule::new(
+            RuleBody::new(None, vec![v("a").eq(init.clone()), v("c").eq(init.clone())]),
+            RelationApp::new("bb0", vec![v("a"), v("c"), v("d"), v("e")]),
+        ));
+        vc.add_rule(Rule::new(
+            RuleBody::new(
+                Some(RelationApp::new("bb0", vec![v("a"), v("c"), v("d"), v("e")])),
+                vec![
+                    v("b__out").eq(v("a")),
+                    v("dead__out").eq(v("c")),
+                    v("d__out").eq(v("d")),
+                    v("e__out").eq(v("e")).and(v("f__out").eq(v("e"))),
+                ],
+            ),
+            RelationApp::new("bb1", vec![v("a__out"), v("b__out"), v("d__out"), v("e__out"), v("f__out")]),
+        ));
+        vc
+    }
+
+    #[test]
+    fn escape_set_matches_the_per_array_scan() {
+        let vc = vc();
+        let escaping = inputs_escaping_to_live_output_copies(&vc);
+        for input in ["a", "c", "d", "e"] {
+            let output = format!("{input}__out");
+            assert_eq!(
+                escaping.contains(input),
+                whole_input_escapes_to_live_output_copy(&vc, input, &output),
+                "{input}"
+            );
+        }
+        assert!(escaping.contains("a") && escaping.contains("e"), "{escaping:?}");
+        assert!(!escaping.contains("c") && !escaping.contains("d"), "{escaping:?}");
+    }
+
+    #[test]
+    fn occurrence_index_lists_exactly_the_transition_constraints_mentioning_a_var() {
+        let vc = vc();
+        let sets = collect_constraint_var_sets(&vc);
+        let index = transition_constraint_occurrences(&vc, &sets);
+        for (rule_idx, rule) in vc.rules.iter().enumerate() {
+            for (constraint_idx, vars) in sets[rule_idx].iter().enumerate() {
+                for var in vars {
+                    let listed = index.get(var.as_str()).is_some_and(|occ| {
+                        occ.iter().any(|&(r, c, _)| (r, c) == (rule_idx, constraint_idx))
+                    });
+                    assert_eq!(listed, rule.body.relation.is_some(), "{var} at {rule_idx}/{constraint_idx}");
+                }
+            }
+        }
+        // The entry rule's `a` constraint is not a transition occurrence.
+        let a_positions: Vec<(usize, usize)> =
+            index.get("a").unwrap().iter().map(|&(r, c, _)| (r, c)).collect();
+        assert_eq!(a_positions, vec![(1, 0)]);
+        // Rule order is preserved for the early exit.
+        assert!(index.values().all(|occ| occ.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1))));
+    }
+
+    #[test]
+    fn identification_is_unchanged_on_the_escape_fixture() {
+        let infos = identify_const_foldable_arrays(&vc());
+        let names: std::collections::BTreeSet<_> = infos.iter().map(|i| i.input_name.as_str()).collect();
+        assert!(!names.contains("a") && !names.contains("e"), "escaping inputs must not fold: {names:?}");
+    }
 }

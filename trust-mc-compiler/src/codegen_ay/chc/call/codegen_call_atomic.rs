@@ -11,6 +11,26 @@ use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 use trust_mc_codegen_types::types::unwrap_single_field_datatype;
 
+/// The scalar an atomic holds, through every single-field datatype layer of
+/// its value. The Trust standard library declares
+/// `Atomic<T: AtomicPrimitive> { v: UnsafeCell<T::Storage> }`, the storage a
+/// one-field `#[repr(C, align(N))]` struct (`Align8<usize>`), so with the field
+/// types instantiated (Rule A, `shared::mono_ty`) an atomic's value is a chain
+/// of single-field datatypes around the scalar, as deep as the declaration
+/// nests it. On a destination variable the result is the chain of field
+/// selections down to the scalar; a constraint on it determines the variable
+/// exactly, since every layer has one constructor with one field.
+pub(in crate::codegen_ay::chc) fn atomic_scalar(expr: ay_bindings::Expr) -> ay_bindings::Expr {
+    let mut cur = expr;
+    for _ in 0..8 {
+        match unwrap_single_field_datatype(&cur) {
+            Some(inner) => cur = inner,
+            None => break,
+        }
+    }
+    cur
+}
+
 use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_atomic_from_ptr::codegen_atomic_from_ptr;
@@ -182,6 +202,9 @@ impl<'tcx, 'body> CallDispatchAtomic for ChcCtx<'tcx, 'body> {
             .or_else(|| self.resolve_callee_path(dcx.func))
             .or_else(|| self.resolve_fn_def_name(dcx.func));
         let Some(ref path) = callee_path else { return false };
+        if super::codegen_call_static_atomic_address::try_static_atomic_as_ptr(self, dcx) {
+            return true;
+        }
         let Some(kind) = detect_atomic_intrinsic(path) else { return false };
 
         // Fences: no-op in sequential verification — no memory effect, no return value.
@@ -195,6 +218,27 @@ impl<'tcx, 'body> CallDispatchAtomic for ChcCtx<'tcx, 'body> {
         }
 
         let Some(target) = dcx.target else { return true };
+        // The receiver is the memory the operation reads or writes: bounded
+        // when it points into a static or a constant allocation
+        // (`codegen_stmt_rvalue_offset_const_access.rs`).
+        // A terminator's checks are not drained at the block's end (the
+        // statements' are), so the bound's rules are emitted here.
+        if !matches!(
+            kind,
+            AtomicKind::New | AtomicKind::FromPtr | AtomicKind::GetMut | AtomicKind::Fence
+        ) {
+            let staged_from = self.heap_state.pending_checks.len();
+            self.emit_const_object_receiver_bound(dcx.args.first(), dcx.modified_locals);
+            let staged = self.heap_state.pending_checks.split_off(staged_from);
+            for check in staged {
+                self.emit_error_rule_for_condition(
+                    dcx.from_app,
+                    check,
+                    dcx.stmt_constraints,
+                    *target,
+                );
+            }
+        }
         match kind {
             AtomicKind::Load => codegen_atomic_load(self, dcx, *target),
             AtomicKind::Store => codegen_atomic_store(self, dcx, *target),
@@ -400,8 +444,7 @@ fn codegen_atomic_load(
     // The destination sort is Bool. Without unwrapping, coercion sees
     // Datatype→Bool which is unsupported. Unwrapping yields BV8, then
     // BV8→Bool coercion (BV8 != 0) succeeds via make_coerced_eq_constraint.
-    let loaded = loaded.into_expr();
-    let loaded = unwrap_single_field_datatype(&loaded).unwrap_or(loaded);
+    let loaded = atomic_scalar(loaded.into_expr());
 
     if let Some((_, dest_var)) = ctx.resolve_destination(dest_local) {
         let s = dest_var.sort().clone();
@@ -456,10 +499,11 @@ fn codegen_atomic_store(
 
         let mut extra = Vec::new();
         if let Some((_, rv)) = ctx.resolve_destination(referent_local) {
+            let rv = atomic_scalar(rv);
             let s = rv.sort().clone();
             if let Some(eq) = ctx.make_coerced_eq_constraint(
                 &rv,
-                new_value.clone(),
+                atomic_scalar(new_value.clone()),
                 &s,
                 referent_local,
                 "atomic_store",
@@ -546,14 +590,8 @@ fn codegen_atomic_new(
         // the dest sort is Datatype(Atomic*, [fld_v: inner_sort]) but init_value
         // has the inner value sort (Bool for AtomicBool::new(true)). Constrain
         // the inner field directly so coercion (Bool→BV8 etc.) can succeed.
-        let (coerce_target, coerce_sort) =
-            if let Some(inner) = unwrap_single_field_datatype(&dest_var) {
-                let s = inner.sort().clone();
-                (inner, s)
-            } else {
-                let s = dest_var.sort().clone();
-                (dest_var, s)
-            };
+        let coerce_target = atomic_scalar(dest_var);
+        let coerce_sort = coerce_target.sort().clone();
         let eq = ctx.make_coerced_eq_constraint(
             &coerce_target,
             init_value,

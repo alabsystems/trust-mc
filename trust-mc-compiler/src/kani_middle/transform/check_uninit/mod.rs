@@ -15,7 +15,7 @@ use relevant_instruction::{InitRelevantInstruction, MemoryInitOp};
 use rustc_public::{
     mir::{
         AggregateKind, BasicBlock, Body, ConstOperand, Mutability, Operand, Place, Rvalue,
-        Statement, StatementKind, Terminator, TerminatorKind, UnwindAction, mono::Instance,
+        Statement, StatementKind, TerminatorKind, UnwindAction, mono::Instance,
     },
     ty::{FnDef, GenericArgKind, GenericArgs, MirConst, RigidTy, Ty, TyConst, TyKind, UintTy},
 };
@@ -259,8 +259,8 @@ impl<'a> UninitInstrumenter<'a> {
                     layout.len(),
                     *pointee_info.ty(),
                 );
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             is_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -271,8 +271,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
             PointeeLayout::Slice { element_layout } => {
                 // Since `str`` is a separate type, need to differentiate between [T] and str.
@@ -292,8 +292,8 @@ impl<'a> UninitInstrumenter<'a> {
                 );
                 let layout_operand =
                     mk_layout_operand(body, &mut statements, source, element_layout);
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             is_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -304,8 +304,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
             PointeeLayout::TraitObject => {
                 let reason = "trust_mc does not support reasoning about memory initialization of pointers to trait objects.";
@@ -357,8 +357,8 @@ impl<'a> UninitInstrumenter<'a> {
                     intersection_layout.len(),
                     *pointee_info.ty(),
                 );
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             is_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -369,8 +369,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
         };
 
@@ -479,8 +479,8 @@ impl<'a> UninitInstrumenter<'a> {
                     layout.len(),
                     *pointee_info.ty(),
                 );
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             set_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -491,8 +491,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // this will be overriden in add_bb
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
             PointeeLayout::Slice { element_layout } => {
                 // Since `str`` is a separate type, need to differentiate between [T] and str.
@@ -512,8 +512,8 @@ impl<'a> UninitInstrumenter<'a> {
                 );
                 let layout_operand =
                     mk_layout_operand(body, &mut statements, source, element_layout);
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             set_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -532,8 +532,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
             PointeeLayout::TraitObject => {
                 unreachable!("Cannot change the initialization state of a trait object directly.");
@@ -578,8 +578,8 @@ impl<'a> UninitInstrumenter<'a> {
                     layout.len(),
                     *pointee_info.ty(),
                 );
-                Terminator {
-                    kind: TerminatorKind::Call {
+                crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Call {
                         func: Operand::Copy(Place::from(body.new_local(
                             set_ptr_initialized_instance.ty(),
                             source.span(body.blocks()),
@@ -590,8 +590,8 @@ impl<'a> UninitInstrumenter<'a> {
                         target: Some(0), // this will be overriden in add_bb
                         unwind: UnwindAction::Terminate,
                     },
-                    span: source.span(body.blocks()),
-                }
+                    source.span(body.blocks()),
+                )
             }
         };
         // Construct the basic block and insert it into the body.
@@ -672,8 +672,8 @@ impl<'a> UninitInstrumenter<'a> {
         );
         let operand = operation.mk_operand(body, &mut statements, source);
         let argument_no = operation.expect_argument_no();
-        let terminator = Terminator {
-            kind: TerminatorKind::Call {
+        let terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Call {
                 func: Operand::Copy(Place::from(body.new_local(
                     argument_operation_instance.ty(),
                     source.span(body.blocks()),
@@ -692,8 +692,8 @@ impl<'a> UninitInstrumenter<'a> {
                 target: Some(0), // this will be overriden in add_bb
                 unwind: UnwindAction::Terminate,
             },
-            span: source.span(body.blocks()),
-        };
+            source.span(body.blocks()),
+        );
 
         // Construct the basic block and insert it into the body.
         body.insert_bb(BasicBlock { statements, terminator }, source, operation.position());
@@ -720,8 +720,8 @@ impl<'a> UninitInstrumenter<'a> {
             *pointee_info.ty(),
         );
         let (from, to) = operation.expect_assign_union_operands(body, &mut statements, source);
-        let terminator = Terminator {
-            kind: TerminatorKind::Call {
+        let terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Call {
                 func: Operand::Copy(Place::from(body.new_local(
                     copy_init_state_instance.ty(),
                     source.span(body.blocks()),
@@ -732,8 +732,8 @@ impl<'a> UninitInstrumenter<'a> {
                 target: Some(0), // this will be overriden in add_bb
                 unwind: UnwindAction::Terminate,
             },
-            span: source.span(body.blocks()),
-        };
+            source.span(body.blocks()),
+        );
 
         // Construct the basic block and insert it into the body.
         body.insert_bb(BasicBlock { statements, terminator }, source, operation.position());
@@ -747,11 +747,11 @@ impl<'a> UninitInstrumenter<'a> {
         reason: &str,
     ) {
         let span = source.span(body.blocks());
-        let rvalue = Rvalue::Use(Operand::Constant(ConstOperand {
+        let rvalue = rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
             const_: MirConst::from_bool(false),
             span,
             user_ty: None,
-        }));
+        })));
         let result = body.insert_assignment(rvalue, source, position);
         body.insert_check(&self.safety_check_type, source, position, Some(result), reason);
     }
@@ -801,7 +801,10 @@ pub(crate) fn mk_layout_operand(
     );
     let ret_ty = rvalue.ty(body.locals()).expect("rvalue should have type");
     let result = body.new_local(ret_ty, span, Mutability::Not);
-    let stmt = Statement { kind: StatementKind::Assign(Place::from(result), rvalue), span };
+    let stmt = crate::rustc_compat::mir_statement(
+        StatementKind::Assign(Place::from(result), rvalue),
+        span,
+    );
     statements.push(stmt);
 
     Operand::Move(Place { local: result, projection: vec![] })

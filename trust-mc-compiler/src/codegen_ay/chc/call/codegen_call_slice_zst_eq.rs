@@ -36,6 +36,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn slice_operand_elem_ty(&self, operand: &Operand) -> Option<rustc_public::ty::Ty> {
+        // `Place::ty` indexes `locals` and panics on a local outside this body.
+        if let Operand::Copy(place) | Operand::Move(place) = operand
+            && place.local >= self.body.locals().len()
+        {
+            return None;
+        }
         let ty = self.resolve_body_ty(operand.ty(self.body.locals()).ok()?);
         let inner_ty = match ty.kind() {
             TyKind::RigidTy(RigidTy::Ref(_, inner, _))

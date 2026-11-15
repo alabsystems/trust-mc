@@ -47,17 +47,30 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         //            _23 = Cast(Misc, move _24, *mut bool) → needs propagation
         //            _62 = Use(Move(_23))                  → needs propagation
         let src_place = match rhs {
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => Some(src),
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => Some(src),
             Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _) => Some(src),
             _ => None,
         };
         if let Some(src) = src_place {
+            // A constant address crosses a copy only between single-producer
+            // locals, like every other path-insensitive side table here: a copy
+            // out of a path-merged pointer would revive one arm's address.
             if src.projection.is_empty()
+                && self.path_insensitive_metadata_copy_is_unique(src.local, local_idx)
                 && let Some(addr) = self.known_stack_addr_expr(src.local)
             {
                 self.known_stack_addr_exprs.insert(local_idx, addr);
             }
+            // A field source is one producer's operand. When the aggregate (or,
+            // below, the local a deref reaches) has several producers, the
+            // destination inherits nothing, and loses what a previous producer
+            // of its own left behind.
             if src.projection.len() == 1
+                && matches!(src.projection[0], ProjectionElem::Field(..))
+                && self.local_has_multiple_whole_definitions(src.local)
+            {
+                self.clear_path_insensitive_ref_metadata(local_idx);
+            } else if src.projection.len() == 1
                 && let ProjectionElem::Field(field_idx, _) = src.projection[0]
                 && let Some(&source_local) = aggregate_field_sources.get(&(src.local, field_idx))
             {
@@ -83,7 +96,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             {
                 let deref_target =
                     self.ref_resolution.ref_targets.get(&src.local).map(|rt| rt.local);
-                if let Some(target_local) = deref_target {
+                if let Some(target_local) = deref_target
+                    && self.local_has_multiple_whole_definitions(target_local)
+                {
+                    self.clear_path_insensitive_ref_metadata(local_idx);
+                } else if let Some(target_local) = deref_target {
                     let afs_result = aggregate_field_sources.get(&(target_local, field_idx));
                     if let Some(&source_local) = afs_result {
                         self.propagate_ref_metadata(
@@ -174,6 +191,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     true,
                     RefMetadataOffsetMode::Copy,
                 );
+                if matches!(
+                    rhs,
+                    Rvalue::Cast(
+                        rustc_public::mir::CastKind::PointerCoercion(
+                            rustc_public::mir::PointerCoercion::Unsize
+                        ),
+                        ..,
+                    )
+                ) && !self.ref_resolution.subslice_len.contains_key(&local_idx)
+                    && self.path_insensitive_metadata_copy_is_unique(src_local, local_idx)
+                    && let Ok(src_ty) = src.ty(self.body.locals())
+                    && let Some(len) = Self::extract_array_len_from_ref(self.resolve_body_ty(src_ty))
+                {
+                    self.ref_resolution.subslice_len.insert(
+                        local_idx,
+                        Expr::bitvec_const(len as u128, crate::codegen_ay::types::POINTER_WIDTH),
+                    );
+                }
             }
         }
 
@@ -281,6 +316,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         .unwrap_or_else(|| rhs_expr.clone());
                     let prev_suppress = self.suppress_heap_store_checks;
                     self.suppress_heap_store_checks = true;
+                    // A whole interior-mutable value moved or copied in
+                    // reaches memory field by field, where the Cell lane
+                    // reads it (see `mirror_local_assignment_to_memory`).
+                    if !matches!(rhs, Rvalue::Aggregate(..))
+                        && memory_store_value.sort().is_datatype()
+                        && self.ty_has_interior_mut(local_ty)
+                    {
+                        self.try_decompose_struct_store(
+                            &addr_expr,
+                            &memory_store_value,
+                            local_ty,
+                            constraints,
+                        );
+                    }
                     if let Some(store_constraint) = self.build_memory_store_untyped(
                         addr_expr.clone(),
                         memory_store_value,

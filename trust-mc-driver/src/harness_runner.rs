@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use trust_mc_metadata::{HarnessKind, HarnessMetadata};
 
 use crate::args::NumThreads;
+use crate::chc_claim_policy::{EvidenceAccounting, ctrex_evidence_is_complete};
 use crate::ctrex_classify::classify_ctrex;
 use crate::demotion::{
     apply_sound_fallback_fail_close, demote_for_all_unsoundness, lookup_per_harness,
@@ -29,8 +30,9 @@ use crate::session::KaniSession;
 use crate::unknown_quality::classify_unknown_quality;
 use crate::unsoundness_counts::UnsoundnessCounts;
 use crate::verification_result::{
-    CtrexCategory, FailedProperties, ProofCrosscheck, VacuityShape, VerificationResult,
-    VerificationStatus, classify_vacuity, has_satisfied_cover, has_unsatisfiable_cover,
+    CtrexCategory, FailedProperties, OBLIGATION_FREE_CERTIFIED_QUALIFIER, ProofCrosscheck,
+    VacuityShape, VerificationResult, VerificationStatus, classify_vacuity, has_satisfied_cover,
+    has_unsatisfiable_cover,
 };
 
 /// A HarnessRunner is responsible for checking all proof harnesses. The data in this structure represents
@@ -105,6 +107,12 @@ impl<'pr> HarnessRunner<'_, 'pr> {
         // call. See `args::common::QUIET_OUTPUT`.
         crate::args::common::set_quiet_output(self.sess.args.common_args.quiet);
         let sorted_harnesses = crate::metadata::sort_harnesses_by_loc(harnesses);
+        // Register the schedule so a wall-clock fire can NAME any harness that
+        // never starts instead of dropping it from the transcript
+        // (wall_clock_watchdog::write_unattempted_harnesses).
+        crate::wall_clock_watchdog::register_harnesses(
+            sorted_harnesses.iter().map(|harness| harness.pretty_name.as_str()),
+        );
         let unsoundness_counts = UnsoundnessCounts::from_project(self.project);
         let pool = {
             let mut builder = rayon::ThreadPoolBuilder::new();
@@ -249,18 +257,33 @@ fn find_smt_file(model_file: &Path, outdir: &Path) -> Result<PathBuf> {
     bail!("SMT-LIB2 file not found (tried: {})", tried)
 }
 
-/// The BMC unwind bound was exhausted: some loop asked for an iteration past
-/// `--unwind N` / `#[kani::unwind(N)]`, so the unwinding assertion the unroller
-/// planted on the cut back-edge is among the FAILED checks (class `"unwind"`,
-/// see `classify_violation`).
+/// An unwinding bound was exhausted, so the search was TRUNCATED rather than a
+/// bug found. Two shapes, one meaning:
 ///
-/// This is the one counterexample shape that says nothing whatsoever about the
-/// program: the search was truncated, not a bug found. Every consumer that would
-/// otherwise present it as a bug — the CTREX category, the not-certified caveat,
-/// concrete playback — keys off this predicate.
+/// * class `"unwind"` — the BMC loop bound. Some loop asked for an iteration
+///   past `--unwind N` / `#[kani::unwind(N)]`, so the unwinding assertion the
+///   unroller planted on the cut back-edge is among the FAILED checks (see
+///   `classify_violation`).
+/// * class `"recursion"` — the recursive-inline bound. `; RECURSIVE_UNWIND_ASSERTION:`
+///   says recursive inlining exhausted the active harness unwind bound, and
+///   `verdict_policy::recursion_unwind_property` relabels the harness's failure
+///   as "recursion unwinding assertion" (class `"recursion"`, id 1).
+///
+/// These are the counterexample shapes that say nothing whatsoever about the
+/// program. Every consumer that would otherwise present one as a bug — the CTREX
+/// category, the not-certified caveat, concrete playback — keys off this
+/// predicate.
+///
+/// The `"recursion"` arm is the fix for a measured false positive: on the trustc
+/// route `kani/DynTrait/unsized_cast.rs` and `unsized_rc_cast.rs` exhaust the
+/// bound in `Box`/`Rc` drop-glue dyn dispatch, and the truncated search was
+/// reported as `[AY:CTREX_CAT:Genuine]` — a CERTIFIED failure on a correct
+/// program — purely because the class was spelled `recursion` and not `unwind`.
+/// Fail closed: the engine could not decide the harness, so it must not certify.
 fn unwind_bound_exhausted(results: &[crate::property_model::Property]) -> bool {
     results.iter().any(|p| {
-        p.status == crate::property_model::CheckStatus::Failure && p.property_id.class == "unwind"
+        p.status == crate::property_model::CheckStatus::Failure
+            && matches!(p.property_id.class.as_ref(), "unwind" | "recursion")
     })
 }
 
@@ -273,12 +296,133 @@ fn proof_crosscheck_marker(proof_crosscheck: &ProofCrosscheck) -> Option<String>
     proof_crosscheck.label().map(|label| format!("[AY:PROOF_CROSSCHECK:{label}]"))
 }
 
+/// V4b's trigger: a harness about to count as verified while its obligation set
+/// is EMPTY.
+///
+/// Deliberately reads no certificate FILE. Whether the compiler vouched for the
+/// body decides how [`settle_no_checks_result`] settles the result, never
+/// whether this fires: zero obligations discharged is not a proof, whichever
+/// lane produced them. A result already settled as a certified obligation-free
+/// success carries [`OBLIGATION_FREE_CERTIFIED_QUALIFIER`] and is not about to
+/// count as a CLEAN success, so the gate does not fire twice on it (the second
+/// check after the two-lane retry would otherwise print the marker again).
+/// `should_panic` is exempt, as for V4, because its verdict is panic-shaped.
+/// A cover-only harness has non-empty `results`, so V5 adjudicates it.
+pub(crate) fn no_checks_gate_fires(result: &VerificationResult, should_panic: bool) -> bool {
+    !should_panic
+        && result.status != VerificationStatus::Failure
+        && result.results.is_empty()
+        && !result.is_certified_obligation_free()
+}
+
+/// Settle a result whose obligation set is EMPTY, once [`no_checks_gate_fires`]
+/// has said so.
+///
+/// * CERTIFIED (`ArtifactMetadata.obligation_free_body`): the walk in
+///   `codegen_ay/obligation_free_walk.rs` proved every reachable statement and
+///   terminator carries no obligation, so nothing was dropped and nothing
+///   could fail. The harness stays a success and exits 0, as it does under
+///   Kani — carrying [`OBLIGATION_FREE_CERTIFIED_QUALIFIER`], which keeps it
+///   from ever reading as a clean proof: the verdict line, the qualifier
+///   marker, the summary verdict and the SARIF note all key on it (D16).
+/// * NOT certified: an obligation may have been dropped, and zero checks
+///   discharged is not a proof. `INCONCLUSIVE (no checks)`, exit 1.
+pub(crate) fn settle_no_checks_result(
+    result: &mut VerificationResult,
+    certified_obligation_free: bool,
+) {
+    if certified_obligation_free {
+        result.status = VerificationStatus::Success;
+        result.failed_properties = FailedProperties::None;
+        if !result.is_certified_obligation_free() {
+            result.proof_qualifiers.push(OBLIGATION_FREE_CERTIFIED_QUALIFIER.to_string());
+        }
+    } else {
+        result.status = VerificationStatus::Failure;
+        result.failed_properties = FailedProperties::Other;
+    }
+}
+
+/// The `[AY:VACUOUS:no-checks]` line.
+///
+/// The tag prefix is identical for both causes, because consumers key on it:
+/// `tools/kani-domination` classifies `[AY:VACUOUS`, and the tests and
+/// expected files match `[AY:VACUOUS:no-checks]`. The explanation — and, since
+/// D16's second step, the verdict — differs: a certified body dropped no
+/// obligation and had none to prove; an uncertified one may have dropped one.
+pub(crate) fn no_checks_marker(harness: &str, certified_obligation_free: bool) -> String {
+    if certified_obligation_free {
+        format!(
+            "[AY:VACUOUS:no-checks] {harness}: the harness produced no verification conditions \
+             — the compiler certified that no obligation site is reachable from it (every \
+             reachable statement and terminator was walked), so nothing was dropped and \
+             nothing could fail. Reported SUCCESSFUL with the proof qualifier \
+             `{OBLIGATION_FREE_CERTIFIED_QUALIFIER}`, never as a clean proof: nothing was \
+             proved because there was nothing to prove (Kani reports this shape as \
+             SUCCESSFUL; see `trust-mc explain kani`)."
+        )
+    } else {
+        format!(
+            "[AY:VACUOUS:no-checks] {harness}: the harness produced no verification conditions \
+             — and the compiler could not certify the body obligation-free, so an obligation \
+             may have been dropped. Zero checks discharged is not a proof."
+        )
+    }
+}
+
+/// The non-clean proof qualifier of a SUCCESSFUL whose only checks are the anonymous
+/// `chc.0` fallback ([`crate::property_model::Property::is_unattributed_chc_check`]).
+pub(crate) const UNATTRIBUTED_CHC_CHECK_QUALIFIER: &str = "unattributed_check=chc.0";
+
+/// [`UNATTRIBUTED_CHC_CHECK_QUALIFIER`] when `result` is a success whose every non-cover
+/// check is the anonymous CHC fallback. A cover is its own obligation and does not
+/// attribute the proof, so covers are ignored. Only a success qualifies: the qualifier
+/// marks a proof that names nothing, and a FAILED verdict is reported unchanged.
+pub(crate) fn unattributed_chc_check_qualifier(
+    result: &VerificationResult,
+) -> Option<&'static str> {
+    if result.status != VerificationStatus::Success {
+        return None;
+    }
+    let mut checks = result.results.iter().filter(|property| !property.is_cover_property());
+    let first = checks.next()?;
+    (first.is_unattributed_chc_check()
+        && checks.all(|property| property.is_unattributed_chc_check()))
+    .then_some(UNATTRIBUTED_CHC_CHECK_QUALIFIER)
+}
+
+/// Whether every FAILED non-cover check of `result` is the anonymous CHC fallback
+/// ([`crate::property_model::Property::is_unattributed_chc_check`]), and there is at least one.
+/// Such a failure names no property, so it cannot be certified as a panic (V7).
+pub(crate) fn should_panic_rests_on_unattributed_chc_check(result: &VerificationResult) -> bool {
+    let mut failing = result
+        .results
+        .iter()
+        .filter(|property| !property.is_cover_property())
+        .filter(|property| property.status == crate::property_model::CheckStatus::Failure);
+    let Some(first) = failing.next() else {
+        return false;
+    };
+    first.is_unattributed_chc_check()
+        && failing.all(|property| property.is_unattributed_chc_check())
+}
+
+/// The proof qualifiers a result reports: the backend's own, then
+/// [`UNATTRIBUTED_CHC_CHECK_QUALIFIER`] when it applies.
+pub(crate) fn reported_proof_qualifiers(result: &VerificationResult) -> Vec<String> {
+    let mut quals = result.proof_qualifiers.clone();
+    if let Some(qualifier) = unattributed_chc_check_qualifier(result) {
+        quals.push(qualifier.to_string());
+    }
+    quals
+}
+
 pub(crate) fn proof_qualifiers_marker(result: &VerificationResult) -> Option<String> {
     if result.status != VerificationStatus::Success {
         return None;
     }
 
-    let mut quals = result.proof_qualifiers.clone();
+    let mut quals = reported_proof_qualifiers(result);
     if result.sound_fallback_count > 0 {
         quals.push(format!("sound_fallback={}", result.sound_fallback_count));
     }
@@ -529,44 +673,119 @@ fn sha256_field<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a s
 /// (`"name=count"`), `ev` the compiler-plumbed identity evidence, `results` the
 /// per-check verdicts. Returns true iff BOTH completeness gates hold AND at
 /// least one violated `error_p{N}` is data-independent of every freed var.
+/// Sound-approximation categories whose events the compiler never accounts
+/// with a freed-var identity (`ChcVc::record_approximation_identity`): the
+/// reachability boundary's unstubbed abstraction is decided before the CHC
+/// encoder runs, so no dependence analysis sees what it frees.
 fn ctrex_certifiable_genuine(
     categories: &[String],
     ev: &crate::ay_parse::vc_artifact::ApproximationEvidence,
     results: &[crate::property_model::Property],
 ) -> bool {
-    // Parse the harness taint total and its `unhandled_calls` share. Each
-    // `unhandled_calls` double-labels a `chc_translation_drop` event from the
-    // SAME SoundFallback site, so subtracting it recovers the count of DISTINCT
-    // freed-value events the compiler was expected to account.
-    let mut taint_total = 0usize;
-    let mut unhandled = 0usize;
-    for entry in categories {
-        let Some((name, count)) = entry.rsplit_once('=') else { continue };
-        let Ok(count) = count.parse::<usize>() else { continue };
-        taint_total += count;
-        if name == "unhandled_calls" {
-            unhandled += count;
-        }
-    }
-    let effective_total = taint_total.saturating_sub(unhandled);
-
-    // COMPLETENESS: there was real taint (effective_total > 0), the compiler's
-    // local flag holds, AND the accounted count equals the driver's own
-    // (double-count adjusted) taint total — i.e. EVERY approximation on the
-    // harness recorded its freed-var identity. Any failure means an
-    // approximation freed a value the dependence analysis never saw, so the
-    // whole harness stays tainted (an unplumbed site is fail-closed).
-    if effective_total == 0 || !ev.complete || ev.accounted != effective_total {
+    if !ctrex_evidence_is_complete(
+        categories,
+        EvidenceAccounting { complete: ev.complete, accounted: ev.accounted },
+    ) {
         return false;
     }
 
     // DEPENDENCE: the counterexample is genuine iff at least one VIOLATED
     // `error_p{N}` is data-INDEPENDENT of every freed var. A violated check
     // whose verdict is dependent, or unknown/absent, leaves the taint.
+    // An unattributed failure (`chc.0`) carries id 0, which is not the id of
+    // the check that failed, so its lookup would read another check's verdict.
     results.iter().any(|p| {
         p.status == crate::property_model::CheckStatus::Failure
+            && !p.is_unattributed_chc_check()
             && matches!(ev.dependent_by_id.get(&p.property_id.id), Some(Some(false)))
     })
+}
+
+/// Replay gate for a counterexample certified independent of a float-binop
+/// table (`trust_mc_core::chc::FLOAT_BINOP_TABLE_F32` / `_F64`).
+///
+/// `None` when no table is among the freed variables: the gate does not apply.
+/// Otherwise `Ok` names the violated, table-independent `error_p{N}` that a
+/// replay derived on the system with every table read removed
+/// (`trust_mc_driver::replay_error_derivation_free_of`), and `Err` says why no
+/// violated check did.
+///
+/// The per-property dependence verdict is computed by a name-based taint
+/// closure over the compiler's rules. The table is a whole array threaded
+/// through every relation, so a counterexample certified from that verdict
+/// alone would rest entirely on the closure seeing every flow of a table value;
+/// the replay confirms the counterexample itself instead — a derivation of the
+/// violated check that never evaluates a select, re-checked with a total model
+/// on an independently rebuilt system. Only a SAT verdict can be upgraded by
+/// this gate, and only when BOTH the dependence analysis and the replay agree.
+fn float_table_ctrex_replay(
+    smt_text: &str,
+    ev: &crate::ay_parse::vc_artifact::ApproximationEvidence,
+    results: &[crate::property_model::Property],
+) -> Option<Result<String, String>> {
+    let tables: Vec<&str> = ev
+        .approximated_vars
+        .iter()
+        .map(String::as_str)
+        .filter(|var| trust_mc_core::chc::is_float_binop_table_var(var))
+        .collect();
+    if tables.is_empty() {
+        return None;
+    }
+    let mut refusals = Vec::new();
+    for property in results {
+        if property.status != crate::property_model::CheckStatus::Failure
+            || !matches!(ev.dependent_by_id.get(&property.property_id.id), Some(Some(false)))
+        {
+            continue;
+        }
+        let Some(relation) = ev.relation_by_id.get(&property.property_id.id) else {
+            continue;
+        };
+        match trust_mc_driver::replay_error_derivation_free_of(smt_text, relation, &tables) {
+            Ok(summary) => return Some(Ok(summary)),
+            Err(reason) => refusals.push(format!("{relation}: {reason}")),
+        }
+    }
+    Some(Err(if refusals.is_empty() {
+        "no violated table-independent check to replay".to_string()
+    } else {
+        refusals.join("; ")
+    }))
+}
+
+/// Kani's wording for both same-allocation obligations of the offset models.
+const SAME_ALLOCATION_CHECK: &str = "point to the same allocation";
+
+/// BMC lane: a counterexample whose ONLY taint is `offset_provenance_unresolved`
+/// and whose failing checks all lie OUTSIDE the same-allocation family is
+/// genuine.
+///
+/// In the BMC lane that record frees no value. A `ptr::offset` / `add` / `sub`
+/// site whose allocation cannot be named emits no same-allocation obligation at
+/// all (alloc_view.rs `emit_offset_same_allocation_check`), which can only REMOVE
+/// failures; an `offset_from` site falls back to the region predicate, which
+/// affects only its own same-allocation check and an assumption that cuts
+/// paths. Neither can make a DIFFERENT check fail, so an assertion, overflow or
+/// bounds counterexample under that taint is real — and the record still
+/// demotes every proof. The CHC lane frees a symbolic `obj_id` instead and keeps
+/// the per-property dependence route (`ctrex_certifiable_genuine`); its
+/// artifacts carry `error_p{N}` properties, a BMC artifact carries none.
+fn bmc_offset_only_ctrex_is_genuine(
+    categories: &[String],
+    ev: &crate::ay_parse::vc_artifact::ApproximationEvidence,
+    results: &[crate::property_model::Property],
+) -> bool {
+    let is_bmc_artifact = ev.dependent_by_id.is_empty();
+    let offset_only = !categories.is_empty()
+        && categories.iter().all(|c| c.starts_with("offset_provenance_unresolved="));
+    let mut failing =
+        results.iter().filter(|p| p.status == crate::property_model::CheckStatus::Failure);
+    let any_failing = failing.clone().next().is_some();
+    is_bmc_artifact
+        && offset_only
+        && any_failing
+        && failing.all(|p| !p.description.contains(SAME_ALLOCATION_CHECK))
 }
 
 impl KaniSession {
@@ -583,12 +802,22 @@ impl KaniSession {
     /// certifies Genuine; `dual_77_dependent` and `ffi_ptr` (bug reads the
     /// havocked extern return) stay `OverApproximation` because their violated
     /// `error_p3` is `approximation_dependent`.
+    ///
+    /// An upgrade also returns what it certified (`independent of ...`), which
+    /// the caller prints as the `[AY:CTREX_CAT:Genuine:certified ...]` marker only
+    /// when the category is still `Genuine` after
+    /// [`Self::gate_genuine_on_havoc_reads`]. Printed here, a counterexample the
+    /// havoc gate then refused carried a `Genuine` marker before its final
+    /// `OverApproximation` one, and the readers that take any `Genuine` marker as
+    /// a certificate (the dual gate, the corpus scorer's single-harness path)
+    /// counted a false certificate (`chc_dead_heap_owner_target_dual.rs`
+    /// `safe_string_moved_read`, once main's Rule E accounted its havoc).
     fn recertify_overapprox_ctrex(
         &self,
         category: CtrexCategory,
         smt_binary: &Path,
         results: &[crate::property_model::Property],
-    ) -> CtrexCategory {
+    ) -> (CtrexCategory, Option<String>) {
         // Two certifiable lanes (OFFSET_PROV_GENUINE_CERT):
         //   * OverApproximation — the sound-approximation taint lane (Task #77
         //     twin duals); and
@@ -612,41 +841,109 @@ impl KaniSession {
             {
                 categories.clone()
             }
-            _ => return category,
+            _ => return (category, None),
         };
         let vc_path = crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(smt_binary);
         let Some(ev) = crate::ay_parse::vc_artifact::load_approximation_evidence(&vc_path) else {
-            return category; // no evidence → stay tainted (fail-closed)
+            return (category, None); // no evidence → stay tainted (fail-closed)
         };
-        if ctrex_certifiable_genuine(&categories, &ev, results) {
-            marker_println!(
-                self,
-                "[AY:CTREX_CAT:Genuine:certified independent of {} freed var(s) (was {})]",
-                ev.approximated_vars.len(),
+        if bmc_offset_only_ctrex_is_genuine(&categories, &ev, results) {
+            let upgrade = format!(
+                "independent of the unresolved offset allocation(s) (was {})",
                 category.label()
             );
-            CtrexCategory::Genuine
-        } else {
-            category
+            return (CtrexCategory::Genuine, Some(upgrade));
+        }
+        if !ctrex_certifiable_genuine(&categories, &ev, results) {
+            return (category, None);
+        }
+        // A float-binop table among the freed variables: the counterexample must
+        // also REPLAY without any table read (`float_table_ctrex_replay`).
+        if ev.approximated_vars.iter().any(|var| trust_mc_core::chc::is_float_binop_table_var(var))
+        {
+            let replay = std::fs::read_to_string(smt_binary)
+                .map_err(|error| format!("cannot read {}: {error}", smt_binary.display()))
+                .and_then(|text| {
+                    float_table_ctrex_replay(&text, &ev, results)
+                        .unwrap_or_else(|| Err("no float-binop table is freed".to_string()))
+                });
+            match replay {
+                Ok(summary) => marker_println!(self, "[AY:CTREX_REPLAY:confirmed] {summary}"),
+                Err(reason) => {
+                    marker_println!(
+                        self,
+                        "[AY:CTREX_REPLAY:refused] the counterexample is independent of the \
+                         float-binop table by the dependence analysis but did not replay \
+                         without it, so it stays {}: {reason}",
+                        category.label()
+                    );
+                    return (category, None);
+                }
+            }
+        }
+        let upgrade = format!(
+            "independent of {} freed var(s) (was {})",
+            ev.approximated_vars.len(),
+            category.label()
+        );
+        (CtrexCategory::Genuine, Some(upgrade))
+    }
+
+    /// fix/chc-false-certificates: a `Genuine` CHC counterexample stays
+    /// `Genuine` only when some violated check is derivable without reading a
+    /// value no clause defines (`crate::ctrex_havoc`). A refused counterexample
+    /// is an over-approximation: it still fails the harness, but it is never
+    /// reported as a certified bug.
+    ///
+    /// `strict` (a `should_panic` harness, where a `Genuine` counterexample is
+    /// the proof) adds the gate's strict rules (`certify_error_free_of_havoc`).
+    fn gate_genuine_on_havoc_reads(
+        &self,
+        category: CtrexCategory,
+        smt_binary: &Path,
+        results: &[crate::property_model::Property],
+        strict: bool,
+    ) -> CtrexCategory {
+        if category != CtrexCategory::Genuine {
+            return category;
+        }
+        match crate::ctrex_havoc::havoc_gate(smt_binary, results, strict) {
+            crate::ctrex_havoc::HavocGate::NotApplicable
+            | crate::ctrex_havoc::HavocGate::Certified(None) => category,
+            crate::ctrex_havoc::HavocGate::Certified(Some(summary)) => {
+                marker_println!(self, "[AY:CTREX_HAVOC:certified] {summary}");
+                category
+            }
+            crate::ctrex_havoc::HavocGate::Refused(reason) => {
+                marker_println!(
+                    self,
+                    "[AY:CTREX_HAVOC:refused] every violated check depends on a value no \
+                     clause defines, so the counterexample is not certified: {reason}"
+                );
+                CtrexCategory::OverApproximation { categories: vec!["havoc_read=1".to_string()] }
+            }
         }
     }
 
-    /// Answer a loop contract's TWO questions with the strongest sound method
-    /// for each, when this harness's single lane could not answer both.
+    /// Retry a loop-contract harness this run did not prove, once, in a child
+    /// driver that checks the same harness under the same loop-contract
+    /// semantics with the CHC lane, the compound-measure encoding and a longer
+    /// per-query budget (`loop_two_lane.rs` has the design and why it has one
+    /// lane since review round 3). A CHILD PROCESS: the unsoundness counters
+    /// are process-global and accumulate, so an in-process second run would
+    /// trip markers this run never trips and demote a clean proof to a failure.
     ///
-    /// Obligations lane: rule ON + `--prove-safety-only` -> base / step /
-    /// decreases. Properties lane: rule OFF + bounded unroll -> assertions and
-    /// memory safety. Both are CHILD PROCESSES: the unsoundness counters are
-    /// process-global and accumulate, so an in-process second lane would trip
-    /// markers this lane never trips and demote a clean proof to a failure.
-    ///
-    /// Only ever upgrades a verdict, and only when BOTH lanes discharge what
-    /// they own; on any doubt the original verdict stands untouched.
+    /// The verdict moves only toward SUCCESS, and only when `lanes::merge`
+    /// accepts the child: it checked exactly this harness, proved every check,
+    /// and reported the base-case and inductive-step obligations. A wrongly
+    /// accepted child is a missed bug, so each of those is a precondition; on
+    /// any doubt the original verdict stands untouched.
     fn maybe_two_lane_retry(
         &self,
         binary: &Path,
         harness: &HarnessMetadata,
         result: &mut VerificationResult,
+        deadline: crate::deadline::Deadline,
     ) {
         use crate::loop_two_lane as lanes;
 
@@ -657,101 +954,139 @@ impl KaniSession {
             return;
         }
 
-        // One clock for the WHOLE retry: the parent's watchdog kills it at
-        // ~80s (harness_timeout*5+5), and a kill degrades this row to a
-        // timeout — which would make the feature a regression.
+        // Never START a lane the active route will refuse. The lane sets an
+        // engine generation knob on its child and the Trustc route refuses a
+        // child while one is set, so spawning one there cost the retry AND
+        // printed the CHILD's refusal inside this process's diagnostic — where
+        // a reader (`tools/kani-domination`'s route check included) took it for
+        // THIS process refusing and scored an attested, verdict-bearing run a
+        // route error. Say by name what the route cannot do instead; the
+        // first run's verdict stands.
+        let is_trustc = matches!(self.route, crate::session::CompilerRoute::Trustc { .. });
+        if let Some(limitation) = lanes::route_limitation(is_trustc) {
+            println!("{}", limitation.marker());
+            println!("{}", limitation.explanation());
+            return;
+        }
+
+        // One clock for the retry, inside the harness's own deadline: the
+        // parent's watchdog kills it ~10s past that deadline, and a kill
+        // degrades this row to a timeout — which would make the feature a
+        // regression. So the retry is not started when what the first run left
+        // is below a lane's floor.
         let retry_start = std::time::Instant::now();
         // `--harness` is a filter over PRETTY names; passing the mangled name
         // yields "no harnesses matched the harness filter" and a silent no-op.
         let harness_name = harness.pretty_name.as_str();
-
-        // RUN THE LANES CONCURRENTLY. They are INDEPENDENT — the obligations
-        // lane proves base/step/decreases, the properties lane proves the user
-        // assertions — so sequencing them cost `sum` where `max` suffices.
-        // MEASURED: obligations ~44s, properties ~20s. Sequential 64s left only
-        // ~6s of headroom under the parent's 80s watchdog, and under the
-        // corpus's `--jobs 3` contention that overran the retry budget: the row
-        // reported false_positive at exactly the 70s cap while the SAME harness
-        // proved in 64.4s on an idle machine. A feature that only works on an
-        // unloaded machine is not working.
-        let budget = match lanes::lane_budget(retry_start.elapsed()) {
-            Some(b) => b,
-            None => return,
+        let Some(budget) = lanes::lane_budget(retry_start.elapsed(), deadline.remaining()) else {
+            marker_println!(
+                self,
+                "{} — the loop-contract retry is not started; the first lane's verdict stands",
+                deadline.stage_skipped_marker("two-lane-retry", lanes::LANE_MIN_BUDGET)
+            );
+            return;
         };
-        let (o_res, p_res) = std::thread::scope(|scope| {
-            let o = scope.spawn(|| {
-                lanes::lane_o_command(harness_name)
-                    .and_then(|c| crate::session::run_piped_with_timeout(c, budget).ok())
-            });
-            let p = scope.spawn(|| {
-                lanes::lane_p_command(harness_name, lanes::LANE_P_DEPTHS[0])
-                    .and_then(|c| crate::session::run_piped_with_timeout(c, budget).ok())
-            });
-            (o.join().ok().flatten(), p.join().ok().flatten())
-        });
-
-        let Some(out_o) = o_res else {
+        // The lane's memory cap is what THIS HARNESS owns of the driver's armed
+        // cap (AY ask R2), the same share its in-process envelope gets: under
+        // `--jobs N` that is the cap less the driver's footprint, divided by N.
+        // The lane runs alone and one harness, on a one-thread pool (its argv
+        // carries no `--jobs`), so the whole share is its cap.
+        let child_cap_mb = retry_child_cap();
+        // The row export (`TRUST_MC_CHC_ROW_EXPORT_DIR`): the lane writes its own
+        // export below this harness's, never over it.
+        let export_dir = retry_lane_export_dir(harness_name);
+        let Some(mut cmd) = lanes::retry_lane_command(harness_name, export_dir.as_deref()) else {
             println!("[AY:LOOP_TWO_LANE] obligations lane did not run");
             return;
         };
-        let o_stdout = String::from_utf8_lossy(&out_o.stdout).into_owned();
-        if !lanes::child_proved(&o_stdout) {
-            let tail: Vec<&str> = o_stdout
-                .lines()
-                .filter(|l| l.starts_with("VERIFICATION") || l.starts_with("error"))
-                .collect();
-            println!("[AY:LOOP_TWO_LANE] obligations lane did not prove: {tail:?}");
-            return;
+        if let Some(mb) = child_cap_mb {
+            cmd.env("TRUST_MC_AY_MEMORY_LIMIT_MB", mb.to_string());
         }
-        println!("[AY:LOOP_TWO_LANE] obligations lane discharged");
+        let child_argv: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let lane = crate::session::run_piped_with_timeout(cmd, budget).ok();
 
-        let mut p_proved = p_res
-            .as_ref()
-            .is_some_and(|o| lanes::child_proved(&String::from_utf8_lossy(&o.stdout)));
+        // Under --allow-unpinned-ay the lane demotes its own success; see
+        // `lanes::child_proved`.
+        let unpinned = crate::ay_binary::unpinned_solver_accepted();
 
-        // Deepen only if the first depth did not answer AND time remains.
-        if !p_proved {
-            for depth in &lanes::LANE_P_DEPTHS[1..] {
-                let Some(b) = lanes::lane_budget(retry_start.elapsed()) else {
-                    println!("[AY:LOOP_TWO_LANE] out of retry budget before depth {depth}");
-                    break;
-                };
-                let Some(cmd) = lanes::lane_p_command(harness_name, *depth) else { break };
-                let Ok(out) = crate::session::run_piped_with_timeout(cmd, b) else { continue };
-                if lanes::child_proved(&String::from_utf8_lossy(&out.stdout)) {
-                    p_proved = true;
-                    break;
-                }
+        let outcome = match &lane {
+            None => {
+                println!("[AY:LOOP_TWO_LANE] obligations lane did not run");
+                "did not run".to_string()
             }
-        }
-
-        match lanes::merge(true, &o_stdout, p_proved) {
-            lanes::TwoLaneOutcome::Proved => {
-                println!(
-                    "[AY:LOOP_TWO_LANE] obligations and properties discharged in separate lanes"
-                );
-                // Every check this lane could not discharge WAS discharged —
-                // the obligations in Lane O, the user properties in Lane P.
-                // Leaving them marked FAILURE would print "Failed Checks: ..."
-                // directly above a SUCCESSFUL verdict: contradictory output that
-                // misleads a reader and any tool parsing the check list. Record
-                // WHERE each one was discharged rather than silently flipping it.
-                for prop in &mut result.results {
-                    if prop.status == crate::property_model::CheckStatus::Failure {
-                        prop.status = crate::property_model::CheckStatus::Success;
-                        prop.description = std::borrow::Cow::Owned(format!(
-                            "{} [discharged in the two-lane loop-contract retry]",
-                            prop.description
-                        ));
+            Some(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                match lanes::merge(harness_name, lanes::child_proved(&stdout, unpinned), &stdout) {
+                    lanes::TwoLaneOutcome::Proved => {
+                        println!(
+                            "[AY:LOOP_TWO_LANE] every check, the loop contract included, \
+                             discharged in the retry lane"
+                        );
+                        // Every check this run could not discharge WAS
+                        // discharged, with the loop contract on, in the lane.
+                        // Leaving them marked FAILURE would print "Failed
+                        // Checks: ..." directly above a SUCCESSFUL verdict.
+                        // Record WHERE each one was discharged rather than
+                        // silently flipping it.
+                        for prop in &mut result.results {
+                            if prop.status == crate::property_model::CheckStatus::Failure {
+                                prop.status = crate::property_model::CheckStatus::Success;
+                                prop.description = std::borrow::Cow::Owned(format!(
+                                    "{} [discharged in the loop-contract retry]",
+                                    prop.description
+                                ));
+                            }
+                        }
+                        result.status = VerificationStatus::Success;
+                        result.failed_properties = FailedProperties::None;
+                        "proved".to_string()
+                    }
+                    lanes::TwoLaneOutcome::Inconclusive(why) => {
+                        let tail: Vec<&str> = stdout
+                            .lines()
+                            .filter(|l| l.starts_with("VERIFICATION") || l.starts_with("error"))
+                            .collect();
+                        println!("[AY:LOOP_TWO_LANE] not proved: {why} (lane: {tail:?})");
+                        format!("inconclusive: {why}")
                     }
                 }
-                result.status = VerificationStatus::Success;
-                result.failed_properties = FailedProperties::None;
             }
-            lanes::TwoLaneOutcome::Inconclusive(why) => {
-                println!("[AY:LOOP_TWO_LANE] not proved: {why}");
-            }
-        }
+        };
+        record_retry_export(
+            harness_name,
+            serde_json::json!({
+                "lane": "loop-contract retry (rule on, CHC, compound measures, every check)",
+                "argv": child_argv,
+                "env_set": {
+                    "TRUST_MC_LOOP_LANE": "obligations",
+                    "TRUST_MC_COMPOUND_DECREASES": "1",
+                    "TRUST_MC_AY_MEMORY_LIMIT_MB": child_cap_mb,
+                },
+                "lane_export_dir": export_dir.as_ref().map(|d| d.display().to_string()),
+                "wall_budget_ms": budget.as_millis(),
+                "wall_ms": retry_start.elapsed().as_millis(),
+                "outcome": outcome,
+                "note": "the lane child exports its own query under lane_export_dir; \
+                         source.smt2 and the rows above are this (parent) process's",
+            }),
+        );
+    }
+
+    /// Settle a harness whose obligation set is EMPTY. The caller has already
+    /// established [`no_checks_gate_fires`]; the compiler's certificate decides
+    /// between the two outcomes of [`settle_no_checks_result`].
+    fn settle_no_checks(
+        &self,
+        binary: &Path,
+        harness: &HarnessMetadata,
+        result: &mut VerificationResult,
+    ) {
+        let certified = crate::ay_parse::vc_artifact::artifact_body_is_obligation_free(
+            &crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(binary),
+        );
+        marker_println!(self, "{}", no_checks_marker(&harness.pretty_name, certified));
+        settle_no_checks_result(result, certified);
     }
 
     /// Run the verification process for a single harness
@@ -761,7 +1096,15 @@ impl KaniSession {
         harness: &HarnessMetadata,
         unsoundness_counts: &crate::unsoundness_counts::CrateUnsoundnessCounts,
     ) -> Result<VerificationResult> {
+        crate::wall_clock_watchdog::mark_harness_started(&harness.pretty_name);
         let thread_index = rayon::current_thread_index().unwrap_or_default();
+        // A loop-contract retry child names every harness it checks, whatever
+        // its output format; the parent accepts it only when this is the one
+        // harness it retried (`loop_two_lane::lane_checked_exactly`). Read by
+        // the parent and never shown, so `--quiet` does not suppress it.
+        if crate::loop_two_lane::is_lane_child() {
+            println!("{}", crate::loop_two_lane::lane_harness_marker(&harness.pretty_name));
+        }
         if !self.args.common_args.quiet {
             // If the harness is automatically generated, pretty_name refers to the function under verification.
             let mut msg = if harness.is_automatically_generated {
@@ -802,10 +1145,12 @@ impl KaniSession {
         // so one harness can never consume more than its retry-ladder
         // budget of the driver's wall clock.
         let deadline = crate::deadline::Deadline::for_harness(self.args.harness_timeout);
+        let run_ay_started = std::time::Instant::now();
         let mut result = self.with_timer(
             || self.run_ay(binary, harness, demoted_fallback_count, deadline),
             "run_ay",
         )?;
+        crate::stage_timing::record("run-ay", run_ay_started, &format!("{:?}", result.status));
         demote_for_all_unsoundness(&mut result, harness, unsoundness_counts);
         if let Some(marker) = demotion_reasons_marker(&result) {
             marker_println!(self, "{marker}");
@@ -853,6 +1198,31 @@ impl KaniSession {
             // On the CHC path, Other means UNKNOWN (or soundness override) — both inconclusive.
             // On the BMC path, Other can also mean a real non-assertion violation (overflow,
             // division-by-zero, bounds-check). Those produce non-"chc" class Failure properties.
+            //
+            // `chc_exact_counterexample` is the ONE case where that detection is
+            // wrong in the other direction, and it is wrong for a decided row.
+            // `interpret_chc_trivial_unsafe` DERIVES `error` (constraint-free
+            // zero-arity closure, or an SMT-model-backed acyclic witness) and
+            // then reports it through the legacy aggregate `chc.0` property
+            // whenever per-property attribution finds no `error_p{N}` in the VC
+            // table. `chc.0` carries class "chc", and the failure class comes
+            // from the REACHABLE check's kind — so an exactly derived memory
+            // safety / pointer-overflow / valid-value counterexample arrives as
+            // `Other` + no non-chc violation, i.e. spelled exactly like a
+            // solver that could not decide. Measured 2026-09-14 on three corpus
+            // units (`expected/pointer-overflow/main.rs`,
+            // `expected/valid-value-checks/non_null.rs`,
+            // `kani/Overflow/pointer_overflow_fail.rs`): each printed
+            // `[AY:CTREX] … (exact CHC derivation)` and
+            // `[AY:UNKNOWN_QUALITY:Clean]` beside `[AY:CTREX_CAT:Unknown]`.
+            //
+            // The flag does NOT decide the category. It routes the row into
+            // `classify_ctrex` below, which still returns EncodingGap /
+            // OverApproximation when the harness carries approximations — only
+            // a harness with zero unsoundness counts comes out `Genuine`. So no
+            // check is weakened: a row that cannot be certified still is not.
+            // Every other producer leaves the flag `false`, which is the
+            // pre-existing fail-closed reading.
             let has_non_chc_violation = result.results.iter().any(|p| {
                 p.status == crate::property_model::CheckStatus::Failure
                     && p.property_id.class != "chc"
@@ -875,9 +1245,11 @@ impl KaniSession {
                 // worst a "raise the bound, then look again"; the alternative
                 // costs someone a day hunting a bug that was never found.
                 result.ctrex_category = Some(CtrexCategory::Unknown);
-            } else if matches!(result.failed_properties, FailedProperties::Other)
-                && !has_non_chc_violation
-            {
+            } else if chc_failure_is_undecided(
+                result.failed_properties,
+                has_non_chc_violation,
+                result.chc_exact_counterexample,
+            ) {
                 result.ctrex_category = Some(CtrexCategory::Unknown);
             } else {
                 // Task #78: an OverApproximation counterexample can be SOUNDLY
@@ -885,8 +1257,28 @@ impl KaniSession {
                 // approximation's freed-var identity AND the violated
                 // `error_p{N}`'s reachability is independent of every freed var.
                 let category = classify_ctrex(harness, unsoundness_counts);
-                result.ctrex_category =
-                    Some(self.recertify_overapprox_ctrex(category, binary, &result.results));
+                let (category, recertified) =
+                    self.recertify_overapprox_ctrex(category, binary, &result.results);
+                let category = self.gate_genuine_on_havoc_reads(
+                    category,
+                    binary,
+                    &result.results,
+                    harness.attributes.should_panic,
+                );
+                // The upgrade's marker names `Genuine`: printed only when the havoc
+                // gate kept it, so a refused counterexample shows no `Genuine` marker.
+                if let Some(upgrade) = recertified {
+                    if category == CtrexCategory::Genuine {
+                        marker_println!(self, "[AY:CTREX_CAT:Genuine:certified {upgrade}]");
+                    } else {
+                        marker_println!(
+                            self,
+                            "[AY:CTREX_RECERTIFY:withdrawn] the upgrade ({upgrade}) was refused \
+                             by the havoc gate"
+                        );
+                    }
+                }
+                result.ctrex_category = Some(category);
             }
         }
 
@@ -922,6 +1314,10 @@ impl KaniSession {
         // dead-check arm to a pass is a separate decision that needs its own corpus
         // run (see docs/findings/2026-08-23-v4-fires-on-a-dead-check.md).
         let vacuity_shape = classify_vacuity(&result.results, result.harness_feasibility);
+        // The vacuity gate (V4 here, V5 below) that failed this harness closed,
+        // if one did. The loop-contract retry never overturns it
+        // (`loop_two_lane::FailClosedGate`).
+        let mut vacuity_gate: Option<crate::loop_two_lane::FailClosedGate> = None;
         if !harness.attributes.should_panic
             && result.status != VerificationStatus::Failure
             && vacuity_shape != VacuityShape::None
@@ -954,6 +1350,7 @@ impl KaniSession {
                     );
                     result.status = VerificationStatus::Failure;
                     result.failed_properties = FailedProperties::Other;
+                    vacuity_gate = Some(crate::loop_two_lane::FailClosedGate::UnsatAssumption);
                 }
                 (false, VacuityShape::DeadChecks) => {
                     marker_println!(
@@ -967,6 +1364,7 @@ impl KaniSession {
                     );
                     result.status = VerificationStatus::Failure;
                     result.failed_properties = FailedProperties::Other;
+                    vacuity_gate = Some(crate::loop_two_lane::FailClosedGate::DeadChecks);
                 }
                 (_, VacuityShape::None) => unreachable!("guarded by vacuity_shape != None"),
             }
@@ -982,34 +1380,37 @@ impl KaniSession {
         // observed instance: `Option::<u32>::None.unwrap()`, which panics
         // unconditionally at runtime yet yields an obligation-free query).
         //
-        // A proof of zero obligations is not a proof. Fail closed so it renders as
-        // `VERIFICATION:- INCONCLUSIVE (no checks)` — the verdict
-        // `verification_result` already defines for this shape but could never
-        // reach while the status stayed Success — and exits non-zero. Cover-only
-        // harnesses are exempt: their covers ARE the obligation, and V5 below
-        // adjudicates them.
-        // A body with NO obligation site (no Call, no Assert terminator) cannot
-        // have had an obligation dropped — zero checks there is the
-        // `fn check() {}` shape Kani reports as a clean `0 of 0 failed`.
-        // Certified by the compiler, which is the only side that sees the MIR;
-        // absent or unreadable evidence keeps the fail-closed path.
-        let body_has_no_obligation_site = crate::ay_parse::vc_artifact::
-            artifact_body_is_obligation_free(
-                &crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(binary),
-            );
-        if !harness.attributes.should_panic
-            && result.status != VerificationStatus::Failure
-            && result.results.is_empty()
-            && !body_has_no_obligation_site
-        {
-            marker_println!(
-                self,
-                "[AY:VACUOUS:no-checks] {}: the harness produced no verification \
-                 conditions — there was nothing to prove, so this is not a proof.",
-                harness.pretty_name
-            );
-            result.status = VerificationStatus::Failure;
-            result.failed_properties = FailedProperties::Other;
+        // A proof of zero obligations is not a proof. Two outcomes, decided by
+        // the compiler's obligation-free certificate
+        // (`ArtifactMetadata.obligation_free_body`), per D16
+        // (docs/kani-spec-engine-plan-2026-09-10.md, second step, 2026-09-13):
+        //
+        // * uncertified: fail closed as `VERIFICATION:- INCONCLUSIVE (no
+        //   checks)`, exit 1 — an obligation may have been dropped;
+        // * certified: the walk in `codegen_ay/obligation_free_walk.rs` proved
+        //   every reachable statement AND terminator carries no obligation, so
+        //   the harness exits 0 as it does under Kani — visibly, never as a
+        //   clean pass: `[AY:VACUOUS:no-checks]`, the verdict line
+        //   `SUCCESSFUL (no checks — compiler-certified obligation-free)`, the
+        //   `no_checks=compiler_certified_obligation_free` proof qualifier in
+        //   place of `clean`, `successful_no_checks` in the summary and a SARIF
+        //   note.
+        //
+        // Cover-only harnesses are exempt: their covers ARE the obligation, and
+        // V5 below adjudicates them.
+        //
+        // History, because it is the hazard this gate guards: from 886f60544
+        // (2026-08-25) a certified body SKIPPED this gate, so
+        // `fn h() { let _x: u8 = 3; }` printed a bare clean
+        // `VERIFICATION:- SUCCESSFUL` with an empty `--sarif` report in BOTH
+        // lanes — while the walk read TERMINATORS only, and lowered intrinsics
+        // (`AddUnchecked`, `Offset`, `CopyNonOverlapping`, a raw deref) are
+        // STATEMENTS it could not see. 2026-09-11 closed the skip and made every
+        // empty set INCONCLUSIVE; the walk counts statement sites since
+        // f5305896b, which is what lets a certified shape exit 0 THROUGH this
+        // gate rather than around it.
+        if no_checks_gate_fires(&result, harness.attributes.should_panic) {
+            self.settle_no_checks(binary, harness, &mut result);
         }
 
         // V5 (mandatory witness): a declared `cover(...)` the solver PROVED unsatisfiable
@@ -1028,6 +1429,8 @@ impl KaniSession {
                 if matches!(result.failed_properties, FailedProperties::None) {
                     result.failed_properties = FailedProperties::Other;
                 }
+                vacuity_gate
+                    .get_or_insert(crate::loop_two_lane::FailClosedGate::UnsatisfiableCover);
             } else {
                 eprintln!(
                     "warning: {}: a declared cover(...) is provably unsatisfiable/unreachable — \
@@ -1059,6 +1462,7 @@ impl KaniSession {
             if matches!(result.failed_properties, FailedProperties::None) {
                 result.failed_properties = FailedProperties::Other;
             }
+            vacuity_gate.get_or_insert(crate::loop_two_lane::FailClosedGate::Conformance);
         }
 
         // Step B (recognize-clean) + Step C (fail-close) — the SoundHavoc split.
@@ -1095,11 +1499,11 @@ impl KaniSession {
             // appends the raise-the-bound tip off the check description.
             if unwind_exhausted {
                 println!(
-                    "[AY:CTREX_NOT_CERTIFIED] {}: NOT a counterexample — a loop hit the unwind \
-                     bound, so the search was truncated before it could decide this harness. \
-                     Nothing in your program was disproved. Raise the bound (--unwind N, \
-                     --default-unwind N, or #[kani::unwind(N)]) and re-run; if the loop has no \
-                     constant bound, use --ay-chc for unbounded proofs.",
+                    "[AY:CTREX_NOT_CERTIFIED] {}: NOT a counterexample — a loop or a recursive \
+                     call hit the unwind bound, so the search was truncated before it could \
+                     decide this harness. Nothing in your program was disproved. Raise the bound \
+                     (--unwind N, --default-unwind N, or #[kani::unwind(N)]) and re-run; if the \
+                     recursion or loop has no constant bound, use --ay-chc for unbounded proofs.",
                     harness.pretty_name
                 );
             }
@@ -1192,12 +1596,37 @@ impl KaniSession {
                 Some(CtrexCategory::EncodingGap { .. } | CtrexCategory::OverApproximation { .. })
             )
         {
-            println!(
+            marker_println!(
+                self,
                 "[AY:SHOULD_PANIC_NOT_CERTIFIED] {}: the expected panic is a counterexample \
                  the classifier could NOT certify as genuine, so it cannot stand as the proof \
                  this should_panic harness asks for. Failing closed -- nothing was verified. \
                  (The verdict line below reads `other than panics` because the certified-panic \
                  count is now zero.)",
+                harness.pretty_name
+            );
+            result.status = VerificationStatus::Failure;
+            result.failed_properties = FailedProperties::Other;
+        }
+
+        // V7 (should_panic resting only on the anonymous `chc.0` check): fail closed.
+        //
+        // `chc.0` is what a CHC result falls back to when the counterexample names
+        // no registered property. It says `error` was reached, not WHAT reached it,
+        // so it cannot show that the failure was a panic rather than UB, an abort or
+        // an unsupported construct. The CHC interpreters already classify such a
+        // counterexample as `Other`; this is the invariant at the one place every
+        // lane's verdict passes, so no future producer can turn an anonymous failure
+        // into `SUCCESSFUL (encountered one or more panics as expected)`.
+        if harness.attributes.should_panic
+            && matches!(result.failed_properties, FailedProperties::PanicsOnly)
+            && should_panic_rests_on_unattributed_chc_check(&result)
+        {
+            marker_println!(
+                self,
+                "[AY:SHOULD_PANIC_NOT_CERTIFIED] {}: every failing check is the anonymous \
+                 `chc.0` check, which names no property, so nothing shows the failure was the \
+                 panic this should_panic harness asks for. Failing closed -- nothing was verified.",
                 harness.pretty_name
             );
             result.status = VerificationStatus::Failure;
@@ -1258,13 +1687,77 @@ impl KaniSession {
         // had to answer both, so a VALID but WEAK invariant made a CORRECT
         // program report FAILED. Only reached when THIS lane did not already
         // succeed, so a passing harness is never re-adjudicated — that is the
-        // no-regression net. See loop_two_lane.rs for the soundness argument.
-        if !crate::demotion::is_effective_manual_success(
+        // no-regression net — and never when a vacuity gate failed the run
+        // closed (`FailClosedGate`). See loop_two_lane.rs for the soundness
+        // argument.
+        let first_run_succeeded = crate::demotion::is_effective_manual_success(
             result.status,
             harness.attributes.should_panic,
             result.failed_properties,
+        );
+        let eligible = !first_run_succeeded
+            && crate::loop_two_lane::harness_is_eligible(
+                &crate::ay_parse::vc_artifact::vc_artifact_path_for_smt(binary),
+            );
+        match crate::loop_two_lane::retry_decision(first_run_succeeded, eligible, vacuity_gate) {
+            crate::loop_two_lane::RetryDecision::NotNeeded => {}
+            crate::loop_two_lane::RetryDecision::Refused(gate) => {
+                println!("{}", gate.refusal_marker());
+            }
+            crate::loop_two_lane::RetryDecision::Start => {
+                let retry_started = std::time::Instant::now();
+                self.maybe_two_lane_retry(binary, harness, &mut result, deadline);
+                crate::stage_timing::record(
+                    "two-lane-retry",
+                    retry_started,
+                    &format!("{:?}", result.status),
+                );
+            }
+        }
+
+        // The V4b invariant again, after the last step that can turn a verdict
+        // into a success: the two-lane retry sets `status = Success` itself.
+        // Every harness `check_harness` verifies (bounded, CHC, native) reaches
+        // `process_output` through here, so none of them can print a clean
+        // success over an empty obligation set. It cannot fire twice on one
+        // harness: the gate above either failed the result closed or settled
+        // it as a certified obligation-free success, which the predicate
+        // recognises by its qualifier, and nothing between the two checks
+        // empties `results`.
+        if no_checks_gate_fires(&result, harness.attributes.should_panic) {
+            self.settle_no_checks(binary, harness, &mut result);
+        }
+
+        // An off-pin `ay` accepted under --allow-unpinned-ay: every harness
+        // carries the marker and no success is printed as a clean SUCCESSFUL.
+        // After the two-lane retry, so a retried success is demoted too; before
+        // `process_output`, which prints the verdict.
+        let clean_before_demotion = crate::loop_two_lane::clean_success_before_unpinned_demotion(
+            &result,
+            harness.attributes.should_panic,
+        );
+        if let Some(marker) = crate::ay_binary::demote_for_unpinned_solver(
+            &mut result,
+            harness.attributes.should_panic,
         ) {
-            self.maybe_two_lane_retry(binary, harness, &mut result);
+            marker_println!(self, "{marker}");
+            // A lane child tells its parent the demotion was the only caveat
+            // (`loop_two_lane::child_proved`). Its stdout is read by the parent
+            // and never shown, so `--quiet` does not suppress it.
+            if clean_before_demotion && crate::loop_two_lane::is_lane_child() {
+                println!("{}", crate::loop_two_lane::UNPINNED_DEMOTION_ONLY_MARKER);
+            }
+        }
+        // A `TRUST_MC_LOOP_LANE=properties` success is never a proof: the
+        // compiler checks no loop contract in such a process, and the retry no
+        // longer starts one. Demoted after the retry and the solver-pin
+        // demotion, before `process_output` prints the verdict.
+        if let Some(marker) = crate::loop_two_lane::demote_properties_lane_success(
+            &mut result,
+            harness.attributes.should_panic,
+            crate::loop_two_lane::is_properties_lane_child(),
+        ) {
+            marker_println!(self, "{marker}");
         }
 
         self.process_output(&result, harness, thread_index)?;
@@ -1278,9 +1771,23 @@ impl KaniSession {
         // only when an unwinding assertion actually FAILED.
         if unwind_exhausted && self.args.concrete_playback.is_some() {
             println!(
-                "WARNING: no concrete playback for `{}`: a loop hit the unwind bound, so the \
-                 counterexample may depend on a truncated path and the generated test could \
-                 fail to reproduce. Raise the bound and re-run.",
+                "WARNING: no concrete playback for `{}`: a loop or a recursive call hit the \
+                 unwind bound, so the counterexample may depend on a truncated path and the \
+                 generated test could fail to reproduce. Raise the bound and re-run.",
+                harness.pretty_name
+            );
+        } else if self.args.concrete_playback.is_some()
+            && !crate::concrete_playback::witness_is_usable(
+                result.validation_status,
+                result.ctrex_category.as_ref(),
+                result.solver_unknown_reason.is_some(),
+                !result.demotion_reasons.is_empty()
+                    || classify_ctrex(harness, unsoundness_counts) != CtrexCategory::Genuine,
+            )
+        {
+            println!(
+                "WARNING: no concrete playback for `{}`: the result has no validated \
+                 counterexample or cover witness for the supported encoding.",
                 harness.pretty_name
             );
         } else {
@@ -1289,6 +1796,61 @@ impl KaniSession {
         Ok(result)
     }
 }
+
+/// Is a non-demoted `Failure` on the CHC lane an UNDECIDED verdict wearing a
+/// counterexample's clothes?
+///
+/// `FailedProperties::Other` with no non-`chc` failing property is how the CHC
+/// lane spells "the solver did not decide" (`call_ay`'s undecided-model arm
+/// preserves exactly that shape). It is also, unavoidably, how an EXACTLY
+/// DERIVED non-panic counterexample arrives when per-property attribution found
+/// no `error_p{N}`: the aggregate `chc.0` property carries class "chc", and the
+/// failure class is the reachable check's kind (memory safety, pointer
+/// overflow, a valid-value check ⇒ `Other`).
+///
+/// `chc_exact_counterexample` is the positive signal that separates them, set
+/// only where the driver derived `error` itself. Every other producer leaves it
+/// `false`, so the default reading stays fail-closed: an unattributed failure
+/// the driver cannot vouch for is UNKNOWN, never a counterexample.
+pub(crate) fn chc_failure_is_undecided(
+    failed_properties: FailedProperties,
+    has_non_chc_violation: bool,
+    chc_exact_counterexample: bool,
+) -> bool {
+    matches!(failed_properties, FailedProperties::Other)
+        && !has_non_chc_violation
+        && !chc_exact_counterexample
+}
+
+/// The memory cap for the loop-contract retry's child driver: the share of
+/// the armed cap that the harness on the calling thread owns
+/// (`memory_limit::current_harness_share_bytes`: the cap less the driver's
+/// footprint, divided by the `--jobs` pool). `None` when no cap is armed: the
+/// child then derives its own.
+fn retry_child_cap() -> Option<u64> {
+    crate::memory_limit::retry_child_cap_mb(crate::memory_limit::current_harness_share_bytes())
+}
+
+/// The retry lane's own row-export directory, when this process exports
+/// (`TRUST_MC_CHC_ROW_EXPORT_DIR`).
+#[cfg(feature = "ay-chc-native")]
+fn retry_lane_export_dir(harness: &str) -> Option<std::path::PathBuf> {
+    crate::call_ay::retry_lane_export_dir(harness)
+}
+
+#[cfg(not(feature = "ay-chc-native"))]
+fn retry_lane_export_dir(_harness: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Record the retry in this harness's row export, when this process exports.
+#[cfg(feature = "ay-chc-native")]
+fn record_retry_export(harness: &str, record: serde_json::Value) {
+    crate::call_ay::record_loop_contract_retry(harness, record);
+}
+
+#[cfg(not(feature = "ay-chc-native"))]
+fn record_retry_export(_harness: &str, _record: serde_json::Value) {}
 
 #[cfg(test)]
 #[path = "harness_runner_tests.rs"]

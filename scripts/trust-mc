@@ -39,7 +39,7 @@ then
     [[ -n "$_CARGO_TD" ]] && echo "  - $REPO_DIR/$_CARGO_TD/release/trust-mc-driver"
     echo "  - $REPO_DIR/target/release/trust-mc-driver"
     echo "  - $REPO_DIR/target/debug/trust-mc-driver"
-    echo "Was trust-mc successfully built first? (cargo build -p trust-mc-driver --release)"
+    echo "Was trust-mc successfully built first? (targo --unverified build -p trust-mc-driver --release)"
     exit 1
 fi
 

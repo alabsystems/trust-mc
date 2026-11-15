@@ -8,9 +8,11 @@
 // See GitHub history for details.
 
 #![crate_name = "compiletest"]
-// The `test` crate is the only unstable feature
-// allowed here, just to share similar code.
+// The `test` crate is the only unstable library feature allowed here, just to
+// share similar code. `cfg_version` selects libtest's API on each measured
+// Trust endpoint (see `libtest_compat` below).
 #![feature(test)]
+#![feature(cfg_version)]
 // Ported upstream Kani compiletest code uses fallible-value access patterns
 // where panic is the intended error path. Suppressing clippy lints that fire
 // across the entire crate of upstream code.
@@ -69,9 +71,8 @@ fn main() {
 /// run and its child compiler/verifier processes, so the writes are
 /// intentionally permanent. The lock serializes all mutation entrypoints, and
 /// every caller runs before the test harness spawns worker threads. This is the
-/// crate's one item-level `env_mutation` allow; `unknown_lints` keeps the
-/// stock-rustc build green (the lint is defined only by the Trust toolchain).
-#[allow(unknown_lints, env_mutation)]
+/// crate's one item-level `env_mutation` allow (a Trust toolchain lint).
+#[allow(env_mutation)]
 fn set_process_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -277,17 +278,8 @@ pub fn run_tests(config: Config) {
     }
 
     if config.dry_run {
-        // libtest now takes a `TestList` (tests + a sortedness tag) rather than a
-        // bare Vec: `filter_tests` uses binary search for `--exact` when the list
-        // is known sorted. These tests come from `make_tests` above, not from
-        // rustc's `--test` harness, so their order is NOT guaranteed and
-        // `Unsorted` is the only sound tag -- claiming `Sorted` would let the
-        // binary search miss tests. `filter_tests` still RETURNS a Vec, so the
-        // uses below are unchanged.
-        let tests = test::filter_tests(
-            &opts,
-            test::TestList::new(tests, test::TestListOrder::Unsorted),
-        );
+        let tests =
+            libtest_compat::with_unsorted_list(tests, |list| test::filter_tests(&opts, list));
         print_msg(&config, format!("Number of Tests: {}", tests.len()));
         for test in tests {
             print_msg(&config, format!(" - {} ...", test.desc.name.as_slice()));
@@ -295,10 +287,8 @@ pub fn run_tests(config: Config) {
         return;
     }
 
-    let res = test::run_tests_console(
-        &opts,
-        test::TestList::new(tests, test::TestListOrder::Unsorted),
-    );
+    let res =
+        libtest_compat::with_unsorted_list(tests, |list| test::run_tests_console(&opts, list));
     match res {
         Ok(true) => {}
         Ok(false) => {
@@ -601,7 +591,7 @@ fn make_test(config: &Config, testpaths: &TestPaths, inputs: &Stamp) -> test::Te
 
     let up_to_date = !config.force_rerun && is_up_to_date(config, testpaths, inputs);
     let testfn = if up_to_date {
-        test::DynTestFn(Box::new(|| Ok(())))
+        libtest_compat::dyn_test_fn(|| Ok(()))
     } else {
         make_test_closure(config, testpaths)
     };
@@ -670,10 +660,58 @@ fn make_test_name(config: &Config, testpaths: &TestPaths) -> test::TestName {
 fn make_test_closure(config: &Config, testpaths: &TestPaths) -> test::TestFn {
     let config = config.clone();
     let testpaths = testpaths.clone();
-    test::DynTestFn(Box::new(move || {
-        runtest::run(config, &testpaths);
+    // On 1.101 a test function is a shared `Fn` that may be called more than
+    // once, so the closure cannot move its captured `Config` out; `runtest::run`
+    // consumes a `Config`, so each call hands it a fresh clone.
+    libtest_compat::dyn_test_fn(move || {
+        runtest::run(config.clone(), &testpaths);
         Ok(())
-    }))
+    })
+}
+
+/// libtest's API on the two measured Trust endpoints (docs/DECISION_QUEUE.md,
+/// "Preserve both native compiler API endpoints"). The 1.99 seal takes an owned
+/// `TestList` and boxes a `FnOnce`; the 1.101 seal borrows the list as a slice of
+/// `&TestDescAndFn` (cloning only the tests its filter keeps) and shares an
+/// `Arc<dyn Fn + Send + Sync>`. Both endpoints run the same tests with the same
+/// filters; only the argument shapes differ.
+mod libtest_compat {
+    /// Hand `tests` to `run` as a libtest `TestList` tagged `Unsorted`.
+    ///
+    /// The tag is the only sound one here: these tests come from `make_tests`, not
+    /// from rustc's `--test` harness, so their order is not guaranteed, and a
+    /// `Sorted` tag would let `--exact` filtering binary-search past a test.
+    #[cfg(version("1.101"))]
+    pub(crate) fn with_unsorted_list<R>(
+        tests: Vec<test::TestDescAndFn>,
+        run: impl FnOnce(test::TestList<'_>) -> R,
+    ) -> R {
+        let refs: Vec<&test::TestDescAndFn> = tests.iter().collect();
+        run(test::TestList::new(&refs, test::TestListOrder::Unsorted))
+    }
+
+    #[cfg(not(version("1.101")))]
+    pub(crate) fn with_unsorted_list<R>(
+        tests: Vec<test::TestDescAndFn>,
+        run: impl FnOnce(test::TestList) -> R,
+    ) -> R {
+        run(test::TestList::new(tests, test::TestListOrder::Unsorted))
+    }
+
+    /// A dynamic libtest test function.
+    #[cfg(version("1.101"))]
+    pub(crate) fn dyn_test_fn(
+        f: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> test::TestFn {
+        test::DynTestFn(std::sync::Arc::new(f))
+    }
+
+    #[cfg(not(version("1.101")))]
+    pub(crate) fn dyn_test_fn(
+        f: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> test::TestFn {
+        test::DynTestFn(Box::new(f))
+    }
 }
 
 /// Print a message and error out without panicking

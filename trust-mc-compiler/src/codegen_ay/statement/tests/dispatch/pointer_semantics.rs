@@ -193,20 +193,29 @@ fn test_isize_max_computation() {
 // Three-valued return semantics
 // =============================================================================
 
-/// Verify the three-valued return of try_codegen_stdlib_stub_call.
+/// The three-valued return of a stub encoder, as `try_codegen_stdlib_stub_call`
+/// converts it (`CallDispatchOutcome::from_nested_target_for_call`).
+///
+/// Outer `None` is a miss. An inner `None` on a call WITH a MIR return target is
+/// an encoding failure, never a divergence: it must keep the successor edge and
+/// record the fallback (`FallthroughToUnsupported`). Mapping it to `Diverge`
+/// deleted the post-call path (terminator.rs `handled_call_successors`), so every
+/// later assertion held vacuously. Only a call with no return target diverges.
+/// See docs/dispatch-diverge-hazard-2026-09-17.md.
 #[test]
 fn test_three_valued_return_semantics() {
-    // None = stub didn't match
-    let not_matched: Option<Option<usize>> = None;
-    assert!(not_matched.is_none());
+    use crate::codegen_ay::statement::dispatch::CallDispatchOutcome;
 
-    // Some(None) = stub handled, diverges (panic/unreachable)
-    let diverged: Option<Option<usize>> = Some(None);
-    assert_eq!(diverged, Some(None));
-
-    // Some(Some(bb)) = stub handled, continue to block bb
-    let handled: Option<Option<usize>> = Some(Some(42));
-    assert_eq!(handled, Some(Some(42)));
+    let convert = CallDispatchOutcome::from_nested_target_for_call;
+    // Stub did not match, or could not encode (`.map(Some)`): a miss.
+    assert_eq!(convert(None, Some(7)), CallDispatchOutcome::Miss);
+    assert_eq!(convert(None, None), CallDispatchOutcome::Miss);
+    // Stub handled the call and continues.
+    assert_eq!(convert(Some(Some(7)), Some(7)), CallDispatchOutcome::Continue(7));
+    // Stub handled a call that has no return target: a genuine divergence.
+    assert_eq!(convert(Some(None), None), CallDispatchOutcome::Diverge);
+    // Stub returned no block for a call that returns: not a divergence.
+    assert_eq!(convert(Some(None), Some(7)), CallDispatchOutcome::FallthroughToUnsupported);
 }
 
 // =============================================================================

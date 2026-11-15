@@ -14,7 +14,7 @@ use crate::session::KaniSession;
 use crate::verification_result::VerificationResult;
 use anyhow::{Context, Result};
 use concrete_vals_extractor::{ConcreteItem, PrimitiveConcreteVal, extract_harness_values};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::ffi::OsString;
 use std::fs::{File, read_to_string};
 use std::hash::{Hash, Hasher};
@@ -40,8 +40,8 @@ impl KaniSession {
 
         if harness_values.is_empty() {
             println!(
-                "WARNING: Kani could not produce a concrete playback for `{}` because there \
-                were no failing panic checks or satisfiable cover statements.",
+                "WARNING: no concrete playback for `{}`: no complete input witness was \
+                 available for a failing check or a satisfied cover.",
                 harness.pretty_name
             )
         } else {
@@ -49,10 +49,16 @@ impl KaniSession {
                 .iter()
                 .map(|(prop, concrete_items)| {
                     let pretty_name = harness.get_harness_name_unqualified();
-                    format_unit_test(pretty_name, concrete_items, gen_test_doc(harness, prop))
+                    format_unit_test(
+                        pretty_name,
+                        &harness.pretty_name,
+                        concrete_items,
+                        gen_test_doc(harness, prop),
+                    )
                 })
                 .collect();
-            unit_tests.dedup_by(|a, b| a.name == b.name);
+            let mut seen = HashSet::new();
+            unit_tests.retain(|test| seen.insert(test.name.clone()));
             match playback_mode {
                 ConcretePlaybackMode::Print => {
                     for generated_unit_test in &unit_tests {
@@ -153,20 +159,14 @@ impl KaniSession {
             .with_context(|| format!("failed to read source file: {source_path}"))?;
 
         // filter out existing harnesses.
-        unit_tests.retain(|unit_test| {
-            if source_string.contains(&unit_test.name) {
-                if !self.args.common_args.quiet {
-                    println!(
-                        "Concrete playback unit test `{}/{}` already found in source code, so skipping modification.",
-                        source_path, unit_test.name,
-                    );
-                }
-
-                false
-            } else {
-                true
+        for existing_name in retain_new_unit_tests(&source_string, &mut unit_tests) {
+            if !self.args.common_args.quiet {
+                println!(
+                    "Concrete playback unit test `{}/{}` already found in source code, so skipping modification.",
+                    source_path, existing_name,
+                );
             }
-        });
+        }
 
         // Create temp file
         if !unit_tests.is_empty() {
@@ -202,13 +202,14 @@ impl KaniSession {
         Ok(!unit_tests.is_empty())
     }
 
-    /// Run rustfmt on the given src file, and optionally on only the specific lines.
+    /// Run the formatter ([`formatter`]) on the given src file, and optionally on
+    /// only the specific lines.
     fn run_rustfmt(
         &self,
         file_line_ranges: &[FileLineRange],
         current_dir_opt: Option<&str>,
     ) -> Result<()> {
-        let mut cmd = Command::new("rustfmt");
+        let mut cmd = Command::new(formatter());
         let mut args: Vec<OsString> = Vec::new();
 
         // Deal with file line ranges.
@@ -249,6 +250,18 @@ impl KaniSession {
         }
         Ok(())
     }
+}
+
+/// The formatter the playback test is formatted with: `trustfmt` of the
+/// toolchain that built this driver (a Trust seal ships it), else `trustfmt` from
+/// PATH -- never a PATH `rustfmt`, which on an ALab host is not the Trust
+/// toolchain. Formatting is best-effort: a failure is reported as a warning.
+fn formatter() -> OsString {
+    let exe = format!("trustfmt{}", std::env::consts::EXE_SUFFIX);
+    crate::session::install::build_toolchain_sysroot()
+        .map(|sysroot| sysroot.join("bin").join(&exe))
+        .filter(|trustfmt| trustfmt.is_file())
+        .map_or_else(|| OsString::from(exe.clone()), |trustfmt| trustfmt.into_os_string())
 }
 
 fn gen_test_doc(harness: &HarnessMetadata, property: &Property) -> String {
@@ -296,15 +309,32 @@ fn gen_test_doc(harness: &HarnessMetadata, property: &Property) -> String {
     doc_str
 }
 
+/// Remove already injected tests without conflating equally named harnesses
+/// from different modules. Return the existing names for the normal diagnostic.
+fn retain_new_unit_tests(source: &str, tests: &mut Vec<UnitTest>) -> Vec<String> {
+    let mut existing = Vec::new();
+    tests.retain(|test| {
+        if source.contains(&test.name) {
+            existing.push(test.name.clone());
+            false
+        } else {
+            true
+        }
+    });
+    existing
+}
+
 /// Generate a formatted unit test from a list of concrete values.
 fn format_unit_test(
     harness_name: &str,
+    harness_identity: &str,
     concrete_items: &[ConcreteItem],
     doc_str: String,
 ) -> UnitTest {
-    // Hash the concrete values along with the proof harness name.
+    // Include the full path: a::check and b::check in one source file must not
+    // suppress one another through the global existing-test check.
     let mut hasher = DefaultHasher::new();
-    harness_name.hash(&mut hasher);
+    harness_identity.hash(&mut hasher);
     concrete_items.hash(&mut hasher);
     let hash = hasher.finish();
     let func_name = format!("kani_concrete_playback_{harness_name}_{hash}");
@@ -427,7 +457,13 @@ mod concrete_vals_extractor {
         result_items
             .iter()
             .filter(|prop| {
-                (prop.property_class() != "unwind" && prop.status == CheckStatus::Failure)
+                // Class "unwind" (loop bound) and class "recursion" (recursive
+                // inline bound) are both statements about the BOUND, never about
+                // the program: no `#[test]` is minted for a bug that was never
+                // found. `harness_runner::unwind_bound_exhausted` keys off the
+                // same two classes.
+                (!matches!(prop.property_class(), "unwind" | "recursion")
+                    && prop.status == CheckStatus::Failure)
                     || (prop.property_class() == "cover" && prop.status == CheckStatus::Satisfied)
             })
             .filter_map(|property| {
@@ -465,7 +501,7 @@ mod concrete_vals_extractor {
 
         let declared_width = width_u64 as usize;
         let actual_width = bit_concrete_val.len();
-        if declared_width != actual_width {
+        if declared_width == 0 || declared_width % 8 != 0 || declared_width != actual_width {
             tracing::warn!(
                 "Declared width of {declared_width} doesn't equal actual width of {actual_width}"
             );
@@ -649,7 +685,8 @@ mod tests {
             byte_arr: vec![0, 0],
             interp_val: "0".to_string(),
         })];
-        let unit_test = format_unit_test(harness_name, &concrete_vals, doc_str.to_string());
+        let unit_test =
+            format_unit_test(harness_name, harness_name, &concrete_vals, doc_str.to_string());
         let full_func = unit_test.code;
         let split_unit_test_name = split_unit_test_name(&unit_test.name);
         let expected_after_func_name = vec![
@@ -674,6 +711,7 @@ mod tests {
     /// Generates a unit test and returns its hash.
     fn extract_hash_from_unit_test(harness_name: &str, concrete_items: &[ConcreteItem]) -> String {
         let unit_test = format_unit_test(
+            harness_name,
             harness_name,
             concrete_items,
             "/// Harness created for unit test".to_string(),
@@ -725,6 +763,33 @@ mod tests {
         assert_ne!(hash_base, hash_diff_harness_name);
         assert_ne!(hash_base, hash_diff_concrete_byte);
         assert_ne!(hash_base, hash_diff_interp_val);
+    }
+
+    #[test]
+    fn module_harness_names_do_not_collide_and_regeneration_is_idempotent() {
+        fn generate(identity: &str) -> UnitTest {
+            format_unit_test("check", identity, &[], "/// Same inputs, distinct harness".into())
+        }
+        let first = generate("crate::a::check");
+        let second = generate("crate::b::check");
+        assert_ne!(first.name, second.name);
+        for test in [&first, &second] {
+            assert!(test.code.iter().any(|line| line.contains("concrete_vals, check);")));
+            assert!(!test.code.iter().any(|line| line.contains("concrete_vals, crate::")));
+        }
+
+        // Exercise the same global source filter used by in-place injection.
+        let first_source = first.code.join("\n");
+        let mut pending = vec![generate("crate::a::check"), generate("crate::b::check")];
+        assert_eq!(retain_new_unit_tests(&first_source, &mut pending), [first.name]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, second.name);
+
+        let complete_source =
+            format!("mod a {{\n{first_source}\n}}\nmod b {{\n{}\n}}", second.code.join("\n"));
+        let mut regenerated = vec![generate("crate::a::check"), generate("crate::b::check")];
+        assert_eq!(retain_new_unit_tests(&complete_source, &mut regenerated).len(), 2);
+        assert!(regenerated.is_empty());
     }
 
     #[test]
@@ -1067,6 +1132,39 @@ mod tests {
             // Reversed for little-endian: [129, 1]
             assert_eq!(concrete_val.byte_arr, vec![129, 1]);
             assert_eq!(concrete_val.interp_val, "#x0181");
+        }
+    }
+
+    /// A bound-exhaustion failure mints no `#[test]`: nothing was disproved, and
+    /// the satisfying model was free to use the cut edge, so the generated test
+    /// could reproduce nothing at all. Class `"unwind"` (loop bound) and class
+    /// `"recursion"` (recursive-inline bound) are the same statement about the
+    /// BOUND; only the first was skipped before.
+    #[test]
+    fn check_concrete_vals_extractor_skips_both_bound_exhaustion_classes() {
+        fn bound_check(class: &'static str) -> Property {
+            Property {
+                description: Cow::Borrowed("recursion unwinding assertion"),
+                property_id: PropertyId {
+                    fn_name: Some("check_box".to_string()),
+                    class: Cow::Borrowed(class),
+                    id: 1,
+                },
+                status: CheckStatus::Failure,
+                source_location: RawSourceLocation {
+                    column: None,
+                    file: None,
+                    function: None,
+                    line: None,
+                },
+                trace: Some(vec![]),
+            }
+        }
+        for class in ["unwind", "recursion"] {
+            assert!(
+                extract_harness_values(&[bound_check(class)]).is_empty(),
+                "class {class} is a statement about the bound, not a counterexample"
+            );
         }
     }
 }

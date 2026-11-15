@@ -1,0 +1,161 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# Reviewed exclusions of the pin gate (scripts/pinned_package_paths.py, run by
+# scripts/check-shared-pins.sh). A frozen content pin must move when live main
+# changes ANY path of the pinned repository, except a changed regular file under
+# a pattern below. Patterns are repository-relative; `*` and `?` match within one
+# component. The gate never excludes a Cargo.toml, .gitattributes, .gitmodules,
+# .cargo, .git, a build.rs beside a Cargo.toml, a symbolic link, a submodule, or
+# a spelling another tracked path folds onto, whatever the pattern.
+#
+# When every change is excluded, the gate checks the pin, as a checkout writes
+# it: an excluded path must not lie in (or be) a package the pinned ones reach by
+# path, a crate-root directory or manifest-named file of one, a file rustc's
+# dep-info names or the directory rustc looks for module files in beside one, a
+# path a build script watches, or a directory the linker searches for a library
+# a build script links, in the consumer's dev/release checks with every feature
+# set a build of the consumer can give each package and with every build
+# [consumer-builds] declares, dependencies included, as Cargo resolves it; or a
+# symbolic link's target; for a repository under [cargo-at-run-time], also the
+# workspace's Cargo.lock, a member's directory or a member path dependency's.
+# Whatever those checks run (rustc, a procedural macro, a build script and the
+# preprocessor, assembler or anything else it runs) must not read an excluded
+# path, however it names or reaches it: the gate watches each excluded path's
+# access time through every check, then checks every probe again with the
+# excluded paths removed from the tree, where every build script of the tree
+# must print and leave in its OUT_DIR what it did with them (names, links and
+# bytes), and the checks must leave the tree of the pin as they found it. In
+# union with that, and for any host, it reads from the files at the pin what
+# every tracked file names for the C preprocessor or an assembler (`#include`,
+# `.incbin`, `.include` and kin), wherever a search directory puts the name,
+# refusing such a directive whose name is no string literal outside the
+# patterns below (and inside them, in a file a build is seen to read), what a
+# Rust file a consumer can compile from the closure includes or declares as a
+# module (`include_str!`, `include_bytes!`, `include!`, a `path` attribute,
+# `mod`) under whatever cfg, refusing an include no literal spells, and what a
+# string literal of a closure build script names as a path from its package's
+# directory; and in a library search directory a build script gives
+# beneath the target directory, what a symbolic link that is or holds the
+# directory, or one in it, resolves to. No other manifest may declare a pinned
+# package's name, no package of the closure may declare `links` (its build
+# script's metadata reaches its dependents' build scripts), and no compiled
+# file or compiler expansion of a closure unit may spell an assembler
+# `.incbin` or `.include` (the assembler reads what an asm! template names
+# when rustc generates code, which `check` never does for a library). What it
+# cannot check: a read in another configuration (host, cfg(doc), a feature no
+# consumer manifest asks for, what a build no lane declares gives the
+# closure's dependencies, a flag passed outside the command line such as
+# RUSTFLAGS or TRUSTFLAGS' dependency verification) other than through such a
+# name, include, module or literal, a read that tolerates the path's absence,
+# leaves its access time as it was and changes nothing a build script leaves
+# (a test of whether it exists), a read of a path the pin does not hold that
+# no such name reaches, a directive whose name is no literal in an unchanged
+# file under a pattern below that no build is seen to read, a read at run
+# time, and a read outside the members by a
+# package run-time Cargo compiles. Each reason below says who reads the path,
+# if anyone, and why none of those reaches a consumer. Add an entry only with
+# that reason; the measurement behind this list is in the commits that changed
+# it.
+# The gate's threat model (accidental regressions, not deliberate evasion) is in
+# scripts/pinned_package_paths.py.
+
+# Pinned: trust-ir, trust-ir-build (closure: + trust-ir-giveback and
+# trust-ir-laws, all under crates/). trust-ir's build script embeds a git
+# identity and reads no file of the tree; trust-ir-build's in-process Clean
+# checker loads .olean files from $HOME/clean, outside this repository.
+#
+# NOT excluded, on purpose:
+# - wire-allocations.toml: trust-ir's wire_census and its formula_schema_census
+#   integration test read it at run time from CARGO_MANIFEST_DIR/../.. (a
+#   #[cfg(test)] module and a test target today, which a consumer never
+#   compiles, but code that reads the tree at run time is not something this
+#   list can watch move out of cfg(test)).
+# - benchmarks/, frontend/Cargo.toml, crates/*/Cargo.toml and root files other
+#   than those below: manifests Cargo reads, or rarely changed.
+[trust-ir]
+"docs" = "Markdown specifications and roadmaps. The pinned crates name docs/ only in comments and messages; trust-ir-conformance's integration tests read docs/binary-format.md and docs/formats.md at test run time, and no consumer compiles them."
+"designs" = "Markdown design notes and one patch; nothing in crates/ names designs/."
+"reports" = "Measurement and review archives (JSON, logs, archived Cargo.toml.archived crates that Cargo does not read by name); nothing in crates/ names reports/."
+"lean" = "Lean 4 semantics and Clean test projects, built by lake, never by Cargo; trust-ir-build loads Clean's .olean files from $HOME/clean, not from here. The integration tests of trust-ir, trust-ir-build and trust-ir-conformance read lean/ at test run time, and no consumer compiles them."
+"scripts" = "Python and shell gates of TrustIR's own CI; no build script runs them and no pinned crate names them. trust-ir-conformance's harness_selftest integration test include_str!s two scripts/gates files, and no consumer compiles it."
+"publish" = "The public-mirror publishing scripts and allow-lists; run by hand, never by a build."
+"*.md" = "Root prose (CHANGELOG.md, CLAUDE.md, TRUST.md, ...): no closure manifest sets readme or license-file, and the pinned crates name these files only in messages. trust-ir-conformance's integration tests read LIMITATIONS.md and lowering-target-subset.md at test run time, and no consumer compiles them."
+"Cargo.lock" = "TrustIR's own lockfile. Cargo resolves a path or Git dependency with the consuming workspace's lockfile (trust-mc's), never the dependency's."
+"crates/trust-ir-conformance/src" = "Conformance battery; trust-ir-conformance depends on the pinned crates, none of them on it, and it is no run-time input of theirs."
+"crates/trust-ir-conformance/tests" = "Integration tests of trust-ir-conformance, compiled only by its own cargo test."
+"crates/trust-ir-cli/src" = "The trust-ir command line; it depends on the pinned crates, none of them on it."
+"crates/trust-ir-cli/tests" = "Integration tests of trust-ir-cli, compiled only by its own cargo test."
+"crates/trust-ir-ay/src" = "The ay bridge; it depends on trust-ir, and nothing pinned depends on it."
+"crates/trust-ir-ay/tests" = "Integration tests of trust-ir-ay, compiled only by its own cargo test."
+"crates/trust-ir-diff/src" = "The IR diff tool; it depends on trust-ir, and nothing pinned depends on it."
+"crates/trust-ir-diff/tests" = "Integration tests of trust-ir-diff, compiled only by its own cargo test."
+"frontend/src" = "The workspace-excluded C frontend; nothing pinned depends on it (trust-ir scans it only in its own tests: the #[cfg(test)] wire_census unit tests and the formula_schema_census integration test, neither of which a consumer compiles)."
+"frontend/Cargo.lock" = "The frontend's own lockfile; no consumer resolves with it. trust-ir's dependency_pin_coherence integration test reads it (include_str! of its Clean rows, and Cargo's `metadata --locked` of frontend/Cargo.toml at test run time), and no consumer compiles it."
+
+# Pinned: trust-vc-merge-contract (closure: itself; its dependencies are
+# registry crates). It reads its own fixtures/ at run time (fixtures::*, which
+# trust-mc-trust-vc-ingest's tests call), so nothing under
+# crates/trust-vc-merge-contract is excluded.
+#
+# Its public api_surface runs `targo --unverified rustdoc --lib --manifest-path
+# <member>/Cargo.toml` (`$CARGO`, else targo; no --locked) on six members
+# (PROTECTED_CRATES) at run time, so trust-vc is under [cargo-at-run-time]
+# below: that Cargo loads every member and resolves with the root Cargo.lock
+# (measured: a lock-only commit moves trust-vc-core's itoa 1.0.18 -> 1.0.15; a
+# duplicate test name under crates/trust-vc/tests fails the load), and the gate
+# refuses an entry under either. trust-mc calls only the contract types and
+# fixtures::* today, but a call this gate cannot see would make those reads.
+# The code rustdoc compiles for it (the libraries of PROTECTED_CRATES and of
+# trust-vc-kernel, their one path dependency outside them) reads none of the
+# paths below outside #[cfg(test)]; their tests and targo-trust-vc
+# (crates/cargo-trust-vc) read some, as each reason says. `rustdoc --lib`
+# compiles no test, and nothing pinned depends on or runs targo-trust-vc.
+[trust-vc]
+"docs" = "Markdown plans, audits and progress reports. trust-vc's doc_api_syntax integration test reads docs/*.md at test run time; no code that rustdoc compiles for api_surface (tests aside) reads docs/."
+"evals" = "Verus-ported evaluation programs and their JSON/YAML indexes; each eval crate is its own workspace, no member of the root one, that nothing pinned depends on (the gate still treats every eval Cargo.toml as drift and refuses one that declares a pinned name). Readers: trust-vc's integration tests (crates/trust-vc/tests, by #[path] and at test run time), trust-vc-core's #[cfg(test)] vc_extraction tests (evals/verus/ported/adts.rs), and targo-trust-vc (crates/cargo-trust-vc, evals/verus at run time); no code that rustdoc compiles for api_surface (tests aside) reads evals/."
+"scripts" = "Python and shell gates of trust-vc's own CI; no build script runs them. targo-trust-vc (crates/cargo-trust-vc) runs scripts/rust_frontend.sh from its gate command; no code that rustdoc compiles for api_surface (tests aside) reads scripts/."
+"publish" = "The public-mirror publishing scripts and allow-lists; run by hand, never by a build."
+".claude" = "Agent settings for sessions in trust-vc; no tool of a build reads them."
+"*.md" = "Root prose (design-*.md, CLAUDE.md, VISION.md, ...): trust-vc-merge-contract's manifest sets no readme or license-file, and no code that rustdoc compiles for api_surface (tests aside) reads one. trust-vc's doc_api_syntax integration test reads README.md at test run time."
+
+# Repositories whose pinned packages run Cargo on their own pinned workspace at
+# run time, each with where. The gate then counts as read the workspace's
+# Cargo.lock, the directory of every member and of every path dependency of one,
+# and each directory a member glob lists.
+[cargo-at-run-time]
+"trust-vc" = "trust-vc-merge-contract's public api_surface runs `targo --unverified rustdoc --lib --manifest-path <member>/Cargo.toml` (`$CARGO`, else targo from PATH; no --locked) for PROTECTED_CRATES: trust-vc, trust-vc-core, trust-vc-types, trust-vc-merge-contract, trust-vc-merge-runner, trust-vc-trust-engine."
+
+# The builds of trust-mc, the consumer, that its lanes run: lane = the command
+# after the `targo` executable, as the lane spells it. For each, the gate asks
+# Cargo for the unit graph of that command in trust-mc and checks, at the pin,
+# every package the build compiles for a pinned one (the pinned packages and
+# everything they depend on, registry and Git sources included) with exactly
+# the features Cargo's resolver gives each in that build. A lane goes here in
+# the commit that adds or changes it: test_pinned_package_paths.py's
+# ReviewedListTests require every build, check, test or run that a shell script
+# of the working tree outside tests/ (tracked or not ignored), publish/config.sh's
+# ship gate or tools/build-trust-mc spells to be listed, however the script
+# spells targo (bare, any variable, an array, a command substitution), unless
+# OTHER_WORKSPACES there names the manifest it builds instead. The gate refuses
+# a command it cannot read, and a list under which no build compiles a pinned
+# package. `targo trust <command>` resolves as `--unverified <command>`, `run`
+# as `build`.
+[consumer-builds]
+"ship gate: publish/config.sh CHECK_CMD_DEFAULT, 1 of 2" = "--unverified build --locked -p compile-timer -p compiletest -p kani -p kani_core -p kani_macros -p std -p trust-mc -p trust-mc-codegen-stubs -p trust-mc-core -p trust-mc-cov -p trust-mc-driver -p trust-mc-metadata -p trust-mc-replay -p trust-mc-trust-bmc -p trust-mc-trust-vc-ingest"
+"ship gate: publish/config.sh CHECK_CMD_DEFAULT, 2 of 2" = "--unverified test --locked -p trust-mc-core --lib"
+"scripts/check-trust-lane-build.sh" = "--unverified build --locked --target-dir target -p trust-mc-driver -p trust-mc-backend -p trust-mc -p build-trust-mc"
+"scripts/check-trust-lane-build.sh engine lints" = "--unverified test --locked --target-dir target -p trust-mc-engine --lib"
+"scripts/check-trust-lane-build.sh engine lints on the engine suite's binary" = "--unverified test --locked --target-dir target -p trust-mc-engine --lib --features ay,compiler-corpus-tests"
+"scripts/check-trust-verification.sh" = "trust check --certify --hardened --trust-profile unix_hardened --locked --workspace"
+"scripts/check-trust-verification.sh --build" = "trust build --certify --hardened --trust-profile unix_hardened --locked --workspace"
+"scripts/check-trust-advisory-lane.sh libs" = "trust check --allow-l0-gaps --locked --lib -p trust-mc-trust-vc-ingest"
+"scripts/check-trust-advisory-lane.sh bins" = "trust check --allow-l0-gaps --locked --bins -p trust-mc-replay -p compile-timer"
+"scripts/check-trust-advisory-lane.sh cov" = "trust check --allow-l0-gaps --locked --bins -p trust-mc-cov"
+"build-dev: tools/build-trust-mc build_bin" = "--unverified build --bins --lib -p trust-mc-compiler -p trust-mc-driver -p trust-mc-backend --features trust-mc-compiler/ay --message-format=json-render-diagnostics"
+"build-dev --release and bundle: tools/build-trust-mc build_bin" = "--unverified build --release --bins --lib -p trust-mc-compiler -p trust-mc-driver -p trust-mc-backend --features trust-mc-compiler/ay --message-format=json-render-diagnostics"
+"bundle: tools/build-trust-mc build_tools" = "--unverified build --release -p trust-mc-cov"
+"scripts/ay-bump-canary.sh, gate 1 of 3" = "--unverified check -p trust-mc-driver --all-targets --features ay,ay-chc-native"
+"scripts/ay-bump-canary.sh, gate 2 of 3" = "--unverified check --all-targets"
+"scripts/ay-compiletest.sh" = "--unverified run --quiet -p compiletest"
+"development tests (AGENTS.md: targo --unverified test)" = "--unverified test --workspace"

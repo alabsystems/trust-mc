@@ -9,11 +9,21 @@
 //! `Operand::Constant` and `Operand::Copy/Move` of locals assigned constants.
 //! Follows up to 8 levels of Copy/Move indirection (Part of #3616).
 //!
+//! A local's constant is taken from its assignment ONLY when that assignment is
+//! the sole write the body can make to it (`sole_plain_assignment`). The scan
+//! used to return the first `local = const` it found anywhere in the body,
+//! flow-insensitively, so `let mut a = 1.0; if c { a = -0.0 } a.min(0.0)` was
+//! folded as `min(1.0, 0.0)` and CHC proved a sign Rust leaves to either zero
+//! on the `c` path. With one plain assignment and no borrow, call destination,
+//! partial write or discriminant write to the local, borrow checking guarantees
+//! that value reaches every use, on every path; anything else is not folded
+//! and the relation decides.
+//!
 //! Split from `math.rs` per file size limit (Part of #3524).
 
 use ay_bindings::{Expr, ExprValue};
-use rustc_public::mir::{Body, Operand, Rvalue, StatementKind};
-use rustc_public::ty::{ConstantKind, FloatTy, RigidTy, TyConstKind, TyKind};
+use rustc_public::mir::{Body, Operand, Rvalue, StatementKind, TerminatorKind};
+use rustc_public::ty::{FloatTy, RigidTy, TyKind};
 use std::collections::HashSet;
 
 use super::super::ChcCtx;
@@ -37,6 +47,8 @@ pub(in crate::codegen_ay::chc) fn try_extract_const_f32(
             }
             find_const_f32_assignment(body, place.local)
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -68,6 +80,8 @@ pub(in crate::codegen_ay::chc) fn try_extract_const_f64(
             }
             find_const_f64_assignment(body, place.local)
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -94,6 +108,8 @@ pub(in crate::codegen_ay::chc) fn try_extract_const_i32(
             }
             find_const_i32_assignment(body, place.local)
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -162,12 +178,14 @@ pub(in crate::codegen_ay::chc) fn try_fold_f32_intrinsic(
     } else if intrinsic_name.ends_with("copysignf32") {
         let bits1 = try_extract_const_f32_with_ctx(ctx, args.get(1)?, modified_locals)?;
         return Some(val0.copysign(f32::from_bits(bits1)).to_bits());
-    } else if intrinsic_name.ends_with("minnumf32") {
-        let bits1 = try_extract_const_f32_with_ctx(ctx, args.get(1)?, modified_locals)?;
-        return Some(val0.min(f32::from_bits(bits1)).to_bits());
-    } else if intrinsic_name.ends_with("maxnumf32") {
-        let bits1 = try_extract_const_f32_with_ctx(ctx, args.get(1)?, modified_locals)?;
-        return Some(val0.max(f32::from_bits(bits1)).to_bits());
+    } else if intrinsic_name.ends_with("minnumf32") || intrinsic_name.ends_with("maxnumf32") {
+        let val1 =
+            f32::from_bits(try_extract_const_f32_with_ctx(ctx, args.get(1)?, modified_locals)?);
+        // Decided by IEEE comparison where both toolchains agree; opposite zeros, two NaNs and
+        // a signalling NaN are left to the relation (`float_minmax`). Never the host's `min`.
+        let is_min = intrinsic_name.ends_with("minnumf32");
+        return crate::codegen_ay::float_minmax::minmax_num_fold_f32(is_min, val0, val1)
+            .map(f32::to_bits);
     } else if intrinsic_name.ends_with("fmaf32") {
         let bits1 = try_extract_const_f32_with_ctx(ctx, args.get(1)?, modified_locals)?;
         let bits2 = try_extract_const_f32_with_ctx(ctx, args.get(2)?, modified_locals)?;
@@ -236,12 +254,13 @@ pub(in crate::codegen_ay::chc) fn try_fold_f64_intrinsic(
     } else if intrinsic_name.ends_with("copysignf64") {
         let bits1 = try_extract_const_f64_with_ctx(ctx, args.get(1)?, modified_locals)?;
         return Some(val0.copysign(f64::from_bits(bits1)).to_bits());
-    } else if intrinsic_name.ends_with("minnumf64") {
-        let bits1 = try_extract_const_f64_with_ctx(ctx, args.get(1)?, modified_locals)?;
-        return Some(val0.min(f64::from_bits(bits1)).to_bits());
-    } else if intrinsic_name.ends_with("maxnumf64") {
-        let bits1 = try_extract_const_f64_with_ctx(ctx, args.get(1)?, modified_locals)?;
-        return Some(val0.max(f64::from_bits(bits1)).to_bits());
+    } else if intrinsic_name.ends_with("minnumf64") || intrinsic_name.ends_with("maxnumf64") {
+        let val1 =
+            f64::from_bits(try_extract_const_f64_with_ctx(ctx, args.get(1)?, modified_locals)?);
+        // See the f32 arm: IEEE comparison where determined, the relation otherwise.
+        let is_min = intrinsic_name.ends_with("minnumf64");
+        return crate::codegen_ay::float_minmax::minmax_num_fold_f64(is_min, val0, val1)
+            .map(f64::to_bits);
     } else if intrinsic_name.ends_with("fmaf64") {
         let bits1 = try_extract_const_f64_with_ctx(ctx, args.get(1)?, modified_locals)?;
         let bits2 = try_extract_const_f64_with_ctx(ctx, args.get(2)?, modified_locals)?;
@@ -259,106 +278,90 @@ pub(in crate::codegen_ay::chc) fn try_fold_f64_intrinsic(
 /// Prevents infinite loops on pathological MIR (e.g., self-referencing locals).
 const MAX_COPY_CHAIN_DEPTH: usize = 8;
 
-/// Scan MIR body for a constant f32 assignment to the given local.
+/// The one `Rvalue` assigned to `local`, when that assignment is the ONLY write the body
+/// can make to it: exactly one whole-place `Assign`, and no partial write
+/// (`local.field = …`), no `SetDiscriminant`, no borrow or raw address of any
+/// place rooted at the local (a write through the reference would not name it), no call or
+/// `Yield` destination, no inline assembly (whose outputs are opaque here), and the local is
+/// not an argument (its first value is the caller's). Under those conditions borrow checking
+/// guarantees the assigned value reaches every use on every path, so reading it is
+/// flow-insensitive only in appearance.
+///
+/// Returns `None` for every other shape. The previous scan returned the FIRST `local = const`
+/// found in any block, so a local assigned on two paths folded to whichever assignment came
+/// first in block order: a false proof when the other path's constant changes the result.
+fn sole_plain_assignment(body: &Body, local: usize) -> Option<&Rvalue> {
+    if (1..=body.arg_locals().len()).contains(&local) {
+        return None;
+    }
+    let mut sole: Option<&Rvalue> = None;
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                StatementKind::Assign(lhs, rhs) => {
+                    if lhs.local == local {
+                        if !lhs.projection.is_empty() || sole.is_some() {
+                            return None;
+                        }
+                        sole = Some(rhs);
+                    }
+                    if let Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) = rhs
+                        && place.local == local
+                    {
+                        return None;
+                    }
+                }
+                StatementKind::SetDiscriminant { place, .. } if place.local == local => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        match &bb.terminator.kind {
+            TerminatorKind::Call { destination, .. } if destination.local == local => {
+                return None;
+            }
+            TerminatorKind::InlineAsm { .. } => return None,
+            _ => {}
+        }
+    }
+    sole
+}
+
+/// Follow `local`'s sole assignment to a constant, through up to `depth` plain copies of
+/// other sole-assigned locals, reading the constant with `extract`.
+fn find_sole_const_assignment<T>(
+    body: &Body,
+    local: usize,
+    depth: usize,
+    extract: fn(&rustc_public::mir::ConstOperand) -> Option<T>,
+) -> Option<T> {
+    if depth == 0 {
+        return None;
+    }
+    match sole_plain_assignment(body, local)? {
+        Rvalue::Use(Operand::Constant(c), ..) => extract(c),
+        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) if src.projection.is_empty() => {
+            find_sole_const_assignment(body, src.local, depth - 1, extract)
+        }
+        _ => None,
+    }
+}
+
+/// The constant f32 `local` holds at every use, if its sole assignment is one.
 /// Follows Copy/Move chains up to MAX_COPY_CHAIN_DEPTH levels deep.
-/// Part of #3839: fix multi-hop constant extraction for math intrinsics.
 fn find_const_f32_assignment(body: &Body, local_idx: usize) -> Option<u32> {
-    find_const_f32_recursive(body, local_idx, MAX_COPY_CHAIN_DEPTH)
+    find_sole_const_assignment(body, local_idx, MAX_COPY_CHAIN_DEPTH, extract_f32_from_const_op)
 }
 
-fn find_const_f32_recursive(body: &Body, local_idx: usize, depth: usize) -> Option<u32> {
-    if depth == 0 {
-        return None;
-    }
-    for bb in &body.blocks {
-        for stmt in &bb.statements {
-            if let StatementKind::Assign(lhs, rhs) = &stmt.kind
-                && lhs.local == local_idx
-                && lhs.projection.is_empty()
-            {
-                match rhs {
-                    Rvalue::Use(Operand::Constant(c)) => {
-                        return extract_f32_from_const_op(c);
-                    }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                        if src.projection.is_empty() =>
-                    {
-                        return find_const_f32_recursive(body, src.local, depth - 1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Scan MIR body for a constant f64 assignment to the given local.
-/// Follows Copy/Move chains up to MAX_COPY_CHAIN_DEPTH levels deep.
-/// Part of #3839: fix multi-hop constant extraction for math intrinsics.
+/// The constant f64 `local` holds at every use, if its sole assignment is one.
 fn find_const_f64_assignment(body: &Body, local_idx: usize) -> Option<u64> {
-    find_const_f64_recursive(body, local_idx, MAX_COPY_CHAIN_DEPTH)
+    find_sole_const_assignment(body, local_idx, MAX_COPY_CHAIN_DEPTH, extract_f64_from_const_op)
 }
 
-fn find_const_f64_recursive(body: &Body, local_idx: usize, depth: usize) -> Option<u64> {
-    if depth == 0 {
-        return None;
-    }
-    for bb in &body.blocks {
-        for stmt in &bb.statements {
-            if let StatementKind::Assign(lhs, rhs) = &stmt.kind
-                && lhs.local == local_idx
-                && lhs.projection.is_empty()
-            {
-                match rhs {
-                    Rvalue::Use(Operand::Constant(c)) => {
-                        return extract_f64_from_const_op(c);
-                    }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                        if src.projection.is_empty() =>
-                    {
-                        return find_const_f64_recursive(body, src.local, depth - 1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Scan MIR body for a constant i32 assignment to the given local.
-/// Follows Copy/Move chains up to MAX_COPY_CHAIN_DEPTH levels deep.
-/// Part of #3839: fix multi-hop constant extraction for math intrinsics.
+/// The constant i32 `local` holds at every use, if its sole assignment is one.
 fn find_const_i32_assignment(body: &Body, local_idx: usize) -> Option<i32> {
-    find_const_i32_recursive(body, local_idx, MAX_COPY_CHAIN_DEPTH)
-}
-
-fn find_const_i32_recursive(body: &Body, local_idx: usize, depth: usize) -> Option<i32> {
-    if depth == 0 {
-        return None;
-    }
-    for bb in &body.blocks {
-        for stmt in &bb.statements {
-            if let StatementKind::Assign(lhs, rhs) = &stmt.kind
-                && lhs.local == local_idx
-                && lhs.projection.is_empty()
-            {
-                match rhs {
-                    Rvalue::Use(Operand::Constant(c)) => {
-                        return extract_i32_from_const_op(c);
-                    }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                        if src.projection.is_empty() =>
-                    {
-                        return find_const_i32_recursive(body, src.local, depth - 1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    None
+    find_sole_const_assignment(body, local_idx, MAX_COPY_CHAIN_DEPTH, extract_i32_from_const_op)
 }
 
 fn try_extract_f32_from_expr(expr: &Expr) -> Option<u32> {
@@ -391,24 +394,8 @@ fn extract_f32_from_const_op(const_op: &rustc_public::mir::ConstOperand) -> Opti
     if !matches!(ty.kind(), TyKind::RigidTy(RigidTy::Float(FloatTy::F32))) {
         return None;
     }
-    let read_f32 = |alloc: &rustc_public::ty::Allocation| -> Option<u32> {
-        if alloc.bytes.len() < 4 {
-            return None;
-        }
-        let mut arr = [0u8; 4];
-        for (i, b) in alloc.bytes.iter().take(4).enumerate() {
-            arr[i] = (*b)?;
-        }
-        Some(u32::from_le_bytes(arr))
-    };
-    match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => read_f32(alloc),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_ty, alloc) => read_f32(alloc),
-            _ => None,
-        },
-        _ => None,
-    }
+    let bits = crate::codegen_ay::shared::const_pointer::const_uint(mir_const)?;
+    u32::try_from(bits).ok()
 }
 
 /// Extract f64 bits from a ConstOperand.
@@ -418,38 +405,126 @@ fn extract_f64_from_const_op(const_op: &rustc_public::mir::ConstOperand) -> Opti
     if !matches!(ty.kind(), TyKind::RigidTy(RigidTy::Float(FloatTy::F64))) {
         return None;
     }
-    let read_f64 = |alloc: &rustc_public::ty::Allocation| -> Option<u64> {
-        if alloc.bytes.len() < 8 {
-            return None;
-        }
-        let mut arr = [0u8; 8];
-        for (i, b) in alloc.bytes.iter().take(8).enumerate() {
-            arr[i] = (*b)?;
-        }
-        Some(u64::from_le_bytes(arr))
-    };
-    match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => read_f64(alloc),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_ty, alloc) => read_f64(alloc),
-            _ => None,
-        },
-        _ => None,
-    }
+    let bits = crate::codegen_ay::shared::const_pointer::const_uint(mir_const)?;
+    u64::try_from(bits).ok()
 }
 
 /// Extract i32 from a ConstOperand.
 fn extract_i32_from_const_op(const_op: &rustc_public::mir::ConstOperand) -> Option<i32> {
     let mir_const = &const_op.const_;
-    let read_i32 = |alloc: &rustc_public::ty::Allocation| -> Option<i32> {
-        alloc.read_int().ok().map(|v| v as i32)
-    };
-    match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => read_i32(alloc),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_ty, alloc) => read_i32(alloc),
-            _ => None,
-        },
-        _ => None,
+    crate::codegen_ay::shared::const_pointer::const_int(mir_const).map(|v| v as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen_ay::context::with_test_ay_ctx_for_source;
+    use crate::codegen_ay::test_fixtures::find_instance_by_suffix;
+    use rustc_public::CrateDef;
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    const SOURCE: &str = r#"#![allow(dead_code, unused_assignments)]
+pub fn straight() -> f32 {
+    let a = 1.0f32;
+    a.min(0.0)
+}
+pub fn copied() -> f32 {
+    let a = -0.0f32;
+    let b = a;
+    b.min(0.0)
+}
+pub fn phi(c: bool) -> f32 {
+    let mut a = 1.0f32;
+    if c {
+        a = -0.0;
+    }
+    a.min(0.0)
+}
+pub fn reassigned() -> f32 {
+    let mut a = 1.0f32;
+    a = -0.0;
+    a.min(0.0)
+}
+#[inline(never)]
+fn set(p: &mut f32) {
+    *p = -0.0;
+}
+pub fn borrowed() -> f32 {
+    let mut a = 1.0f32;
+    set(&mut a);
+    a.min(0.0)
+}
+pub fn raw(c: bool) -> f32 {
+    let mut a = 1.0f32;
+    let p = &raw mut a;
+    if c {
+        unsafe { *p = -0.0 };
+    }
+    a.min(0.0)
+}
+pub fn argument(a: f32) -> f32 {
+    a.min(0.0)
+}
+pub fn wide(c: bool) -> f64 {
+    let mut a = 1.0f64;
+    if c {
+        a = -0.0;
+    }
+    a.max(0.0)
+}
+"#;
+
+    /// The first argument operand of the `min` / `max` call in `body`.
+    fn min_max_first_arg(body: &Body) -> Operand {
+        for bb in &body.blocks {
+            if let TerminatorKind::Call { func, args, .. } = &bb.terminator.kind
+                && let Ok(ty) = func.ty(body.locals())
+                && let TyKind::RigidTy(RigidTy::FnDef(def, _)) = ty.kind()
+                && let Some(name) = def.name().rsplit("::").next()
+                && matches!(name, "min" | "max")
+            {
+                return args[0].clone();
+            }
+        }
+        panic!("no min/max call in body");
+    }
+
+    fn first_arg_f32(fn_suffix: &str) -> Option<u32> {
+        let mut result = None;
+        with_test_ay_ctx_for_source(SOURCE, |ctx| {
+            let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
+            let body = instance.body().expect("body");
+            result = Some(try_extract_const_f32(&min_max_first_arg(&body), &body));
+        });
+        result.expect("callback ran")
+    }
+
+    fn first_arg_f64(fn_suffix: &str) -> Option<u64> {
+        let mut result = None;
+        with_test_ay_ctx_for_source(SOURCE, |ctx| {
+            let instance = find_instance_by_suffix(ctx.tcx, fn_suffix);
+            let body = instance.body().expect("body");
+            result = Some(try_extract_const_f64(&min_max_first_arg(&body), &body));
+        });
+        result.expect("callback ran")
+    }
+
+    /// A local with one plain assignment, directly or through a copy, folds.
+    #[test]
+    fn sole_assignment_folds_through_copies() {
+        assert_eq!(first_arg_f32("straight"), Some(1.0f32.to_bits()));
+        assert_eq!(first_arg_f32("copied"), Some(0x8000_0000));
+    }
+
+    /// A local written on two paths, reassigned, borrowed, aliased by a raw pointer or
+    /// received as an argument is never folded: the value at the call depends on the path.
+    #[test]
+    fn multiply_written_or_aliased_locals_do_not_fold() {
+        assert_eq!(first_arg_f32("phi"), None);
+        assert_eq!(first_arg_f32("reassigned"), None);
+        assert_eq!(first_arg_f32("borrowed"), None);
+        assert_eq!(first_arg_f32("raw"), None);
+        assert_eq!(first_arg_f32("argument"), None);
+        assert_eq!(first_arg_f64("wide"), None);
     }
 }

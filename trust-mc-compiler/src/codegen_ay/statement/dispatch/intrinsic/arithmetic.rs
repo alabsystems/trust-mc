@@ -4,10 +4,13 @@
 //
 //! Arithmetic intrinsic dispatch: wrapping, unchecked, checked, saturating, overflowing.
 
+use ay_bindings::Expr;
 use rustc_public::mir::{BasicBlockIdx, BinOp, Operand, Place};
-use tracing::debug;
+use rustc_public::ty::{RigidTy, TyKind};
+use tracing::{debug, warn};
 
-use crate::codegen_ay::statement::StatementCodegen;
+use crate::codegen_ay::statement::{IntoOption, StatementCodegen};
+use crate::codegen_ay::types::POINTER_WIDTH;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Arithmetic intrinsics: wrapping, unchecked, checked, saturating, overflowing.
@@ -18,6 +21,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        // These names are INTEGER methods. `<*const T>::wrapping_add(self, count)`
+        // matches the same name, and lowering it as `ptr + count` moved the
+        // pointer by `count` BYTES instead of `count * size_of::<T>()`:
+        // `(&v as *const u128).wrapping_add(10)` landed 10 bytes past `v`, so
+        // `offset_from` reported a misaligned distance instead of the
+        // out-of-allocation pointer Kani reports
+        // (tests/expected/offset-bounds-check/offset_from.rs).
+        if args.first().and_then(|a| a.ty(self.body.locals()).into_option()).is_some_and(|t| {
+            matches!(t.kind(), TyKind::RigidTy(RigidTy::RawPtr(..)))
+        }) {
+            return self.codegen_raw_ptr_wrapping_offset(fn_name, args, destination, target);
+        }
         // Wrapping arithmetic - just perform the operation (wraps naturally in bitvector)
         if let Some(op) = match_arithmetic_variant(fn_name, "wrapping_") {
             debug!("AY codegen: handling wrapping_{:?}", op);
@@ -63,6 +78,37 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return self.codegen_exact_div(args, destination, target);
         }
         None
+    }
+
+    /// `<*T>::wrapping_add` / `wrapping_sub`: a wrapping offset by `count`
+    /// ELEMENTS (`wrapping_offset`). Leaving the object is not UB here, so no
+    /// obligation is emitted; a later dereference carries it. Any other
+    /// arithmetic name on a raw-pointer receiver is not an integer operation
+    /// and is declined.
+    fn codegen_raw_ptr_wrapping_offset(
+        &mut self,
+        fn_name: &str,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+    ) -> Option<BasicBlockIdx> {
+        let op = match_arithmetic_variant(fn_name, "wrapping_")?;
+        if !matches!(op, BinOp::Add | BinOp::Sub) || args.len() < 2 {
+            return None;
+        }
+        let ptr_ty = args[0].ty(self.body.locals()).into_option();
+        let Some(pointee_size) = ptr_ty.and_then(Self::pointee_size_for_offset_ty) else {
+            warn!(?ptr_ty, "raw pointer {fn_name}: pointee size unknown; declining");
+            return None;
+        };
+        let ptr = self.codegen_operand(&args[0])?;
+        let count = self.codegen_operand(&args[1])?;
+        let ptr = self.coerce_to_ptr_width(ptr);
+        let count = Self::coerce_to_width_typed(count, POINTER_WIDTH, false);
+        let bytes = count.bvmul(Expr::bitvec_const(pointee_size as u128, POINTER_WIDTH));
+        let result = if matches!(op, BinOp::Add) { ptr.bvadd(bytes) } else { ptr.bvsub(bytes) };
+        self.assign_value_to_place(destination, result);
+        target
     }
 }
 

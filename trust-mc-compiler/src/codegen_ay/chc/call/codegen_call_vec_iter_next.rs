@@ -21,11 +21,19 @@ pub(super) fn translate_vec_into_iter_next_branches(
     ctx: &mut ChcCtx<'_, '_>,
     args: &[Operand],
     modified_locals: &HashSet<usize>,
+    address_item_ty: Option<rustc_public::ty::Ty>,
+    address_bound: Option<u64>,
 ) -> Option<Vec<CollectionCallResult>> {
     let iter_arg = args.first()?;
     let projected_state = projected_vec_into_iter_state(ctx, iter_arg, modified_locals);
-    let (iter_and_vec, pos, len, data) = if let Some(state) = projected_state.as_ref() {
-        (None, state.pos.clone(), state.len.clone(), state.data.clone())
+    let (iter_and_vec, pos, len, data, base) = if let Some(state) = projected_state.as_ref() {
+        (
+            None,
+            state.pos.clone(),
+            state.len.clone(),
+            state.data.clone(),
+            state.fields.first()?.as_ref()?.clone(),
+        )
     } else {
         let iter = ctx.get_collection_arg(iter_arg, modified_locals)?;
         let iter_sort = iter.sort().clone();
@@ -39,14 +47,24 @@ pub(super) fn translate_vec_into_iter_next_branches(
 
         let len = constructor_field_expr(&vec, &vec_dt.name, vec_ctor, "fld_len")?;
         let data = constructor_field_expr(&vec, &vec_dt.name, vec_ctor, "fld_data")?;
-        (Some((iter, vec)), pos, len, data)
+        let base = constructor_field_expr(&vec, &vec_dt.name, vec_ctor, "fld_ptr")?;
+        (Some((iter, vec)), pos, len, data, base)
+    };
+    // Constant propagation is allowed only when EVERY producer agrees and
+    // the closed iterator operation set preserves these two fields. A joined
+    // iterator with differing addresses or lengths keeps the runtime fields.
+    let (base, len) = if address_item_ty.is_some() {
+        ctx.static_iterator_invariants(iter_arg).unwrap_or((base, len))
+    } else {
+        (base, len)
     };
     let data_sort = data.sort().array_sort()?;
     if &data_sort.index_sort != pos.sort() {
         return None;
     }
 
-    if let Some(state) = projected_state.as_ref()
+    if address_item_ty.is_none()
+        && let Some(state) = projected_state.as_ref()
         && let Some((concrete_elems, concrete_len_constraint)) =
             concrete_vec_into_iter_elems(ctx, iter_arg, &len, &data_sort.element_sort)
         && let Some(branches) = projected_concrete_vec_into_iter_next_branches(
@@ -61,18 +79,27 @@ pub(super) fn translate_vec_into_iter_next_branches(
         return Some(branches);
     }
 
-    let (elem, concrete_constraints) =
-        concrete_vec_into_iter_elem(ctx, iter_arg, &pos, &len, &data_sort.element_sort)
-            .map_or_else(
-                || (data.select(pos.clone()), Vec::new()),
-                |(elem, constraint)| (elem, vec![constraint]),
-            );
+    let (elem, concrete_constraints) = if let Some(ty) = address_item_ty {
+        let stride = ctx.get_type_size(ty)?;
+        if stride == 0 {
+            return None;
+        }
+        (
+            base.bvadd(pos.clone().bvmul(Expr::bitvec_const(stride as u128, POINTER_WIDTH))),
+            Vec::new(),
+        )
+    } else {
+        concrete_vec_into_iter_elem(ctx, iter_arg, &pos, &len, &data_sort.element_sort).map_or_else(
+            || (data.select(pos.clone()), Vec::new()),
+            |(elem, constraint)| (elem, vec![constraint]),
+        )
+    };
     let in_bounds = pos.clone().bvult(len.clone());
     let pos_in_range = pos.clone().bvule(len.clone());
     let one = Expr::bitvec_const(1u64, pos.sort().bitvec_width().unwrap_or(POINTER_WIDTH));
     let advanced_pos = pos.clone().bvadd(one);
     let advanced_pos_in_range = advanced_pos.clone().bvule(len.clone());
-    let exhausted_pos_is_len = pos.eq(len.clone());
+    let exhausted_pos_is_len = pos.clone().eq(len.clone());
 
     let (advanced_iter, exhausted_iter, some_update_fields, none_update_fields) =
         if let Some(state) = projected_state {
@@ -112,32 +139,66 @@ pub(super) fn translate_vec_into_iter_next_branches(
     some_constraints.extend(concrete_constraints.clone());
     let mut none_constraints = vec![pos_in_range, in_bounds.not(), exhausted_pos_is_len];
     none_constraints.extend(concrete_constraints);
-    Some(vec![
-        CollectionCallResult {
-            map_update: advanced_iter,
-            map_update_fields: some_update_fields,
-            result: Some(elem.clone()),
-            result_is_some: Some(Expr::bool_const(true)),
-            len_update: None,
-            present_update: None,
-            result_fields: None,
-            constraints: some_constraints,
-            force_error: false,
-            aux_targets_dest: false,
-        },
-        CollectionCallResult {
-            map_update: exhausted_iter,
-            map_update_fields: none_update_fields,
-            result: Some(elem),
-            result_is_some: Some(Expr::bool_const(false)),
-            len_update: None,
-            present_update: None,
-            result_fields: Some(Vec::new()),
-            constraints: none_constraints,
-            force_error: false,
-            aux_targets_dest: false,
-        },
-    ])
+    let some = CollectionCallResult {
+        map_update: advanced_iter,
+        map_update_fields: some_update_fields,
+        result: Some(elem.clone()),
+        result_is_some: Some(Expr::bool_const(true)),
+        len_update: None,
+        present_update: None,
+        result_fields: None,
+        constraints: some_constraints,
+        force_error: false,
+        aux_targets_dest: false,
+    };
+    let none = CollectionCallResult {
+        map_update: exhausted_iter,
+        map_update_fields: none_update_fields,
+        result: Some(elem),
+        result_is_some: Some(Expr::bool_const(false)),
+        len_update: None,
+        present_update: None,
+        result_fields: Some(Vec::new()),
+        constraints: none_constraints,
+        force_error: false,
+        aux_targets_dest: false,
+    };
+    if address_item_ty.is_some()
+        && let Some(bound) = address_bound.filter(|n| *n <= 256)
+    {
+        let mut branches = Vec::new();
+        // Split NEXT, not the loop body. This exposes the finite cursor cases
+        // while retaining all stores, breaks, aliases and other body effects.
+        for i in 0..bound {
+            let mut branch = some.clone();
+            if let ExprValue::Var { name } = pos.value() {
+                let substitution = std::collections::HashMap::from([(
+                    name.to_string(),
+                    Expr::bitvec_const(i as u128, POINTER_WIDTH),
+                )]);
+                let specialize = |e: &Expr| super::substitute_vars(e, &substitution);
+                branch.result = branch.result.as_ref().map(specialize);
+                branch.map_update = branch.map_update.as_ref().map(specialize);
+                if let Some((_, fields)) = &mut branch.map_update_fields {
+                    for field in fields {
+                        *field = field.as_ref().map(specialize);
+                    }
+                }
+                branch.constraints = branch.constraints.iter().map(specialize).collect();
+            }
+            branch.constraints.push(pos.clone().eq(Expr::bitvec_const(i as u128, POINTER_WIDTH)));
+            branches.push(branch);
+        }
+        // No coverage assumption or discarded execution: retain the original
+        // symbolic transition for any cursor not covered by the finite split.
+        let mut rest = some;
+        rest.constraints.push(pos.bvuge(Expr::bitvec_const(bound as u128, POINTER_WIDTH)));
+        branches.push(rest);
+        branches.push(none);
+        Some(branches)
+    } else {
+        Some(vec![some, none])
+    }
 }
 
 struct ProjectedVecIntoIterState {

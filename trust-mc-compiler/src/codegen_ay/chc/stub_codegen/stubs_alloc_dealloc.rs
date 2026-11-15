@@ -6,6 +6,7 @@
 //!
 //! Extracted from `stubs_alloc_heap_ops.rs` — Part of #4206.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, ExprValue, Sort};
@@ -14,7 +15,17 @@ use rustc_public::mir::Operand;
 use tracing::{debug, warn};
 
 use super::types::POINTER_WIDTH;
-use super::{AllocCallResult, ChcCtx, chc_fresh_name, codegen_expr_heap, declare_pending_var};
+use super::{AllocCallResult, ChcCtx, chc_fresh_name, codegen_expr_heap};
+
+/// See [`ChcCtx::dealloc_pointer_terms`].
+pub(in crate::codegen_ay::chc) struct DeallocPointerTerms {
+    /// The freed object's id (BV32).
+    pub(in crate::codegen_ay::chc) obj_id: Expr,
+    /// Must-hold conditions, each a memory-safety check.
+    pub(in crate::codegen_ay::chc) safety_checks: Vec<Expr>,
+    /// Transition constraints: the freed object is no stack local.
+    pub(in crate::codegen_ay::chc) stack_anti_alias: Vec<Expr>,
+}
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Index of the argument that carries the allocation's ADDRESS, decided by
@@ -192,11 +203,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "RustDealloc: failed to resolve size/align arguments; \
                  using symbolic fallback to preserve obj_valid invalidation"
             );
-            self.record_sound_fallback_reason("dealloc_args_unresolved");
+            let booked = self.record_sound_fallback_reason("dealloc_args_unresolved");
             let symbolic_size =
-                declare_pending_var(chc_fresh_name("__dealloc_size"), Sort::bitvec(64));
+                Havoc::booked(booked, chc_fresh_name("__dealloc_size"), Sort::bitvec(64));
             let symbolic_align =
-                declare_pending_var(chc_fresh_name("__dealloc_align"), Sort::bitvec(64));
+                Havoc::booked(booked, chc_fresh_name("__dealloc_align"), Sort::bitvec(64));
             (symbolic_size, symbolic_align, false)
         };
         let size_32 = self.coerce_to_heap_bv32(size_expr.clone()).unwrap_or_else(|| {
@@ -204,8 +215,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 sort = ?size_expr.sort(),
                 "RustDealloc: size expression is not a bitvec; using symbolic BV32 fallback"
             );
-            self.record_sound_fallback_reason("dealloc_size_bv32_coercion_failed");
-            declare_pending_var(chc_fresh_name("__dealloc_size32"), Sort::bitvec(32))
+            let booked = self.record_sound_fallback_reason("dealloc_size_bv32_coercion_failed");
+            Havoc::booked(booked, chc_fresh_name("__dealloc_size32"), Sort::bitvec(32))
         });
 
         let mut heap_constraints = Vec::new();
@@ -233,114 +244,35 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         if let Some(ptr) = ptr_expr {
-            let (raw_obj_id_expr, raw_offset_expr) = match self.split_pointer(&ptr) {
-                Some(parts) => parts,
-                None => {
-                    return Some(AllocCallResult {
-                        result: None,
-                        heap_constraints,
-                        safety_checks,
-                        alloc_obj_id: None,
-                        transition_branches: Vec::new(),
-                    });
-                }
-            };
-            let resolved_alloc_id = Self::const_obj_id_u32(&raw_obj_id_expr)
-                .or_else(|| args.get(ptr_arg_idx).and_then(|arg| self.trace_arg_to_alloc_id(arg)));
-            let obj_id_expr = resolved_alloc_id
-                .map(|obj_id| Expr::bitvec_const(obj_id as i128, 32))
-                .unwrap_or_else(|| raw_obj_id_expr.clone());
-
+            let traced_alloc_id =
+                args.get(ptr_arg_idx).and_then(|arg| self.trace_arg_to_alloc_id(arg));
             let obj_valid_in = codegen_expr_heap::obj_valid_in();
-            let obj_valid_out = codegen_expr_heap::obj_valid_out();
             let obj_size_in = codegen_expr_heap::obj_size_in();
-            let obj_size_out = codegen_expr_heap::obj_size_out();
-            let known_recorded_size = resolved_alloc_id
-                .and_then(|obj_id| self.heap_state.heap_alloc_size(obj_id))
-                .map(|size| Expr::bitvec_const(size as u128, 32));
-            let recorded_size = || {
-                known_recorded_size
-                    .clone()
-                    .unwrap_or_else(|| obj_size_in.clone().select(obj_id_expr.clone()))
+            let Some(terms) = self.dealloc_pointer_terms(
+                &ptr,
+                args_resolved.then_some(size_32),
+                traced_alloc_id,
+                &obj_valid_in,
+                &obj_size_in,
+            ) else {
+                return Some(AllocCallResult {
+                    result: None,
+                    heap_constraints,
+                    safety_checks,
+                    alloc_obj_id: None,
+                    transition_branches: Vec::new(),
+                });
             };
-
-            // Part of #1173: Double-free detection.
-            // Part of #3655: Exempt unregistered allocations (obj_size[id]==0) from
-            // the double-free check. String/Vec stubs create symbolic allocations
-            // without registering obj_valid[id]=true. For these objects,
-            // obj_valid[id] is solver-default (can be false), causing a false CTREX.
-            // When obj_size[id]==0, the allocation was never registered via
-            // exchange_malloc, so the double-free check is vacuous.
-            let obj_valid_check = obj_valid_in.clone().select(obj_id_expr.clone());
-            let unregistered_alloc = recorded_size().eq(Expr::bitvec_const(0u64, 32));
-            safety_checks.push(Expr::or(unregistered_alloc, obj_valid_check));
-
-            // Part of #1174: Validate dealloc size matches allocation size.
-            // Part of #2769: Only emit when args were resolved. On symbolic fallback
-            // (args_resolved == false), size_32 is unconstrained — the solver trivially
-            // satisfies `obj_size[id] == <unconstrained>`, making the check vacuous.
-            // Part of #3159: Exempt zero-size allocations from size check.
-            // When obj_size[id] == 0 (dyn trait or ZST allocations where the
-            // compile-time size is unresolvable), the mismatch is spurious.
-            if args_resolved {
-                let zero = Expr::bitvec_const(0u64, 32);
-                let recorded_size = recorded_size();
-                let is_zero_size = recorded_size.clone().eq(zero);
-                let sizes_match = recorded_size.eq(size_32);
-                safety_checks.push(Expr::or(is_zero_size, sizes_match));
-            }
-
-            // Require dealloc pointer to be base address (offset == 0).
-            // Part of #3655: Also exempt unregistered allocations (obj_size==0).
-            let offset_zero = raw_offset_expr.eq(Expr::bitvec_const(0, 32));
-            let unregistered_offset = recorded_size().eq(Expr::bitvec_const(0u64, 32));
-            safety_checks.push(Expr::or(unregistered_offset, offset_zero));
-
-            // Deallocating a stack local is undefined behavior — the free
-            // argument must be a dynamic (heap) object. When the dealloc
-            // pointer's obj_id is PROVABLY a concrete stack-local id, emit a
-            // fail-closed memory-safety violation ("free argument must be
-            // dynamic object") instead of the anti-alias constraint below.
-            //
-            // Soundness: the old `obj_id != stack_id` anti-alias constraint,
-            // applied to a concrete stack obj_id, makes the transition body
-            // contradictory (stack_id != stack_id), rendering the post-dealloc
-            // path infeasible so every downstream check verifies vacuously and
-            // the UB is hidden. Recording the check as a memory-safety error
-            // rule instead makes `error` reachable → FAILED.
-            let ptr_obj_id_is_stack_local = resolved_alloc_id
-                .is_some_and(|id| self.heap_state.local_idx_for_obj_id(id).is_some());
-            if ptr_obj_id_is_stack_local {
-                // `false` as a must-hold condition ⇒ `¬false = true` heads the
-                // per-property memory-safety error rule (unconditionally
-                // reachable whenever the dealloc block is reached).
-                safety_checks.push(Expr::bool_const(false));
-            } else {
-                // Part of #3159: Prevent dealloc from aliasing with stack locals.
-                // Stack locals are valid for the entire function lifetime — they are
-                // never freed. Without this constraint, a symbolic dealloc pointer
-                // (common for Box<dyn Trait> due to type-punned memory arrays breaking
-                // the store/load chain during unsized casts) could be assigned an
-                // obj_id matching a stack local, invalidating its obj_valid and causing
-                // false CTREX on subsequent access checks.
-                // These are HEAP CONSTRAINTS (transition body), not safety checks,
-                // because safety checks become error rules that a symbolic pointer
-                // trivially triggers. Transition constraints instead restrict which
-                // obj_id values the solver may assign.
-                for stack_obj_id in self.heap_state.stack_local_obj_ids() {
-                    let stack_id_expr = Expr::bitvec_const(stack_obj_id as i128, 32);
-                    heap_constraints.push(obj_id_expr.clone().eq(stack_id_expr).not());
-                }
-            }
+            safety_checks.extend(terms.safety_checks);
+            heap_constraints.extend(terms.stack_anti_alias);
 
             // Constraint: obj_valid__out = store(obj_valid, obj_id, false) (mark freed)
-            // Last use of obj_id_expr — moved directly.
-            let freed_constraint =
-                obj_valid_out.eq(obj_valid_in.store(obj_id_expr, Expr::bool_const(false)));
+            let freed_constraint = codegen_expr_heap::obj_valid_out()
+                .eq(obj_valid_in.store(terms.obj_id, Expr::bool_const(false)));
             heap_constraints.push(freed_constraint);
 
             // Preserve size metadata on dealloc (explicitly carry forward obj_size).
-            heap_constraints.push(obj_size_out.eq(obj_size_in));
+            heap_constraints.push(codegen_expr_heap::obj_size_out().eq(obj_size_in));
 
             // Mark metadata arrays as modified (#1100 follow-up)
             self.mark_heap_metadata_modified();
@@ -360,5 +292,161 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             alloc_obj_id: None,
             transition_branches: Vec::new(),
         })
+    }
+    /// The pointer-level terms of the Rust deallocator contract for the freed
+    /// pointer `ptr`: the object it names, the safety checks (double free,
+    /// size match when `size_32` is the resolved BV32 size, base address, a
+    /// provably stack-local object) and the heap constraints that keep a
+    /// symbolic freed object off every stack local. `obj_valid_now` and
+    /// `obj_size_now` are the arrays the checks read: the rule's inputs for
+    /// the statement path, this rule's running definitions for a walk (an
+    /// earlier free in the same walk must be seen). `None` when the pointer
+    /// does not split.
+    ///
+    /// Shared by the statement path ([`Self::translate_dealloc_object`]) and
+    /// the CHC inline walker ([`Self::inline_rust_dealloc`]), so a
+    /// `__rust_dealloc` means the same wherever it is encoded.
+    pub(in crate::codegen_ay::chc) fn dealloc_pointer_terms(
+        &mut self,
+        ptr: &Expr,
+        size_32: Option<Expr>,
+        traced_alloc_id: Option<u32>,
+        obj_valid_now: &Expr,
+        obj_size_now: &Expr,
+    ) -> Option<DeallocPointerTerms> {
+        let (raw_obj_id_expr, raw_offset_expr) = self.split_pointer(ptr)?;
+        let resolved_alloc_id = Self::const_obj_id_u32(&raw_obj_id_expr).or(traced_alloc_id);
+        let obj_id_expr = resolved_alloc_id
+            .map(|obj_id| Expr::bitvec_const(obj_id as i128, 32))
+            .unwrap_or_else(|| raw_obj_id_expr.clone());
+        let known_recorded_size = resolved_alloc_id
+            .and_then(|obj_id| self.heap_state.heap_alloc_size(obj_id))
+            .map(|size| Expr::bitvec_const(size as u128, 32));
+        let recorded_size = || {
+            known_recorded_size
+                .clone()
+                .unwrap_or_else(|| obj_size_now.clone().select(obj_id_expr.clone()))
+        };
+        let mut safety_checks = Vec::new();
+        let mut stack_anti_alias = Vec::new();
+
+        // Part of #1173: Double-free detection.
+        // Part of #3655: Exempt unregistered allocations (obj_size[id]==0) from
+        // the double-free check. String/Vec stubs create symbolic allocations
+        // without registering obj_valid[id]=true. For these objects,
+        // obj_valid[id] is solver-default (can be false), causing a false CTREX.
+        // When obj_size[id]==0, the allocation was never registered via
+        // exchange_malloc, so the double-free check is vacuous.
+        let obj_valid_check = obj_valid_now.clone().select(obj_id_expr.clone());
+        let unregistered_alloc = recorded_size().eq(Expr::bitvec_const(0u64, 32));
+        safety_checks.push(Expr::or(unregistered_alloc, obj_valid_check));
+
+        // Part of #1174: Validate dealloc size matches allocation size.
+        // Part of #2769: Only emit when args were resolved. On symbolic fallback
+        // (args_resolved == false), size_32 is unconstrained — the solver trivially
+        // satisfies `obj_size[id] == <unconstrained>`, making the check vacuous.
+        // Part of #3159: Exempt zero-size allocations from size check.
+        // When obj_size[id] == 0 (dyn trait or ZST allocations where the
+        // compile-time size is unresolvable), the mismatch is spurious.
+        if let Some(size_32) = size_32 {
+            let zero = Expr::bitvec_const(0u64, 32);
+            let recorded_size = recorded_size();
+            let is_zero_size = recorded_size.clone().eq(zero);
+            let sizes_match = recorded_size.eq(size_32);
+            safety_checks.push(Expr::or(is_zero_size, sizes_match));
+        }
+
+        // Require dealloc pointer to be base address (offset == 0).
+        // Part of #3655: Also exempt unregistered allocations (obj_size==0).
+        let offset_zero = raw_offset_expr.eq(Expr::bitvec_const(0, 32));
+        let unregistered_offset = recorded_size().eq(Expr::bitvec_const(0u64, 32));
+        safety_checks.push(Expr::or(unregistered_offset, offset_zero));
+
+        // Deallocating a stack local is undefined behavior — the free
+        // argument must be a dynamic (heap) object. When the dealloc
+        // pointer's obj_id is PROVABLY a concrete stack-local id, emit a
+        // fail-closed memory-safety violation ("free argument must be
+        // dynamic object") instead of the anti-alias constraint below.
+        //
+        // Soundness: the old `obj_id != stack_id` anti-alias constraint,
+        // applied to a concrete stack obj_id, makes the transition body
+        // contradictory (stack_id != stack_id), rendering the post-dealloc
+        // path infeasible so every downstream check verifies vacuously and
+        // the UB is hidden. Recording the check as a memory-safety error
+        // rule instead makes `error` reachable → FAILED.
+        let ptr_obj_id_is_stack_local =
+            resolved_alloc_id.is_some_and(|id| self.heap_state.local_idx_for_obj_id(id).is_some());
+        if ptr_obj_id_is_stack_local {
+            // `false` as a must-hold condition ⇒ `¬false = true` heads the
+            // per-property memory-safety error rule (unconditionally
+            // reachable whenever the dealloc block is reached).
+            safety_checks.push(Expr::bool_const(false));
+        } else {
+            // Part of #3159: Prevent dealloc from aliasing with stack locals.
+            // Stack locals are valid for the entire function lifetime — they are
+            // never freed. Without this constraint, a symbolic dealloc pointer
+            // (common for Box<dyn Trait> due to type-punned memory arrays breaking
+            // the store/load chain during unsized casts) could be assigned an
+            // obj_id matching a stack local, invalidating its obj_valid and causing
+            // false CTREX on subsequent access checks.
+            // These are HEAP CONSTRAINTS (transition body), not safety checks,
+            // because safety checks become error rules that a symbolic pointer
+            // trivially triggers. Transition constraints instead restrict which
+            // obj_id values the solver may assign.
+            for stack_obj_id in self.heap_state.stack_local_obj_ids() {
+                let stack_id_expr = Expr::bitvec_const(stack_obj_id as i128, 32);
+                stack_anti_alias.push(obj_id_expr.clone().eq(stack_id_expr).not());
+            }
+        }
+        Some(DeallocPointerTerms { obj_id: obj_id_expr, safety_checks, stack_anti_alias })
+    }
+
+    /// `__rust_dealloc(ptr, size, align)` reached in a WALKED body (the CHC
+    /// inline walker, `terminator_exec.rs`), over the walk's translated
+    /// terms: the statement path's deallocator contract
+    /// ([`Self::dealloc_pointer_terms`], plus the resolved size/align checks
+    /// of [`Self::translate_dealloc_object`]) with the free applied to this
+    /// rule's running `obj_valid` (`push_pending_obj_valid_invalidation`, so a
+    /// second free in the same walk chains on the first and its double-free
+    /// check sees it). Returns the checks the walk records under its path
+    /// condition; `None` when the pointer does not split (the caller keeps
+    /// its havoc and fail-closed booking).
+    ///
+    /// `size` and `align` are `None` when the walk could not translate the
+    /// argument, or when its term rides a symbol the walker minted where it
+    /// gave up (a depth-exhausted `Layout::size`): the size and alignment
+    /// obligations are then not stated here and the caller records them as an
+    /// uncertified reach check.
+    pub(in crate::codegen_ay::chc) fn inline_rust_dealloc(
+        &mut self,
+        ptr: &Expr,
+        size: Option<Expr>,
+        align: Option<Expr>,
+    ) -> Option<Vec<Expr>> {
+        let obj_valid_now = self.pending_obj_valid_chain();
+        let obj_size_now = self.current_obj_size_array();
+        let mut checks = Vec::new();
+        let size_32 = match &size {
+            Some(size_expr) => {
+                checks.extend(self.fits_in_bv32_check(size_expr));
+                checks.extend(self.nonzero_bv_check(size_expr.clone(), POINTER_WIDTH));
+                Some(self.coerce_to_heap_bv32(size_expr.clone())?)
+            }
+            None => None,
+        };
+        if let Some(align_expr) = align {
+            checks.extend(self.power_of_two_bv_check(align_expr.clone(), POINTER_WIDTH));
+            checks.extend(self.nonzero_bv_check(align_expr, POINTER_WIDTH));
+        }
+        let terms =
+            self.dealloc_pointer_terms(ptr, size_32, None, &obj_valid_now, &obj_size_now)?;
+        checks.extend(terms.safety_checks);
+        self.heap_state.pending_updates.extend(terms.stack_anti_alias);
+        self.push_pending_obj_valid_invalidation(terms.obj_id);
+        // A memory effect for the walker's branch-arm rule
+        // (`note_inline_branch_arm_effects`): a free made on one arm is applied
+        // by the host on every path, which fails closed.
+        self.heap_state.note_memory_effect();
+        Some(checks)
     }
 }

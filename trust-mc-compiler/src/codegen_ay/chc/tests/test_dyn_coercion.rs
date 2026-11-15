@@ -379,6 +379,9 @@ fn test_boxed_dyn_fn_once_resolves_unique_callable_body() {
     with_test_ay_ctx_for_source(BOXED_DYN_FN_ONCE_PROBE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_boxed_dyn_fn_once");
         let body = instance.body().expect("function body");
+        // The resolver's uniqueness needs the harness's dyn-coercion universe
+        // (design 3: `dyn_dispatch_scope.rs`).
+        let _universe = install_harness_dyn_universe(ctx.tcx, instance);
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_boxed_dyn_fn_once", ChcConfig::default());
 
         let (fn_def, fn_args) = body
@@ -436,6 +439,9 @@ fn test_multi_signature_dyn_callable_resolves_unique_body_per_signature() {
     with_test_ay_ctx_for_source(MULTI_SIGNATURE_DYN_CALLABLE_PROBE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_multi_signature_dyn_callable");
         let body = instance.body().expect("function body");
+        // The resolver's uniqueness needs the harness's dyn-coercion universe
+        // (design 3: `dyn_dispatch_scope.rs`).
+        let _universe = install_harness_dyn_universe(ctx.tcx, instance);
         let chc_ctx =
             ChcCtx::new(ctx.tcx, &body, "probe_multi_signature_dyn_callable", ChcConfig::default());
 

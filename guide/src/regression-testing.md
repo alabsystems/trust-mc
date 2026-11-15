@@ -4,7 +4,7 @@ trust-mc relies on a quite extensive range of tests to perform regression testin
 There is no monolithic regression wrapper; run the maintained gates explicitly:
 
 ```bash
-cargo test --workspace --no-fail-fast
+targo --unverified test --workspace --no-fail-fast
 ./scripts/ay-compiletest.sh expected
 ./scripts/ay-soundness-gate.sh
 ```
@@ -99,7 +99,7 @@ environment. The `ay` solver binary must also be on `PATH`.
 # Run a single test from the `expected` suite end to end
 PATH="$HOME/ay/target/release:$PATH" \
 TRUST_MC_TEST_BIN="$(pwd)/target/debug/trust-mc-driver" \
-cargo run -p compiletest --quiet -- \
+targo --unverified run -p compiletest --quiet -- \
   --suite expected --mode expected expected/assert-eq/main.rs --force-rerun
 ```
 
@@ -109,7 +109,7 @@ Extra driver options are passed with repeated `--trust_mc-flag` arguments:
 # Run with explicit ay solver selection
 PATH="$HOME/ay/target/release:$PATH" \
 TRUST_MC_TEST_BIN="$(pwd)/target/debug/trust-mc-driver" \
-cargo run -p compiletest --quiet -- \
+targo --unverified run -p compiletest --quiet -- \
   --suite expected --mode expected \
   --trust_mc-flag '--ay-solver' --trust_mc-flag 'ay'
 ```
@@ -152,7 +152,7 @@ These tests follow the
 style.
 
 At present, trust-mc runs unit tests from workspace packages. To see which packages
-have tests, run `cargo test --workspace --no-run` and check the compiled test
+have tests, run `targo --unverified test --workspace --no-run` and check the compiled test
 binaries. Key packages with unit tests include:
  * `trust-mc-driver` - CLI and driver logic
  * `trust-mc-compiler` - Compiler and codegen

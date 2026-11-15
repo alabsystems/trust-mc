@@ -421,11 +421,18 @@ mod tests {
     fn test_session_with_target(target_dir: PathBuf) -> KaniSession {
         let mut args = CargoKaniArgs::try_parse_from(["cargo-trust-mc"]).unwrap().verify_opts;
         args.output_into_files = true;
-        args.target_dir = Some(target_dir);
+        args.target_dir = Some(target_dir.clone());
         KaniSession {
             args,
             autoharness_compiler_flags: None,
-            install: crate::session::InstallType::new().expect("install type"),
+            // Named, not detected. `InstallType::new()` reads the running
+            // executable's location, and a unit-test binary lives in
+            // `target/<profile>/deps`, which is no install location, so the
+            // fixture only worked where TRUST_MC_SYSROOT happened to be set.
+            // Writing the per-harness output file never consults the install.
+            install: crate::session::InstallType::Release(target_dir),
+            route: crate::session::CompilerRoute::DevCli,
+            trustc_identity: std::sync::OnceLock::new(),
             temporaries: Mutex::default(),
         }
     }

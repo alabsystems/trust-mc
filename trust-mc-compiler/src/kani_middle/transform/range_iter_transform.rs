@@ -12,8 +12,8 @@ use super::body::MutableBody;
 use super::range_iter::{ElemIntType, RangeForLoop};
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::{
-    BinOp, ConstOperand, Local, Mutability, Operand, Place, ProjectionElem, Rvalue, Statement,
-    StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    BinOp, ConstOperand, Local, Mutability, Operand, Place, ProjectionElem, Rvalue, StatementKind,
+    SwitchTargets, TerminatorKind,
 };
 use rustc_public::ty::{MirConst, Ty};
 
@@ -63,21 +63,24 @@ fn replace_into_iter(
         _ => return false, // external enum: TerminatorKind
     };
 
-    into_iter_block.statements.push(Statement {
-        kind: StatementKind::Assign(
+    into_iter_block.statements.push(crate::rustc_compat::mir_statement(
+        StatementKind::Assign(
             Place::from(idx_local),
-            Rvalue::Use(Operand::Copy(start_place)),
+            rvalue_use!(Rvalue::Use(Operand::Copy(start_place))),
         ),
-        span: loop_info.span,
-    });
-    into_iter_block.statements.push(Statement {
-        kind: StatementKind::Assign(Place::from(end_local), Rvalue::Use(Operand::Copy(end_place))),
-        span: loop_info.span,
-    });
+        loop_info.span,
+    ));
+    into_iter_block.statements.push(crate::rustc_compat::mir_statement(
+        StatementKind::Assign(
+            Place::from(end_local),
+            rvalue_use!(Rvalue::Use(Operand::Copy(end_place))),
+        ),
+        loop_info.span,
+    ));
 
     if let Some(target) = original_target {
         into_iter_block.terminator =
-            Terminator { kind: TerminatorKind::Goto { target }, span: loop_info.span };
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, loop_info.span);
     }
     true
 }
@@ -96,15 +99,15 @@ fn replace_next_call(
     let idx_operand = Operand::Copy(Place::from(idx_local));
     let end_operand = Operand::Copy(Place::from(end_local));
     let lt_rvalue = Rvalue::BinaryOp(BinOp::Lt, idx_operand, end_operand);
-    next_block.statements.push(Statement {
-        kind: StatementKind::Assign(Place::from(cond_local), lt_rvalue),
-        span: loop_info.span,
-    });
+    next_block.statements.push(crate::rustc_compat::mir_statement(
+        StatementKind::Assign(Place::from(cond_local), lt_rvalue),
+        loop_info.span,
+    ));
 
-    next_block.terminator = Terminator {
-        kind: TerminatorKind::Goto { target: loop_info.switch_bb },
-        span: loop_info.span,
-    };
+    next_block.terminator = crate::rustc_compat::mir_terminator(
+        TerminatorKind::Goto { target: loop_info.switch_bb },
+        loop_info.span,
+    );
 }
 
 /// Step 3: Replace the Option discriminant switch with the condition switch.
@@ -114,13 +117,13 @@ fn replace_option_switch(body: &mut MutableBody, loop_info: &RangeForLoop, cond_
         SwitchTargets::new(vec![(0, loop_info.exit_bb), (1, loop_info.body_bb)], loop_info.exit_bb);
 
     switch_block.statements.clear();
-    switch_block.terminator = Terminator {
-        kind: TerminatorKind::SwitchInt {
+    switch_block.terminator = crate::rustc_compat::mir_terminator(
+        TerminatorKind::SwitchInt {
             discr: Operand::Copy(Place::from(cond_local)),
             targets: new_targets,
         },
-        span: loop_info.span,
-    };
+        loop_info.span,
+    );
 }
 
 /// Step 4: Replace Option unwrap reads with idx reads and add `_idx += 1`.
@@ -148,8 +151,8 @@ fn replace_unwrap_and_add_increment(
     for stmt in &mut body_block.statements {
         if let StatementKind::Assign(_lhs_place, rvalue) = &mut stmt.kind {
             let (source_place, is_copy) = match rvalue {
-                Rvalue::Use(Operand::Copy(p)) => (Some(p), true),
-                Rvalue::Use(Operand::Move(p)) => (Some(p), false),
+                Rvalue::Use(Operand::Copy(p), ..) => (Some(p), true),
+                Rvalue::Use(Operand::Move(p), ..) => (Some(p), false),
                 _ => (None, false), // external enum: Rvalue
             };
 
@@ -162,17 +165,17 @@ fn replace_unwrap_and_add_increment(
                 } else {
                     Operand::Move(Place::from(idx_local))
                 };
-                *rvalue = Rvalue::Use(operand);
+                *rvalue = rvalue_use!(Rvalue::Use(operand));
             }
         }
     }
 
     let idx_operand = Operand::Copy(Place::from(idx_local));
     let add_rvalue = Rvalue::BinaryOp(BinOp::Add, idx_operand, one_operand);
-    body_block.statements.push(Statement {
-        kind: StatementKind::Assign(Place::from(idx_local), add_rvalue),
-        span: loop_info.span,
-    });
+    body_block.statements.push(crate::rustc_compat::mir_statement(
+        StatementKind::Assign(Place::from(idx_local), add_rvalue),
+        loop_info.span,
+    ));
 }
 
 pub(super) fn range_field_place(range_place: &Place, field_idx: usize, field_ty: Ty) -> Place {

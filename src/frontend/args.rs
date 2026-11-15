@@ -95,7 +95,8 @@ pub(crate) fn translate(argv: &[OsString]) -> Front<Plan> {
         return Err(Fail::usage(format!(
             "error: no input file\n\n{}The input must be a path ending in `.rs`. To get one:\n\
              \n    trust-mc example > demo.rs\n    trust-mc demo.rs\n\n\
-             To verify a Cargo package instead, use `cargo trust-mc`.",
+             To verify a Cargo package instead, use `targo trust-mc` (`cargo trust-mc` with \
+             stock Rust).",
             help::usage_lines()
         )));
     };
@@ -162,11 +163,14 @@ pub(crate) fn translate_cargo(argv: &[OsString]) -> Front<Plan> {
 /// legal and only the former eats the next token.
 pub(crate) const ENGINE_VALUE_FLAGS: &[&str] = &[
     "--backend",
+    "--backend-dylib",
     "--bench",
     "--bin",
+    "--compiler-route",
     "--concrete-playback",
     "--conformance-harness",
     "--default-unwind",
+    "--edition",
     "--example",
     "--exclude",
     "--export-smtlib",
@@ -182,6 +186,7 @@ pub(crate) const ENGINE_VALUE_FLAGS: &[&str] = &[
     "--target-dir",
     "--test",
     "--trust-vc-bundle",
+    "--trustc",
     "--unstable",
     "--unwind",
 ];
@@ -337,7 +342,8 @@ fn translate_flags(argv: &[OsString]) -> Front<(Vec<OsString>, Option<OsString>,
                 return Err(Fail::usage(format!(
                     "error: {text} is a directory\n       \
                      trust-mc verifies one Rust source file (`trust-mc path/to/file.rs`).\n       \
-                     To verify a Cargo package, run `cargo trust-mc` inside it."
+                     To verify a Cargo package, run `targo trust-mc` inside it (`cargo \
+                     trust-mc` with stock Rust)."
                 )));
             }
             // Unrecognized: hand it to the engine untouched. The engine's
@@ -624,6 +630,6 @@ mod tests {
         let err = translate(&args(&[env!("CARGO_MANIFEST_DIR")])).unwrap_err();
         assert_eq!(err.code, super::super::EXIT_USAGE);
         assert!(err.msg.contains("is a directory"), "{}", err.msg);
-        assert!(err.msg.contains("cargo trust-mc"), "{}", err.msg);
+        assert!(err.msg.contains("targo trust-mc"), "{}", err.msg);
     }
 }

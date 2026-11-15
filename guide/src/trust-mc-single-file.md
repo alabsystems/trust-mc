@@ -25,12 +25,12 @@ library sysroot  /work/trust-mc/target/trust-mc
   [x] playback/lib  concrete playback
 
 rust toolchain (the compiler is a rustc driver)
-  [x] trust-mc-compiler starts: rustc 1.93.0-nightly (646a3f8c1 2025-12-02)
+  [x] trust-mc-compiler starts: rustc 1.99.0-dev (321aaeda7 2026-09-17)
 
 SMT solver (bounded runs shell out to it; CHC solves in-process)
-  [x] ay  /work/ay/target/release/ay
+  [x] ay  /work/ay/target/release/ay (on PATH)
       ay <version>+build.<n>.<sha>@...
-  [x] the binary is the same AY commit the engine links
+  [x] the binary is the pinned AY commit <sha> (pinned by the engine)
 
 ready. Try:
 
@@ -39,9 +39,17 @@ ready. Try:
 ```
 
 When something is missing, `doctor` exits 3 and prints the command that
-produces it (`cargo run --release -p build-trust-mc -- build-dev --release` for
-the engine and sysroot; a sibling `ay` checkout built with
-`cargo build --release -p ay --features cli` for the solver).
+produces it (`targo --unverified build-dev --release` for the engine and
+sysroot; a sibling `ay` checkout built with
+`targo --unverified build --release -p ay --features cli` for the solver).
+
+The solver has to be the AY commit the workspace pins. The engine runs
+`$TRUST_MC_AY_BIN` when it is set, otherwise `ay` on `PATH`, and refuses any
+other build before compiling anything; `doctor` reports such a binary as
+`off-pin` and not ready, with the same fix. `--allow-unpinned-ay` (or
+`TRUST_MC_ALLOW_UNPINNED_AY=1`) runs it anyway: each harness prints
+`[AY:SOLVER_PIN_MISMATCH:found=<commit>:pin=<commit>]` and every success is
+reported as `SUCCESSFUL (UNVALIDATED)`.
 
 ## Run a harness
 

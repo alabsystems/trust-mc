@@ -52,11 +52,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Returns Some(expr) with expr.sort() matching operand type
     /// ENSURES: Returns None if operand cannot be translated
     pub(super) fn codegen_operand(&mut self, operand: &Operand) -> Option<Expr> {
+        self.guard_box_pointer_load(operand);
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.codegen_place(place),
-            Operand::Constant(constant) => self
-                .codegen_constant(constant)
-                .or_else(|| self.codegen_uninit_const_arbitrary(constant)),
+            Operand::Constant(constant) => {
+                self.premint_const_ref_targets(&constant.const_);
+                self.codegen_constant(constant)
+                    .or_else(|| self.codegen_uninit_const_arbitrary(constant))
+            }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(checks) => {
+                Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(checks)))
+            }
         }
     }
 
@@ -96,29 +103,32 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         debug!("codegen_constant: ty={:?}, kind={:?}", ty.kind(), mir_const.kind());
 
-        // Try to extract the scalar value from the constant
-        let extracted = match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => self.codegen_scalar_from_alloc(alloc, ty),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(value_ty, alloc) => {
-                    debug!("codegen_constant: TyConstKind::Value value_ty={:?}", value_ty.kind());
-                    self.codegen_scalar_from_alloc(alloc, *value_ty)
-                }
-                // ZSTs carry zero bits of information — any value is
-                // semantically correct. Produce canonical value directly
-                // to avoid false constant_zero_fallback counts that cause
-                // PROOF demotion. Matches CHC path (codegen_expr_constant.rs:53).
-                // Part of #3094.
-                TyConstKind::ZSTValue(_) => Some(Expr::bool_const(true)),
-                TyConstKind::Bound(..) | TyConstKind::Param(_) | TyConstKind::Unevaluated(..) => {
+        // Try to extract the scalar value from the constant's own bytes
+        // (`const_pointer::const_bytes`, THE entry point). A top-level
+        // reference is decoded through its pointee below, not here.
+        let extracted =
+            if let Some(bytes) = crate::codegen_ay::shared::const_pointer::const_bytes(mir_const) {
+                if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..))) {
                     None
+                } else {
+                    self.codegen_scalar_from_bytes(&bytes, ty)
                 }
-            },
-            // ZSTs carry zero bits — matches CHC path (codegen_expr_constant.rs:58).
-            // Part of #3094.
-            ConstantKind::ZeroSized => Some(Expr::bool_const(true)),
-            ConstantKind::Param(_) | ConstantKind::Unevaluated(_) => None,
-        };
+            } else {
+                match mir_const.kind() {
+                    // ZSTs carry zero bits of information — any value is
+                    // semantically correct. Produce canonical value directly
+                    // to avoid false constant_zero_fallback counts that cause
+                    // PROOF demotion. Matches CHC path (codegen_expr_constant.rs:53).
+                    // Part of #3094.
+                    ConstantKind::ZeroSized => Some(Expr::bool_const(true)),
+                    ConstantKind::Ty(ty_const)
+                        if matches!(ty_const.kind(), TyConstKind::ZSTValue(_)) =>
+                    {
+                        Some(Expr::bool_const(true))
+                    }
+                    _ => None,
+                }
+            };
 
         debug!("codegen_constant: extracted={:?}", extracted);
 

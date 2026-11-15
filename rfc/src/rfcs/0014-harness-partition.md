@@ -210,4 +210,3 @@ We could potentially introduce a separate API, e.g. `unsafe_partition`, that all
 7. (Similar to #3) How can a coverage check failure be best presented to users?
 Perhaps by running the coverage harness with concrete playback to generate a test case that doesn't fall into the partitions?
 
-[^unstable_feature]: This unique ident should be used to enable features proposed in the RFC using `-Z <ident>` until the feature has been stabilized.

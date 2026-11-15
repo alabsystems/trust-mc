@@ -4,6 +4,8 @@
 //! Checks that `write_bytes` fails when `dst` is not aligned.
 //! This test is a modified version of the example in
 //! https://doc.rust-lang.org/std/ptr/fn.write_bytes.html
+#![feature(core_intrinsics)]
+
 use std::intrinsics::write_bytes;
 
 #[kani::proof]

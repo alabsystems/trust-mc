@@ -128,7 +128,9 @@ fn test_translate_rvalue_with_env_resolves_len_from_datatype_env() {
         );
         assert_eq!(after, before, "datatype env resolution should not increment fallback_count");
         assert!(
-            expr.to_string().contains("fld_len"),
+            // ay folds fld_len over the constructor (8a7c063209) to the stored length.
+            expr.to_string().contains("fld_len")
+                || matches!(expr.value(), ExprValue::BitVecConst { .. }),
             "resolved expression should select fld_len, got {expr:?}"
         );
     });

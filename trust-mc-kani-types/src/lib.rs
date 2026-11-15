@@ -12,6 +12,8 @@
 //! on `trust_mc-compiler`.
 
 #![feature(rustc_private)]
+// The abi.rs tests select rustc_public spellings per measured Trust endpoint.
+#![cfg_attr(test, feature(cfg_version))]
 extern crate rustc_public;
 // rustc_driver is required for sysroot crate linking in test binaries.
 #[cfg(test)]

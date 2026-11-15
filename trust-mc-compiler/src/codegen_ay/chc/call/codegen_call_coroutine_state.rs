@@ -9,7 +9,6 @@ use ay_bindings::sort::SortInner;
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
 
-use super::super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
 use super::ChcCtx;
 use crate::codegen_ay::types::{
     SignExtension, bool_sort, coerce_bitvec_width_safe, flatten_datatype_to_bitvec,
@@ -28,11 +27,16 @@ pub(super) enum CoroutineStateBranch {
 /// For the `CoroutineState<Y, R>` enum, prefer an `ite(choice, Yielded(..),
 /// Complete(..))` expression so the solver can explore both outcomes. If only
 /// one constructor is present, fall back to that variant alone.
+///
+/// The resume is not walked, so the outcome and the payloads are values the
+/// model does not compute: `mint` makes each one (a name prefix and a sort),
+/// and the caller books them (Rule E: `sound_havoc::UNTRACKED_COROUTINE_STATE`).
 pub(super) fn try_construct_coroutine_state_expr(
     dest_sort: &ay_bindings::Sort,
     yield_is_zst: bool,
     complete_is_zst: bool,
     allow_complete_branch: bool,
+    mint: &mut dyn FnMut(&'static str, Sort) -> Expr,
 ) -> Option<Expr> {
     let SortInner::Datatype(dt) = dest_sort.inner() else {
         return None;
@@ -47,9 +51,9 @@ pub(super) fn try_construct_coroutine_state_expr(
         name_lower.contains("complete")
     });
 
-    let build_ctor = |ctor: &ay_bindings::sort::DatatypeConstructor,
-                      payload_is_zst: bool,
-                      fresh_prefix: &str| {
+    let mut build_ctor = |ctor: &ay_bindings::sort::DatatypeConstructor,
+                          payload_is_zst: bool,
+                          fresh_prefix: &'static str| {
         let field_exprs: Vec<Expr> = ctor
             .fields
             .iter()
@@ -57,7 +61,7 @@ pub(super) fn try_construct_coroutine_state_expr(
                 if payload_is_zst && field.sort.is_bool() {
                     Expr::bool_const(true)
                 } else {
-                    declare_pending_var(chc_fresh_name(fresh_prefix), field.sort.clone())
+                    mint(fresh_prefix, field.sort.clone())
                 }
             })
             .collect();
@@ -78,7 +82,7 @@ pub(super) fn try_construct_coroutine_state_expr(
         (Some(yielded_ctor), Some(complete_ctor)) => {
             let yielded_expr = build_ctor(yielded_ctor, yield_is_zst, "__coroutine_yield");
             let complete_expr = build_ctor(complete_ctor, complete_is_zst, "__coroutine_complete");
-            let choice = declare_pending_var(chc_fresh_name("__coro_outcome"), bool_sort());
+            let choice = mint("__coro_outcome", bool_sort());
             Some(Expr::ite(choice, yielded_expr, complete_expr))
         }
         (Some(yielded_ctor), None) => {
@@ -96,6 +100,7 @@ pub(super) fn try_construct_coroutine_state_variant_expr(
     branch: CoroutineStateBranch,
     yield_is_zst: bool,
     complete_is_zst: bool,
+    mint: &mut dyn FnMut(&'static str, Sort) -> Expr,
 ) -> Option<Expr> {
     let SortInner::Datatype(dt) = dest_sort.inner() else {
         return None;
@@ -122,7 +127,7 @@ pub(super) fn try_construct_coroutine_state_variant_expr(
             if payload_is_zst && field.sort.is_bool() {
                 Expr::bool_const(true)
             } else {
-                declare_pending_var(chc_fresh_name(fresh_prefix), field.sort.clone())
+                mint(fresh_prefix, field.sort.clone())
             }
         })
         .collect();

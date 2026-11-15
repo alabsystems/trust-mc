@@ -13,7 +13,6 @@ use super::super::ChcCtx;
 use super::super::chc_call_context::DispatchCallContext;
 use super::super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::super::codegen_rules::CodegenRules;
-use crate::codegen_ay::chc::pointer_step::step_split_pointer;
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
 use crate::kani_middle::abi::LayoutOf;
 
@@ -87,8 +86,13 @@ pub(in crate::codegen_ay::chc) fn codegen_arith_offset(
             // identity so a count-independent counterexample can recertify.
             ctx.record_offset_provenance_unresolved(&base_expr);
         }
-        // Part of #3921: use split-pointer step to preserve obj_id.
-        let result = step_split_pointer(base_expr, byte_offset).result;
+        // `arith_offset` IS `wrapping_offset`: defined out of bounds, so the
+        // step is exact mod 2^64. The in-bounds lane step kept only the low 32
+        // bits of the byte offset (`arith_offset(p, 1 << 31)` on a `*const
+        // u32` read as `p`).
+        let base_t64 = ctx.wrapping_operand_t64(&args[0], &base_expr, modified_locals);
+        let result =
+            ctx.step_wrapping_address_from(base_expr, byte_offset, /* is_sub = */ false, base_t64);
 
         debug!("CHC: arith_offset encoded as pointer arithmetic (Part of #3444)");
 
@@ -308,6 +312,8 @@ fn extract_pointee_size(ctx: &ChcCtx<'_, '_>, operand: &Operand) -> Option<usize
             ctx.body.locals().get(place.local).map(|local| local.ty)?
         }
         Operand::Constant(constant) => constant.ty(),
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => rustc_public::ty::Ty::bool_ty(),
     };
 
     match ty.kind() {

@@ -5,11 +5,18 @@
 //! File I/O and codegen-results factory for the AY backend.
 
 use ay_bindings::AYProgram;
+#[cfg(trust_toolchain)]
+use rustc_codegen_ssa::CompiledModules;
 use rustc_codegen_ssa::back::archive::{
     ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder, DEFAULT_OBJECT_READER,
 };
+#[cfg(not(trust_toolchain))]
 use rustc_codegen_ssa::{CodegenResults, CrateInfo};
+#[cfg(not(trust_toolchain))]
 use rustc_data_structures::fx::FxIndexMap;
+#[cfg(trust_toolchain)]
+use rustc_middle::dep_graph::WorkProductMap;
+#[cfg(not(trust_toolchain))]
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
@@ -20,6 +27,7 @@ use tracing::{debug, info};
 use trust_mc_metadata::ArtifactType;
 use trust_mc_metadata::artifact::convert_type;
 
+#[cfg(not(trust_toolchain))]
 pub(in crate::codegen_ay) fn codegen_results(tcx: TyCtxt) -> Box<dyn std::any::Any> {
     let work_products = FxIndexMap::<WorkProductId, WorkProduct>::default();
     Box::new((
@@ -30,6 +38,16 @@ pub(in crate::codegen_ay) fn codegen_results(tcx: TyCtxt) -> Box<dyn std::any::A
         },
         work_products,
     ))
+}
+
+/// Trust: rustc builds the `CrateInfo` itself, from `CodegenBackend::target_cpu`
+/// (which returns the same `"ay"` as above), and hands it to `join_codegen` and
+/// `link`. Only the empty module list and the work products are returned; the
+/// backend emits no object files.
+#[cfg(trust_toolchain)]
+pub(in crate::codegen_ay) fn codegen_results(_tcx: TyCtxt) -> Box<dyn std::any::Any> {
+    let work_products = WorkProductMap::default();
+    Box::new((CompiledModules { modules: vec![], allocator_module: None }, work_products))
 }
 
 pub(super) struct ArArchiveBuilderBuilder;
@@ -366,6 +384,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -426,6 +445,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,
@@ -489,6 +509,7 @@ mod tests {
             into_option_drops: None,
             internal_workarounds: None,
             abstracted_fallbacks: None,
+            unstubbed_abstractions: None,
             vec_field_fallbacks: None,
             pointee_synthesis_fallbacks: None,
             unsupported_construct_fallbacks: None,

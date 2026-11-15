@@ -9,7 +9,8 @@
 
 use super::stubs::StubKind;
 use super::stubs_numeric_arg::NumericArgKind;
-use super::{ChcCtx, StubTranslateArgs, chc_fresh_name, declare_pending_var, ty_signedness};
+use super::{ChcCtx, StubTranslateArgs, chc_fresh_name, ty_signedness};
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use std::collections::HashSet;
@@ -117,13 +118,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Some(arg_expr)
             } else {
                 // Part of #3447: Record that BigInt::from arg has unsupported sort.
-                self.record_sound_fallback_reason("bigint_from_unsupported_sort");
-                Some(declare_pending_var(chc_fresh_name("bigint_from"), int_sort()))
+                let booked = self.record_sound_fallback_reason("bigint_from_unsupported_sort");
+                Some(Havoc::booked(booked, chc_fresh_name("bigint_from"), int_sort()))
             }
         } else {
             // Part of #3447: Record that BigInt::from arg translation failed.
-            self.record_sound_fallback_reason("bigint_from_arg_unresolved");
-            Some(declare_pending_var(chc_fresh_name("bigint_from"), int_sort()))
+            let booked = self.record_sound_fallback_reason("bigint_from_arg_unresolved");
+            Some(Havoc::booked(booked, chc_fresh_name("bigint_from"), int_sort()))
         }
     }
 
@@ -179,21 +180,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Bit shift — LIA cannot express symbolic exponent; return unconstrained (sound).
     fn translate_bigint_shl(&mut self, _ctx: &StubTranslateArgs<'_>) -> Option<Expr> {
         // Part of #3447: LIA cannot express shifts — result is unconstrained.
-        self.record_sound_fallback_reason("bigint_shl_lia_unsupported");
-        Some(declare_pending_var(chc_fresh_name("bigint_shl"), int_sort()))
+        let booked = self.record_sound_fallback_reason("bigint_shl_lia_unsupported");
+        Some(Havoc::booked(booked, chc_fresh_name("bigint_shl"), int_sort()))
     }
 
     fn translate_bigint_shr(&mut self, _ctx: &StubTranslateArgs<'_>) -> Option<Expr> {
         // Part of #3447: LIA cannot express shifts — result is unconstrained.
-        self.record_sound_fallback_reason("bigint_shr_lia_unsupported");
-        Some(declare_pending_var(chc_fresh_name("bigint_shr"), int_sort()))
+        let booked = self.record_sound_fallback_reason("bigint_shr_lia_unsupported");
+        Some(Havoc::booked(booked, chc_fresh_name("bigint_shr"), int_sort()))
     }
 
     /// Bitwise ops on unbounded Int cannot be expressed in LIA; return unconstrained (sound).
     fn translate_bigint_bitwise(&mut self, _ctx: &StubTranslateArgs<'_>) -> Option<Expr> {
         // Part of #3447: LIA cannot express bitwise ops — result is unconstrained.
-        self.record_sound_fallback_reason("bigint_bitwise_lia_unsupported");
-        Some(declare_pending_var(chc_fresh_name("bigint_bitwise"), int_sort()))
+        let booked = self.record_sound_fallback_reason("bigint_bitwise_lia_unsupported");
+        Some(Havoc::booked(booked, chc_fresh_name("bigint_bitwise"), int_sort()))
     }
 
     /// Gets a BigInt argument as a AY Int expression.

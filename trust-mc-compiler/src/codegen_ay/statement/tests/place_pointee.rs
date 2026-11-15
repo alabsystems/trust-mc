@@ -566,3 +566,51 @@ fn test_projection_suffix_compound() {
 // =============================================================================
 // Helper
 // =============================================================================
+
+/// A `ref_pointees` entry that names a pointee derived from ITSELF must resolve
+/// to `None`, not recurse without bound. `bytes = rest` inside a
+/// `-Z loop-contracts` while-let over a slice builds exactly this shape, and
+/// before the guard the compiler died with a stack overflow (SIGABRT) on
+/// tests/expected/loop-contract/while_let_loop_for_slice.rs.
+#[test]
+fn test_self_referential_ref_pointee_is_unresolvable_not_a_stack_overflow() {
+    with_test_ay_ctx_for_source(
+        r#"
+        pub fn first_or(a: &[u8], d: u8) -> u8 {
+            a.first().copied().unwrap_or(d)
+        }
+        "#,
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "first_or");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+            let fn_name = codegen.ctx.current_fn_name().to_owned();
+            let reference = format!("{fn_name}::local_900");
+            let derived = format!("{fn_name}::local_900_deref_field_0");
+            codegen
+                .ref_pointees
+                .insert(std::sync::Arc::from(reference.as_str()), std::sync::Arc::from(derived.as_str()));
+            assert!(codegen.env_lookup(&derived).is_none(), "precondition: not in env");
+
+            assert!(
+                codegen.ensure_derived_pointee_in_env(&derived).is_none(),
+                "a self-derived pointee has no value to build"
+            );
+
+            // A two-step cycle is refused the same way.
+            let other = format!("{fn_name}::local_901");
+            let other_derived = format!("{fn_name}::local_901_deref_field_1");
+            codegen.ref_pointees.insert(
+                std::sync::Arc::from(reference.as_str()),
+                std::sync::Arc::from(other_derived.as_str()),
+            );
+            codegen
+                .ref_pointees
+                .insert(std::sync::Arc::from(other.as_str()), std::sync::Arc::from(derived.as_str()));
+            assert!(codegen.ensure_derived_pointee_in_env(&derived).is_none());
+        },
+    );
+}

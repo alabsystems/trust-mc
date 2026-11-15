@@ -13,9 +13,12 @@
 //! Migrated from include!() to proper module.
 //! Part of #2306: include!() to proper module migration.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
+use crate::rustc_public_bridge::IndexedVal;
 use ay_bindings::{Expr, ExprValue};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::mir::{Operand, Place, Rvalue, StatementKind};
@@ -47,11 +50,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn omitted_flattened_field_expr(
         field_ty: Option<rustc_public::ty::Ty>,
     ) -> Option<Expr> {
-        let sort = Self::translate_ty(field_ty?)?;
+        let field_ty = field_ty?;
+        let sort = Self::translate_ty(field_ty)?;
         if sort.is_bool() {
             return Some(Expr::bool_const(true));
         }
-        Self::sort_default_expr(&sort)
+        Self::sort_default_expr(&sort).or_else(|| Self::omitted_zst_datatype_expr(field_ty, &sort))
+    }
+
+    /// The value of an OMITTED (zero-sized) flattened-enum field whose sort has
+    /// no scalar default — a Datatype such as `Option<Infallible>` or an Array
+    /// such as `[i32; 0]`. A zero-sized type has exactly one value, so the
+    /// canonical one is exact, not an approximation. `None` when the type is
+    /// not actually zero-sized or has no canonical form.
+    pub(in crate::codegen_ay::chc) fn omitted_zst_datatype_expr(
+        field_ty: rustc_public::ty::Ty,
+        sort: &ay_bindings::Sort,
+    ) -> Option<Expr> {
+        if !crate::codegen_ay::chc::call::codegen_call_kani_model_dst::is_zst_ty(field_ty) {
+            return None;
+        }
+        crate::codegen_ay::chc::call::canonical_zst_expr_for_sort(field_ty, sort)
+            .filter(|expr| expr.sort() == sort)
     }
 
     fn resolve_static_ref_deref_place(
@@ -256,9 +276,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 // At Mem track level, use translate_place_with_deref which handles
                 // memory loads for Deref projections. It delegates to
                 // translate_place_with_modified when there's no Deref.
-                self.translate_place_with_deref(place, modified_locals)
+                let expr = self.translate_place_with_deref(place, modified_locals)?;
+                // Design 3 (call/fn_ptr_targets.rs): a closed fn-pointer local's
+                // term can hold only that local's ids, which completes the
+                // candidate set of a walked call through it.
+                self.note_fn_ptr_operand_domain(operand, &expr);
+                Some(expr)
             }
             Operand::Constant(const_op) => self.translate_constant(const_op),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(checks) => {
+                Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(checks)))
+            }
         }
     }
 
@@ -273,6 +302,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
         let local_idx: usize = place.local;
+
+        // A closed borrowed-static next producer stores a LOCATION in this
+        // slot. The generic enum reader reconstructs the pointee's datatype
+        // from its bits, which would truncate/repack this pointer.
+        if matches!(place.projection.as_slice(),
+            [rustc_public::mir::ProjectionElem::Downcast(v), rustc_public::mir::ProjectionElem::Field(0, _)] if v.to_index() == 1)
+            && self.borrowed_static_next_sources(local_idx).is_some()
+        {
+            return self.flattened_local_field_expr(local_idx, 1, modified_locals);
+        }
 
         // Part of #2214 / #3908 Step 5: Flattened locals dispatch to dedicated method.
         if self.flatten.flattened_tuple_locals.contains(&local_idx) {
@@ -312,6 +351,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 "CHC: redirected leading deref through unique MIR ref source"
             );
             return self.translate_place_with_modified(&redirected_place, modified_locals);
+        }
+
+        // A flat union local read through a field: the typed projection chain,
+        // whose Field arm reads the union's bits in memory order before any
+        // type-blind selector can misread them (`union_bv_field_coerce`).
+        if matches!(place.projection.first(), Some(rustc_public::mir::ProjectionElem::Field(..)))
+            && let Some(local) = self.body.locals().get(local_idx)
+            && self.flat_union_width(local.ty).is_some()
+            && root_expr.sort().is_bitvec()
+        {
+            return self.translate_place_field_index(
+                &place.projection,
+                root_expr,
+                Some(local.ty),
+                modified_locals,
+            );
         }
 
         // Handle any index-bearing projection chain on non-flattened locals.
@@ -505,54 +560,51 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return crate::codegen_ay::types::coroutine_root_select(current, cons_idx, field_idx);
         }
 
+        // A union field first: the type-blind selectors below misread a flat
+        // union's bits (see `union_bv_field_coerce`).
+        if let Some(ty) = current_ty
+            && cons_idx.is_none()
+            && let Some(value) = self.union_bv_field_coerce(&current, ty, field_ty)
+        {
+            return Some(value);
+        }
         let selections = vec![FieldProjection { field_idx, cons_idx, field_ty: Some(field_ty) }];
         if let Some(expr) = Self::apply_field_selections(current.clone(), &selections) {
             return Some(expr);
         }
         if let Some(ty) = current_ty
             && current.sort().is_bitvec()
+            && let Some(selected) = Self::bv_field_select(&current, ty, &selections)
         {
-            if let Some(selected) = Self::bv_field_select(&current, ty, &selections) {
-                return Some(selected);
-            }
-            if let Some(coerced) = Self::union_bv_field_coerce(&current, ty, field_ty) {
-                return Some(coerced);
-            }
+            return Some(selected);
         }
         None
     }
 
-    /// Union field select on a BV root: unions translate to
-    /// `Sort::bitvec(size*8)`, so a field read is a zero-extend/truncate to the
-    /// field's width (LE layout, all union fields at offset 0). `None` when the
-    /// root isn't a BV-sorted union. Shared by `apply_field_projection` and the
-    /// deref-chain Field arm.
+    /// Union field select on a BV root: a union translates to one bitvector of
+    /// its size, and a field read is the field's bytes at offset 0 read back
+    /// as the field's type, in MEMORY order (`codegen_stmt_union_bits.rs`), or
+    /// a fresh value with a booking when the layout lane does not model the
+    /// field. `None` when the root is not a flat union. Shared by
+    /// `apply_field_projection` and the deref-chain Field arm, which ask it
+    /// BEFORE the type-blind selectors: those read a 128-bit container as
+    /// `Layout { size, align }` and a 64-bit one as a pointer wrapper, so
+    /// `u.x` of a 128-bit union kept its low 64 bits and `u.w` of a 64-bit
+    /// union was the whole union, unflattened in declaration order.
     pub(in crate::codegen_ay::chc) fn union_bv_field_coerce(
+        &self,
         current: &Expr,
         current_ty: rustc_public::ty::Ty,
         field_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
-        use crate::codegen_ay::types::{SignExtension, coerce_bitvec_width_safe};
-        use rustc_public::ty::{RigidTy, TyKind};
         if !current.sort().is_bitvec() {
             return None;
         }
-        let TyKind::RigidTy(RigidTy::Adt(def, _)) = current_ty.kind() else {
-            return None;
-        };
-        if def.kind() != rustc_public::ty::AdtKind::Union {
+        let width = self.flat_union_width(current_ty)?;
+        if current.sort().bitvec_width() != Some(width) {
             return None;
         }
-        let field_width = field_ty
-            .layout()
-            .ok()
-            .map(|l| byte_size_to_bv_width(l.shape().size.bytes()))
-            .unwrap_or(0);
-        Some(if field_width == 0 {
-            Expr::bool_const(true)
-        } else {
-            coerce_bitvec_width_safe(current.clone(), field_width, SignExtension::ZeroExtend)
-        })
+        self.union_field_value(current, field_ty)
     }
 
     /// Element select from a fixed-size scalar array `[T; N]` that reached this

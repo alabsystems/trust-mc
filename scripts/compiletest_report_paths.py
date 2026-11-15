@@ -14,6 +14,7 @@ REPORT_TOOL_PATHS = (
     "scripts/extract_proof_harnesses.py",
     "scripts/extract_replacement_proof_report.py",
     "scripts/generate_non_proof_closure.py",
+    "scripts/generate_upstream_inactive_authority.py",
     "scripts/replacement_harness_dispositions.py",
     "scripts/replacement_public_runner.py",
     "scripts/lane_policy_query.py",
@@ -36,6 +37,10 @@ REPORT_TOOL_PATHS = (
     "tests/trust-mc/replacement-harness-inventory.json",
     "tests/trust-mc/replacement-harness-inventory.proof.json",
     "tests/trust-mc/replacement-harness-dispositions.json",
+    # The fourth frozen authority: the rows upstream Kani disabled. It decides
+    # which cfg-disabled rows sit outside the replacement bar, so it belongs to
+    # the measurement identity exactly like the other three.
+    "tests/trust-mc/replacement-upstream-inactive.json",
 )
 MEASUREMENT_FINGERPRINT_PATHS = (
     ":(glob)**/*.rs",

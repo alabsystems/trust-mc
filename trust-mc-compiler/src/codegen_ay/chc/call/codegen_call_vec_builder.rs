@@ -11,6 +11,11 @@
 //!
 //! Part of #3348: Vec iteration encoding for for-loop push patterns.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -138,7 +143,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
         let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        let callee_body = instance.body()?;
+        let callee_body = instance.callee_body()?;
 
         // Check destination type: must be a struct (ADT) or Vec directly.
         let dest_local: usize = dcx.destination.local;
@@ -178,15 +183,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.collections.projection_locals.get(&dest_local).copied()
             == Some(CollectionProjectionKind::Vec)
         {
-            let ptr =
-                super::declare_pending_var(format!("vec_builder_ptr_{dest_local}"), ptr_sort());
+            let ptr = Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("vec_builder_ptr_{dest_local}"),
+                ptr_sort(),
+            );
             let data_sort = self
                 .state_var_mgr
                 .output_state_vars
                 .get(dest_vec_idx + vec_layout::IDX_DATA)
                 .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| ay_bindings::Sort::array(ptr_sort(), ptr_sort()));
-            let data = make_vec_builder_data_expr(dest_local, &data_sort, vec_data_expr);
+            let data = make_vec_builder_data_expr(self, dest_local, &data_sort, vec_data_expr);
             Self::emit_cap_ge_len(len_bv.clone(), len_bv.clone(), constraints);
             let handled = self.constrain_projected_vec_fields_for_call(
                 dest_local,
@@ -222,9 +231,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .get(vec_base_abs + vec_layout::IDX_DATA)
                 .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| ay_bindings::Sort::array(ptr_sort(), ptr_sort()));
-            let ptr =
-                super::declare_pending_var(format!("vec_builder_ptr_{dest_local}"), ptr_sort());
-            let data = make_vec_builder_data_expr(dest_local, &data_sort, vec_data_expr);
+            let ptr = Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("vec_builder_ptr_{dest_local}"),
+                ptr_sort(),
+            );
+            let data = make_vec_builder_data_expr(self, dest_local, &data_sort, vec_data_expr);
             let mut field_values = vec![None; field_count];
             for (slot, value) in [Some(ptr), Some(len_bv.clone()), Some(len_bv.clone()), Some(data)]
                 .into_iter()
@@ -294,13 +307,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         extra_dests: &mut Vec<usize>,
     ) -> bool {
         let dt_name = out_sort.datatype_name().expect("has datatype_sort");
-        let ptr = super::declare_pending_var(format!("vec_builder_ptr_{dest_local}"), ptr_sort());
+        let ptr = Havoc::mint_deferred(
+            self,
+            sound_havoc::UNTRACKED_POINTER_VALUE,
+            format!("vec_builder_ptr_{dest_local}"),
+            ptr_sort(),
+        );
         let data_sort = dt
             .constructors
             .first()
             .and_then(|c| c.field_sort(vec_layout::FLD_DATA))
             .unwrap_or_else(|| ay_bindings::Sort::array(ptr_sort(), ptr_sort()));
-        let data = make_vec_builder_data_expr(dest_local, &data_sort, vec_data_expr);
+        let data = make_vec_builder_data_expr(self, dest_local, &data_sort, vec_data_expr);
         Self::emit_cap_ge_len(len_bv.clone(), len_bv.clone(), constraints);
         constraints.push(Self::build_vec_datatype_eq(
             dt_name,
@@ -335,14 +353,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             let inner_dt_name = field.sort.datatype_name().expect("has datatype_sort");
-            let vec_ptr =
-                super::declare_pending_var(format!("vec_builder_ptr_{dest_local}"), ptr_sort());
+            let vec_ptr = Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("vec_builder_ptr_{dest_local}"),
+                ptr_sort(),
+            );
             let vec_data_sort = inner_dt
                 .constructors
                 .first()
                 .and_then(|c| c.field_sort(vec_layout::FLD_DATA))
                 .unwrap_or_else(|| ay_bindings::Sort::array(ptr_sort(), ptr_sort()));
-            let vec_data = make_vec_builder_data_expr(dest_local, &vec_data_sort, vec_data_expr);
+            let vec_data =
+                make_vec_builder_data_expr(self, dest_local, &vec_data_sort, vec_data_expr);
 
             Self::emit_cap_ge_len(len_bv.clone(), len_bv.clone(), constraints);
             let vec_expr = Expr::datatype_constructor(
@@ -363,7 +386,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if Some(fi) == vec_field_idx {
                         vec_expr.clone()
                     } else {
-                        super::declare_pending_var(
+                        Havoc::mint_deferred(
+                            self,
+                            sound_havoc::UNTRACKED_COLLECTION_STATE,
                             format!("vec_builder_fld{fi}_{dest_local}"),
                             f.sort.clone(),
                         )
@@ -392,10 +417,12 @@ fn dest_has_vec_field(ty: rustc_public::ty::Ty) -> bool {
             def.trimmed_name() == "Vec"
                 || def.variants().first().is_some_and(|v| {
                     v.fields().iter().any(|f| {
-                        matches!(f.ty_with_args(&args).kind(),
-                            TyKind::RigidTy(RigidTy::Adt(inner_def, _))
-                            if inner_def.trimmed_name() == "Vec"
-                        )
+                        mono_ty::field_ty(f, &args).is_some_and(|t| {
+                            matches!(t.kind(),
+                                TyKind::RigidTy(RigidTy::Adt(inner_def, _))
+                                if inner_def.trimmed_name() == "Vec"
+                            )
+                        })
                     })
                 })
         }
@@ -410,11 +437,13 @@ fn find_vec_field_idx(ty: rustc_public::ty::Ty) -> Option<usize> {
                 return Some(0);
             }
             def.variants().first()?.fields().iter().position(|f| {
-                matches!(
-                    f.ty_with_args(&args).kind(),
-                    TyKind::RigidTy(RigidTy::Adt(inner_def, _))
-                        if inner_def.trimmed_name() == "Vec"
-                )
+                mono_ty::field_ty(f, &args).is_some_and(|t| {
+                    matches!(
+                        t.kind(),
+                        TyKind::RigidTy(RigidTy::Adt(inner_def, _))
+                            if inner_def.trimmed_name() == "Vec"
+                    )
+                })
             })
         }
         _ => None,

@@ -26,8 +26,19 @@ mod tests;
 pub(in crate::codegen_ay) use cfg::Cfg;
 pub(in crate::codegen_ay) use cfg::topo_sort;
 pub(in crate::codegen_ay) use const_trip::derive_const_trip_unroll_depth;
+pub(in crate::codegen_ay) use dominators::compute_idom_lengauer_tarjan;
 pub(in crate::codegen_ay) use dominators::find_loop_headers;
 use rustc_public::mir::Body;
+
+/// The blocks of the natural loop `header` heads, given its latches (the
+/// sources of its back edges, `find_loop_headers`).
+pub(in crate::codegen_ay) fn natural_loop_blocks(
+    cfg: &Cfg,
+    header: usize,
+    latches: &[usize],
+) -> std::collections::HashSet<usize> {
+    natural_loop(cfg, header, latches).blocks.into_iter().collect()
+}
 use tracing::{debug, warn};
 use unroll::{
     MAX_EXPANDED_BLOCKS, check_single_entry, compute_effective_unwind_depth, natural_loop,

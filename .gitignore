@@ -78,6 +78,8 @@ doc/
 
 # Compiletest output (per-harness JSON/TSV reports)
 reports/
+# Committed soundness dual gate baselines (scripts/soundness-dual-gate.py)
+!tools/soundness-duals/reports/
 
 # Crash dumps and temp artifacts
 rustc-ice-*.txt

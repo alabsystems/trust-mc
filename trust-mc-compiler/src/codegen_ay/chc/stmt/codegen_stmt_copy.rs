@@ -4,6 +4,10 @@
 
 //! CopyNonOverlapping intrinsic encoding for CHC (#2226, #2306).
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -16,8 +20,53 @@ use crate::codegen_ay::types::{
     SignExtension, coerce_bitvec_width_safe, coerce_datatype_structural,
 };
 
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::{ChcCtx, stmt_accumulator::StmtAccumulator};
+
+/// Whether the field path `fields` of a `ty` value starts at its byte 0, from
+/// rustc's layout: each field at offset 0 of its parent, which every field of a
+/// union is. `projection_tail_at_offset_zero` reads struct layouts only, so a
+/// copy into a union field (`&mut u.x as *mut u32 as *mut u16`) took the
+/// demoting fallback where main and Kani prove it (second review of round 9 of
+/// fix/chc-false-certificates, `r2_copy.rs` `c09_safe_union_field`).
+pub(super) fn field_path_starts_at_byte_zero(
+    mut ty: rustc_public::ty::Ty,
+    fields: &[rustc_public::mir::ProjectionElem],
+) -> bool {
+    for elem in fields {
+        let rustc_public::mir::ProjectionElem::Field(idx, field_ty) = elem else {
+            return false;
+        };
+        let Ok(layout) = ty.layout() else { return false };
+        let at_zero = match &layout.shape().fields {
+            rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
+                offsets.get(*idx).is_some_and(|offset| offset.bytes() == 0)
+            }
+            rustc_public::abi::FieldsShape::Union(count) => *idx < count.get(),
+            _ => false,
+        };
+        if !at_zero {
+            return false;
+        }
+        ty = *field_ty;
+    }
+    true
+}
+
+/// Whether a value of type `ty` owns a heap buffer its own bytes only point
+/// to: a `Vec`, `VecDeque`, `String`, `Box`, `Rc` or `Arc`.
+fn ty_owns_heap_buffer(ty: rustc_public::ty::Ty) -> bool {
+    use rustc_public::CrateDef;
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+            let name = def.name();
+            ["vec::Vec", "VecDeque", "string::String", "boxed::Box", "rc::Rc", "sync::Arc"]
+                .iter()
+                .any(|n| name.contains(n))
+        }
+        _ => false,
+    }
+}
 
 pub(super) struct CopyDestination {
     pub(super) local_idx: Option<usize>,
@@ -138,6 +187,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Expr::bitvec_const(0u64, elem_width),
             );
             return Some(Expr::const_array(arr.index_sort.clone(), bv_expr));
+        }
+        // Design 4 D: a slice view (`fld_ptr` + `fld_len`) into a wide slot
+        // packs its declared roles, `[fld_len : upper | fld_ptr : lower]`,
+        // before the `fld_ptr`-only and MSB-first flatten arms below can write
+        // a widened thin pointer or transpose the halves.
+        if let Some(out_width) = out_sort.bitvec_width()
+            && let Some(packed) =
+                super::codegen_stmt_slice_len_write::pack_declared_slice_roles(&rhs_expr, out_width)
+        {
+            return Some(packed);
         }
         // Part of #3159: Dyn_Trait DT → BV coercion.
         // When the RHS is a Dyn_Trait{fld_ptr, fld_vtable} expression and the
@@ -268,16 +327,178 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
         }
-        let target_local =
-            self.ref_resolution.ref_targets.get(&place.local).map(|target| target.local)?;
-        let offset = match self.ref_resolution.subslice_offset.get(&place.local) {
-            Some(expr) => Self::const_usize_from_expr(expr)?,
-            None => 0,
+        let target = self.ref_resolution.ref_targets.get(&place.local)?;
+        let target_local = target.local;
+        // A pointer whose ref target is a collection or smart pointer local
+        // (`Vec::as_mut_ptr(&mut v)`'s result names `v`) points into that
+        // value's heap buffer, not into the local's own bytes, unless it is a
+        // pointer to the collection itself: splicing the copy into the local
+        // overwrote the handle while the elements kept their old values
+        // (self-review of round 10, `q_typed.rs` ty02, ty03; the same on main).
+        if target.projections.is_empty() {
+            let target_ty = self.resolve_body_ty(self.body.locals().get(target_local)?.ty);
+            let pointee = operand.ty(self.body.locals()).ok().and_then(|ty| {
+                match self.resolve_body_ty(ty).kind() {
+                    TyKind::RigidTy(RigidTy::RawPtr(inner, _) | RigidTy::Ref(_, inner, _)) => {
+                        Some(self.resolve_body_ty(inner))
+                    }
+                    _ => None,
+                }
+            });
+            if ty_owns_heap_buffer(target_ty) && pointee != Some(target_ty) {
+                return None;
+            }
+        }
+        // The element the pointer was taken at. Dropping the target's projection
+        // resolved `&mut a[2]` to `a` at offset 0: `copy_nonoverlapping(&a[0],
+        // &mut a[2], 1)` then flagged a false overlap and copied into the wrong
+        // element (copy_overlap_separately_derived.rs,
+        // disjoint_projection_same_array_safe, FAILED certified Genuine). A
+        // projection other than one constant element index leaves the fallback
+        // path to handle the copy.
+        let element = match target.projections.as_slice() {
+            [] => 0,
+            [
+                rustc_public::mir::ProjectionElem::ConstantIndex {
+                    offset, from_end: false, ..
+                },
+            ] => usize::try_from(*offset).ok()?,
+            [rustc_public::mir::ProjectionElem::Index(index_local)] => {
+                self.unique_const_usize_definition(*index_local)?
+            }
+            // A field path at byte offset 0 (`&mut p.a` of a `#[repr(C)]
+            // struct { a: u32, b: u32 }`, or any field of a union) starts at
+            // the local's first byte, so the copy writes the local from offset
+            // 0, as the bytes in memory are. The definition chain below must
+            // still reach that field place. A field at another offset leaves
+            // the copy to the fallback.
+            fields
+                if fields
+                    .iter()
+                    .all(|p| matches!(p, rustc_public::mir::ProjectionElem::Field(..))) =>
+            {
+                let base_ty = self.resolve_body_ty(self.body.locals().get(target_local)?.ty);
+                if !field_path_starts_at_byte_zero(base_ty, fields) {
+                    return None;
+                }
+                0
+            }
+            _ => return None,
         };
+        let tracked = self.ref_resolution.subslice_offset.get(&place.local);
+        let offset = match tracked {
+            Some(expr) if element == 0 => Self::const_usize_from_expr(expr)?,
+            Some(_) => return None,
+            None => element,
+        };
+        // The ref target does not carry a byte step its metadata missed:
+        // `p.byte_add(2).read_unaligned()` copies from `x`'s THIRD byte, and
+        // resolving it to `x` at offset 0 read `x`'s first (third review:
+        // `of_read_unaligned_off_bug` a clean proof on main and the branch).
+        // Where the pointer's definition chain establishes its offset from the
+        // target place, it must be the one the metadata records (beyond that
+        // place, `subslice_offset` elements of the pointee); otherwise the
+        // copy leaves this path.
+        if let Some(chain) = self.store_pointer_referent_byte_offset(place.local, target) {
+            let pointee_layout = operand.ty(self.body.locals()).ok().and_then(|ty| {
+                match self.resolve_body_ty(ty).kind() {
+                    rustc_public::ty::TyKind::RigidTy(
+                        rustc_public::ty::RigidTy::RawPtr(inner, _)
+                        | rustc_public::ty::RigidTy::Ref(_, inner, _),
+                    ) => self.resolve_body_ty(inner).layout().ok(),
+                    _ => None,
+                }
+            });
+            let pointee_bytes = pointee_layout.as_ref().map(|layout| layout.shape().size.bytes());
+            let recorded = match tracked {
+                None => Some(0u128),
+                Some(_) => pointee_bytes.and_then(|b| {
+                    u128::try_from(offset).ok()?.checked_mul(u128::try_from(b).ok()?)
+                }),
+            };
+            // The chain is the pointer's offset from the target place, so an
+            // element-aligned chain into an array of the pointee type names the
+            // element itself, whatever the metadata recorded: a pointer moved by
+            // `byte_add(2)` into a `[u8; 4]` and carried through a struct field
+            // is element 2 (`co2_struct_copy_nonoverlapping_safe` exact, not a
+            // fallback).
+            let target_elem_is_pointee = rustc_public::mir::Place {
+                local: target_local,
+                projection: Vec::new(),
+            }
+            .ty(self.body.locals())
+            .ok()
+            .and_then(|ty| self.get_array_element_ty(self.resolve_body_ty(ty)))
+            .zip(operand.ty(self.body.locals()).ok().and_then(|ty| {
+                match self.resolve_body_ty(ty).kind() {
+                    rustc_public::ty::TyKind::RigidTy(
+                        rustc_public::ty::RigidTy::RawPtr(inner, _)
+                        | rustc_public::ty::RigidTy::Ref(_, inner, _),
+                    ) => Some(inner),
+                    _ => None,
+                }
+            }))
+            .is_some_and(|(elem, pointee)| {
+                self.resolve_body_ty(elem) == self.resolve_body_ty(pointee)
+            });
+            let chain_element = pointee_bytes
+                .and_then(|b| i128::try_from(b).ok())
+                .filter(|&b| b > 0 && chain >= 0 && chain % b == 0 && target_elem_is_pointee)
+                .and_then(|b| usize::try_from(chain / b).ok())
+                .and_then(|steps| element.checked_add(steps));
+            if recorded.and_then(|r| i128::try_from(r).ok()) != Some(chain)
+                && let Some(index) = chain_element
+            {
+                return Some((target_local, index));
+            }
+            if recorded.and_then(|r| i128::try_from(r).ok()) != Some(chain) {
+                // Unless the pointer is misaligned on EVERY execution: the
+                // target place is aligned to its own type, which the pointee's
+                // alignment divides, and the offset is not a multiple of the
+                // pointee's alignment. The copy is then UB wherever it runs and
+                // its emitted alignment obligation fails on every path, so the
+                // value it copies decides nothing (Kani's
+                // `copy-unaligned-src` / `copy-unaligned-dst` expected tests
+                // stay certified).
+                let target_place = rustc_public::mir::Place {
+                    local: target_local,
+                    projection: target.projections.clone(),
+                };
+                let place_align = target_place
+                    .ty(self.body.locals())
+                    .ok()
+                    .and_then(|ty| self.resolve_body_ty(ty).layout().ok())
+                    .and_then(|layout| i128::try_from(layout.shape().abi_align).ok());
+                let pointee_align =
+                    pointee_layout.and_then(|layout| i128::try_from(layout.shape().abi_align).ok());
+                let misaligned_everywhere = match (place_align, pointee_align) {
+                    (Some(place), Some(pointee)) if pointee > 1 => {
+                        place % pointee == 0 && chain.rem_euclid(pointee) != 0
+                    }
+                    _ => false,
+                };
+                if !misaligned_everywhere {
+                    return None;
+                }
+            }
+        } else {
+            // No chain answer: the pointer came through a hop the walk does not
+            // follow (a tuple or struct field, a reborrowed slot, a parameter,
+            // two definitions). The ref target it inherited through that hop
+            // carries no byte step, so resolving the copy to the target at the
+            // metadata's offset read `x`'s first byte for `(p.byte_add(2),).0
+            // .read_unaligned()` (fourth review of fix/chc-false-certificates,
+            // 2026-09-28: `co_field_read_unaligned_bug`, `co2_struct_write_bug`,
+            // `co2_slot_bug` clean proofs where Kani fails, on main and the
+            // branch). The copy leaves this path for the demoting fallback.
+            return None;
+        }
         Some((target_local, offset))
     }
 
@@ -499,7 +720,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// `min_bytes` is the number of low image bytes the caller will consume;
     /// shapes smaller than that return `None`.
-    fn scalar_le_byte_image(
+    pub(in crate::codegen_ay::chc) fn scalar_le_byte_image(
         &mut self,
         expr: &Expr,
         ty: Option<rustc_public::ty::Ty>,
@@ -556,7 +777,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let mut segments: Vec<(usize, usize, Expr)> = Vec::with_capacity(fields.len());
         for (idx, field) in fields.iter().enumerate() {
-            let field_ty = field.ty_with_args(&args);
+            let field_ty = mono_ty::field_ty(field, &args)?;
             let field_off = usize::try_from(self.get_field_offset(ty, idx)?).ok()?;
             let field_size = self.get_type_size(field_ty)?;
             if field_size == 0 || field_off.checked_add(field_size)? > total_size {
@@ -603,7 +824,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// (Their INIT-ness is tracked by the shadow-memory instrumentation.)
     fn fresh_padding_bits(width_bits: usize) -> Option<Expr> {
         let width = u32::try_from(width_bits).ok()?;
-        Some(declare_pending_var(chc_fresh_name("copy_splice_pad"), Sort::bitvec(width)))
+        Some(ExactVar::nondet(chc_fresh_name("copy_splice_pad"), Sort::bitvec(width)))
     }
 
     /// Types whose BV expression IS its little-endian memory byte image:
@@ -626,6 +847,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         acc: &mut StmtAccumulator<'_>,
     ) {
         self.record_fallback();
+        self.copy_destination_keep(dst, acc);
+    }
+
+    /// [`Self::copy_destination_self_loop`] without the fallback: for a copy
+    /// every execution of which already violates an emitted obligation.
+    pub(super) fn copy_destination_keep(
+        &mut self,
+        dst: &CopyDestination,
+        acc: &mut StmtAccumulator<'_>,
+    ) {
         if let Some(local_idx) = dst.local_idx {
             acc.modified.insert(local_idx);
             self.encode.local_expr_env.remove(&local_idx);

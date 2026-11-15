@@ -3,6 +3,8 @@
 
 //! Checks that `copy_nonoverlapping` fails when `dst` is not aligned.
 
+#![feature(core_intrinsics)]
+
 #[kani::proof]
 fn test_copy_nonoverlapping_unaligned() {
     let arr: [i32; 3] = [0, 1, 0];

@@ -22,11 +22,12 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::super::ChcCtx;
-use super::super::codegen_call_atomic::{AtomicKind, detect_atomic_intrinsic};
+use super::super::codegen_call_atomic::{AtomicKind, atomic_scalar, detect_atomic_intrinsic};
 use super::super::codegen_call_atomic_rmw::compute_rmw_value;
+use super::super::codegen_types::CodegenTypes;
 use super::super::inline_shared::{PlaceResolver, inline_operand_to_expr};
 use super::super::ptr_receiver_mem;
-use crate::codegen_ay::provenance::{MaybeLoc, Val};
+use crate::codegen_ay::provenance::MaybeLoc;
 
 /// Handle atomic operations (fetch_add, load, store, etc.) inside an inlined
 /// function body.
@@ -71,20 +72,45 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
     }
     let kind = kind?;
 
-    // 3. Translate args in inline context.
-    let translated_args: Vec<Expr> = args
+    // 3. Translate args in inline context, by position: an argument that does
+    // not translate must not shift the ones after it into its place (the
+    // ordering argument read as the operand).
+    let translated_args: Vec<Option<Expr>> = args
         .iter()
-        .filter_map(|arg| inline_operand_to_expr(ctx, arg, local_exprs, resolver, locals))
+        .map(|arg| inline_operand_to_expr(ctx, arg, local_exprs, resolver, locals))
         .collect();
+    let arg = |i: usize| translated_args.get(i).cloned().flatten();
+    let n_translated = translated_args.iter().flatten().count();
 
     // Need at least the receiver (&self) for all atomic ops.
-    if translated_args.is_empty() {
+    if n_translated == 0 {
         return None;
     }
-    let receiver_addr = &translated_args[0];
+    let receiver_addr = &arg(0)?;
 
-    // Resolve pointee type: AtomicUsize → usize, AtomicBool → bool, etc.
-    let pointee_ty = resolve_atomic_pointee_ty(&callee_path, &fn_args)?;
+    // The memory cell is keyed by what the receiver POINTS AT (`&Atomic<u32>`
+    // is a cell of `Atomic<u32>`, `atomic_xadd`'s `*mut u32` one of `u32`):
+    // every other access of the atomic (its `load`, a static's seeding) reads
+    // that key, and a write under the scalar's key instead was lost
+    // (`field_type_static_generic_dual.rs::bug_generic_static` was proved).
+    // The cell holds the scalar the signature names (`atomic_value_ty`,
+    // never the callee's name); a cell whose element sort is not that
+    // scalar's is refused rather than written with a mismatched value.
+    let value_ty = atomic_value_ty(&kind, func_ty)?;
+    let pointee_ty = atomic_cell_ty(func_ty).unwrap_or(value_ty);
+    let value_sort = ChcCtx::translate_ty(value_ty);
+    if matches!(kind, AtomicKind::Load | AtomicKind::Store) || is_atomic_rmw(&kind) {
+        let value_sort = value_sort.clone()?;
+        if ctx.elem_sort_for_memory_array(pointee_ty) != value_sort {
+            debug!(
+                ?kind,
+                ?pointee_ty,
+                ?value_ty,
+                "atomic_inline: cell sort is not the value's — refused"
+            );
+            return None;
+        }
+    }
 
     debug!(
         ?kind,
@@ -95,22 +121,40 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
 
     match kind {
         AtomicKind::Load => {
-            // Load: read from memory at receiver address.
-            ptr_receiver_mem::load_from_memory(
+            // Load: read from memory at receiver address. The cell is keyed by
+            // the atomic, whose load may come back as the atomic's datatype
+            // (`Atomic_usize { v: .. }`); the operation returns its scalar.
+            let loaded = ptr_receiver_mem::load_from_memory(
                 ctx,
                 &MaybeLoc::Unknown(receiver_addr.clone()),
                 pointee_ty,
-            )
-            .map(Val::into_expr)
+            )?
+            .into_expr();
+            let loaded = atomic_scalar(loaded);
+            if Some(loaded.sort()) != value_sort.as_ref() {
+                debug!(
+                    ?pointee_ty,
+                    ?value_ty,
+                    "atomic_inline: loaded sort is not the value's — refused"
+                );
+                return None;
+            }
+            Some(loaded)
         }
 
         AtomicKind::Store => {
             // Store: write value to memory at receiver address.
-            if translated_args.len() < 2 {
+            let value = arg(1)?;
+            if Some(value.sort()) != value_sort.as_ref() {
+                debug!(?value_ty, "atomic_inline: stored value's sort is not the cell's — refused");
                 return None;
             }
-            let value = translated_args[1].clone();
-            ctx.build_memory_store_untyped(receiver_addr.clone(), value, pointee_ty);
+            // A static the store may write is havocked, and the stored value's
+            // own views written back (`static_store_from_inlined_body`).
+            ctx.with_static_store_routing(|ctx| {
+                ctx.build_memory_store_untyped(receiver_addr.clone(), value.clone(), pointee_ty);
+                ctx.static_store_from_inlined_body(receiver_addr, pointee_ty, &value);
+            });
             // Store returns () — produce a dummy value.
             Some(Expr::bitvec_const(0u64, crate::codegen_ay::types::POINTER_WIDTH))
         }
@@ -126,44 +170,62 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
         | AtomicKind::FetchUmax
         | AtomicKind::FetchUmin
         | AtomicKind::Exchange => {
-            // RMW: load old, compute new, store new, return old.
-            if !matches!(kind, AtomicKind::Exchange) && translated_args.len() < 2 {
-                return None;
-            }
+            // RMW: load old, compute new, store new, return old. The operand
+            // and the loaded cell must both have the value's sort: a cell the
+            // memory model reads back under another sort is refused, never
+            // combined with the operand (`bvadd requires same BitVec sorts`).
+            let operand = arg(1)?;
             // A translated call argument: `translate_operand` reports nothing about
             // what it produced, so the ignorance is stated, not papered over.
-            let old_value = ptr_receiver_mem::load_from_memory(
-                ctx,
-                &MaybeLoc::Unknown(receiver_addr.clone()),
-                pointee_ty,
-            )?
-            .into_expr();
+            let old_value = atomic_scalar(
+                ptr_receiver_mem::load_from_memory(
+                    ctx,
+                    &MaybeLoc::Unknown(receiver_addr.clone()),
+                    pointee_ty,
+                )?
+                .into_expr(),
+            );
+            let value_sort = value_sort.as_ref();
+            if Some(old_value.sort()) != value_sort || Some(operand.sort()) != value_sort {
+                debug!(
+                    ?kind,
+                    ?pointee_ty,
+                    old_sort = ?old_value.sort(),
+                    operand_sort = ?operand.sort(),
+                    ?value_sort,
+                    "atomic_inline: RMW sorts disagree — refused"
+                );
+                return None;
+            }
 
             let new_value = if matches!(kind, AtomicKind::Exchange) {
-                if translated_args.len() < 2 {
-                    return None;
-                }
-                translated_args[1].clone()
+                operand
             } else {
-                let operand = translated_args[1].clone();
                 compute_rmw_value(&kind, old_value.clone(), operand)
             };
 
-            ctx.build_memory_store_untyped(receiver_addr.clone(), new_value, pointee_ty);
+            ctx.with_static_store_routing(|ctx| {
+                ctx.build_memory_store_untyped(
+                    receiver_addr.clone(),
+                    new_value.clone(),
+                    pointee_ty,
+                );
+                ctx.static_store_from_inlined_body(receiver_addr, pointee_ty, &new_value);
+            });
             debug!(?kind, "atomic_inline: RMW completed, old_value returned (#4023)");
             Some(old_value)
         }
 
         AtomicKind::New => {
             // AtomicT::new(val) — store initial value.
-            if translated_args.len() < 2 {
+            if n_translated < 2 {
                 return None;
             }
             // For `new`, args[0] is the value, not a receiver.
             // AtomicUsize::new(val) is a constructor — returns the AtomicUsize.
             // In inline context, this is typically handled by the assignment
             // to the destination local. The constructor just wraps the value.
-            Some(translated_args[0].clone())
+            arg(0)
         }
 
         AtomicKind::Fence => {
@@ -184,45 +246,71 @@ pub(super) fn try_handle_atomic_call_inline<'tcx, 'body>(
     }
 }
 
-/// Resolve the pointee type for an atomic operation.
-///
-/// Atomic types wrap `UnsafeCell<T>` where T is the value type.
-/// We extract T from the callee path pattern (e.g., `AtomicUsize` → `usize`).
-fn resolve_atomic_pointee_ty(
-    callee_path: &str,
-    _fn_args: &rustc_public::ty::GenericArgs,
-) -> Option<rustc_public::ty::Ty> {
-    use rustc_public::ty::{IntTy, UintTy};
+/// The receiver's pointee: the atomic cell the operation reads and writes.
+fn atomic_cell_ty(func_ty: rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    let sig = func_ty.kind().fn_sig()?.skip_binder();
+    match sig.inputs().first()?.kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => Some(pointee),
+        _ => None,
+    }
+}
 
-    // Match stable API paths like `core::sync::atomic::AtomicUsize::fetch_add`
-    // or intrinsic paths like `core::intrinsics::atomic_xadd`.
-    if callee_path.contains("AtomicUsize") || callee_path.contains("atomic_usize") {
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::Usize))
-    } else if callee_path.contains("AtomicIsize") || callee_path.contains("atomic_isize") {
-        Some(rustc_public::ty::Ty::signed_ty(IntTy::Isize))
-    } else if callee_path.contains("AtomicU8") || callee_path.contains("atomic_u8") {
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U8))
-    } else if callee_path.contains("AtomicU16") || callee_path.contains("atomic_u16") {
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U16))
-    } else if callee_path.contains("AtomicU32") || callee_path.contains("atomic_u32") {
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U32))
-    } else if callee_path.contains("AtomicU64") || callee_path.contains("atomic_u64") {
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U64))
-    } else if callee_path.contains("AtomicI8") || callee_path.contains("atomic_i8") {
-        Some(rustc_public::ty::Ty::signed_ty(IntTy::I8))
-    } else if callee_path.contains("AtomicI16") || callee_path.contains("atomic_i16") {
-        Some(rustc_public::ty::Ty::signed_ty(IntTy::I16))
-    } else if callee_path.contains("AtomicI32") || callee_path.contains("atomic_i32") {
-        Some(rustc_public::ty::Ty::signed_ty(IntTy::I32))
-    } else if callee_path.contains("AtomicI64") || callee_path.contains("atomic_i64") {
-        Some(rustc_public::ty::Ty::signed_ty(IntTy::I64))
-    } else if callee_path.contains("AtomicBool") || callee_path.contains("atomic_bool") {
-        // AtomicBool stores as u8 internally.
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U8))
-    } else {
-        // Fallback: try usize for unrecognized atomic intrinsic paths.
-        // Many raw intrinsics like `atomic_xadd_seqcst` don't contain the
-        // type name — the type is inferred from the generic parameter.
-        Some(rustc_public::ty::Ty::unsigned_ty(UintTy::Usize))
+fn is_atomic_rmw(kind: &AtomicKind) -> bool {
+    matches!(
+        kind,
+        AtomicKind::FetchAdd
+            | AtomicKind::FetchSub
+            | AtomicKind::FetchAnd
+            | AtomicKind::FetchOr
+            | AtomicKind::FetchXor
+            | AtomicKind::FetchNand
+            | AtomicKind::FetchMax
+            | AtomicKind::FetchMin
+            | AtomicKind::FetchUmax
+            | AtomicKind::FetchUmin
+            | AtomicKind::Exchange
+    )
+}
+
+/// The value type an atomic operation reads or writes, from the callee's
+/// signature: a load returns it, a store or read-modify-write takes it as its
+/// second argument (`AtomicU32::fetch_add(&self, val: u32, ..)`,
+/// `atomic_xadd::<u32>(dst: *mut u32, src: u32)`). A `bool` is stored as a
+/// byte. `None` when the signature does not say (the walk then gives up on the
+/// call, and Rule D books it).
+///
+/// This read the callee's NAME before (`contains("AtomicU32")`, falling back to
+/// `usize`), and the Trust standard library names every atomic method
+/// `Atomic::<T>::..`: a `u32` receiver was loaded as a `usize` and added to a
+/// `u32` operand (`bvadd requires same BitVec sorts`,
+/// `field_type_static_generic_dual.rs::safe_generic_static`).
+fn atomic_value_ty(
+    kind: &AtomicKind,
+    func_ty: rustc_public::ty::Ty,
+) -> Option<rustc_public::ty::Ty> {
+    use rustc_public::ty::UintTy;
+    let sig = func_ty.kind().fn_sig()?.skip_binder();
+    let value_ty = match kind {
+        AtomicKind::Load => sig.output(),
+        AtomicKind::Store
+        | AtomicKind::FetchAdd
+        | AtomicKind::FetchSub
+        | AtomicKind::FetchAnd
+        | AtomicKind::FetchOr
+        | AtomicKind::FetchXor
+        | AtomicKind::FetchNand
+        | AtomicKind::FetchMax
+        | AtomicKind::FetchMin
+        | AtomicKind::FetchUmax
+        | AtomicKind::FetchUmin
+        | AtomicKind::Exchange => *sig.inputs().get(1)?,
+        // `new`, fences, `get_mut` and the compare-exchanges read no value
+        // through the receiver here; their arms do not use this type.
+        _ => return Some(rustc_public::ty::Ty::unsigned_ty(UintTy::Usize)),
+    };
+    match value_ty.kind() {
+        TyKind::RigidTy(RigidTy::Bool) => Some(rustc_public::ty::Ty::unsigned_ty(UintTy::U8)),
+        TyKind::RigidTy(RigidTy::Int(_) | RigidTy::Uint(_) | RigidTy::RawPtr(..)) => Some(value_ty),
+        _ => None,
     }
 }

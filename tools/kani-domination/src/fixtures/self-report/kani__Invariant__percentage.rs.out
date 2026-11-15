@@ -1,0 +1,32 @@
+# Reconstructed transcript: the results-verification-bmc unit log this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+warning: UNSOUND: 2 pointer dereference(s) created fresh unconstrained symbolic variables
+Checking harness check_percentage_new...
+[AY:PROOF] BMC verification: no violation within bound
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_percentage_new.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: p.is_safe()"
+	 - Location: /corpus/kani/Invariant/percentage.rs:34:5 in function check_percentage_new
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_percentage_any...
+[AY:UNKNOWN_QUALITY:EncodingGap:unconstrained_assignment=1]
+Check 1: check_percentage_any.assertion.1
+	 - Status: UNDETERMINED
+	 - Description: "assertion failed: pct.0 <= 100"
+	 - Location: /corpus/kani/Invariant/percentage.rs:41:5 in function check_percentage_any
+
+SUMMARY:
+ ** 0 of 1 failed (1 undetermined)
+
+VERIFICATION:- INCONCLUSIVE (solver undecided)
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_percentage_any
+Complete - 1 successfully verified harnesses, 1 failures, 2 total.

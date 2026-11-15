@@ -43,8 +43,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Get the AY Datatype sort for the Rust type (pre-flattening).
         let type_sort = Self::translate_ty(root_ty)?;
 
-        // Extract field indices from projections.
-        let field_indices: Vec<usize> = field_projections.iter().map(|fp| fp.field_idx).collect();
+        // The path through the checked walk (C5b, `flat_field_path_from`): a
+        // step `translate_ty` collapses has no level in the sort tree.
+        let field_indices: Vec<usize> = Self::flat_field_path_from(root_ty, field_projections)
+            .ok()
+            .filter(|path| !path.is_empty())?
+            .iter()
+            .map(|fp| fp.field_idx)
+            .collect();
 
         // Find the target leaf slot in the flattened layout.
         let leaf_slot = crate::codegen_ay::chc::codegen_decl_flatten::compute_nested_flat_slot(
@@ -157,8 +163,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Get the AY Datatype sort for the Rust type (pre-flattening).
         let type_sort = Self::translate_ty(root_ty)?;
 
-        // Extract field indices from projections.
-        let field_indices: Vec<usize> = field_projections.iter().map(|fp| fp.field_idx).collect();
+        // The path through the checked walk (C5b, `flat_field_path_from`): a
+        // step `translate_ty` collapses has no level in the sort tree.
+        let field_indices: Vec<usize> = Self::flat_field_path_from(root_ty, field_projections)
+            .ok()
+            .filter(|path| !path.is_empty())?
+            .iter()
+            .map(|fp| fp.field_idx)
+            .collect();
 
         // Find the target field's span in the flattened layout.
         // compute_nested_flat_span works for both leaf and non-leaf fields.

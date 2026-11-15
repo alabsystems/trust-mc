@@ -7,6 +7,8 @@
 //! This module contains code that are backend agnostic. For example, MIR analysis
 //! and transformations.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use crate::kani_queries::QueryDb;
@@ -30,7 +32,11 @@ pub(crate) mod analysis;
 pub(crate) mod attributes;
 pub(crate) mod codegen_units;
 pub(crate) mod coercion;
+pub(crate) mod dyn_universe;
+#[cfg(test)]
+mod coercion_test;
 pub(crate) mod kani_functions;
+pub(crate) mod loop_contract_reach;
 pub(crate) mod metadata;
 pub(crate) mod points_to;
 pub(crate) mod reachability;
@@ -39,6 +45,7 @@ mod reachability_test;
 pub(crate) mod resolve;
 pub(crate) mod simd_monomorphization;
 pub(crate) mod stable_atomic_policy;
+pub(crate) mod std_abstraction;
 pub(crate) mod stubbing;
 pub(crate) mod transform;
 pub(crate) mod tuple_usage;

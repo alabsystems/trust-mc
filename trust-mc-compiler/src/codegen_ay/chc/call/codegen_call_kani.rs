@@ -18,7 +18,8 @@ use super::codegen_call_kani_model::CallKaniModel;
 use super::codegen_rules::CodegenRules;
 use super::{ChcCtx, KaniHook, KaniIntrinsic, KaniModel};
 use crate::codegen_ay::float_range_check::{
-    eval_float_in_int_range, extract_const_float, trace_local_const_float,
+    eval_float_in_int_range, extract_const_float, float_to_int_in_range_expr,
+    trace_local_const_float,
 };
 use crate::codegen_ay::types::{
     POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, int_ty_to_bitvec_width,
@@ -98,13 +99,27 @@ impl<'tcx, 'body> CallKani for ChcCtx<'tcx, 'body> {
                 let is_size = matches!(kani_intrinsic, KaniIntrinsic::CheckedSizeOf);
                 self.emit_checked_size_or_align(dcx, is_size);
             }
-            // Part of #3840: float_to_int_in_range — concrete fast path, nondet fallback.
+            // Part of #3840: float_to_int_in_range — concrete fast path, exact
+            // bitvector predicate, nondet fallback.
             KaniIntrinsic::FloatToIntInRange => {
                 if let Some(result) = self.try_eval_float_to_int_in_range(dcx) {
                     self.emit_dest_constrained_to_bool(dcx, result, "FloatToIntInRange");
                     return;
                 }
-                // Symbolic fallback: nondet boolean.
+                // The concrete path declines whenever the target width exceeds the
+                // float's mantissa (f64 -> i128/u128, f32 -> i32 and wider), not
+                // only for non-literal operands. Encode the predicate exactly on
+                // the IEEE bit pattern instead, with the builder the BMC lane uses.
+                if let Some(result) = self.float_to_int_in_range_bv_predicate(dcx) {
+                    self.emit_dest_constrained_to_expr(dcx, result, "FloatToIntInRange");
+                    return;
+                }
+                // Symbolic fallback: nondet boolean. The destination reaches the head
+                // as a fresh `__out` value, so a proof over it holds for either
+                // answer, but a counterexample may read the wrong one: it must never
+                // be certified Genuine (negative/float_to_int_in_range.rs::
+                // huge_f64_i128_not_in_range_safe was a false certificate here).
+                self.record_sound_fallback_reason("float_to_int_in_range_nondet");
                 let dest_local: usize = destination.local;
                 if let Some(target) = target {
                     let new_output_args = self.build_output_args(modified_locals, &[dest_local]);
@@ -216,12 +231,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             bounds.extend(self.char_nondet_bounds(dest_local));
             // #47: bind each nondet `X__out` head var to a declared FRESH
             // universal variable. Semantically a no-op (the fresh var is
-            // unconstrained), but it keeps the out var syntactically
-            // CONSTRAINED: chc_const_prop's propagate_to_unconstrained_out_vars
-            // assumes "unconstrained __out == identity pass-through" and would
-            // otherwise silently UN-HAVOC the destination whenever the incoming
-            // value is constant (observed as a false proof on the loop-contract
-            // rule's havoc of a constant-initialized loop counter).
+            // unconstrained): it states the havoc in the encoding. It was
+            // added because constant propagation used to read an unbound
+            // `__out` as an identity pass-through and silently UN-HAVOC the
+            // destination whenever the incoming value was constant (observed
+            // as a false proof on the loop-contract rule's havoc of a
+            // constant-initialized loop counter). That reading is gone; an
+            // unbound `__out` is a havoc everywhere.
             bounds.extend(self.nondet_out_binding_constraints(dest_local));
             if bounds.is_empty() {
                 self.emit_goto_rule(from_app, *target, &new_output_args, stmt_constraints);
@@ -547,6 +563,55 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         value: bool,
         site: &'static str,
     ) {
+        self.emit_dest_constrained_to_expr(dcx, Expr::bool_const(value), site);
+    }
+
+    /// `float_to_int_in_range::<Float, Int>(value)` as a pure bitvector predicate
+    /// over the operand's IEEE bit pattern. `None` when the generic arguments are
+    /// not an f32/f64 float and a primitive integer, or when the operand does not
+    /// translate to a bitvector of the float's width.
+    fn float_to_int_in_range_bv_predicate(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+    ) -> Option<Expr> {
+        let func_ty = dcx.func.ty(self.body.locals()).ok()?;
+        let TyKind::RigidTy(RigidTy::FnDef(_, fn_args)) = func_ty.kind() else {
+            return None;
+        };
+        let (float_ty, int_ty) = match (fn_args.0.first(), fn_args.0.get(1)) {
+            (Some(GenericArgKind::Type(ft)), Some(GenericArgKind::Type(it))) => (*ft, *it),
+            _ => return None,
+        };
+        let float_width = match float_ty.kind() {
+            TyKind::RigidTy(RigidTy::Float(rustc_public::ty::FloatTy::F32)) => 32,
+            TyKind::RigidTy(RigidTy::Float(rustc_public::ty::FloatTy::F64)) => 64,
+            _ => return None,
+        };
+        let (int_width, int_signed) = match int_ty.kind() {
+            TyKind::RigidTy(RigidTy::Int(it)) => (int_ty_to_bitvec_width(it), true),
+            TyKind::RigidTy(RigidTy::Uint(ut)) => (uint_ty_to_bitvec_width(ut), false),
+            _ => return None,
+        };
+        let operand = dcx.args.first()?;
+        let value = self.translate_operand_with_modified(operand, dcx.modified_locals)?;
+        if value.sort().bitvec_width() != Some(float_width) {
+            return None;
+        }
+        let result = float_to_int_in_range_expr(&value, int_width, int_signed)?;
+        debug!(
+            float_width,
+            int_width, int_signed, "CHC float_to_int_in_range: exact bitvector predicate"
+        );
+        Some(result)
+    }
+
+    /// Constrain a call destination to `value` and emit a goto rule.
+    fn emit_dest_constrained_to_expr(
+        &mut self,
+        dcx: &DispatchCallContext<'_>,
+        value: Expr,
+        site: &'static str,
+    ) {
         let dest_local = dcx.destination.local;
         let dest_vec_idx = self.state_idx_for_local(dest_local);
         if let Some(target) = dcx.target {
@@ -554,13 +619,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let out_sort = self.state_var_mgr.output_state_vars[dest_vec_idx].1.clone();
             let dest_var =
                 Expr::var(&*self.state_var_mgr.output_state_vars[dest_vec_idx].0, out_sort.clone());
-            let eq = self.make_coerced_eq_constraint(
-                &dest_var,
-                Expr::bool_const(value),
-                &out_sort,
-                dest_local,
-                site,
-            );
+            let eq = self.make_coerced_eq_constraint(&dest_var, value, &out_sort, dest_local, site);
             self.emit_goto_rule_extra(
                 dcx.from_app,
                 *target,

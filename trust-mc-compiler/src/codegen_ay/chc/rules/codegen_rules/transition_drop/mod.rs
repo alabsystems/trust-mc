@@ -24,7 +24,9 @@ mod box_drop;
 mod codegen_drop;
 mod dyn_dispatch;
 mod dyn_dispatch_multi;
+mod effects;
 mod emit_helpers;
+mod native_box;
 mod no_drop;
 mod shared_ptr;
 #[cfg(test)]
@@ -34,6 +36,13 @@ pub(in crate::codegen_ay::chc) use box_drop::collect_box_dyn_dealloc_effects;
 pub(super) use codegen_drop::codegen_drop;
 pub(in crate::codegen_ay::chc) use codegen_drop::{
     coroutine_drop_fields_trivially_no_drop, pin_box_coroutine_inner_ty,
+};
+pub(in crate::codegen_ay::chc) use effects::compose_host_drop_constraints;
+#[cfg(test)]
+pub(in crate::codegen_ay::chc) use effects::require_native_deallocation_extent;
+pub(in crate::codegen_ay::chc) use native_box::{
+    append_outer_free, codegen_native_dyn_box_drop, translate_native_dyn_box_drop,
+    translate_native_thin_box_free,
 };
 pub(in crate::codegen_ay::chc) use no_drop::ty_trivially_no_drop;
 pub(in crate::codegen_ay::chc) use shared_ptr::{
@@ -53,6 +62,8 @@ enum DropFallbackReason {
     DropShimNoBody,
     /// `translate_inline_body` returned `None` — inline walk bailed out.
     DropInlineWalkFailed,
+    /// `shared::mono_ty::drop_in_place` refused: the type names a parameter.
+    DropGlueUnresolvedParams,
 }
 
 impl DropFallbackReason {
@@ -61,6 +72,7 @@ impl DropFallbackReason {
             Self::DynDropUnsupported => "dyn_drop_unsupported",
             Self::DropShimNoBody => "drop_shim_no_body",
             Self::DropInlineWalkFailed => "drop_inline_walk_failed",
+            Self::DropGlueUnresolvedParams => "drop_glue_unresolved_params",
         }
     }
 }

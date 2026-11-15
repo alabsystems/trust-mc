@@ -154,12 +154,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         let ChcVecFields { vec_sort, ptr, len, cap, data } = fields;
 
-        // Perform push: data[len] = val, new_len = len + 1, new_cap = max(cap, new_len).
-        let val = super::codegen_call_vec_ops::coerce_array_element(val, &data.sort());
+        // Perform push: data[len] = val, new_len = len + 1, new_cap = RawVec's growth.
+        let val = super::codegen_call_vec_ops::coerce_array_element(self, val, &data.sort());
         let new_data = data.store(len.clone(), val);
         let new_len = len.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-        let grow_needed = cap.clone().bvult(new_len.clone());
-        let new_cap = Expr::ite(grow_needed, new_len.clone(), cap.clone());
+        let new_cap = self.vec_reserved_cap(
+            field_projs.last().and_then(|proj| proj.field_ty),
+            &cap,
+            &new_len,
+            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            extra_constraints,
+        );
         let new_ptr = self.allocate_vec_backing_on_zero_cap_growth(
             ptr,
             &cap,
@@ -272,12 +277,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         }
 
-        // Perform push: data[len] = val, new_len = len + 1, new_cap = max(cap, new_len).
-        let val = super::codegen_call_vec_ops::coerce_array_element(val, &old_data_e.sort());
+        // Perform push: data[len] = val, new_len = len + 1, new_cap = RawVec's growth.
+        let val = super::codegen_call_vec_ops::coerce_array_element(self, val, &old_data_e.sort());
         let new_data = old_data_e.store(old_len_e.clone(), val);
         let new_len = old_len_e.bvadd(Expr::bitvec_const(1u64, POINTER_WIDTH));
-        let grow_needed = old_cap_e.clone().bvult(new_len.clone());
-        let new_cap = Expr::ite(grow_needed, new_len.clone(), old_cap_e.clone());
+        let new_cap = self.vec_reserved_cap(
+            field_projs.last().and_then(|proj| proj.field_ty),
+            &old_cap_e,
+            &new_len,
+            crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
+            extra_constraints,
+        );
         let new_ptr = self.allocate_vec_backing_on_zero_cap_growth(
             old_ptr_e,
             &old_cap_e,

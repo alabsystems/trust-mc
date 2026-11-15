@@ -50,6 +50,7 @@ fn test_flattened_copy_assignment_updates_destination_field_env() {
                     rhs @ rustc_public::mir::Rvalue::Use(
                         rustc_public::mir::Operand::Copy(src)
                         | rustc_public::mir::Operand::Move(src),
+                        ..,
                     ),
                 ) = &stmt.kind
                 else {

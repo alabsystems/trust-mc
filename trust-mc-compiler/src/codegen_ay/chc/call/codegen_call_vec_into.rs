@@ -9,6 +9,7 @@
 //! type-indexed memory and constructing a populated Vec Datatype.
 
 use crate::codegen_ay::chc::call::call_accumulator::CallAccumulator;
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::{AggregateKind, Operand, ProjectionElem, Rvalue, StatementKind};
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
@@ -20,7 +21,6 @@ use super::ChcCtx;
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_call_vec_ops::ProjectedVecState;
-use super::codegen_ctx::globals::declare_pending_var;
 use super::codegen_ctx::types::{AdapterSourceData, CollectionProjectionKind};
 use super::codegen_expr_heap::{obj_size_in, obj_size_out, obj_valid_in, obj_valid_out};
 use super::codegen_rules::CodegenRules;
@@ -158,13 +158,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let mut name = String::with_capacity(ptr_name.len() + 14);
                     name.push_str(&ptr_name);
                     name.push_str("_into_vec_ptr");
-                    declare_pending_var(name, ptr_sort)
+                    Havoc::mint(self, sound_havoc::UNTRACKED_COLLECTION_STATE, name, ptr_sort)
                 });
                 let data = data_expr.clone().unwrap_or_else(|| {
                     let mut name = String::with_capacity(data_name.len() + 15);
                     name.push_str(&data_name);
                     name.push_str("_into_vec_data");
-                    declare_pending_var(name, data_sort)
+                    Havoc::mint(self, sound_havoc::UNTRACKED_COLLECTION_STATE, name, data_sort)
                 });
                 Self::emit_cap_ge_len(cap_expr.clone(), len_expr.clone(), &mut extra_constraints);
                 if self.constrain_projected_vec_fields_for_call(
@@ -188,7 +188,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             {
                 let dt_name = out_sort.datatype_name().expect("has datatype_sort");
                 // Part of #2267: pre-allocate instead of format!().
-                let ptr = declare_pending_var(
+                let ptr = Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     {
                         let mut n = String::with_capacity(out_name.len() + 14);
                         n.push_str(&out_name);
@@ -216,7 +218,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let mut n = String::with_capacity(out_name.len() + 15);
                     n.push_str(&out_name);
                     n.push_str("_into_vec_data");
-                    declare_pending_var(n, data_sort)
+                    Havoc::mint(self, sound_havoc::UNTRACKED_COLLECTION_STATE, n, data_sort)
                 });
                 Self::emit_cap_ge_len(cap_expr.clone(), len_expr.clone(), &mut extra_constraints);
                 extra_constraints.push(Self::build_vec_datatype_eq(
@@ -582,7 +584,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let data_sort = Sort::array(ptr_sort(), declared_elem_sort);
         // Part of #2267: pre-allocate instead of format!().
         let base_data =
-            declare_pending_var(["into_vec_", &info.type_key, "_base"].concat(), data_sort);
+            ExactVar::nondet(["into_vec_", &info.type_key, "_base"].concat(), data_sort);
 
         let mut result = base_data;
         for i in 0..info.array_len {
@@ -645,7 +647,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let signed =
                     crate::codegen_ay::shared::ty_signedness_shallow(*elem_ty).unwrap_or(false);
                 let data_sort = Sort::array(ptr_sort(), info.elem_sort.clone());
-                let base_data = declare_pending_var(
+                let base_data = ExactVar::nondet(
                     ["into_vec_", &info.type_key, "_direct_base"].concat(),
                     data_sort,
                 );

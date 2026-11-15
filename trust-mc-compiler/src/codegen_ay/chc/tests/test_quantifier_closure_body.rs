@@ -114,6 +114,8 @@ fn operand_uses_capture_field(operand: &Operand) -> bool {
                 && place.projection.iter().any(|proj| matches!(proj, ProjectionElem::Field(_, _)))
         }
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 
@@ -122,7 +124,9 @@ fn rvalue_uses_capture_field(rvalue: &Rvalue) -> bool {
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
             operand_uses_capture_field(lhs) || operand_uses_capture_field(rhs)
         }
-        Rvalue::UnaryOp(_, operand) | Rvalue::Use(operand) => operand_uses_capture_field(operand),
+        Rvalue::UnaryOp(_, operand) | Rvalue::Use(operand, ..) => {
+            operand_uses_capture_field(operand)
+        }
         Rvalue::Ref(_, _, place) | Rvalue::CopyForDeref(place) => {
             place.local == 1
                 && place.projection.iter().any(|proj| matches!(proj, ProjectionElem::Field(_, _)))

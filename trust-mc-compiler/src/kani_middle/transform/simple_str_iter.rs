@@ -56,12 +56,61 @@ struct SimpleStrNthChain {
     index: Operand,
 }
 
+/// Chars past which `Chars::advance_by` takes its 32-byte chunked path, whose
+/// loop count was not measured.
+const CHARS_CHUNK_SIZE: u64 = 32;
+
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SimpleStrIterPass;
+pub(crate) struct SimpleStrIterPass {
+    /// The unwind bound with Kani's unwinding assertions on: the unit's
+    /// smallest (`transform::unit_declared_unwind`), then each harness's own
+    /// as it is translated (`set_harness_declared_unwind`).
+    declared_unwind: Option<u32>,
+}
 
 impl SimpleStrIterPass {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self
+        Self { declared_unwind: None }
+    }
+
+    /// The pass for a unit whose smallest declared unwind bound (with
+    /// unwinding assertions on) is `declared_unwind`.
+    ///
+    /// `chars().nth(k)` runs `Chars::advance_by(k)`, a loop of one pass per
+    /// skipped char that Kani unwinds: measured on the corpus-rev Kani over
+    /// `"abcdefgh".chars().nth(k)` for `k` in 0..=5 and `U` in 1..=6, the
+    /// harness passes exactly when `k < U` (walker fail-closed review 6
+    /// round 3; `tools/soundness-duals/str_chars_nth_unwind_dual.rs`), one
+    /// pass per skipped char whatever its width (`Chars::advance_by` below
+    /// its 32-char chunked path). The CHC encoder models the helper this
+    /// pass substitutes (`codegen_call_string_nth.rs`) and states no
+    /// unwinding assertion for it, and the helper's own walk over a
+    /// non-ASCII string has a `while` loop of a different count, so
+    /// `chars().nth(4)` under `#[kani::unwind(3)]` verified clean. Under a
+    /// declared bound a `chars().nth(k)` is rewritten only for a constant
+    /// `k < U` (and below the chunked path); any other keeps the std call.
+    /// `bytes().nth(k)` is a slice index in std, loop-free.
+    pub(crate) fn with_declared_unwind(declared_unwind: Option<u32>) -> Self {
+        Self { declared_unwind }
+    }
+
+    /// May `chain` be replaced by its loop-free helper under the declared
+    /// bound?
+    fn rewrite_keeps_unwinding(&self, chain: &SimpleStrNthChain) -> bool {
+        let Some(unwind) = self.declared_unwind else {
+            return true;
+        };
+        if chain.kind == StrIterKind::Bytes {
+            return true;
+        }
+        let Operand::Constant(index) = &chain.index else {
+            return false;
+        };
+        index
+            .const_
+            .eval_target_usize()
+            .is_ok_and(|k| k < u64::from(unwind) && k < CHARS_CHUNK_SIZE)
     }
 }
 
@@ -80,6 +129,10 @@ impl TransformPass for SimpleStrIterPass {
         true
     }
 
+    fn set_harness_declared_unwind(&mut self, declared_unwind: Option<u32>) {
+        self.declared_unwind = declared_unwind;
+    }
+
     fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         debug!("SimpleStrIterPass::transform for {:?}", instance.name());
 
@@ -94,6 +147,14 @@ impl TransformPass for SimpleStrIterPass {
         let mut transformed = false;
 
         for chain in &chains {
+            if !self.rewrite_keeps_unwinding(chain) {
+                debug!(
+                    kind = ?chain.kind,
+                    declared_unwind = ?self.declared_unwind,
+                    "simple_str_iter: `nth` may fail Kani's unwinding assertion here; std call kept"
+                );
+                continue;
+            }
             let helper = match chain.kind {
                 StrIterKind::Bytes => bytes_helper,
                 StrIterKind::Chars => chars_helper,
@@ -154,8 +215,8 @@ fn find_simple_nth_chains(body: &Body) -> Vec<SimpleStrNthChain> {
 }
 
 fn transform_chain(body: &mut MutableBody, chain: &SimpleStrNthChain, helper: Instance) -> bool {
-    let constructor_span = body.blocks()[chain.constructor_bb].terminator.span;
-    let nth_span = body.blocks()[chain.nth_bb].terminator.span;
+    let constructor_span = mir_span!(body.blocks()[chain.constructor_bb].terminator);
+    let nth_span = mir_span!(body.blocks()[chain.nth_bb].terminator);
     let (nth_destination, nth_target, nth_unwind) =
         match &body.blocks()[chain.nth_bb].terminator.kind {
             TerminatorKind::Call { destination, target, unwind, .. } => {
@@ -169,17 +230,17 @@ fn transform_chain(body: &mut MutableBody, chain: &SimpleStrNthChain, helper: In
 
     {
         let constructor_block = body.block_mut(chain.constructor_bb);
-        constructor_block.statements.push(Statement {
-            kind: StatementKind::Assign(
+        constructor_block.statements.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 Place::from(chain.iter_local),
                 Rvalue::Aggregate(AggregateKind::Tuple, vec![]),
             ),
-            span: constructor_span,
-        });
-        constructor_block.terminator = Terminator {
-            kind: TerminatorKind::Goto { target: chain.constructor_target_bb },
-            span: constructor_span,
-        };
+            constructor_span,
+        ));
+        constructor_block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: chain.constructor_target_bb },
+            constructor_span,
+        );
     }
 
     {
@@ -192,16 +253,16 @@ fn transform_chain(body: &mut MutableBody, chain: &SimpleStrNthChain, helper: In
         });
         let nth_block = body.block_mut(chain.nth_bb);
         nth_block.statements.retain(|stmt| !should_remove_statement(stmt, chain));
-        nth_block.terminator = Terminator {
-            kind: TerminatorKind::Call {
+        nth_block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Call {
                 func: helper_func,
                 args: vec![chain.source.clone(), chain.index.clone()],
                 destination: nth_destination,
                 target: nth_target,
                 unwind: nth_unwind,
             },
-            span: nth_span,
-        };
+            nth_span,
+        );
     }
 
     true

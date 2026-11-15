@@ -71,6 +71,10 @@
 //!   sort, a nullable pointer whose null test this lane does not model — is a
 //!   refusal, never a guess.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::{BasicBlockIdx, Operand, Place, ProjectionElem};
 use rustc_public::ty::{RigidTy, Ty, TyKind};
@@ -83,7 +87,7 @@ use super::super::chc_call_context::DispatchCallContext;
 use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_call_kani_model::CallKaniModel;
 use super::super::codegen_rules::CodegenRules;
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 use crate::c_ffi::{self, CBinOp, CExpr, CFunc, CProgram, CStmt, CTarget, CTy, CUnOp};
 use crate::codegen_ay::c_ffi_check::{CArgShape, CProtoMatch, CRetShape, check_prototype};
 use trust_mc_metadata::ChcTrackLevel;
@@ -400,7 +404,7 @@ impl CBodyLowering {
                 // a `va_arg` before `va_start` cannot discharge its range
                 // obligation — which is exactly the status C gives it. Never a
                 // convenient zero.
-                let cursor = declare_pending_var(
+                let cursor = ExactVar::nondet(
                     chc_fresh_name("__c_ffi_va_unstarted"),
                     Sort::bitvec(VA_CURSOR_BITS),
                 );
@@ -425,7 +429,7 @@ impl CBodyLowering {
                     }
                     // An uninitialised local reads as an indeterminate value.
                     // Fresh and unconstrained: never a convenient zero.
-                    None => declare_pending_var(
+                    None => ExactVar::nondet(
                         chc_fresh_name("__c_ffi_uninit"),
                         Sort::bitvec(bits.max(1)),
                     ),
@@ -440,7 +444,7 @@ impl CBodyLowering {
                         let v = self.eval(ctx, dcx, e, &live)?;
                         let converted = self.convert(v, bits, signed)?;
                         let previous = self.ret_val.clone().unwrap_or_else(|| {
-                            declare_pending_var(
+                            ExactVar::nondet(
                                 chc_fresh_name("__c_ffi_no_return"),
                                 converted.sort().clone(),
                             )
@@ -554,7 +558,7 @@ impl CBodyLowering {
         if matches!(e.value(), ExprValue::BitVecConst { .. } | ExprValue::BoolConst(_)) {
             return e;
         }
-        let v = declare_pending_var(chc_fresh_name(tag), e.sort().clone());
+        let v = ExactVar::defined(chc_fresh_name(tag), e.sort().clone());
         self.defs.push(v.clone().eq(e));
         v
     }
@@ -634,11 +638,7 @@ impl CBodyLowering {
                 // `int`; `u` forces unsigned. Wider constants take the first
                 // type in the standard's list that represents them.
                 let (bits, signed) = literal_type(*value, *unsigned);
-                Some(CVal::Int {
-                    expr: Expr::bitvec_const(wrap(*value, bits), bits),
-                    bits,
-                    signed,
-                })
+                Some(CVal::Int { expr: Expr::bitvec_const(wrap(*value, bits), bits), bits, signed })
             }
             CExpr::SizeOfTy(ty) => {
                 let (size, _) = self.program.size_align(ty, self.ctarget)?;
@@ -731,21 +731,13 @@ impl CBodyLowering {
             CExpr::IncDec { prefix, inc, target } => {
                 let (bits, signed) = self.lvalue_type(ctx, dcx, target)?;
                 let old = self.eval(ctx, dcx, target, guard)?;
-                let one = CVal::Int {
-                    expr: Expr::bitvec_const(1, 32),
-                    bits: 32,
-                    signed: true,
-                };
+                let one = CVal::Int { expr: Expr::bitvec_const(1, 32), bits: 32, signed: true };
                 let op = if *inc { CBinOp::Add } else { CBinOp::Sub };
                 let combined = self.binary(op, old.clone(), one, guard)?;
                 let new = self.convert(combined, bits, signed)?;
                 self.write_lvalue(ctx, dcx, target, new.clone(), guard)?;
                 let CVal::Int { expr: old_expr, .. } = old else { return None };
-                Some(CVal::Int {
-                    expr: if *prefix { new } else { old_expr },
-                    bits,
-                    signed,
-                })
+                Some(CVal::Int { expr: if *prefix { new } else { old_expr }, bits, signed })
             }
             // `assert` is the one callee with a meaning here; every other call
             // is Tier 2 (a call into unmodelled C, or recursion).
@@ -763,8 +755,7 @@ impl CBodyLowering {
                     return None;
                 }
                 let cursor = self.va_lists.get(ap)?.clone();
-                let started =
-                    s_ite(guard.clone(), Expr::bitvec_const(0, VA_CURSOR_BITS), cursor);
+                let started = s_ite(guard.clone(), Expr::bitvec_const(0, VA_CURSOR_BITS), cursor);
                 self.va_lists.insert(ap.clone(), started);
                 Some(void_val())
             }
@@ -776,7 +767,7 @@ impl CBodyLowering {
                 // N" would be an invented fact.
                 let ended = s_ite(
                     guard.clone(),
-                    declare_pending_var(
+                    ExactVar::nondet(
                         chc_fresh_name("__c_ffi_va_ended"),
                         Sort::bitvec(VA_CURSOR_BITS),
                     ),
@@ -825,7 +816,7 @@ impl CBodyLowering {
         ));
 
         let mut value =
-            declare_pending_var(chc_fresh_name("__c_ffi_va_oob"), Sort::bitvec(bits.max(1)));
+            ExactVar::nondet(chc_fresh_name("__c_ffi_va_oob"), Sort::bitvec(bits.max(1)));
         for (k, actual) in self.actuals.iter().enumerate().rev() {
             let idx = i128::try_from(k).ok()?;
             let selects = cursor.clone().eq(Expr::bitvec_const(idx, VA_CURSOR_BITS));
@@ -951,10 +942,10 @@ impl CBodyLowering {
         let cdef = self.program.structs.get(&tag)?;
         let idx = cdef.fields.iter().position(|f| f.name == field)?;
         let base_ty = place.ty(ctx.body.locals()).ok()?;
-        let TyKind::RigidTy(RigidTy::Adt(def, _)) = base_ty.kind() else { return None };
+        let TyKind::RigidTy(RigidTy::Adt(def, args)) = base_ty.kind() else { return None };
         let variants = def.variants();
         let variant = variants.first()?;
-        let field_ty = variant.fields().get(idx)?.ty();
+        let field_ty = mono_ty::field_ty(variant.fields().get(idx)?, &args)?;
         place.projection.push(ProjectionElem::Field(idx, field_ty));
         Some(place)
     }
@@ -1082,11 +1073,8 @@ impl CBodyLowering {
         require_bitvec(&expr)?;
         let actual = expr.sort().bitvec_width()?;
         // The encoder's slot width is authoritative for what is in hand.
-        let expr = if actual != from_bits {
-            resize(expr, actual, bits, from_signed)?
-        } else {
-            expr
-        };
+        let expr =
+            if actual != from_bits { resize(expr, actual, bits, from_signed)? } else { expr };
         let width = expr.sort().bitvec_width()?;
         if width == bits {
             return Some(expr);
@@ -1254,12 +1242,7 @@ impl CBodyLowering {
             };
             let out_sort = dest_var.sort().clone();
             if !ctx.push_coerced_eq_constraint(
-                &mut extra,
-                &dest_var,
-                value,
-                &out_sort,
-                dest_local,
-                SITE,
+                &mut extra, &dest_var, value, &out_sort, dest_local, SITE,
             ) {
                 debug!(symbol, "c_ffi: return value could not be coerced to the destination sort");
                 return false;
@@ -1267,13 +1250,11 @@ impl CBodyLowering {
             extra_dests.push(dest_local);
         }
 
-        // (2) STORES. Each written slot is bound to its final symbolic value.
-        // A bare unconstrained `__out` would be ambiguous — the constant folder
-        // reads one as an identity pass-through — so the write is stated
-        // explicitly, exactly as `kani::write_any_slim` states its havoc.
+        // (2) STORES. Each written slot is bound to its final symbolic value,
+        // stated explicitly, exactly as `kani::write_any_slim` states its
+        // havoc (a bare unbound `__out` would be a havoc of the slot).
         for (slot, PendingStore { value, place }) in store {
-            let Some((out_name, out_sort)) =
-                ctx.state_var_mgr.output_state_vars.get(slot).cloned()
+            let Some((out_name, out_sort)) = ctx.state_var_mgr.output_state_vars.get(slot).cloned()
             else {
                 debug!(symbol, slot, "c_ffi: written slot has no output state variable");
                 return false;
@@ -1300,14 +1281,11 @@ impl CBodyLowering {
             if ctx.track_level >= ChcTrackLevel::Mem
                 && let Some(addr_expr) = ctx.translate_ref_to_address(&place, dcx.modified_locals)
             {
-                let place_ty = place
-                    .ty(ctx.body.locals())
-                    .unwrap_or(ctx.body.locals()[place.local].ty);
+                let place_ty =
+                    place.ty(ctx.body.locals()).unwrap_or(ctx.body.locals()[place.local].ty);
                 let prev_suppress = ctx.suppress_heap_store_checks;
                 ctx.suppress_heap_store_checks = true;
-                if let Some(store_constraint) =
-                    ctx.build_memory_store(addr_expr, value, place_ty)
-                {
+                if let Some(store_constraint) = ctx.build_memory_store(addr_expr, value, place_ty) {
                     extra.push(store_constraint);
                 }
                 ctx.suppress_heap_store_checks = prev_suppress;
@@ -1353,11 +1331,7 @@ impl CBodyLowering {
             dcx.stmt_constraints,
             extra,
         );
-        debug!(
-            symbol,
-            bb_idx = dcx.bb_idx,
-            "foreign call encoded from its C definition (--c-lib)"
-        );
+        debug!(symbol, bb_idx = dcx.bb_idx, "foreign call encoded from its C definition (--c-lib)");
         true
     }
 }
@@ -1384,9 +1358,7 @@ fn s_or(a: Expr, b: Expr) -> Expr {
     match (a.value(), b.value()) {
         (ExprValue::BoolConst(false), _) => b,
         (_, ExprValue::BoolConst(false)) => a,
-        (ExprValue::BoolConst(true), _) | (_, ExprValue::BoolConst(true)) => {
-            Expr::bool_const(true)
-        }
+        (ExprValue::BoolConst(true), _) | (_, ExprValue::BoolConst(true)) => Expr::bool_const(true),
         _ => a.or(b),
     }
 }
@@ -1406,11 +1378,12 @@ fn s_ite(cond: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
     }
 }
 
-
 fn operand_place(op: &Operand) -> Option<Place> {
     match op {
         Operand::Copy(p) | Operand::Move(p) => Some(p.clone()),
         Operand::Constant(_) => None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -1614,11 +1587,7 @@ mod tests {
 
         // A trailing return after a partial `if` rescues it.
         let trailing = CStmt::Compound(vec![
-            CStmt::If {
-                cond: CExpr::Ident("p".into()),
-                then: Box::new(ret(1)),
-                other: None,
-            },
+            CStmt::If { cond: CExpr::Ident("p".into()), then: Box::new(ret(1)), other: None },
             ret(0),
         ]);
         assert!(always_returns(&trailing));

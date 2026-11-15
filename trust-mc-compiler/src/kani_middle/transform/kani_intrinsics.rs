@@ -25,11 +25,13 @@ use crate::kani_middle::transform::check_uninit::{
 use crate::kani_middle::transform::check_values::{build_limits, ty_validity_per_offset};
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AggregateKind, BasicBlock, BinOp, Body, ConstOperand, Local, Mutability, Operand, Place,
-    RETURN_LOCAL, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp, UnwindAction,
+    RETURN_LOCAL, Rvalue, StatementKind, TerminatorKind, UnOp, UnwindAction,
 };
 use rustc_public::target::MachineInfo;
 use rustc_public::ty::{
@@ -121,13 +123,13 @@ impl IntrinsicGeneratorPass {
         let span = new_body.locals()[ret_var].span;
         let assign = StatementKind::Assign(
             Place::from(ret_var),
-            Rvalue::Use(Operand::Constant(ConstOperand {
+            rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
                 span,
                 user_ty: None,
                 const_: MirConst::from_bool(true),
-            })),
+            }))),
         );
-        let stmt = Statement { kind: assign, span };
+        let stmt = crate::rustc_compat::mir_statement(assign, span);
         new_body.insert_stmt(stmt, &mut terminator, InsertPosition::Before);
         let machine_info = MachineInfo::target();
 
@@ -162,7 +164,7 @@ impl IntrinsicGeneratorPass {
             }
             Ok(ranges) => {
                 // Given the pointer argument, check for possible invalid ranges.
-                let rvalue = Rvalue::Use(Operand::Move(Place::from(1)));
+                let rvalue = rvalue_use!(Rvalue::Use(Operand::Move(Place::from(1))));
                 for range in ranges {
                     let result =
                         build_limits(&mut new_body, &range, rvalue.clone(), &mut terminator);
@@ -172,7 +174,7 @@ impl IntrinsicGeneratorPass {
                         Operand::Move(Place::from(result)),
                     );
                     let assign = StatementKind::Assign(Place::from(ret_var), rvalue);
-                    let stmt = Statement { kind: assign, span };
+                    let stmt = crate::rustc_compat::mir_statement(assign, span);
                     new_body.insert_stmt(stmt, &mut terminator, InsertPosition::Before);
                 }
             }
@@ -213,14 +215,14 @@ impl IntrinsicGeneratorPass {
             let span = new_body.locals()[ret_var].span;
             let assign = StatementKind::Assign(
                 Place::from(ret_var),
-                Rvalue::Use(Operand::Constant(ConstOperand {
+                rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
                     span,
                     user_ty: None,
                     const_: MirConst::from_bool(true),
-                })),
+                }))),
             );
             new_body.insert_stmt(
-                Statement { kind: assign, span },
+                crate::rustc_compat::mir_statement(assign, span),
                 &mut source,
                 InsertPosition::Before,
             );
@@ -268,14 +270,14 @@ impl IntrinsicGeneratorPass {
                             let span = new_body.locals()[ret_var].span;
                             let assign = StatementKind::Assign(
                                 Place::from(ret_var),
-                                Rvalue::Use(Operand::Constant(ConstOperand {
+                                rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
                                     span,
                                     user_ty: None,
                                     const_: MirConst::from_bool(true),
-                                })),
+                                }))),
                             );
                             new_body.insert_stmt(
-                                Statement { kind: assign, span },
+                                crate::rustc_compat::mir_statement(assign, span),
                                 &mut source,
                                 InsertPosition::Before,
                             );
@@ -292,8 +294,8 @@ impl IntrinsicGeneratorPass {
                         let layout_operand =
                             mk_layout_operand(&mut new_body, &mut statements, &mut source, layout);
 
-                        let terminator = Terminator {
-                            kind: TerminatorKind::Call {
+                        let terminator = crate::rustc_compat::mir_terminator(
+                            TerminatorKind::Call {
                                 func: Operand::Copy(Place::from(new_body.new_local(
                                     is_ptr_initialized_instance.ty(),
                                     source.span(new_body.blocks()),
@@ -304,8 +306,8 @@ impl IntrinsicGeneratorPass {
                                 target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                                 unwind: UnwindAction::Terminate,
                             },
-                            span: source.span(new_body.blocks()),
-                        };
+                            source.span(new_body.blocks()),
+                        );
                         // Construct the basic block and insert it into the body.
                         new_body.insert_bb(
                             BasicBlock { statements, terminator },
@@ -338,8 +340,8 @@ impl IntrinsicGeneratorPass {
                             &mut source,
                             element_layout,
                         );
-                        let terminator = Terminator {
-                            kind: TerminatorKind::Call {
+                        let terminator = crate::rustc_compat::mir_terminator(
+                            TerminatorKind::Call {
                                 func: Operand::Copy(Place::from(new_body.new_local(
                                     is_ptr_initialized_instance.ty(),
                                     source.span(new_body.blocks()),
@@ -350,8 +352,8 @@ impl IntrinsicGeneratorPass {
                                 target: Some(0), // The current value does not matter, since it will be overwritten in add_bb.
                                 unwind: UnwindAction::Terminate,
                             },
-                            span: source.span(new_body.blocks()),
-                        };
+                            source.span(new_body.blocks()),
+                        );
                         // Construct the basic block and insert it into the body.
                         new_body.insert_bb(
                             BasicBlock { statements, terminator },
@@ -649,7 +651,7 @@ impl IntrinsicGeneratorPass {
 fn build_some(option: AdtDef, args: GenericArgs, val_op: Operand) -> Rvalue {
     let var_idx = option
         .variants_iter()
-        .find_map(|var| (!var.fields().is_empty()).then_some(var.idx))
+        .find_map(|var| (!var.fields().is_empty()).then_some(var.variant_idx()))
         .expect("Option type should have a Some variant with fields");
     Rvalue::Aggregate(AggregateKind::Adt(option, var_idx, args, None, None), vec![val_op])
 }
@@ -659,7 +661,7 @@ fn build_some(option: AdtDef, args: GenericArgs, val_op: Operand) -> Rvalue {
 fn build_none(option: AdtDef, args: GenericArgs) -> Rvalue {
     let var_idx = option
         .variants_iter()
-        .find_map(|var| var.fields().is_empty().then_some(var.idx))
+        .find_map(|var| var.fields().is_empty().then_some(var.variant_idx()))
         .expect("Option type should have a None variant without fields");
     Rvalue::Aggregate(AggregateKind::Adt(option, var_idx, args, None, None), vec![])
 }

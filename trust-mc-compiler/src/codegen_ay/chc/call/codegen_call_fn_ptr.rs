@@ -7,21 +7,21 @@
 //! Handles `TerminatorKind::Call` where the callee operand has type
 //! `RigidTy::FnPtr(..)` — indirect calls through function pointers.
 //!
-//! The entire dispatch chain only handles `RigidTy::FnDef`; FnPtr calls
-//! fall through all dispatchers to the unconstrained fallback, producing
-//! false CTREX due to unhandled_calls.
-//!
-//! Resolution strategy: scan the caller MIR for `PointerCoercion::ReifyFnPointer`
-//! and `PointerCoercion::ClosureFnPointer` casts that produce the function
-//! pointer local. These casts reveal the concrete function or closure that
-//! was coerced to a fn pointer, allowing resolution and inline translation.
+//! Resolution strategy (design 3 of `docs/chc-hole-fix-designs-2026-09-24.md`,
+//! `fn_ptr_targets.rs`): the pointer's value decides. A minted id names one
+//! function exactly; an if-then-else of minted ids, or a local whose every
+//! definition is a reification or a copy of such a local, names a complete
+//! set, dispatched under `pointer == id` with the obligation "invalid
+//! function pointer" as its default arm. Any other pointer takes the
+//! fail-closed unhandled-call fallback. (This route used to walk the first
+//! reification in the pointer's copy chain, or the first in the whole body,
+//! unconditionally.)
 //!
 //! Part of #1739: UNKNOWN→PROOF smoke suite recovery.
 
 use ay_bindings::Expr;
-use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{CastKind, Operand, PointerCoercion, Rvalue, StatementKind};
-use rustc_public::ty::{ClosureKind, RigidTy, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::codegen_ay::shared::{MAX_INLINE_EFFECTIVE_BLOCKS, count_effective_blocks};
@@ -30,9 +30,7 @@ use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
-use super::inline_body::{
-    InlineReturn, extract_inline_assert_guard, strip_inline_assert_fallback, translate_inline_body,
-};
+use super::inline_body::{InlineReturn, translate_inline_body};
 use super::inline_result_shared::{
     InlineResultEpilogueSpec, emit_prepared_inline_result, prepare_inline_result_epilogue,
 };
@@ -57,15 +55,63 @@ impl<'tcx, 'body> CallDispatchFnPtr for ChcCtx<'tcx, 'body> {
             return false;
         }
 
-        let (body, is_closure) = match self.resolve_fn_ptr_callee_body(dcx) {
-            Some(resolved) => resolved,
-            None => return false,
-        };
+        // A callee reached through a function pointer is WALKED, and the
+        // walker receives a `&T` argument as its referent's VALUE
+        // (`resolve_ref_operand` below) with no Cell store lane and no
+        // write-back through a shared reference. A write the callee makes
+        // through interior mutability was dropped with no record: `let f:
+        // fn(&Cell<u8>) = set200; f(&c); assert!(c.get() < 100)` verified
+        // SUCCESSFUL clean and its `== 200` twin FAILED Genuine (review of
+        // fix/chc-cell-set-write, 2026-09-26). Such a call havocs everything
+        // its arguments can write instead, and fails closed.
+        if dcx.args.iter().any(|arg| {
+            arg.ty(self.body.locals())
+                .is_ok_and(|ty| self.ty_points_to_interior_mut(self.resolve_body_ty(ty), 4))
+        }) {
+            debug!(bb_idx = dcx.bb_idx, "fn_ptr: interior-mutable argument; havoc, not walked");
+            self.emit_interior_mut_call_havoc(
+                dcx.args,
+                dcx.destination,
+                *target,
+                dcx.from_app,
+                dcx.stmt_constraints,
+                dcx.modified_locals,
+                "fn_ptr_interior_mut_arg_havoc",
+            );
+            return true;
+        }
 
-        // Complexity gate: only inline small bodies.
-        let effective = count_effective_blocks(&body);
-        if effective > MAX_INLINE_EFFECTIVE_BLOCKS {
+        // Design 3 (fn_ptr_targets.rs): walk only a COMPLETE candidate set.
+        // The pointer is one minted id, an if-then-else of minted ids, or a
+        // closed local (every definition a reification or a local copy). Any
+        // other pointer (a static, a const, a struct field, a call result)
+        // takes the fail-closed unhandled-call fallback. This route used to
+        // walk the FIRST reification in the pointer's copy chain, or failing
+        // that the first anywhere in the body, unconditionally: a symbolic
+        // choice between `add_safe` and `add_ub` verified the `add_ub` overflow
+        // SUCCESSFUL clean (walker_fn_ptr_target_dual.rs::bug_samename_direct_symbolic).
+        let pointer = self.translate_operand_with_modified(dcx.func, dcx.modified_locals);
+        let candidates = self.fn_ptr_call_candidates(pointer.as_ref(), Some(func_ty));
+        if !candidates.complete || candidates.targets.is_empty() {
+            debug!(
+                bb_idx = dcx.bb_idx,
+                known = candidates.targets.len(),
+                "fn_ptr: candidate set not complete; unhandled-call fallback"
+            );
             return false;
+        }
+        let mut bodies = Vec::with_capacity(candidates.targets.len());
+        for (id, fn_target) in &candidates.targets {
+            let Some(body) = fn_target.target_body() else {
+                debug!(target = %fn_target.label(), "fn_ptr: candidate has no body");
+                return false;
+            };
+            // Complexity gate: only inline small bodies.
+            if count_effective_blocks(&body) > MAX_INLINE_EFFECTIVE_BLOCKS {
+                debug!(target = %fn_target.label(), "fn_ptr: candidate over the inline budget");
+                return false;
+            }
+            bodies.push((*id, body, fn_target.is_closure()));
         }
 
         // Translate arguments using the same operand resolution as fn_inline.
@@ -83,29 +129,89 @@ impl<'tcx, 'body> CallDispatchFnPtr for ChcCtx<'tcx, 'body> {
             return false;
         }
 
-        // Part of #3608: Mark type arrays read by the inline field map.
-        self.mark_inline_field_reads(&body, &params, dcx.bb_idx);
-        // Part of #4185: Snapshot heap state before speculative inline walk.
+        // Part of #4185: Snapshot heap state before speculative inline walks.
         let heap_snapshot = self.heap_state.snapshot_transient_rule_state();
         // Part of #4185 Fix 4: Snapshot modified_state_indices alongside heap.
         let modified_snapshot = self.encode.modified_state_indices.clone();
-        let (result, inline_address_constraints) =
-            self.inline_fn_ptr_body(&body, &params, is_closure, dcx.bb_idx);
-        let Some(inline_result) = result else {
-            // Part of #4185: Restore heap state after failed inline walk.
-            self.heap_state.restore_transient_rule_state(&heap_snapshot);
-            // Part of #4185 Fix 4: Restore modified_state_indices on bail-out.
-            self.encode.modified_state_indices = modified_snapshot;
+
+        if candidates.exact {
+            let (_, body, is_closure) = bodies.pop().expect("one exact candidate");
+            // Part of #3608: Mark type arrays read by the inline field map.
+            self.mark_inline_field_reads(&body, &params, dcx.bb_idx);
+            let (result, inline_address_constraints) =
+                self.inline_fn_ptr_body(&body, &params, is_closure, dcx.bb_idx);
+            let Some(inline_result) = result else {
+                // Part of #4185: Restore heap state after failed inline walk.
+                self.heap_state.restore_transient_rule_state(&heap_snapshot);
+                self.encode.modified_state_indices = modified_snapshot;
+                return false;
+            };
+            debug!(bb_idx = dcx.bb_idx, "fn_ptr: exact target inlined (#1739)");
+            self.emit_fn_ptr_result(dcx, *target, inline_result, &inline_address_constraints);
+            return true;
+        }
+
+        let Some(pointer) =
+            pointer.filter(|p| p.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH))
+        else {
             return false;
         };
-
-        debug!(
-            bb_idx = dcx.bb_idx,
-            effective_blocks = effective,
-            "fn_ptr: successfully resolved and inlined function pointer call (#1739)"
+        let multi = bodies.len() > 1;
+        let mut walked: Vec<(u64, InlineReturn)> = Vec::new();
+        let mut address_constraints: Vec<Expr> = Vec::new();
+        // Phase 0 (inline_walk_guard.rs): a write mark per candidate. One mark
+        // over the whole loop exists so a candidate cannot read what an
+        // earlier one wrote; every such channel is a memory effect, and an arm
+        // with one declines the dispatch below, so each candidate starts from
+        // the host's state. A single mark made the second of two targets
+        // reading `*a` after its own write look like a read after the first
+        // target's write (walker_dyn_deref_write_dual.rs
+        // `bug_add_after_write_fnptr` lost its Genuine certificate).
+        let mut all_walked = true;
+        for (id, body, is_closure) in &bodies {
+            let effects_before = self.heap_state.effect_mark();
+            let checks_before = self.heap_state.pending_checks.len();
+            self.mark_inline_field_reads(body, &params, dcx.bb_idx);
+            let (result, constraints) = self.with_inline_walk_write_mark(|ctx| {
+                ctx.inline_fn_ptr_body(body, &params, *is_closure, dcx.bb_idx)
+            });
+            let Some(result) = result else {
+                all_walked = false;
+                break;
+            };
+            // A memory effect made inside one arm is applied by the host
+            // unguarded, on every path: two arms storing different values to
+            // one `static mut` made the transition unsatisfiable and the
+            // harness VACUOUS. Such a dispatch fails closed whatever happens
+            // (`walker_store_in_branch_arm`), so decline it and leave the call
+            // to the unhandled-call fallback.
+            if multi && self.heap_state.effect_mark() > effects_before {
+                self.note_inline_branch_arm_effects(effects_before);
+                all_walked = false;
+                break;
+            }
+            address_constraints.extend(constraints);
+            super::codegen_call_virtual_inline::guard_dispatch_arm_pending_checks(
+                self,
+                checks_before,
+                &pointer,
+                *id,
+            );
+            walked.push((*id, result));
+        }
+        if !all_walked {
+            // A candidate that cannot be walked could be the one called.
+            self.heap_state.restore_transient_rule_state(&heap_snapshot);
+            self.encode.modified_state_indices = modified_snapshot;
+            debug!(bb_idx = dcx.bb_idx, "fn_ptr: a candidate was not walked; unhandled-call fallback");
+            return false;
+        }
+        let default = self.fn_ptr_obligation_default(&candidates);
+        let merged = super::codegen_call_virtual_inline::merge_guarded_dispatch_results(
+            self, walked, &pointer, default,
         );
-
-        self.emit_fn_ptr_result(dcx, *target, inline_result, &inline_address_constraints);
+        debug!(bb_idx = dcx.bb_idx, "fn_ptr: complete candidate set merged under pointer guards");
+        self.emit_fn_ptr_result(dcx, *target, merged, &address_constraints);
         true
     }
 }
@@ -128,8 +234,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let body_key = &raw const *body as usize;
                 self.inline_local_address_hints = Some((body_key, address_hints));
             }
-            // Value-only semantics for vtable/alias_updates (unchanged), but
-            // PRESERVE the assert-guard side-channel from the closure walk.
+            // Value-only semantics for the vtable, but PRESERVE the
+            // assert-guard side-channel from the closure walk, and the
+            // closure's writes through its reference arguments, re-keyed to
+            // this call's arguments. Dropping them lost the write for the
+            // caller with no reason recorded (review finding M3,
+            // walker_referent_write_dual.rs::bug_fnptr_closure_write).
             let result = super::inline_body::translate_closure_inline_result(
                 self,
                 body,
@@ -141,6 +251,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .map(|full| {
                 let mut value_only = InlineReturn::value_only(full.value);
                 value_only.deferred_checks = full.deferred_checks;
+                value_only.alias_updates =
+                    super::inline_walk_guard::rekey_closure_alias_updates_for_caller(
+                        self,
+                        full.alias_updates,
+                    );
                 value_only
             });
             self.inline_local_address_hints = saved_inline_hints;
@@ -168,9 +283,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Assert-guard SIDE-CHANNEL host emission (see emit_deferred_inline_check_errors).
         self.emit_deferred_inline_check_errors(dcx, deferred_checks);
         let empty_pre_resolved = std::collections::BTreeMap::new();
-        let inline_assert_guard = extract_inline_assert_guard(&result_expr);
-        let result_expr = strip_inline_assert_fallback(&result_expr).unwrap_or(result_expr);
-        let mut extra_constraints = self.emit_inline_assert_guard_error(dcx, inline_assert_guard);
+        let (result_expr, mut extra_constraints) = self.take_inline_result_guards(dcx, result_expr);
         extra_constraints.extend_from_slice(inline_address_constraints);
         let prepared = prepare_inline_result_epilogue(
             self,
@@ -254,108 +367,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         (hints, Vec::new())
     }
 
-    /// Resolve the concrete callee body for a function pointer call.
-    ///
-    /// First tries copy/move chain following from the fn_ptr local, then falls
-    /// back to scanning the entire body for ReifyFnPointer/ClosureFnPointer casts.
-    /// Handles operands with projections (e.g., field access on a struct) by
-    /// skipping chain resolution and using the body-scan fallback directly.
-    fn resolve_fn_ptr_callee_body(
-        &self,
-        dcx: &DispatchCallContext<'_>,
-    ) -> Option<(rustc_public::mir::Body, bool)> {
-        // When the operand has a projection (e.g., `(_5).formatter`),
-        // skip local-chain resolution and go directly to body-scan fallback.
-        let fn_ptr_local = match dcx.func {
-            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => Some(p.local),
-            _ => None,
-        };
-
-        if let Some(resolved) = fn_ptr_local.and_then(|local| self.resolve_fn_ptr_body(local)) {
-            return Some(resolved);
-        }
-
-        // Fallback: scan the entire body for any ReifyFnPointer/ClosureFnPointer cast.
-        // Handles fn ptrs flowing through struct fields, iterators, or other data-flow
-        // patterns that simple copy/move chain tracing cannot follow.
-        // Part of #3335: resolve_any_fn_ptr_body now returns (body, is_closure).
-        self.resolve_any_fn_ptr_body()
-    }
-
-    /// Resolve a function pointer local to its concrete MIR body.
-    ///
-    /// Scans the caller MIR for `ReifyFnPointer` or `ClosureFnPointer` casts
-    /// that assign to `fn_ptr_local`, following copy/move chains up to 5 hops.
-    /// Returns (body, is_closure) — is_closure=true for ClosureFnPointer coercions.
-    fn resolve_fn_ptr_body(&self, fn_ptr_local: usize) -> Option<(rustc_public::mir::Body, bool)> {
-        // Collect locals in the copy/move chain leading to fn_ptr_local.
-        let mut target_locals = std::collections::HashSet::new();
-        target_locals.insert(fn_ptr_local);
-
-        // Follow copy/move chains backwards up to 5 hops.
-        for _ in 0..5 {
-            let mut new_locals = Vec::new();
-            for bb in &self.body.blocks {
-                for stmt in &bb.statements {
-                    if let StatementKind::Assign(place, rvalue) = &stmt.kind {
-                        let dest = place.local;
-                        if !target_locals.contains(&dest) {
-                            continue;
-                        }
-                        match rvalue {
-                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                                if src.projection.is_empty() =>
-                            {
-                                new_locals.push(src.local);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            if new_locals.is_empty() {
-                break;
-            }
-            target_locals.extend(new_locals);
-        }
-
-        // Scan for ReifyFnPointer/ClosureFnPointer casts to any tracked local.
-        for bb in &self.body.blocks {
-            for stmt in &bb.statements {
-                if let StatementKind::Assign(place, rvalue) = &stmt.kind {
-                    if !target_locals.contains(&place.local) {
-                        continue;
-                    }
-                    match rvalue {
-                        Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
-                            operand,
-                            _,
-                        ) => {
-                            if let Some(body) = self.resolve_fn_ptr_operand_body(operand) {
-                                debug!("fn_ptr: resolved via ReifyFnPointer coercion (#1739)");
-                                return Some((body, false));
-                            }
-                        }
-                        Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_)),
-                            operand,
-                            _,
-                        ) => {
-                            if let Some(body) = self.resolve_closure_fn_ptr_body(operand) {
-                                debug!("fn_ptr: resolved via ClosureFnPointer coercion (#1739)");
-                                return Some((body, true));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     /// The LINK SYMBOL of a FOREIGN item reified into this call's function
     /// pointer.
     ///
@@ -398,7 +409,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let StatementKind::Assign(_, rvalue) = &stmt.kind else { continue };
                 let Rvalue::Cast(
                     CastKind::PointerCoercion(
-                        PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_),
+                        PointerCoercion::ReifyFnPointer { .. }
+                        | PointerCoercion::ClosureFnPointer(_),
                     ),
                     operand,
                     _,
@@ -426,7 +438,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if !target_locals.contains(&place.local) {
                         continue;
                     }
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rvalue
                         && src.projection.is_empty()
                     {
                         new_locals.push(src.local);
@@ -449,7 +461,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
                 let Rvalue::Cast(
                     CastKind::PointerCoercion(
-                        PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_),
+                        PointerCoercion::ReifyFnPointer { .. }
+                        | PointerCoercion::ClosureFnPointer(_),
                     ),
                     operand,
                     _,
@@ -469,82 +482,5 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     fn reified_foreign_symbol(&self, operand: &Operand) -> Option<String> {
         let ty = operand.ty(self.body.locals()).ok()?;
         crate::codegen_ay::foreign_defs::foreign_link_symbol(self.tcx, ty)
-    }
-
-    /// Scan all MIR statements for any `ReifyFnPointer` or `ClosureFnPointer`
-    /// cast, regardless of target local. Used by the nested inline handler where
-    /// the fn ptr is a parameter (not a local of the harness body).
-    ///
-    /// Returns `(body, is_closure)` — `is_closure=true` for ClosureFnPointer
-    /// coercions, which use RustCall ABI (local 1 = closure env, local 2+ = params).
-    /// Part of #3335: previously returned bare Body, losing the closure distinction.
-    pub(in crate::codegen_ay::chc) fn resolve_any_fn_ptr_body(
-        &self,
-    ) -> Option<(rustc_public::mir::Body, bool)> {
-        for bb in &self.body.blocks {
-            for stmt in &bb.statements {
-                if let StatementKind::Assign(_place, rvalue) = &stmt.kind {
-                    match rvalue {
-                        Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer),
-                            operand,
-                            _,
-                        ) => {
-                            if let Some(body) = self.resolve_fn_ptr_operand_body(operand) {
-                                return Some((body, false));
-                            }
-                        }
-                        Rvalue::Cast(
-                            CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_)),
-                            operand,
-                            _,
-                        ) => {
-                            if let Some(body) = self.resolve_closure_fn_ptr_body(operand) {
-                                return Some((body, true));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve a `ReifyFnPointer` operand to its MIR body.
-    fn resolve_fn_ptr_operand_body(&self, operand: &Operand) -> Option<rustc_public::mir::Body> {
-        let ty = operand.ty(self.body.locals()).ok()?;
-        let (fn_def, fn_substs) = match ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, substs)) => (def, substs),
-            _ => return None,
-        };
-        let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-        instance.body()
-    }
-
-    /// Resolve a `ClosureFnPointer` operand to its MIR body.
-    ///
-    /// Tries all three closure kinds (Fn, FnMut, FnOnce) since the closure's
-    /// native kind determines which `Instance::resolve_closure` call succeeds
-    /// and produces a body (vs. a shim without an accessible body).
-    fn resolve_closure_fn_ptr_body(&self, operand: &Operand) -> Option<rustc_public::mir::Body> {
-        let ty = operand.ty(self.body.locals()).ok()?;
-        match ty.kind() {
-            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
-                    if let Ok(inst) = Instance::resolve_closure(def, &args, kind) {
-                        if let Some(body) = inst.body() {
-                            return Some(body);
-                        }
-                    }
-                }
-                None
-            }
-            TyKind::RigidTy(RigidTy::FnDef(fn_def, fn_substs)) => {
-                let instance = Instance::resolve(fn_def, &fn_substs).ok()?;
-                instance.body()
-            }
-            _ => None,
-        }
     }
 }

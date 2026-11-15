@@ -64,7 +64,7 @@ pub(super) fn unwind_assert_sentinel_blocks(body: &Body) -> HashSet<usize> {
             && matches!(fail.terminator.kind, TerminatorKind::Unreachable)
             && silent.statements.is_empty()
             && matches!(silent.terminator.kind, TerminatorKind::Return)
-            && fail.terminator.span == silent.terminator.span
+            && mir_span!(fail.terminator) == mir_span!(silent.terminator)
         {
             candidates.push(idx);
         }
@@ -78,12 +78,12 @@ pub(super) fn unwind_assert_sentinel_blocks(body: &Body) -> HashSet<usize> {
     let sentinels: HashSet<usize> = candidates
         .into_iter()
         .filter(|&idx| {
-            let span = body.blocks[idx].terminator.span;
+            let span = mir_span!(body.blocks[idx].terminator);
             cfg.reachable[idx]
                 && cfg.predecessors[idx + 1].is_empty()
                 && cfg.predecessors[idx]
                     .iter()
-                    .any(|&pred| body.blocks[pred].terminator.span == span)
+                    .any(|&pred| mir_span!(body.blocks[pred].terminator) == span)
         })
         .collect();
 

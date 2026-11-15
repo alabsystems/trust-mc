@@ -5,9 +5,9 @@
 We automate most of our formatting preferences. This repository has no CI, so run
 the format checkers locally before submitting a change.
 
-For Rust, we use [rustfmt](https://github.com/rust-lang/rustfmt)
+For Rust, we use `trustfmt` (`targo fmt`), the Trust toolchain's formatter,
 which is configured via the [rustfmt.toml](https://github.com/alabsystems/trust-mc/blob/main/rustfmt.toml) file.
-We are also in the process of enabling `clippy`.
+We are also in the process of enabling `tippy` (`targo tippy`), the Trust toolchain's linter.
 Because of that, we still have a couple of lints disabled (see [.cargo/config](https://github.com/alabsystems/trust-mc/blob/main/.cargo/config.toml) for the updated list).
 
 We also have a bit of C and Python code in our repository.

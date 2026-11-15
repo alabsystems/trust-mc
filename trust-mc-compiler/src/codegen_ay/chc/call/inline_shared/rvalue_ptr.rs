@@ -7,6 +7,7 @@
 //! Extracted from `rvalue.rs` to keep it under the 500-line limit.
 //! Part of #4050: RawPtr aggregate + BinOp::Offset support.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::{Expr, SortInner};
 use rustc_public::mir::{BinOp, LocalDecl, Operand};
 use rustc_public::ty::{RigidTy, TyKind, UintTy};
@@ -358,8 +359,36 @@ pub(super) fn translate_inline_ptr_metadata<'tcx, 'body>(
         // `translate_ptr_metadata`, which are the honest producers.
         match PtrRepr::classify(&expr) {
             Some(PtrRepr::Thin(_)) => {
-                debug!("inline PtrMetadata: BV64 — returning 0 (thin pointer)");
-                return Some(Expr::bitvec_const(0, POINTER_WIDTH));
+                // `is_wide` is a fact about the MIR TYPE; a thin TERM for a wide
+                // type means the metadata was lost on the way here (e.g. a
+                // `&[u8]` loaded through a `&&[u8]` closure capture), not that
+                // the length is 0. Returning 0 fabricated `len == 0` for every
+                // such slice, so `bytes.len() == 0` over a 10-element slice
+                // PROVED.
+                //
+                // Declining (returning `None`) is not the fix either: the
+                // walker then leaves the destination local unwritten, and a
+                // stale value already bound to that local index is read in its
+                // place. Measured: a zero-argument closure's first temp still
+                // held the untupled `()` call argument, `bytes.len() == 1`
+                // read `1 == 1` and PROVED; and a bounds-check `Assert` whose
+                // length did not translate was assumed to pass (#4014).
+                //
+                // So the length is a FRESH value, unconstrained, and the site
+                // is booked fail-closed: every read admits the real length, so
+                // the rules over-approximate, and a proof that rests on this
+                // site is demoted rather than certified.
+                debug!(
+                    "inline PtrMetadata: thin term for a wide type — metadata lost; \
+                     fresh length, fail-closed"
+                );
+                let booked =
+                    ctx.record_sound_fallback_reason("inline_ptr_metadata_lost_for_wide_type");
+                return Some(Havoc::booked(
+                    booked,
+                    crate::codegen_ay::chc::chc_fresh_name("__inline_ptr_metadata_lost"),
+                    crate::codegen_ay::types::ptr_sort(),
+                ));
             }
             Some(repr) => {
                 if let Some(meta) = repr.into_metadata() {
@@ -369,6 +398,14 @@ pub(super) fn translate_inline_ptr_metadata<'tcx, 'body>(
                 debug!("inline PtrMetadata: widened thin pointer — no metadata to read");
             }
             None => {}
+        }
+        // An array carried as its value, unsized to a slice in a walked body
+        // (`rvalue_cast.rs`, `note_array_value_slice_len`): its length.
+        if expr.sort().is_array()
+            && let Some(Some(len)) = ctx.inline_array_value_slice_lens.get(&expr)
+        {
+            debug!(len, "inline PtrMetadata: array value's recorded slice length");
+            return Some(Expr::bitvec_const(u128::from(*len), POINTER_WIDTH));
         }
         let sort = expr.sort().clone();
         if let SortInner::Datatype(dt) = sort.inner()
@@ -385,6 +422,15 @@ pub(super) fn translate_inline_ptr_metadata<'tcx, 'body>(
         }
     }
 
+    // `translate_ptr_metadata` types and translates `operand` against the HOST
+    // body. That is only meaningful when `locals` is the host body's own table;
+    // for an inlined callee the operand's local indexes a different body, which
+    // panics when out of range and silently reads an unrelated host local when in
+    // range. Decline instead: the walker records the gap for this rvalue.
+    if !std::ptr::eq(locals, ctx.body.locals()) {
+        debug!("inline PtrMetadata: callee operand has no host-body metadata lane; declining");
+        return None;
+    }
     let empty = std::collections::HashSet::new();
     ctx.translate_ptr_metadata(operand, &empty).map(|meta| meta.into_expr())
 }

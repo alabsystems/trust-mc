@@ -5,6 +5,9 @@
 //! Referent resolution helpers: resolve_bare_local, resolve_ref_or_const_referent, resolve_raw_eq_referent.
 //! Part of #2408 S1: codegen_call_misc decomposition.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::rustc_internal;
@@ -16,7 +19,7 @@ use super::super::ChcCtx;
 use super::CallMisc;
 use super::dyn_wrapper_restore::peel_pointer_like_dyn_wrapper_expr;
 use crate::codegen_ay::chc::codegen_types::CodegenTypes;
-use crate::codegen_ay::provenance::{Val, mir_ty_denotes_address};
+use crate::codegen_ay::provenance::{Loc, Val, mir_ty_denotes_address};
 use crate::codegen_ay::ptr_repr::PtrSlot;
 use crate::codegen_ay::types::{
     CtorFieldExt, POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe, ptr_sort,
@@ -58,6 +61,35 @@ impl Referent {
 }
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The bare local `arg`'s state variable as its value: the last tier of
+    /// operand resolution, after the operand's own translation failed. A
+    /// flattened local with more than one slot has no such variable: its state
+    /// index names its FIRST slot, one leaf of the value, and binding that leaf
+    /// as the whole bound it and left the other slots free (an inlined
+    /// `into_iter(move r)` on an Int-lifted `Range` handed back `r.start` for
+    /// `r`; the flattened destination builder now refuses such a value). It is
+    /// unresolved instead, and the caller takes its own fallback.
+    pub(in crate::codegen_ay::chc) fn bare_local_value(
+        &self,
+        arg: &Operand,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        if let Operand::Copy(place) | Operand::Move(place) = arg
+            && self.flatten.flattened_tuple_locals.contains(&place.local)
+            && self.flattened_field_count(place.local) != 1
+        {
+            return None;
+        }
+        Self::resolve_bare_local(
+            arg,
+            &self.state_var_mgr.state_vars,
+            &self.state_var_mgr.output_state_vars,
+            modified_locals,
+            &self.state_var_mgr.local_to_state_idx,
+            &self.fn_name,
+        )
+    }
+
     fn resolve_static_seeded_ref_operand(
         &mut self,
         arg: &Operand,
@@ -110,6 +142,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return false,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return false,
         };
         if !place.projection.is_empty() {
             return false;
@@ -171,22 +205,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn fixed_array_view_sort_for_ty(&self, ty: rustc_public::ty::Ty) -> Option<Sort> {
-        match ty.kind() {
-            TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
-                self.fixed_array_view_sort_for_ty(pointee)
-            }
-            TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => {
-                self.fixed_array_view_sort_for_ty(pointee)
-            }
-            TyKind::RigidTy(RigidTy::Array(..)) => Self::translate_ty(ty),
+        // A referent resolver crosses one reference boundary. Its datum may
+        // itself be a pointer; recursively peeling &&[T; N] would turn that
+        // inner pointer's representation into fabricated array elements.
+        let value_ty = match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => pointee,
+            _ => ty,
+        };
+        match value_ty.kind() {
+            TyKind::RigidTy(RigidTy::Array(..)) => Self::translate_ty(value_ty),
             TyKind::RigidTy(RigidTy::Adt(adt_def, args))
-                if rustc_internal::internal(self.tcx, ty).is_simd() =>
+                if rustc_internal::internal(self.tcx, value_ty).is_simd() =>
             {
                 let variants = adt_def.variants();
                 if variants.len() != 1 || variants[0].fields().len() != 1 {
                     return None;
                 }
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 matches!(field_ty.kind(), TyKind::RigidTy(RigidTy::Array(..)))
                     .then(|| Self::translate_ty(field_ty))
                     .flatten()
@@ -195,96 +231,96 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    /// Rebuild a `[T; N]` referent by LOADING it, when the resolved expression
-    /// is an address rather than the referent's bytes.
-    ///
-    /// `reinterpret_fixed_layout_expr`'s BV→Array case is a pure *bit view*: it
-    /// slices the 8 bytes of a BV64 into array elements. That is correct when
-    /// the BV64 holds the referent's data and catastrophically wrong when it
-    /// holds the referent's ADDRESS — the array then contains
-    /// `[obj_id, offset]` bytes instead of the pointee, so e.g.
-    /// `transmute::<&str, &[u8]>("Rust") == &[82, 117, 115, 116]` compares
-    /// `b"Rust"` against `[0, 0, 0, 0]` and reports a bogus counterexample.
-    ///
-    /// The value-vs-address distinction is made EXPLICITLY here rather than by
-    /// another width heuristic:
-    ///
-    /// * `try_extract_constant_addr` is a *structural* test. It only succeeds on
-    ///   `concat(obj_id: bv32 const, offset: bv32 const)`, the exact shape the
-    ///   split-pointer model emits for an address. A BV64 that merely happens to
-    ///   be 8 bytes wide (a genuine flattened `[u8; 8]` value, an arithmetic
-    ///   result, a state variable) does not match it.
-    /// * The Rust type must additionally peel a reference/raw pointer, so a bare
-    ///   `[T; N]` local whose value is carried flattened in a BV is untouched.
-    ///
-    /// Both conditions together mean the expression provably carries pointer
-    /// provenance, so the array is rebuilt from `N` per-element loads.
-    ///
-    /// The load MUST go through the ELEMENT type key (`u8` for `[u8; 4]`), not
-    /// the array/slice key: promoted constants and ordinary stores seed memory
-    /// byte-wise under the element key, so `load_from_memory`'s multi-element
-    /// reconstruction — which keys by the *array* type (`slice_u8`) — reads an
-    /// array nothing was ever written to and yields unconstrained slots. This is
-    /// the same key `try_raw_eq_array`'s Tier 2 memory path already uses.
-    fn try_load_fixed_array_referent_from_address(
+    /// Array equality needs the array datum at the caller's one reference
+    /// boundary. A Value tag alone does not exclude an inner pointer datum.
+    pub(in crate::codegen_ay::chc) fn fixed_array_eq_referent_datum(
+        &self,
+        arg: &Operand,
+        referent: Referent,
+    ) -> Option<Expr> {
+        let expected = self.fixed_array_view_sort_for_ty(arg.ty(self.body.locals()).ok()?)?;
+        let expr = match referent {
+            Referent::Value(value) => value.into_expr(),
+            Referent::Unreported(expr) if expr.sort().is_array() => expr,
+            Referent::Unreported(_) => return None,
+        };
+        (expr.sort() == &expected).then_some(expr)
+    }
+
+    /// Load an array from an established address. The address provenance is
+    /// supplied by the producer; a pointer's bits are never array elements.
+    pub(in crate::codegen_ay::chc) fn try_load_fixed_array_referent_from_address(
         &mut self,
         local_ty: rustc_public::ty::Ty,
-        addr: &Expr,
+        addr: Loc,
         target_sort: &Sort,
-    ) -> Option<Expr> {
-        // Structural proof that `addr` is an address, not data.
-        Self::try_extract_constant_addr(addr)?;
-
-        // ... and that the Rust type agrees: `&[T; N]` / `*const [T; N]`.
-        let (pointee_ty, peeled) = Self::deref_ref_ty(local_ty);
-        if !peeled {
-            return None;
-        }
+    ) -> Option<Val> {
+        let pointee_ty = match local_ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => pointee,
+            _ => return None,
+        };
         let TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) = pointee_ty.kind() else {
             return None;
         };
         let array_len = len_const.eval_target_usize().ok()? as usize;
-        // Same element-wise budget `try_raw_eq_array` uses; keeps formulas bounded.
         if array_len == 0 || array_len > 256 {
             return None;
         }
-
         let arr_sort = target_sort.array_sort()?;
         let idx_width = arr_sort.index_sort.bitvec_width()?;
-        let elem_sort = arr_sort.element_sort.clone();
-        let elem_width = elem_sort.bitvec_width()?;
+        let elem_width = arr_sort.element_sort.bitvec_width()?;
+        // Array layouts flatten aggregate elements, whereas a typed memory
+        // load reconstructs their datatype. Refuse that unsupported crossing
+        // before issuing any load; storing a datatype into Array(BV) is invalid.
+        if Self::translate_ty(elem_ty)? != arr_sort.element_sort {
+            return None;
+        }
         let elem_bytes = self.get_type_size(elem_ty)? as u64;
-        let type_key = self.type_key_for_body_ty(elem_ty).into_owned();
-
-        let base = coerce_bitvec_width_safe(addr.clone(), POINTER_WIDTH, SignExtension::ZeroExtend);
+        let base = addr.into_expr();
         let mut result =
             Expr::const_array(Sort::bitvec(idx_width), Expr::bitvec_const(0u64, elem_width));
         for i in 0..array_len {
             let offset = Expr::bitvec_const((i as u64) * elem_bytes, POINTER_WIDTH);
-            let elem_addr = base.clone().bvadd(offset);
-            let loaded =
-                self.load_from_type_array(elem_addr, &type_key, elem_sort.clone(), None)?;
+            // Adding a byte offset to an established address retains provenance.
+            let elem_addr = Loc::of_address(base.clone().bvadd(offset));
+            let loaded = self.load_array_element_from_memory(elem_addr, elem_ty)?.into_expr();
             let loaded = coerce_bitvec_width_safe(loaded, elem_width, SignExtension::ZeroExtend);
             result = result.store(Expr::bitvec_const(i as u64, idx_width), loaded);
         }
-
         if result.sort() != target_sort {
             return None;
         }
-        debug!(
-            fn_name = %self.fn_name,
-            array_len,
-            elem_type = %type_key,
-            "CHC: fixed-array referent arrived as an address; loaded from memory instead of reinterpreting"
-        );
-        Some(result)
+        Some(Val::of_value(result))
     }
 
-    fn try_reinterpret_fixed_array_view_referent(
+    /// A single, base-preserving MIR producer chain proves the Box/array
+    /// reference's allocation. Unlike a width test, this also rejects joins,
+    /// interior offsets, pointer arithmetic and loads of another pointer.
+    pub(in crate::codegen_ay::chc) fn try_load_traced_fixed_array_referent(
         &mut self,
         arg: &Operand,
-        expr: &Expr,
-    ) -> Option<Expr> {
+    ) -> Option<Val> {
+        if !self.operand_local_is_ref_like(arg) {
+            return None;
+        }
+        let (Operand::Copy(place) | Operand::Move(place)) = arg else { return None };
+        let local_ty = self.body.locals().get(place.local)?.ty;
+        let target_sort = self.fixed_array_view_sort_for_ty(local_ty)?;
+        let obj_id = self.trace_deref_store_alloc_id(place.local)?;
+        let addr = Loc::of_address(
+            Expr::bitvec_const(obj_id as u64, 32).concat(Expr::bitvec_const(0u64, 32)),
+        );
+        self.try_load_fixed_array_referent_from_address(local_ty, addr, &target_sort)
+    }
+
+    /// Reinterpret only a known value's storage layout. Even a value whose
+    /// bits resemble `concat(obj_id, offset)` is data here, not an address.
+    pub(in crate::codegen_ay::chc) fn try_reinterpret_fixed_array_value(
+        &mut self,
+        arg: &Operand,
+        value: &Val,
+    ) -> Option<Val> {
         let (Operand::Copy(place) | Operand::Move(place)) = arg else {
             return None;
         };
@@ -293,19 +329,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         let local_ty = self.body.locals()[place.local].ty;
         let target_sort = self.fixed_array_view_sort_for_ty(local_ty)?;
-        // An address must be dereferenced, never bit-sliced. This runs BEFORE
-        // the width guard below, which only rejects arrays too WIDE for the
-        // pointer — `[u8; 4]` fits inside 8 pointer bytes and would otherwise be
-        // silently fabricated out of `obj_id`/`offset` bits.
-        if let Some(loaded) =
-            self.try_load_fixed_array_referent_from_address(local_ty, expr, &target_sort)
-        {
-            return Some(loaded);
-        }
-        // Guard: do not reinterpret a BV pointer as an array when the Rust
-        // array's total byte width exceeds the BV width. For example,
-        // &[u8; 65] resolves to a BV64 pointer — reinterpreting 8 pointer
-        // bytes as 65 data bytes produces a bogus comparison. Part of #1739.
+        let expr = value.as_expr();
         if let Some(src_bv_width) = expr.sort().bitvec_width() {
             if let Some(array_byte_count) = self.rust_array_byte_count(local_ty) {
                 if array_byte_count * 8 > src_bv_width as usize {
@@ -313,7 +337,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
         }
-        Self::reinterpret_fixed_layout_expr(expr, &target_sort)
+        Self::reinterpret_fixed_layout_expr(expr, &target_sort).map(Val::of_value)
+    }
+
+    fn tracked_array_referent_is_value(&self, arg: &Operand) -> bool {
+        let (Operand::Copy(place) | Operand::Move(place)) = arg else { return false };
+        let Some(target) = self.ref_resolution.ref_targets.get(&place.local) else {
+            return false;
+        };
+        let target_place = rustc_public::mir::Place {
+            local: target.local,
+            projection: target.projections.clone(),
+        };
+        let Ok(target_ty) = target_place.ty(self.body.locals()) else { return false };
+        matches!(target_ty.kind(), TyKind::RigidTy(RigidTy::Array(..)))
+            || rustc_internal::internal(self.tcx, target_ty).is_simd()
     }
 
     /// Extract the total byte count of a Rust fixed-size array type.
@@ -373,6 +411,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return Some(Expr::var(&**name, sort.clone()));
         }
         None
+    }
+
+    /// Is `arg` a reference to an enum whose every variant has no fields (so its
+    /// discriminant is its whole value)?
+    fn operand_pointee_is_fieldless_enum(&self, arg: &Operand) -> bool {
+        arg.ty(self.body.locals()).is_ok_and(|ty| self.pointee_is_fieldless_enum(ty))
+    }
+
+    /// Is `ptr_ty` a reference or raw pointer to an enum whose every variant has
+    /// no fields? Only for such an enum is a recorded discriminant the whole
+    /// referent value.
+    pub(in crate::codegen_ay::chc) fn pointee_is_fieldless_enum(
+        &self,
+        ptr_ty: rustc_public::ty::Ty,
+    ) -> bool {
+        let pointee = match self.resolve_body_ty(ptr_ty).kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => pointee,
+            _ => return false,
+        };
+        match self.resolve_body_ty(pointee).kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                def.kind() == rustc_public::ty::AdtKind::Enum
+                    && def.variants_iter().all(|variant| variant.fields().is_empty())
+            }
+            _ => false,
+        }
     }
 
     /// Resolve a call operand to its referent value through tracked refs + const refs.
@@ -441,11 +505,20 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // campaign's own whitelist: a non-address type means this term is
             // the datum; an address type means it is the operand's own pointer
             // and nothing here resolved through it.
-            let by_value_is_datum = !arg
-                .ty(self.body.locals())
-                .ok()
-                .map(|ty| self.resolve_body_ty(ty))
-                .is_some_and(mir_ty_denotes_address);
+            // `Place::ty` indexes `locals` and panics on a local outside this body
+            // (the same guard `operand_is_raw_pointer_like` carries); a local that
+            // cannot be typed is treated exactly like a type error.
+            let typeable = match arg {
+                rustc_public::mir::Operand::Copy(place)
+                | rustc_public::mir::Operand::Move(place) => place.local < self.body.locals().len(),
+                _ => true,
+            };
+            let by_value_is_datum = !(typeable
+                && arg
+                    .ty(self.body.locals())
+                    .ok()
+                    .map(|ty| self.resolve_body_ty(ty))
+                    .is_some_and(mir_ty_denotes_address));
             let tag = |expr: Expr| {
                 if by_value_is_datum {
                     Referent::Value(Val::of_value(expr))
@@ -454,25 +527,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             };
             if let Some(expr) = self.translate_operand_with_modified(arg, modified_locals) {
-                if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr)
+                if let Some(array_view) =
+                    self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
                 {
                     // A decoded fixed-array view IS the referent's storage image.
-                    return Some(Referent::Value(Val::of_value(array_view)));
+                    return Some(Referent::Value(array_view));
                 }
                 if let Some(dyn_referent) = self.try_restore_dyn_trait_referent(arg, &expr) {
                     return Some(tag(dyn_referent));
                 }
                 return Some(tag(expr));
             }
-            return Self::resolve_bare_local(
-                arg,
-                &self.state_var_mgr.state_vars,
-                &self.state_var_mgr.output_state_vars,
-                modified_locals,
-                &self.state_var_mgr.local_to_state_idx,
-                &self.fn_name,
-            )
-            .map(tag);
+            return self.bare_local_value(arg, modified_locals).map(tag);
         }
 
         // Tiers 1 .. 4.5 all resolve THROUGH the reference, so everything they
@@ -487,8 +553,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Prefer immutable static-backed seeds when the referent is a concrete
         // non-pointer value derived from a tracked static local.
         if let Some(expr) = self.resolve_static_seeded_ref_operand(arg, modified_locals) {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Value(Val::of_value(array_view)));
+            if let Some(array_view) =
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
+            {
+                return Some(Referent::Value(array_view));
             }
             if let Some(dyn_referent) = self.try_restore_dyn_trait_referent(arg, &expr) {
                 return Some(Referent::Value(Val::of_value(dyn_referent)));
@@ -512,16 +580,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && place.projection.is_empty()
             && let Some(expr) = self.ref_resolution.const_ref_values.get(&place.local).cloned()
         {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Value(Val::of_value(array_view)));
+            if let Some(array_view) =
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
+            {
+                return Some(Referent::Value(array_view));
             }
             return Some(Referent::Value(Val::of_value(expr)));
         }
 
         // Tier 1b: generic tracked ref_targets path.
         if let Some(expr) = self.resolve_ref_operand(arg, modified_locals) {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Value(Val::of_value(array_view)));
+            // A tracked target can itself be the Box/NonNull pointer datum.
+            // Only a typed array/SIMD target, or an already materialized array,
+            // establishes the referent value needed for a storage-layout view.
+            let needs_array_value = arg
+                .ty(self.body.locals())
+                .ok()
+                .and_then(|ty| self.fixed_array_view_sort_for_ty(ty))
+                .is_some();
+            if needs_array_value
+                && !expr.sort().is_array()
+                && !self.tracked_array_referent_is_value(arg)
+            {
+                // Only a whole-target decoded value names this referent. A
+                // projected target's parent constant is not the field value.
+                if let Operand::Copy(place) | Operand::Move(place) = arg
+                    && let Some(target) = self.ref_resolution.ref_targets.get(&place.local)
+                    && target.projections.is_empty()
+                    && let Some(value) =
+                        self.ref_resolution.const_ref_values.get(&target.local).cloned()
+                {
+                    return Some(Referent::Value(Val::of_value(value)));
+                }
+                return Some(Referent::Unreported(expr));
+            }
+            if let Some(array_view) =
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
+            {
+                return Some(Referent::Value(array_view));
             }
             if let Some(dyn_referent) = self.try_restore_dyn_trait_referent(arg, &expr) {
                 return Some(Referent::Value(Val::of_value(dyn_referent)));
@@ -580,14 +676,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && place.projection.is_empty()
             && let Some(expr) = self.ref_resolution.const_ref_values.get(&place.local).cloned()
         {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Value(Val::of_value(array_view)));
+            if let Some(array_view) =
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
+            {
+                return Some(Referent::Value(array_view));
             }
             return Some(Referent::Value(Val::of_value(expr)));
         }
         // Tier 3: const_ref_discriminants — resolves promoted unit-enum refs.
+        //
+        // The table also records the TAG of a promoted payload-carrying enum
+        // (`&Some([1, 2])`, for `Discriminant(*_r)` readers). For such an enum
+        // the tag is not the referent: handed back as the referent's datum it
+        // lost the payload, the inline walker decoded an Option out of the bare
+        // tag, and `Some([1, 2]) == Some([1, 2])` folded to false — proving
+        // `!(o == Some([1, 2]))` under --ay-chc
+        // (tools/soundness-duals/negative/review_r22_option_aggregate_payload.rs).
+        // Only an enum whose every variant is fieldless is its tag.
         if let Operand::Copy(place) | Operand::Move(place) = arg
             && place.projection.is_empty()
+            && self.operand_pointee_is_fieldless_enum(arg)
             && let Some(discriminant) =
                 self.ref_resolution.const_ref_discriminants.get(&place.local)
         {
@@ -607,8 +715,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             && let Some(expr) =
                 self.ref_resolution.static_ref_value_seeds.get(&static_vec_idx).cloned()
         {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Value(Val::of_value(array_view)));
+            if let Some(array_view) =
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(expr.clone()))
+            {
+                return Some(Referent::Value(array_view));
             }
             if let Some(dyn_referent) = self.try_restore_dyn_trait_referent(arg, &expr) {
                 return Some(Referent::Value(Val::of_value(dyn_referent)));
@@ -656,9 +766,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Expr::var(&**in_name, in_sort.clone())
             };
             if let Some(array_view) =
-                self.try_reinterpret_fixed_array_view_referent(arg, &pointee_expr)
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(pointee_expr.clone()))
             {
-                return Some(Referent::Value(Val::of_value(array_view)));
+                return Some(Referent::Value(array_view));
             }
             return Some(Referent::Value(Val::of_value(pointee_expr)));
         }
@@ -701,9 +811,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 Expr::var(&**in_name, in_sort.clone())
             };
             if let Some(array_view) =
-                self.try_reinterpret_fixed_array_view_referent(arg, &pointee_expr)
+                self.try_reinterpret_fixed_array_value(arg, &Val::of_value(pointee_expr.clone()))
             {
-                return Some(Referent::Value(Val::of_value(array_view)));
+                return Some(Referent::Value(array_view));
             }
             return Some(Referent::Value(Val::of_value(pointee_expr)));
         }
@@ -738,24 +848,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // about it: `Referent::Unreported`.
         // Tier 5: direct operand translation (may return pointer BV for refs)
         if let Some(expr) = self.translate_operand_with_modified(arg, modified_locals) {
-            if let Some(array_view) = self.try_reinterpret_fixed_array_view_referent(arg, &expr) {
-                return Some(Referent::Unreported(array_view));
-            }
+            // Unknown reference terms must not become arrays by slicing their
+            // bits. A traced address was loaded above; a known value was
+            // handled by the earlier value-producing tiers.
             if let Some(dyn_referent) = self.try_restore_dyn_trait_referent(arg, &expr) {
                 return Some(Referent::Unreported(dyn_referent));
             }
             return Some(Referent::Unreported(expr));
         }
         // Tier 6: bare local state variable
-        Self::resolve_bare_local(
-            arg,
-            &self.state_var_mgr.state_vars,
-            &self.state_var_mgr.output_state_vars,
-            modified_locals,
-            &self.state_var_mgr.local_to_state_idx,
-            &self.fn_name,
-        )
-        .map(Referent::Unreported)
+        self.bare_local_value(arg, modified_locals).map(Referent::Unreported)
     }
 }
 // Array-chain resolution + raw_eq referent moved to referent_resolve_chain.rs per #4206.

@@ -217,12 +217,19 @@ fn test_store_memory_bytes_int_sort_tracks_symbolically() {
         let addr = Expr::bitvec_const(0u128, POINTER_WIDTH);
         let int_val = Expr::int_const(42);
         let mem_before = ctx.memory().clone();
-        ctx.store_memory_bytes(addr, int_val);
-        // Int values are tracked symbolically — memory array is NOT updated
+        ctx.store_memory_bytes(addr.clone(), int_val);
+        // Int values are tracked symbolically: no byte of the value is written.
+        // Byte memory is REPLACED by a fresh array, so a later byte read of the
+        // object cannot see stale bytes (a static's initializer, a stack
+        // local's materialized bytes).
         let mem_after = ctx.memory().clone();
-        assert_eq!(
+        assert_ne!(
             mem_before, mem_after,
-            "Int sort should be stored symbolically, not in byte memory"
+            "a symbolic store must not leave byte memory holding stale bytes"
+        );
+        assert!(
+            ctx.load_symbolic_memory_value(addr).is_some(),
+            "the Int value stays recoverable at its address"
         );
     });
 }
@@ -235,11 +242,15 @@ fn test_store_memory_bytes_array_sort_tracks_symbolically() {
         let arr_sort = Sort::array(Sort::bitvec(POINTER_WIDTH), Sort::bitvec(8));
         let arr_val = ctx.declare_var("test_arr", arr_sort);
         let mem_before = ctx.memory().clone();
-        ctx.store_memory_bytes(addr, arr_val);
+        ctx.store_memory_bytes(addr.clone(), arr_val);
         let mem_after = ctx.memory().clone();
-        assert_eq!(
+        assert_ne!(
             mem_before, mem_after,
-            "Array sort should be stored symbolically, not in byte memory"
+            "a symbolic Array store must replace byte memory rather than keep stale bytes"
+        );
+        assert!(
+            ctx.load_symbolic_memory_value(addr).is_some(),
+            "the Array value stays recoverable at its address"
         );
     });
 }

@@ -4,7 +4,7 @@
 //
 // Unit tests for chc/codegen_types_adt.rs and chc/codegen_types_adt_sort.rs.
 // Covers: nth_type_arg, translate_type_arg_sort_or_param_bv, translate_adt_ty,
-// translate_into_iter_sort, translate_adt_sort, resolve_generic_ty,
+// translate_into_iter_sort, translate_adt_sort, mono_ty::field_ty,
 // adt_sort_name, is_opaque_alloc_infra.
 // Part of #2341: CHC zero-coverage remediation.
 
@@ -15,6 +15,8 @@ use super::super::{
     codegen_types_adt::CodegenTypesAdt, codegen_types_adt_sort::CodegenTypesAdtSort,
 };
 use super::common::*;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 mod test_types_adt_into_iter;
 
@@ -459,23 +461,23 @@ fn test_translate_adt_ty_infallible_produces_bool() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let sig = fn_sig_by_suffix(ctx.tcx, "probe_infallible");
         let ty = sig.inputs()[0];
-        if let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() {
-            let sort = ChcCtx::translate_adt_ty(def, args);
-            assert!(sort.is_some(), "Infallible should translate");
-            let sort = sort.unwrap();
-            assert!(sort.is_bool(), "Infallible should be Bool (uninhabited ZST)");
-        } else {
-            panic!("Infallible should be an ADT type");
+        let sort = match ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => ChcCtx::translate_adt_ty(def, args),
+            // Native core's alias to ! must take the Never translation rule.
+            TyKind::RigidTy(RigidTy::Never) => ChcCtx::translate_ty(ty),
+            other => panic!("Infallible must remain uninhabited: {other:?}"),
         }
+        .expect("Infallible should translate");
+        assert!(sort.is_bool(), "Infallible should be Bool (uninhabited ZST)");
     });
 }
 
 // =============================================================================
-// codegen_types_adt_sort.rs — resolve_generic_ty, adt_sort_name
+// Rule A (`shared::mono_ty::field_ty`), adt_sort_name
 // =============================================================================
 
 #[test]
-fn test_resolve_generic_ty_concrete_type_passes_through() {
+fn test_field_ty_instantiates_a_param_field() {
     const SOURCE: &str = r#"
         #![allow(dead_code)]
         pub struct Wrapper<T> { pub inner: T }
@@ -488,9 +490,8 @@ fn test_resolve_generic_ty_concrete_type_passes_through() {
             // The field type of `inner` after monomorphization should be u32
             let variants = def.variants();
             let field = &variants[0].fields()[0];
-            let field_ty = field.ty();
-            let resolved = ChcCtx::resolve_generic_ty(field_ty, &args);
-            assert!(resolved.is_some(), "concrete field type should resolve");
+            let resolved = crate::codegen_ay::shared::mono_ty::field_ty(field, &args);
+            assert!(resolved.is_some(), "the field type should instantiate");
             let resolved = resolved.unwrap();
             let sort = ChcCtx::translate_ty(resolved);
             assert!(sort.is_some());
@@ -542,7 +543,8 @@ fn test_adt_sort_name_erases_nested_lifetime_names_in_type_args() {
 
         let outer_name = ChcCtx::adt_sort_name(def, &args);
         assert_eq!(
-            outer_name, "Outer_Inner",
+            crate::codegen_ay::test_support::local_sort_name(&outer_name),
+            "Outer_Inner",
             "outer sort name should not leak nested lifetime names"
         );
 
@@ -555,7 +557,8 @@ fn test_adt_sort_name_erases_nested_lifetime_names_in_type_args() {
 
         let inner_name = ChcCtx::adt_sort_name(inner_def, &inner_args);
         assert_eq!(
-            inner_name, "Inner_lt",
+            crate::codegen_ay::test_support::local_sort_name(&inner_name),
+            "Inner_lt",
             "direct lifetime generic args should keep the canonical lt marker"
         );
     });
@@ -780,11 +783,11 @@ fn test_translate_adt_sort_struct_with_fields() {
 }
 
 // =============================================================================
-// Gap 3: codegen_types_adt_sort.rs — resolve_generic_ty Param resolution
+// Gap 3: Rule A (`shared::mono_ty::field_ty`) Param resolution
 // =============================================================================
 
 #[test]
-fn test_resolve_generic_ty_param_resolves_via_args() {
+fn test_field_ty_param_resolves_via_args() {
     // Test that a Param type in a generic struct field resolves to the concrete type
     // when GenericArgs carries the substitution.
     const SOURCE: &str = r#"
@@ -798,10 +801,9 @@ fn test_resolve_generic_ty_param_resolves_via_args() {
         if let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() {
             let variants = def.variants();
             let field = &variants[0].fields()[0]; // item: T
-            let field_ty = field.ty();
 
-            // resolve_generic_ty should resolve the Param to u64
-            let resolved = ChcCtx::resolve_generic_ty(field_ty, &args);
+            // field_ty instantiates T at the ADT's argument u64
+            let resolved = crate::codegen_ay::shared::mono_ty::field_ty(field, &args);
             assert!(resolved.is_some(), "Param T should resolve to u64");
             let resolved = resolved.unwrap();
             let sort = ChcCtx::translate_ty(resolved);
@@ -818,25 +820,27 @@ fn test_resolve_generic_ty_param_resolves_via_args() {
 }
 
 #[test]
-fn test_resolve_generic_ty_out_of_range_param_returns_none() {
-    // If GenericArgs doesn't have enough entries for a Param index, returns None
+fn test_field_ty_refuses_args_that_do_not_fit() {
+    // Arguments that do not supply the field's parameter refuse (None); rustc's
+    // own instantiation would panic ("type parameter out of range").
     const SOURCE: &str = r#"
         #![allow(dead_code)]
-        pub struct Simple { pub val: u32 }
-        pub fn probe_simple(s: Simple) -> Simple { s }
+        pub struct Container<T> { pub item: T, pub count: u32 }
+        pub fn probe_container(c: Container<u64>) -> Container<u64> { c }
     "#;
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
-        let sig = fn_sig_by_suffix(ctx.tcx, "probe_simple");
+        let sig = fn_sig_by_suffix(ctx.tcx, "probe_container");
         let ty = sig.inputs()[0];
-        if let TyKind::RigidTy(RigidTy::Adt(_, args)) = ty.kind() {
-            // Simple has no generic params, so args is empty
-            // A non-param type should still pass through
-            let u32_ty = sig.inputs()[0]; // u32 is non-param, passes through
-            let resolved = ChcCtx::resolve_generic_ty(u32_ty, &args);
-            // Non-Param types are passed through unchanged
-            assert!(resolved.is_some(), "non-Param type should pass through");
+        if let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() {
+            let variants = def.variants();
+            let no_args = rustc_public::ty::GenericArgs(vec![]);
+            let item = &variants[0].fields()[0]; // item: T
+            let count = &variants[0].fields()[1]; // count: u32
+            assert!(crate::codegen_ay::shared::mono_ty::field_ty(item, &no_args).is_none());
+            // A field that names no parameter needs none.
+            assert!(crate::codegen_ay::shared::mono_ty::field_ty(count, &no_args).is_some());
         } else {
-            panic!("Simple should be an ADT type");
+            panic!("Container should be an ADT type");
         }
     });
 }
@@ -929,7 +933,8 @@ fn test_translate_adt_sort_union_returns_bitvec() {
 /// A `#[repr(simd)]` struct with generic array field `[T; N]` must produce
 /// a Datatype sort containing an Array field, not fall through to BV32.
 /// This was the root cause of 3 unsound fallbacks in SIMD compiletest
-/// harnesses: `resolve_generic_ty` only resolved top-level Param types,
+/// harnesses: the shallow field-type substitution this lane used before Rule A
+/// (`shared::mono_ty::field_ty`) resolved only top-level Param types,
 /// missing params nested inside Array elem types.
 #[test]
 fn test_repr_simd_generic_array_field_produces_datatype_with_array_sort() {

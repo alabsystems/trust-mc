@@ -117,24 +117,41 @@ impl LayoutOf {
     ///
     /// REQUIRES: self.ty has valid layout
     /// ENSURES: self.is_sized() implies return == self.layout.size.bytes()
+    ///
+    /// # Panics
+    /// Panics when [`LayoutOf::try_size_of_head`] reports the layout malformed (see
+    /// [`HeadSizeError`]). Callers that can surface an error use that method instead.
     pub fn size_of_head(&self) -> usize {
+        match self.try_size_of_head() {
+            Ok(size) => size,
+            Err(err) => panic!("size_of_head: {err} for `{}`", self.ty),
+        }
+    }
+
+    /// Return the size of the sized portion of this type, or why it cannot be measured.
+    ///
+    /// The total form of [`LayoutOf::size_of_head`]: a layout that violates rustc's
+    /// invariants (an unsized type of a kind that carries no unsized tail, an unsized
+    /// struct or tuple without arbitrary field offsets, or a tail offset whose sum with the
+    /// tail's head size leaves `usize`) is reported, never wrapped or assumed away.
+    ///
+    /// ENSURES: self.is_sized() implies return == Ok(self.layout.size.bytes())
+    pub fn try_size_of_head(&self) -> Result<usize, HeadSizeError> {
         if self.is_sized() {
-            self.layout.size.bytes()
-        } else {
-            match self.ty.kind().rigid().expect("should be monomorphized") {
-                RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) | RigidTy::Foreign(..) => 0,
-                RigidTy::Adt(..) | RigidTy::Tuple(..) => {
-                    let fields_sorted = self.layout.fields.fields_by_offset_order();
-                    let last = *fields_sorted.last().expect("fields should not be empty");
-                    let FieldsShape::Arbitrary { ref offsets } = self.layout.fields else {
-                        unreachable!("ADT and tuple types must have FieldsShape::Arbitrary layout")
-                    };
-                    let unsized_offset_unadjusted = offsets[last].bytes();
-                    debug!(ty=?self.ty, ?unsized_offset_unadjusted, "size_of_sized_portion");
-                    unsized_offset_unadjusted + self.last_field_layout().size_of_head()
-                }
-                _ => unreachable!("Expected sized type, but found: `{}`", self.ty), // external enum: FieldsShape
+            return Ok(self.layout.size.bytes());
+        }
+        match self.ty.kind().rigid() {
+            None => Err(HeadSizeError::NotMonomorphized),
+            Some(
+                RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) | RigidTy::Foreign(..),
+            ) => Ok(0),
+            Some(RigidTy::Adt(..) | RigidTy::Tuple(..)) => {
+                let unsized_offset_unadjusted = unsized_tail_offset(&self.layout.fields)?;
+                debug!(ty=?self.ty, ?unsized_offset_unadjusted, "size_of_sized_portion");
+                let tail_head = self.last_field_layout().try_size_of_head()?;
+                head_size_with_tail(unsized_offset_unadjusted, tail_head)
             }
+            Some(_) => Err(HeadSizeError::UnexpectedUnsizedKind), // external enum: RigidTy
         }
     }
 
@@ -264,29 +281,117 @@ impl LayoutOf {
     }
 }
 
+/// Why [`LayoutOf::try_size_of_head`] could not measure the sized head of a type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadSizeError {
+    /// The type is not rigid: it was not monomorphized.
+    NotMonomorphized,
+    /// The type is unsized but of a kind that carries no unsized tail.
+    UnexpectedUnsizedKind,
+    /// An unsized struct or tuple whose layout has no `FieldsShape::Arbitrary` offsets.
+    NonArbitraryFields,
+    /// An unsized struct or tuple whose layout lists no field to hold the unsized tail.
+    NoFields,
+    /// The tail field's offset plus the tail's head size does not fit in `usize`.
+    Overflow,
+}
+
+impl std::fmt::Display for HeadSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HeadSizeError::NotMonomorphized => "type should be monomorphized",
+            HeadSizeError::UnexpectedUnsizedKind => "expected a type with an unsized tail",
+            HeadSizeError::NonArbitraryFields => {
+                "ADT and tuple types must have FieldsShape::Arbitrary layout"
+            }
+            HeadSizeError::NoFields => "fields should not be empty",
+            HeadSizeError::Overflow => "head size overflows usize",
+        })
+    }
+}
+
+impl std::error::Error for HeadSizeError {}
+
+/// Byte offset of the field that holds the unsized tail: the last field in offset order.
+fn unsized_tail_offset(fields: &FieldsShape) -> Result<usize, HeadSizeError> {
+    let FieldsShape::Arbitrary { offsets } = fields else {
+        return Err(HeadSizeError::NonArbitraryFields);
+    };
+    let last = fields.fields_by_offset_order().last().copied().ok_or(HeadSizeError::NoFields)?;
+    offsets.get(last).map(|offset| offset.bytes()).ok_or(HeadSizeError::NoFields)
+}
+
+/// Head size of an unsized aggregate: the tail field's offset plus the tail's own head size.
+fn head_size_with_tail(tail_offset: usize, tail_head: usize) -> Result<usize, HeadSizeError> {
+    tail_offset.checked_add(tail_head).ok_or(HeadSizeError::Overflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustc_public::abi::{FieldsShape, ValueAbi, VariantsShape};
+    use rustc_public::abi::{FieldsShape, VariantsShape};
     use rustc_public::target::MachineSize;
     use rustc_public::ty::VariantIdx;
     use rustc_public_bridge::IndexedVal;
 
+    // The two measured Trust endpoints (docs/DECISION_QUEUE.md, "Preserve both
+    // native compiler API endpoints") name a layout's backend representation
+    // differently: the 1.101 seal calls the enum `ValueRepr` and the field
+    // `value_repr`, the 1.99 seal `ValueAbi` and `abi`. The variants these tests
+    // build (`Scalar`, `Aggregate`) are the same on both.
+    #[cfg(not(version("1.101")))]
+    use rustc_public::abi::ValueAbi as ValueRepr;
+    #[cfg(version("1.101"))]
+    use rustc_public::abi::ValueRepr;
+
+    /// Helper: a single-variant layout with the given fields, representation,
+    /// alignment and size.
+    #[cfg(version("1.101"))]
+    fn single_variant_layout(
+        fields: FieldsShape,
+        value_repr: ValueRepr,
+        abi_align: u64,
+        size: MachineSize,
+    ) -> LayoutShape {
+        LayoutShape {
+            fields,
+            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
+            value_repr,
+            abi_align,
+            size,
+        }
+    }
+
+    #[cfg(not(version("1.101")))]
+    fn single_variant_layout(
+        fields: FieldsShape,
+        value_repr: ValueRepr,
+        abi_align: u64,
+        size: MachineSize,
+    ) -> LayoutShape {
+        LayoutShape {
+            fields,
+            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
+            abi: value_repr,
+            abi_align,
+            size,
+        }
+    }
+
     /// Helper: sized scalar layout (e.g. u32 = 32 bits, align 4)
     fn sized_scalar_layout(size_bytes: usize, align: u64) -> LayoutShape {
-        LayoutShape {
-            fields: FieldsShape::Primitive,
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Scalar(rustc_public::abi::Scalar::Initialized {
+        single_variant_layout(
+            FieldsShape::Primitive,
+            ValueRepr::Scalar(rustc_public::abi::Scalar::Initialized {
                 value: rustc_public::abi::Primitive::Int {
                     length: rustc_public::abi::IntegerLength::I32,
                     signed: false,
                 },
                 valid_range: rustc_public::abi::WrappingRange { start: 0, end: u32::MAX as u128 },
             }),
-            abi_align: align,
-            size: MachineSize::from_bits(size_bytes * 8),
-        }
+            align,
+            MachineSize::from_bits(size_bytes * 8),
+        )
     }
 
     /// Helper: sized aggregate layout (struct/tuple with field offsets)
@@ -295,26 +400,24 @@ mod tests {
         total_size_bytes: usize,
         align: u64,
     ) -> LayoutShape {
-        LayoutShape {
-            fields: FieldsShape::Arbitrary {
+        single_variant_layout(
+            FieldsShape::Arbitrary {
                 offsets: offsets.into_iter().map(|o| MachineSize::from_bits(o * 8)).collect(),
             },
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Aggregate { sized: true },
-            abi_align: align,
-            size: MachineSize::from_bits(total_size_bytes * 8),
-        }
+            ValueRepr::Aggregate { sized: true },
+            align,
+            MachineSize::from_bits(total_size_bytes * 8),
+        )
     }
 
     /// Helper: unsized aggregate layout
     fn unsized_aggregate_layout() -> LayoutShape {
-        LayoutShape {
-            fields: FieldsShape::Primitive,
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Aggregate { sized: false },
-            abi_align: 1,
-            size: MachineSize::from_bits(0),
-        }
+        single_variant_layout(
+            FieldsShape::Primitive,
+            ValueRepr::Aggregate { sized: false },
+            1,
+            MachineSize::from_bits(0),
+        )
     }
 
     #[test]
@@ -355,13 +458,12 @@ mod tests {
 
     #[test]
     fn test_size_of_zero_sized() {
-        let zst = LayoutShape {
-            fields: FieldsShape::Primitive,
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Aggregate { sized: true },
-            abi_align: 1,
-            size: MachineSize::from_bits(0),
-        };
+        let zst = single_variant_layout(
+            FieldsShape::Primitive,
+            ValueRepr::Aggregate { sized: true },
+            1,
+            MachineSize::from_bits(0),
+        );
         let layout = LayoutOf::new_for_test(zst);
         assert_eq!(layout.size_of(), Some(0));
     }
@@ -422,6 +524,46 @@ mod tests {
         assert_eq!(layout.size_of_head(), 12);
     }
 
+    #[test]
+    fn test_try_size_of_head_sized_matches_size_of_head() {
+        let layout = LayoutOf::new_for_test(sized_struct_layout(vec![0, 4, 8], 12, 4));
+        assert_eq!(layout.try_size_of_head(), Ok(12));
+    }
+
+    /// Regression: the unsized head size was `offset + tail_head` unchecked, so a
+    /// malformed layout wrapped silently in release builds instead of being reported.
+    #[test]
+    fn test_head_size_with_tail_reports_overflow() {
+        assert_eq!(head_size_with_tail(usize::MAX, 1), Err(HeadSizeError::Overflow));
+        assert_eq!(head_size_with_tail(1, usize::MAX), Err(HeadSizeError::Overflow));
+        assert_eq!(head_size_with_tail(usize::MAX, 0), Ok(usize::MAX));
+        assert_eq!(head_size_with_tail(16, 8), Ok(24));
+    }
+
+    #[test]
+    fn test_unsized_tail_offset_is_last_field_by_offset() {
+        let fields = FieldsShape::Arbitrary {
+            offsets: [8usize, 0, 16, 4]
+                .into_iter()
+                .map(|o| MachineSize::from_bits(o * 8))
+                .collect(),
+        };
+        assert_eq!(unsized_tail_offset(&fields), Ok(16));
+    }
+
+    /// Regression: a non-`Arbitrary` or empty field shape reached `unreachable!` / `expect`.
+    #[test]
+    fn test_unsized_tail_offset_rejects_malformed_fields() {
+        assert_eq!(
+            unsized_tail_offset(&FieldsShape::Primitive),
+            Err(HeadSizeError::NonArbitraryFields)
+        );
+        assert_eq!(
+            unsized_tail_offset(&FieldsShape::Arbitrary { offsets: Vec::new() }),
+            Err(HeadSizeError::NoFields)
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_align_of_head_sized() {
@@ -476,26 +618,24 @@ mod tests {
 
     #[test]
     fn test_field_offset_union_returns_none() {
-        let union_layout = LayoutShape {
-            fields: FieldsShape::Union(std::num::NonZero::new(3).expect("non-zero")),
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Aggregate { sized: true },
-            abi_align: 4,
-            size: MachineSize::from_bits(32),
-        };
+        let union_layout = single_variant_layout(
+            FieldsShape::Union(std::num::NonZero::new(3).expect("non-zero")),
+            ValueRepr::Aggregate { sized: true },
+            4,
+            MachineSize::from_bits(32),
+        );
         let layout = LayoutOf::new_for_test(union_layout);
         assert_eq!(layout.field_offset(0), None);
     }
 
     #[test]
     fn test_field_offset_array_returns_none() {
-        let array_layout = LayoutShape {
-            fields: FieldsShape::Array { stride: MachineSize::from_bits(32), count: 10 },
-            variants: VariantsShape::Single { index: VariantIdx::to_val(0) },
-            abi: ValueAbi::Aggregate { sized: true },
-            abi_align: 4,
-            size: MachineSize::from_bits(320),
-        };
+        let array_layout = single_variant_layout(
+            FieldsShape::Array { stride: MachineSize::from_bits(32), count: 10 },
+            ValueRepr::Aggregate { sized: true },
+            4,
+            MachineSize::from_bits(320),
+        );
         let layout = LayoutOf::new_for_test(array_layout);
         assert_eq!(layout.field_offset(0), None);
     }

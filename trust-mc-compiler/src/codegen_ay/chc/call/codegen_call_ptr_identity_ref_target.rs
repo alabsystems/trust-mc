@@ -130,6 +130,7 @@ fn trace_pointer_identity_stmt_ref_target(
     match rhs {
         Rvalue::Use(
             rustc_public::mir::Operand::Copy(place) | rustc_public::mir::Operand::Move(place),
+            ..,
         )
         | Rvalue::Cast(
             _,

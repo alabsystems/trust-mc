@@ -25,17 +25,17 @@ use crate::ay_parse::{
     apply_kani_property_naming, build_cover_properties_from_sat_checks,
     build_coverage_results_from_sat_checks, build_success_properties,
     build_undetermined_properties, determine_failed_from_properties, load_vc_artifact,
-    parse_cover_properties, parse_cover_sat_check_output, parse_coverage_results,
-    parse_kani_any_trace, parse_solver_output, parse_violation_entry_names,
-    parse_violation_properties, vc_artifact_path_for_smt,
+    parse_cover_sat_check_output, parse_coverage_results, parse_kani_any_trace,
+    parse_solver_output, parse_violation_entry_names, parse_violation_properties,
+    vc_artifact_path_for_smt,
 };
 use crate::coverage::cov_results::CoverageResults;
-use crate::deadline::Deadline;
-use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation};
+use crate::deadline::{Deadline, MIN_USEFUL_STAGE_BUDGET};
+use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation, TraceItem};
 use crate::session::{KaniSession, run_piped_with_timeout};
 use crate::smt_io::{
-    SmtLogicClass, build_cover_sat_query, build_harness_reachability_query,
-    classify_smt_logic_from_content, content_uses_horn_logic,
+    SmtLogicClass, build_cover_sat_query, build_cover_witness_query,
+    build_harness_reachability_query, classify_smt_logic_from_content, content_uses_horn_logic,
     extract_cover_declarations_from_content, extract_coverage_declarations_from_content,
     extract_reach_declarations_from_content, extract_violation_declarations_from_content,
 };
@@ -48,6 +48,19 @@ use crate::verification_result::{
 /// This prevents runaway solver processes from consuming unbounded memory.
 /// Can be overridden with --harness-timeout.
 const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 120;
+
+/// One secondary query's answer and its own input model.
+#[derive(Clone)]
+struct SatProbeResult {
+    status: Option<bool>,
+    trace: Option<Vec<TraceItem>>,
+}
+
+impl SatProbeResult {
+    fn unknown() -> Self {
+        Self { status: None, trace: None }
+    }
+}
 
 use crate::args::Timeout;
 
@@ -63,6 +76,17 @@ pub(crate) fn solver_timeout_duration(harness_timeout: Option<Timeout>) -> Durat
 
 fn solver_error_is_timeout(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.to_string().contains(" timed out after "))
+}
+
+/// A solver subprocess that was never started because the budget was
+/// already spent: `session::process` refuses a zero-budget spawn with
+/// `BUDGET_EXHAUSTED_BEFORE_SPAWN`, and `try_ay_solver` bails with the same
+/// phrase when the per-harness deadline has less than a stage's useful floor
+/// left. The refusal keeps the `timed out after` wording for outer consumers,
+/// so a call site that tells the two apart must consult THIS first.
+fn solver_error_is_budget_exhausted(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains(crate::session::BUDGET_EXHAUSTED_BEFORE_SPAWN))
 }
 
 /// ay's per-command rejections of the query the encoder emitted.
@@ -129,7 +153,184 @@ fn native_chc_error_allows_external_proof_fallback(err: &anyhow::Error) -> bool 
     })
 }
 
+/// What `run_ay` decided about the external-ay proof fallback after a native
+/// CHC UNKNOWN. Printed as `[AY:EXTERNAL_AY_FALLBACK:<label>]` (plus
+/// `:proved` / `:unproved` / `:error` after an attempt) so a corpus run can
+/// count how often the fallback runs and how often it converts.
+#[cfg(feature = "ay-chc-native")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalFallbackDisposition {
+    /// The native failure is not one the fallback may retry (a rejected
+    /// false proof, a parse error, a pre-solve deadline bail, ...).
+    NotEligible,
+    /// Eligible, but the native UNKNOWN was budget-bound (`Timeout`,
+    /// `BudgetExhausted`, ...): a second engine under the remainder of the
+    /// same deadline cannot buy the budget back, so it is not started.
+    SkippedBudgetBound,
+    /// Eligible and capability-bound, but less than the useful floor of the
+    /// per-harness deadline is left.
+    SkippedBudgetExhausted,
+    /// `TRUST_MC_EXTERNAL_AY_FALLBACK=never`: the measurement counterfactual.
+    SkippedDisabled,
+    /// Attempt, with this much of the per-harness deadline.
+    Attempt(Duration),
+}
+
+#[cfg(feature = "ay-chc-native")]
+impl ExternalFallbackDisposition {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NotEligible => "not-eligible",
+            Self::SkippedBudgetBound => "skipped-budget-bound",
+            Self::SkippedBudgetExhausted => "skipped-budget-exhausted",
+            Self::SkippedDisabled => "skipped-disabled",
+            Self::Attempt(_) => "attempted",
+        }
+    }
+}
+
+/// `TRUST_MC_EXTERNAL_AY_FALLBACK`: `skip-budget-bound` (the default — do not
+/// retry a budget-bound native UNKNOWN: `Timeout`, `BudgetExhausted`, ...),
+/// `always` (retry every eligible native UNKNOWN that has budget left,
+/// budget-bound ones included), `never`. Anything else reads as the default.
+///
+/// `skip-budget-bound` is the default because this retry was MEASURED, over
+/// the 1280 retained per-unit logs (ay CLI `45cc58c69`, corpus `4c0fce8c30`,
+/// `--harness-timeout=15s`, 2026-09-18), to spend wall clock it cannot turn
+/// into parity. 280 attempts: 238 budget-bound `Timeout` UNKNOWNs unproved
+/// for 3466.3s, 34 capability-bound `SolverError` unproved for 496.9s, and 8
+/// proved — all 8 from a budget-bound `Timeout`, i.e. exactly what this
+/// policy now skips.
+///
+/// Skipping them loses no parity row, because every proof THIS path can
+/// produce is unattributed by construction: it returns one anonymous
+/// `chc.0` property (`chc::external::try_ay_chc_external_proof_fallback`),
+/// which is precisely what `Property::is_unattributed_chc_check` matches, so
+/// `harness_runner::unattributed_chc_check_qualifier` fires and scorer v5
+/// files the unit `unattributed_pass` — outside parity, inside the
+/// denominator. Measured on those 8: the 3 units they rescued scored
+/// `unattributed_pass` and 2 stayed `unknown` anyway, while the same units
+/// are `parity` on the paired `origin/main` bundle, proved NATIVELY with no
+/// retry at all. On that bundle the retry converted 0 of 96 attempts for
+/// 1375.9s of 6325.0s of summed per-unit wall.
+///
+/// It is also fail-closed: skipping can only turn a SUCCESS into an honest
+/// UNKNOWN, never mint a proof, and it withdraws the retry from 27
+/// fail-oracle attempts per corpus pair where an external success would have
+/// scored `missed_bug`.
+///
+/// The capability-bound (`SolverError`) retries are deliberately KEPT, even
+/// though they converted 0 of 34 for 496.9s in that measurement. That count is
+/// at ay `45cc58c69`; the pin then moved to `7bb59d28b7`, whose change is the
+/// acyclic-probe grant reserve — i.e. precisely the capability profile that
+/// decides whether a differently configured external run can settle what the
+/// in-process lane could not. A 0/34 at the old pin is not evidence about the
+/// new one, and 496.9s is cheap insurance against a capability gap nobody has
+/// characterised at this pin. Do NOT widen this skip to the capability-bound
+/// class, or move the default to `never`, without conversion counts measured
+/// AT the current pin (coordinator decision, 2026-09-18).
+///
+/// The note this replaces cited `smack/structures/point.rs` as a verdict the
+/// skip costs. That unit's retained log (2026-09-14, ay `501caafdf`) shows a
+/// NATIVE `[AY:PROOF]` with `PROOF_QUALIFIERS:clean` and no fallback marker
+/// at all; the external-ay proofs in that artifact scored `parity` only
+/// because scorer v2/v3 did not read qualifiers.
+///
+/// Set `always` to restore the retry — and flip this default back if the
+/// external path ever ATTRIBUTES its checks, because then those 3466.3s
+/// would be buying something. The disposition markers keep counting either
+/// way.
+#[cfg(feature = "ay-chc-native")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalFallbackPolicy {
+    Always,
+    SkipBudgetBound,
+    Never,
+}
+
+/// The env mapping, kept pure so the DEFAULT is testable without touching the
+/// process environment (a test that sets a var races every other test in the
+/// binary). Anything unrecognised reads as the default rather than as
+/// `always`: a typo must not silently restore the phase this measured off.
+#[cfg(feature = "ay-chc-native")]
+fn external_fallback_policy_from_value(value: Option<&str>) -> ExternalFallbackPolicy {
+    match value {
+        Some("always") => ExternalFallbackPolicy::Always,
+        Some("never") | Some("off") | Some("0") => ExternalFallbackPolicy::Never,
+        _ => ExternalFallbackPolicy::SkipBudgetBound,
+    }
+}
+
+#[cfg(feature = "ay-chc-native")]
+fn external_fallback_policy_from_env() -> ExternalFallbackPolicy {
+    let raw = std::env::var("TRUST_MC_EXTERNAL_AY_FALLBACK").ok();
+    external_fallback_policy_from_value(raw.as_deref().map(str::trim))
+}
+
+/// The `skip-budget-bound` disposition: pure, so the gate is testable without
+/// a solver. `eligible` is `native_chc_error_allows_external_proof_fallback`;
+/// `budget` is `Deadline::stage_budget` for one per-call timeout.
+#[cfg(feature = "ay-chc-native")]
+fn external_fallback_disposition(
+    eligible: bool,
+    native_reason: SolverUnknownReason,
+    budget: Option<Duration>,
+) -> ExternalFallbackDisposition {
+    if !eligible {
+        return ExternalFallbackDisposition::NotEligible;
+    }
+    if native_reason.is_budget_bound() {
+        return ExternalFallbackDisposition::SkippedBudgetBound;
+    }
+    match budget {
+        Some(budget) => ExternalFallbackDisposition::Attempt(budget),
+        None => ExternalFallbackDisposition::SkippedBudgetExhausted,
+    }
+}
+
+#[cfg(feature = "ay-chc-native")]
+fn external_fallback_disposition_with_policy(
+    policy: ExternalFallbackPolicy,
+    eligible: bool,
+    native_reason: SolverUnknownReason,
+    budget: Option<Duration>,
+) -> ExternalFallbackDisposition {
+    match policy {
+        ExternalFallbackPolicy::SkipBudgetBound => {
+            external_fallback_disposition(eligible, native_reason, budget)
+        }
+        ExternalFallbackPolicy::Never => ExternalFallbackDisposition::SkippedDisabled,
+        ExternalFallbackPolicy::Always => {
+            if !eligible {
+                ExternalFallbackDisposition::NotEligible
+            } else {
+                match budget {
+                    Some(budget) => ExternalFallbackDisposition::Attempt(budget),
+                    None => ExternalFallbackDisposition::SkippedBudgetExhausted,
+                }
+            }
+        }
+    }
+}
+
+/// `[AY:EXTERNAL_AY_FALLBACK:<disposition>[:<outcome>]]`, on stdout unless
+/// `--quiet`, beside the other per-harness markers.
+#[cfg(feature = "ay-chc-native")]
+fn print_external_fallback_marker(disposition: ExternalFallbackDisposition, outcome: Option<&str>) {
+    if crate::args::common::quiet_output() {
+        return;
+    }
+    match outcome {
+        Some(outcome) => println!("[AY:EXTERNAL_AY_FALLBACK:{}:{outcome}]", disposition.label()),
+        None => println!("[AY:EXTERNAL_AY_FALLBACK:{}]", disposition.label()),
+    }
+}
+
 mod chc;
+
+/// The row export's hooks for the loop-contract retry (`harness_runner`).
+#[cfg(feature = "ay-chc-native")]
+pub(crate) use chc::{record_loop_contract_retry, retry_lane_export_dir};
 
 impl KaniSession {
     /// Run AY verification on an SMT-LIB2 file.
@@ -178,6 +379,31 @@ impl KaniSession {
         // Part of #2942: Read SMT file once and pass content to all classification functions.
         let smt_content = std::fs::read_to_string(smt_file)
             .with_context(|| format!("Failed to read SMT file: {}", smt_file.display()))?;
+
+        // The compiler stopped translating this harness at its translation
+        // budget. The artifact is a fail-closed error fact, not a problem to
+        // solve: report the harness UNKNOWN with the typed reason, and leave the
+        // rest of the budget to the other harnesses in the file.
+        if let Some(detail) = chc::smt_translation_timeout_marker(&smt_content) {
+            eprintln!(
+                "[AY] translation of harness `{}` exceeded its budget ({detail}); returning UNKNOWN",
+                harness.pretty_name
+            );
+            return Ok(translation_timeout_result(start.elapsed()));
+        }
+
+        // AY ask R1: a lane an earlier harness abandoned at its deadline is
+        // still quarantined while it lives. No harness starts work beside it:
+        // wait for it (joining it once it exits), bounded by THIS harness's
+        // deadline, and end the harness UNKNOWN if it is still alive then.
+        #[cfg(feature = "ay-chc-native")]
+        if let Err(busy) = chc::await_lane_quarantine(&deadline) {
+            if !crate::args::common::quiet_output() {
+                println!("{busy}");
+                println!("[AY:UNKNOWN] CHC verification: solver returned unknown");
+            }
+            return Ok(unsolved_unknown_result(start.elapsed(), SolverUnknownReason::Timeout));
+        }
 
         // #1910: Export SMT-LIB query for external solver cross-check.
         // #1921: Filter out model query commands (get-value/get-model) — some solvers
@@ -255,6 +481,7 @@ impl KaniSession {
                             proof_transcript_metadata: None,
                             native_full_verification_verdict: None,
                             harness_feasibility: HarnessFeasibility::Undetermined,
+                            chc_exact_counterexample: false,
                         });
                     }
                     Err(e) => {
@@ -307,7 +534,7 @@ impl KaniSession {
                             demotion_reasons: Vec::new(),
                             ctrex_category: None,
                             unknown_quality: None,
-                            solver_unknown_reason: None,
+                            solver_unknown_reason: chc_result.solver_unknown_reason,
                             kani_mem_overapprox_count: 0,
                             sound_fallback_count: 0,
                             proof_crosscheck: chc_result.proof_crosscheck,
@@ -316,17 +543,70 @@ impl KaniSession {
                             native_full_verification_verdict: chc_result
                                 .native_full_verification_verdict,
                             harness_feasibility: HarnessFeasibility::Undetermined,
+                            chc_exact_counterexample: chc_result.exact_counterexample,
                         });
                     }
                     Err(e) => {
-                        if native_chc_error_allows_external_proof_fallback(&e) {
+                        let reason = SolverUnknownReason::from_chc_error(&e);
+                        // The external-ay proof fallback budgets against what
+                        // the native lane LEFT of the per-harness deadline
+                        // (one per-call timeout at most, none below the useful
+                        // floor). It is NOT skipped for a budget-bound native
+                        // UNKNOWN by default — see `ExternalFallbackPolicy` for
+                        // the measured verdict that policy costs. The
+                        // disposition is printed either way so a corpus run
+                        // can count how often the retry converts.
+                        let disposition = external_fallback_disposition_with_policy(
+                            external_fallback_policy_from_env(),
+                            native_chc_error_allows_external_proof_fallback(&e),
+                            reason,
+                            deadline.stage_budget(
+                                solver_timeout_duration(self.args.harness_timeout),
+                                MIN_USEFUL_STAGE_BUDGET,
+                            ),
+                        );
+                        eprintln!(
+                            "[AY] external ay fallback after native UNKNOWN ({}): {} \
+                             ({:.1}s of the per-harness deadline left)",
+                            reason.label(),
+                            disposition.label(),
+                            deadline.remaining().as_secs_f64()
+                        );
+                        if let ExternalFallbackDisposition::Attempt(budget) = disposition {
+                            let attempt_started = Instant::now();
                             match self.try_ay_chc_external_proof_fallback(
                                 smt_file,
                                 &smt_content,
                                 harness,
+                                budget,
                                 deadline,
                             ) {
                                 Ok(Some(mut chc_result)) => {
+                                    // The elapsed here spans the whole call:
+                                    // the solve (killed at `budget` by
+                                    // `run_piped_with_timeout`) AND the
+                                    // post-proof cover-sat and vacuity probes,
+                                    // which draw on the harness deadline. It
+                                    // is therefore NOT comparable to `budget`
+                                    // alone, and reading it as one made a
+                                    // 22.0s-of-15.0s line look like a 47%
+                                    // deadline overrun when the deadline still
+                                    // had ~19s left. Say what each number is.
+                                    eprintln!(
+                                        "[AY] external ay fallback proved the harness in {:.1}s \
+                                         total (solve budget {:.1}s, then the post-proof \
+                                         cover/vacuity probes; {:.1}s of the per-harness \
+                                         deadline left)",
+                                        attempt_started.elapsed().as_secs_f64(),
+                                        budget.as_secs_f64(),
+                                        deadline.remaining().as_secs_f64()
+                                    );
+                                    print_external_fallback_marker(disposition, Some("proved"));
+                                    crate::stage_timing::record(
+                                        "external-ay-fallback",
+                                        attempt_started,
+                                        "proved",
+                                    );
                                     // V5-CHC: same fail-close on the external
                                     // ay proof-fallback path.
                                     self.apply_chc_cover_witness_fail_close(
@@ -347,7 +627,7 @@ impl KaniSession {
                                         demotion_reasons: Vec::new(),
                                         ctrex_category: None,
                                         unknown_quality: None,
-                                        solver_unknown_reason: None,
+                                        solver_unknown_reason: chc_result.solver_unknown_reason,
                                         kani_mem_overapprox_count: 0,
                                         sound_fallback_count: 0,
                                         proof_crosscheck: chc_result.proof_crosscheck,
@@ -357,17 +637,40 @@ impl KaniSession {
                                         native_full_verification_verdict: chc_result
                                             .native_full_verification_verdict,
                                         harness_feasibility: HarnessFeasibility::Undetermined,
+                                        chc_exact_counterexample: chc_result.exact_counterexample,
                                     });
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    eprintln!(
+                                        "[AY] external ay fallback did not prove the harness \
+                                         ({:.1}s of a {:.1}s budget)",
+                                        attempt_started.elapsed().as_secs_f64(),
+                                        budget.as_secs_f64()
+                                    );
+                                    print_external_fallback_marker(disposition, Some("unproved"));
+                                    crate::stage_timing::record(
+                                        "external-ay-fallback",
+                                        attempt_started,
+                                        "unproved",
+                                    );
+                                }
                                 Err(fallback_err) => {
-                                    if self.args.common_args.verbose {
-                                        eprintln!(
-                                            "[AY] external ay fallback errored after native UNKNOWN: {fallback_err}"
-                                        );
-                                    }
+                                    eprintln!(
+                                        "[AY] external ay fallback errored after native UNKNOWN \
+                                         ({:.1}s of a {:.1}s budget): {fallback_err}",
+                                        attempt_started.elapsed().as_secs_f64(),
+                                        budget.as_secs_f64()
+                                    );
+                                    print_external_fallback_marker(disposition, Some("error"));
+                                    crate::stage_timing::record(
+                                        "external-ay-fallback",
+                                        attempt_started,
+                                        "error",
+                                    );
                                 }
                             }
+                        } else {
+                            print_external_fallback_marker(disposition, None);
                         }
                         eprintln!("[AY] ay-chc failed ({e}) — returning UNKNOWN",);
                         let runtime = start.elapsed();
@@ -405,7 +708,7 @@ impl KaniSession {
                             // Split the old catch-all: a pre-solve deadline bail is
                             // BUDGET-bound (no solving was attempted), anything else
                             // here is a genuine ay-chc error. Attribution only.
-                            solver_unknown_reason: Some(SolverUnknownReason::from_chc_error(&e)),
+                            solver_unknown_reason: Some(reason),
                             kani_mem_overapprox_count: 0,
                             sound_fallback_count: 0,
                             proof_crosscheck: ProofCrosscheck::NotRun,
@@ -413,6 +716,7 @@ impl KaniSession {
                             proof_transcript_metadata: None,
                             native_full_verification_verdict: None,
                             harness_feasibility: HarnessFeasibility::Undetermined,
+                            chc_exact_counterexample: false,
                         });
                     }
                 }
@@ -429,7 +733,8 @@ impl KaniSession {
             }
         }
 
-        let ay_available = which::which("ay").is_ok();
+        let ay_located = crate::ay_binary::locate();
+        let ay_available = ay_located.is_ok();
 
         // Bound in two steps so the arms below keep their original indentation:
         // the destructuring pattern no longer fits on the `match` line.
@@ -439,13 +744,30 @@ impl KaniSession {
                 if ay_available {
                     match self.try_ay_solver(smt_file, &smt_content, harness, deadline) {
                         Ok(result) => result,
-                        Err(err) if solver_error_is_timeout(&err) => {
-                            let timeout =
-                                deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
-                            eprintln!(
-                                "[AY] ay solver timed out after {:.1}s; returning UNKNOWN",
-                                timeout.as_secs_f64()
-                            );
+                        Err(err)
+                            if solver_error_is_budget_exhausted(&err)
+                                || solver_error_is_timeout(&err) =>
+                        {
+                            // The budget check comes first: a refused spawn keeps
+                            // the `timed out after` wording for outer consumers,
+                            // so the timeout predicate matches it too.
+                            let reason = if solver_error_is_budget_exhausted(&err) {
+                                eprintln!(
+                                    "[AY] ay solver not started: {:.1}s of the per-harness \
+                                     deadline left, {:.0}s needed; returning UNKNOWN",
+                                    deadline.remaining().as_secs_f64(),
+                                    MIN_USEFUL_STAGE_BUDGET.as_secs_f64()
+                                );
+                                SolverUnknownReason::BudgetExhausted
+                            } else {
+                                let timeout = deadline
+                                    .clamp(solver_timeout_duration(self.args.harness_timeout));
+                                eprintln!(
+                                    "[AY] ay solver timed out after {:.1}s; returning UNKNOWN",
+                                    timeout.as_secs_f64()
+                                );
+                                SolverUnknownReason::Timeout
+                            };
                             let runtime = start.elapsed();
                             let validation_status = logic_tier.validation_status();
                             // Same Kani-parity population as the undecided arm
@@ -473,7 +795,7 @@ impl KaniSession {
                                 demotion_reasons: Vec::new(),
                                 ctrex_category: None,
                                 unknown_quality: None,
-                                solver_unknown_reason: Some(SolverUnknownReason::Timeout),
+                                solver_unknown_reason: Some(reason),
                                 kani_mem_overapprox_count: 0,
                                 sound_fallback_count: 0,
                                 proof_crosscheck: ProofCrosscheck::NotRun,
@@ -481,14 +803,16 @@ impl KaniSession {
                                 proof_transcript_metadata: None,
                                 native_full_verification_verdict: None,
                                 harness_feasibility: HarnessFeasibility::Undetermined,
+                                chc_exact_counterexample: false,
                             });
                         }
                         Err(err) => return Err(err),
                     }
                 } else {
                     bail!(
-                        "AY solver not found in PATH. Install ay to run verification.\n\
+                        "{}\nInstall ay to run verification.\n\
                          SMT-LIB2 file generated at: {}",
+                        ay_located.err().unwrap_or_default(),
                         smt_file.display()
                     );
                 }
@@ -553,6 +877,7 @@ impl KaniSession {
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
             harness_feasibility,
+            chc_exact_counterexample: false,
         })
     }
 
@@ -587,15 +912,12 @@ impl KaniSession {
         HarnessFeasibility,
         Option<SolverUnknownReason>,
     )> {
-        // Check if ay is available
-        let ay_path = which::which("ay")
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "ay solver not found in PATH. Install ay or choose a different solver with `--ay-solver`.\n\
-                     SMT-LIB2 file generated at: {}",
-                    smt_file.display()
-                )
-            })?;
+        // The external `ay`, located and pin-checked once per process. An
+        // off-pin binary is refused unless --allow-unpinned-ay allowed it; see
+        // `crate::ay_binary`. The cover and vacuity probes below reuse this path.
+        let ay_path = crate::ay_binary::pinned_ay().map_err(|err| {
+            anyhow::anyhow!("{err:#}\nSMT-LIB2 file generated at: {}", smt_file.display())
+        })?;
 
         // Note: AY's datatype theory (ay#517) is now fully implemented.
         // Previously, files with datatypes were rejected here. That guard
@@ -611,7 +933,22 @@ impl KaniSession {
             println!("[AY] {msg}: {}", ay_path.display());
         }
 
-        let timeout = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
+        // Below the useful floor the solver is not started at all: a spawn
+        // that can only be killed reports `Timeout` at 0.3s, which is the
+        // wrong story. Same phrase `session::process` refuses a zero-budget
+        // spawn with, so `run_ay` files both as `BudgetExhausted`.
+        let Some(timeout) = deadline.stage_budget(
+            solver_timeout_duration(self.args.harness_timeout),
+            MIN_USEFUL_STAGE_BUDGET,
+        ) else {
+            bail!(
+                "{} {} ({:.1}s of the per-harness deadline left, {:.0}s needed; timed out after 0.0s)",
+                ay_path.display(),
+                crate::session::BUDGET_EXHAUSTED_BEFORE_SPAWN,
+                deadline.remaining().as_secs_f64(),
+                MIN_USEFUL_STAGE_BUDGET.as_secs_f64()
+            );
+        };
 
         let mut cmd = Command::new(&ay_path);
         cmd.arg(smt_file);
@@ -668,10 +1005,10 @@ impl KaniSession {
 
         // Parse result first to determine actual verification status.
         let (base_status, base_failed) = parse_solver_output(&stdout);
-        let any_trace = if base_status == VerificationStatus::Failure {
+        let any_trace = if parse_cover_sat_check_output(&stdout, 1) == [Some(true)] {
             parse_kani_any_trace(&stdout)
         } else {
-            Vec::new()
+            None
         };
 
         // #1164: Load VC artifact for source location mapping
@@ -767,13 +1104,9 @@ impl KaniSession {
             // When covers exist, run a secondary query to determine SATISFIED/UNSATISFIABLE
             // instead of leaving them as UNDETERMINED.
             let cover_properties = if !cover_names.is_empty() {
-                let sat_results = self.check_cover_satisfiability(
-                    smt_content,
-                    &cover_names,
-                    &ay_path,
-                    smt_file,
-                    deadline,
-                );
+                let probes =
+                    self.check_sat_probes(smt_content, &cover_names, &ay_path, smt_file, deadline);
+                let sat_results: Vec<_> = probes.iter().map(|probe| probe.status).collect();
                 if self.args.common_args.verbose {
                     for (name, result) in cover_names.iter().zip(sat_results.iter()) {
                         let status_str = match result {
@@ -789,6 +1122,9 @@ impl KaniSession {
                     &sat_results,
                     location_map.as_ref(),
                 );
+                for (cover, probe) in covers.iter_mut().zip(probes) {
+                    cover.trace = probe.trace;
+                }
                 self.classify_unreachable_covers(
                     smt_content,
                     &cover_names,
@@ -891,7 +1227,7 @@ impl KaniSession {
         // SAT result - parse get-value output to identify failed properties
         // #1164: Pass location map for source location population
         let mut properties =
-            parse_violation_properties(&stdout, true, Some(&any_trace), location_map.as_ref());
+            parse_violation_properties(&stdout, true, any_trace.as_deref(), location_map.as_ref());
 
         // Kani-parity per-check UNDETERMINED population.
         //
@@ -945,13 +1281,13 @@ impl KaniSession {
             .collect();
         if !undecided.is_empty() {
             let names: Vec<String> = undecided.iter().map(|&i| entry_names[i].clone()).collect();
-            let results =
-                self.check_cover_satisfiability(smt_content, &names, &ay_path, smt_file, deadline);
+            let results = self.check_sat_probes(smt_content, &names, &ay_path, smt_file, deadline);
             for (&i, result) in undecided.iter().zip(results.iter()) {
-                if *result == Some(true) {
+                if result.status == Some(true) {
                     // The violation flag is satisfiable on its own: this check
                     // can fail, even though the first model did not surface it.
                     properties[i].status = CheckStatus::Failure;
+                    properties[i].trace = result.trace.clone();
                 }
                 // Some(false): provably not violated — stays SUCCESS and is
                 // eligible for UNREACHABLE classification below.
@@ -973,26 +1309,31 @@ impl KaniSession {
         );
 
         // Part of #922: Also parse cover properties
-        let mut cover_properties =
-            parse_cover_properties(&stdout, true, Some(&any_trace), location_map.as_ref());
-        // Same undecided arm as the violation population above: with no model
-        // there is no per-cover verdict either, so the covers this harness
-        // declared were vanishing from the report entirely. Kani prints them
-        // UNDETERMINED (corpus: `tests/expected/cover/cover-undetermined`).
-        // Guarded on the PARSED list being empty as well, so a cover-only
-        // harness whose model DID name its covers is never listed twice.
-        if no_model_verdict && cover_properties.is_empty() {
-            let cover_names = extract_cover_declarations_from_content(smt_content);
-            if !cover_names.is_empty() {
-                let undecided = vec![None; cover_names.len()];
-                cover_properties = build_cover_properties_from_sat_checks(
-                    &cover_names,
-                    &undecided,
-                    location_map.as_ref(),
-                );
-                synthesized_from_declarations = true;
+        let cover_names = extract_cover_declarations_from_content(smt_content);
+        let cover_properties = if cover_names.is_empty() {
+            Vec::new()
+        } else {
+            let probes =
+                self.check_sat_probes(smt_content, &cover_names, &ay_path, smt_file, deadline);
+            let statuses: Vec<_> = probes.iter().map(|probe| probe.status).collect();
+            let mut covers = build_cover_properties_from_sat_checks(
+                &cover_names,
+                &statuses,
+                location_map.as_ref(),
+            );
+            for (cover, probe) in covers.iter_mut().zip(probes) {
+                cover.trace = probe.trace;
             }
-        }
+            self.classify_unreachable_covers(
+                smt_content,
+                &cover_names,
+                &mut covers,
+                &ay_path,
+                smt_file,
+                deadline,
+            );
+            covers
+        };
         properties.extend(cover_properties);
         // Kani-parity display names, as on the UNSAT path above.
         apply_kani_property_naming(&mut properties);
@@ -1293,8 +1634,17 @@ impl KaniSession {
             return None;
         }
 
-        let timeout = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
+        // Fail-open by construction, so a skipped probe leaves the verdict
+        // untouched (`None` = assume feasible); it is still typed so the
+        // corpus can see which harnesses forfeited the vacuity net.
+        let Some(timeout) = self.probe_stage_budget("reach-probe", deadline) else {
+            let _ = std::fs::remove_file(&probe_path);
+            return None;
+        };
         let mut cmd = Command::new(solver_path);
+        // Its own deadline, so an orphan of a SIGKILLed driver is bounded
+        // (`crate::ay_binary::orphan_deadline_ms`).
+        cmd.arg("-t").arg(crate::ay_binary::orphan_deadline_ms(timeout).to_string());
         cmd.arg(&probe_path);
         let output = match run_piped_with_timeout(cmd, timeout) {
             Ok(output) => output,
@@ -1343,14 +1693,33 @@ impl KaniSession {
         smt_file: &Path,
         deadline: Deadline,
     ) -> Vec<Option<bool>> {
+        self.check_sat_probes(smt_content, cover_names, solver_path, smt_file, deadline)
+            .into_iter()
+            .map(|probe| probe.status)
+            .collect()
+    }
+
+    fn check_sat_probes(
+        &self,
+        smt_content: &str,
+        cover_names: &[String],
+        solver_path: &Path,
+        smt_file: &Path,
+        deadline: Deadline,
+    ) -> Vec<SatProbeResult> {
         if cover_names.is_empty() {
             return Vec::new();
         }
 
-        let total = deadline.clamp(solver_timeout_duration(self.args.harness_timeout));
+        // Every probe stays UNDETERMINED (asserts nothing) when the harness
+        // has less than the useful floor left — typed, and without spawning
+        // a solver that could only be killed.
+        let Some(total) = self.probe_stage_budget("cover-probe", deadline) else {
+            return vec![SatProbeResult::unknown(); cover_names.len()];
+        };
         let started = std::time::Instant::now();
         let n = cover_names.len();
-        let mut results: Vec<Option<bool>> = Vec::with_capacity(n);
+        let mut results: Vec<SatProbeResult> = Vec::with_capacity(n);
 
         // One probe per solver process, each with its own slice of the budget.
         //
@@ -1381,17 +1750,23 @@ impl KaniSession {
             // one batch for whatever is left, or nothing if even that is gone.
             let per_probe = remaining / probes_left as u32;
             let batch_rest = per_probe < Duration::from_millis(1000)
-                || (idx == 1
-                    && started.elapsed() > remaining / (probes_left as u32).max(1));
-            if batch_rest {
+                || (idx == 1 && started.elapsed() > remaining / (probes_left as u32).max(1));
+            // A playback witness belongs to one asserted property. Keep
+            // these queries separate rather than joining independent models.
+            if batch_rest && self.args.concrete_playback.is_none() {
                 if remaining > Duration::from_millis(200) {
                     let rest = &cover_names[idx..];
                     let batched = self.run_cover_probe_file(
-                        smt_content, rest, solver_path, smt_file, idx, remaining,
+                        smt_content,
+                        rest,
+                        solver_path,
+                        smt_file,
+                        idx,
+                        remaining,
                     );
                     results.extend(batched);
                 } else {
-                    results.resize(n, None);
+                    results.resize(n, SatProbeResult::unknown());
                 }
                 break;
             }
@@ -1402,8 +1777,30 @@ impl KaniSession {
             results.append(&mut got);
             idx += 1;
         }
-        results.resize(n, None);
+        results.resize(n, SatProbeResult::unknown());
         results
+    }
+
+    /// Budget for one BMC-lane probe stage (reach probe, cover probes, CHC
+    /// cover check): one per-call timeout, clamped to what is left of the
+    /// per-harness deadline, or `None` — with the typed
+    /// `[AY:STAGE_SKIPPED:<stage>:BudgetExhausted]` marker printed — when
+    /// less than the useful floor is left. Every probe is defense in depth
+    /// over a verdict the main query already produced, so skipping one never
+    /// flips a verdict: a skipped probe answers exactly what an undecided one
+    /// does.
+    fn probe_stage_budget(&self, stage: &str, deadline: Deadline) -> Option<Duration> {
+        let budget = deadline.stage_budget(
+            solver_timeout_duration(self.args.harness_timeout),
+            MIN_USEFUL_STAGE_BUDGET,
+        );
+        if budget.is_none() && !crate::args::common::quiet_output() {
+            println!(
+                "{} — the {stage} is skipped; whatever it would have decided stays undetermined",
+                deadline.stage_skipped_marker(stage, MIN_USEFUL_STAGE_BUDGET)
+            );
+        }
+        budget
     }
 
     /// Solve one cover-check file holding `names` probes under `budget`,
@@ -1417,14 +1814,19 @@ impl KaniSession {
         smt_file: &Path,
         part: usize,
         budget: Duration,
-    ) -> Vec<Option<bool>> {
-        let query = build_cover_sat_query(smt_content, names);
+    ) -> Vec<SatProbeResult> {
+        let with_model = self.args.concrete_playback.is_some() && names.len() == 1;
+        let query = if with_model {
+            build_cover_witness_query(smt_content, &names[0])
+        } else {
+            build_cover_sat_query(smt_content, names)
+        };
         let path = smt_file.with_extension(format!("cover_check.p{part}.smt2"));
         if let Err(e) = std::fs::write(&path, &query) {
             if self.args.common_args.verbose {
                 eprintln!("[AY] Failed to write cover check SMT file: {e}");
             }
-            return vec![None; names.len()];
+            return vec![SatProbeResult::unknown(); names.len()];
         }
 
         let mut cmd = Command::new(solver_path);
@@ -1454,7 +1856,7 @@ impl KaniSession {
                     eprintln!("[AY] Cover check solver failed: {e}");
                 }
                 let _ = std::fs::remove_file(&path);
-                return vec![None; names.len()];
+                return vec![SatProbeResult::unknown(); names.len()];
             }
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1464,6 +1866,16 @@ impl KaniSession {
         let parsed = parse_cover_sat_check_output(&stdout, names.len());
         let _ = std::fs::remove_file(&path);
         parsed
+            .into_iter()
+            .map(|status| SatProbeResult {
+                status,
+                trace: if with_model && status == Some(true) {
+                    parse_kani_any_trace(&stdout)
+                } else {
+                    None
+                },
+            })
+            .collect()
     }
 
     /// Run a secondary solver query to determine cover property satisfiability
@@ -1476,12 +1888,13 @@ impl KaniSession {
     ///
     /// Part of #1162: Cover semantics for CHC path.
     ///
-    /// Deadline note: this helper is invoked from deep inside the CHC
-    /// result-interpretation paths (`native_result.rs`), which do not carry
-    /// the per-harness [`Deadline`]. Its subprocess budget is the per-call
-    /// solver timeout, additionally clamped to the process-wide watchdog
-    /// deadline inside `run_piped_with_timeout` — so it cannot outlive the
-    /// driver budget, but may slightly overshoot the per-harness deadline.
+    /// Deadline: the CHC result-interpretation paths (`native_result.rs`,
+    /// `external.rs`) carry the per-harness [`Deadline`] down to here, so the
+    /// subprocess budget is one per-call solver timeout clamped to what is
+    /// left of it (`probe_stage_budget`), and below the useful floor every
+    /// cover stays UNDETERMINED without a spawn. It used to take a full
+    /// per-call timeout AFTER the deadline, which on a multi-harness file
+    /// pushed the later harnesses into the watchdog.
     ///
     /// REQUIRES: chc_content is valid CHC/HORN SMT-LIB2 content
     /// REQUIRES: cover_names are non-empty cover variable names
@@ -1492,12 +1905,16 @@ impl KaniSession {
         chc_content: &str,
         cover_names: &[String],
         smt_file: &Path,
+        deadline: Deadline,
     ) -> Vec<Option<bool>> {
         use crate::smt_io::build_cover_sat_query_for_chc;
 
         if cover_names.is_empty() {
             return Vec::new();
         }
+        let Some(timeout) = self.probe_stage_budget("chc-cover-check", deadline) else {
+            return vec![None; cover_names.len()];
+        };
 
         let cover_query = build_cover_sat_query_for_chc(chc_content, cover_names);
 
@@ -1513,18 +1930,24 @@ impl KaniSession {
             return vec![None; cover_names.len()];
         }
 
-        let solver_path = which::which("ay").ok();
-        let Some(solver_path) = solver_path else {
-            if self.args.common_args.verbose {
-                eprintln!("[AY] No ay solver found for CHC cover check");
+        // Fail closed (every cover undetermined) when no usable `ay` exists,
+        // including an off-pin one that was not allowed.
+        let solver_path = match crate::ay_binary::pinned_ay() {
+            Ok(path) => path,
+            Err(err) => {
+                if self.args.common_args.verbose {
+                    eprintln!("[AY] CHC cover check skipped, no usable ay solver: {err:#}");
+                }
+                let _ = std::fs::remove_file(&cover_smt_path);
+                return vec![None; cover_names.len()];
             }
-            let _ = std::fs::remove_file(&cover_smt_path);
-            return vec![None; cover_names.len()];
         };
 
-        let timeout = solver_timeout_duration(self.args.harness_timeout);
-
         let mut cmd = Command::new(&solver_path);
+        // Its own deadline, so an orphan of a SIGKILLed driver is bounded
+        // (`crate::ay_binary::orphan_deadline_ms`). When that deadline ends the
+        // run first, the covers decided before it still parse, one by one.
+        cmd.arg("-t").arg(crate::ay_binary::orphan_deadline_ms(timeout).to_string());
         cmd.arg(&cover_smt_path);
         let output = match run_piped_with_timeout(cmd, timeout) {
             Ok(output) => output,
@@ -1849,3 +2272,38 @@ fn export_smtlib_filtered(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+/// The UNKNOWN result for a harness whose translation ran out of budget: no
+/// check was decided, and the reason says why.
+fn translation_timeout_result(runtime: Duration) -> VerificationResult {
+    unsolved_unknown_result(runtime, SolverUnknownReason::TranslationTimeout)
+}
+
+/// An UNKNOWN for a harness that never reached a solver, with its typed
+/// reason. Nothing was derived, so it fails closed.
+fn unsolved_unknown_result(runtime: Duration, reason: SolverUnknownReason) -> VerificationResult {
+    let logic_tier = LogicTier::TierA;
+    VerificationResult {
+        status: VerificationStatus::Failure,
+        failed_properties: FailedProperties::Other,
+        results: Vec::new(),
+        runtime,
+        generated_concrete_test: false,
+        coverage_results: None,
+        logic_tier,
+        validation_status: logic_tier.validation_status(),
+        demotion_reasons: Vec::new(),
+        ctrex_category: None,
+        unknown_quality: None,
+        solver_unknown_reason: Some(reason),
+        // A harness that never reached a solver derived nothing: fail closed.
+        chc_exact_counterexample: false,
+        kani_mem_overapprox_count: 0,
+        sound_fallback_count: 0,
+        proof_crosscheck: ProofCrosscheck::NotRun,
+        proof_qualifiers: Vec::new(),
+        proof_transcript_metadata: None,
+        native_full_verification_verdict: None,
+        harness_feasibility: HarnessFeasibility::Undetermined,
+    }
+}

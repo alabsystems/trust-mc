@@ -177,11 +177,15 @@ fn test_try_extract_obj_id_symbolic_returns_none() {
 
 #[test]
 fn test_try_extract_obj_id_non_concat_returns_none() {
-    // (#1443) Non-concat addresses should return None
-    let addr = Expr::bitvec_const(0x1234_5678_0000_0000i128, 64);
-
+    // (#1443) A symbolic, non-concat address has no extractable object id.
+    let addr = Expr::var("addr_non_concat", ay_bindings::Sort::bitvec(64));
     let extracted = ChcCtx::try_extract_obj_id(&addr);
-    assert_eq!(extracted, None, "Non-concat address should return None");
+    assert_eq!(extracted, None, "Non-concat symbolic address should return None");
+
+    // A 64-bit CONSTANT is a split pointer (obj_id << 32 | offset) since 92766cbb5,
+    // so its object id is its upper half.
+    let constant = Expr::bitvec_const(0x1234_5678_0000_0000i128, 64);
+    assert_eq!(ChcCtx::try_extract_obj_id(&constant), Some(0x1234_5678));
 }
 
 #[test]

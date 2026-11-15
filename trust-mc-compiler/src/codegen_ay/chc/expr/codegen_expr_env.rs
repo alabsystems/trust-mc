@@ -87,8 +87,9 @@ impl<'tcx, 'body> ExprEnv for ChcCtx<'tcx, 'body> {
                 | StatementKind::PlaceMention(..)
                 | StatementKind::AscribeUserType { .. }
                 | StatementKind::Coverage(..)
-                | StatementKind::ConstEvalCounter
-                | StatementKind::Retag(..) => {}
+                | StatementKind::ConstEvalCounter => {}
+                #[cfg(not(trust_toolchain))]
+                StatementKind::Retag(..) => {}
                 _ => return None, // external enum: StatementKind
             }
         }
@@ -108,7 +109,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: Option<usize>,
     ) -> Option<Expr> {
         match rvalue {
-            Rvalue::Use(operand) => {
+            Rvalue::Use(operand, ..) => {
                 self.translate_operand_with_env(operand, env, captured_vars, closure_env_local)
             }
             Rvalue::BinaryOp(op, lhs_op, rhs_op) | Rvalue::CheckedBinaryOp(op, lhs_op, rhs_op) => {
@@ -361,6 +362,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.translate_place_with_env(place, env, captured_vars, closure_env_local)
             }
             Operand::Constant(const_op) => self.translate_constant(const_op),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(checks) => {
+                Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(checks)))
+            }
         }
     }
 

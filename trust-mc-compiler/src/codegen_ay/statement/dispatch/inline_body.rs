@@ -66,9 +66,10 @@ const MAX_BMC_DAG_INLINE_EFFECTIVE_BLOCKS: usize = 64;
 const MAX_BMC_MINI_INLINE_DEPTH: usize = 12;
 
 struct InlineParentState {
+    qualified_storage_lifetimes: crate::codegen_ay::statement::stack_lifetime::QualifiedLifetimes,
     path_condition: Option<Expr>,
     env: std::collections::BTreeMap<std::sync::Arc<str>, Expr>,
-    ref_pointees: std::collections::BTreeMap<std::sync::Arc<str>, std::sync::Arc<str>>,
+    ref_pointees: crate::codegen_ay::statement::RefPointees,
     flattened_tuples: std::collections::HashMap<std::sync::Arc<str>, Vec<Expr>>,
     heap_pointees: std::collections::HashMap<std::sync::Arc<str>, Expr>,
     ptr_source_map: std::collections::HashMap<std::sync::Arc<str>, std::sync::Arc<str>>,
@@ -97,6 +98,12 @@ struct InlineParentState {
     /// Enables nested fn_ptr resolution when the fn_ptr is received as a parameter.
     parent_fn_ptr_callees: Vec<(Instance, bool)>,
     parent_foreign_fn_ptrs: Vec<String>,
+    /// FC-06 (BMC): the caller's active modifies frames. A callee body run by
+    /// the mini-inliner executes INSIDE the caller's frame extent, and its
+    /// stores through caller pointers must be classified against the same
+    /// footprint. A fresh `StatementCodegen` starts with no frames, which left
+    /// every such store unchecked.
+    modifies_frames: Vec<crate::codegen_ay::statement::BmcModifiesFrame>,
 }
 
 pub(in crate::codegen_ay::statement) struct InlineArgValue {
@@ -126,10 +133,11 @@ pub(in crate::codegen_ay::statement) struct InlineArgValue {
 }
 
 struct InlineExecutionResult {
+    qualified_storage_lifetimes: crate::codegen_ay::statement::stack_lifetime::QualifiedLifetimes,
     result: Expr,
     return_base: Arc<str>,
     env: std::collections::BTreeMap<Arc<str>, Expr>,
-    ref_pointees: std::collections::BTreeMap<Arc<str>, Arc<str>>,
+    ref_pointees: crate::codegen_ay::statement::RefPointees,
     /// The callee frame's SSA-var -> folded-constructor cache. Carried back so
     /// the parent can resolve an inline-returned iterator/adaptor value (e.g.
     /// `Copied::new`'s `Ctor(Copied[fld_it=..])`, G2 Wall A) instead of seeing
@@ -242,6 +250,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         self.ctx.restore_current_fn(parent_fn);
 
         let result = result?;
+        self.qualified_storage_lifetimes.extend(result.qualified_storage_lifetimes.clone());
         self.merge_inline_ssa_versions(&result.ssa_version);
         self.merge_inline_writes_to_caller_storage(
             &pre_call_env,
@@ -254,6 +263,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             &result.env,
             &result.ref_pointees,
         );
+        // Reads of the callee table above count against this call site.
+        self.ref_pointees.absorb_hits(&result.ref_pointees);
         // Merge ONLY the callee's SSA->folded-constructor cache (equality-
         // asserted aliases of real values); never the raw inline env wholesale.
         // Without this, an inline-returned adapter value (e.g. `.copied()`'s
@@ -339,6 +350,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // differently-salted) namespace.
         self.ctx.restore_current_fn(parent_fn);
         let result = result?;
+        self.qualified_storage_lifetimes.extend(result.qualified_storage_lifetimes.clone());
         self.merge_inline_ssa_versions(&result.ssa_version);
         self.merge_inline_writes_to_caller_storage(
             &pre_call_env,
@@ -391,7 +403,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
-        self.inline_return_expr()
+        let result = self.inline_return_expr();
+        // The return-value lookups happen after the last terminator's flush.
+        self.flush_ref_pointee_path_ambiguity();
+        result
     }
 
     fn capture_inline_parent_state(&self) -> InlineParentState {
@@ -403,6 +418,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         parent_foreign_fn_ptrs.extend(self.resolve_all_foreign_fn_ptr_names());
 
         InlineParentState {
+            qualified_storage_lifetimes: self.capture_qualified_storage_lifetimes(),
             path_condition: self.current_path_condition.clone(),
             env: self.current_env.clone(),
             ref_pointees: self.ref_pointees.clone(),
@@ -419,10 +435,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ssa_version: self.ssa_version.clone(),
             parent_fn_ptr_callees,
             parent_foreign_fn_ptrs,
+            modifies_frames: self.modifies_frames.clone(),
         }
     }
 
     fn apply_inline_parent_state(&mut self, state: InlineParentState) {
+        self.qualified_storage_lifetimes = state.qualified_storage_lifetimes;
         self.current_path_condition = state.path_condition;
         self.current_env.extend(state.env);
         self.ref_pointees.extend(state.ref_pointees);
@@ -444,6 +462,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         self.parent_fn_ptr_callees = state.parent_fn_ptr_callees;
         self.parent_foreign_fn_ptrs = state.parent_foreign_fn_ptrs;
+        self.modifies_frames = state.modifies_frames;
     }
 
     fn seed_inline_params(&mut self, params: &[InlineArgValue]) -> Option<()> {
@@ -543,6 +562,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 (entries, refs)
             }
             Operand::Constant(_) => (Vec::new(), Vec::new()),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => (Vec::new(), Vec::new()),
         };
         match callee_ty.kind() {
             TyKind::RigidTy(RigidTy::Ref(..)) | TyKind::RigidTy(RigidTy::RawPtr(..)) => {
@@ -556,6 +577,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         })
                     }
                     Operand::Constant(_) => None,
+                    #[cfg(trust_toolchain)]
+                    Operand::RuntimeChecks(_) => None,
                 };
                 Some(InlineArgValue { expr, pointee_base, flattened_entries, nested_ref_pointees })
             }
@@ -612,6 +635,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let ret_base = self.ssa_base_name(&ret_place);
         if let Some(expr) = self.env_lookup(&ret_base) {
             return Some(InlineExecutionResult {
+                qualified_storage_lifetimes: self.completed_inline_storage_lifetimes(),
                 result: expr.clone(),
                 return_base: Arc::from(ret_base.as_str()),
                 env: self.current_env.clone(),
@@ -624,6 +648,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let ret_ty = self.body.locals().first()?.ty;
         if matches!(ret_ty.kind(), TyKind::RigidTy(RigidTy::Tuple(fields)) if fields.is_empty()) {
             return Some(InlineExecutionResult {
+                qualified_storage_lifetimes: self.completed_inline_storage_lifetimes(),
                 result: Expr::bitvec_const(0u64, POINTER_WIDTH),
                 return_base: Arc::from(ret_base.as_str()),
                 env: self.current_env.clone(),
@@ -675,7 +700,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         &mut self,
         pre_call_env: &std::collections::BTreeMap<Arc<str>, Expr>,
         inline_env: &std::collections::BTreeMap<Arc<str>, Expr>,
-        inline_ref_pointees: &std::collections::BTreeMap<Arc<str>, Arc<str>>,
+        inline_ref_pointees: &crate::codegen_ay::statement::RefPointees,
     ) {
         for (base, pre_value) in pre_call_env {
             let Some(post_value) = inline_env.get(base) else {
@@ -689,10 +714,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             if !is_pointee_target {
                 continue;
             }
-            debug!(
-                base = base.as_ref(),
-                "mini-inline: publishing callee write to caller storage"
-            );
+            debug!(base = base.as_ref(), "mini-inline: publishing callee write to caller storage");
             self.current_env.insert(Arc::clone(base), post_value.clone());
         }
     }
@@ -702,7 +724,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         return_base: &Arc<str>,
         inline_env: &std::collections::BTreeMap<Arc<str>, Expr>,
-        inline_ref_pointees: &std::collections::BTreeMap<Arc<str>, Arc<str>>,
+        inline_ref_pointees: &crate::codegen_ay::statement::RefPointees,
     ) {
         let dest_base: Arc<str> = self.ssa_base_name(destination).into();
 
@@ -842,7 +864,7 @@ fn body_is_dag_inline_candidate(body: &rustc_public::mir::Body) -> bool {
 /// (the conservative direction: an extra edge can only add a spurious cycle
 /// or path, never remove an obligation).
 fn assert_can_never_pass(cond: &Operand, expected: bool) -> bool {
-    use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
+    use rustc_public::ty::{RigidTy, TyKind};
     let Operand::Constant(constant) = cond else {
         return false;
     };
@@ -850,10 +872,10 @@ fn assert_can_never_pass(cond: &Operand, expected: bool) -> bool {
     if !matches!(mir_const.ty().kind(), TyKind::RigidTy(RigidTy::Bool)) {
         return false;
     }
-    let ConstantKind::Allocated(alloc) = mir_const.kind() else {
-        return false;
-    };
-    matches!(alloc.read_bool(), Ok(value) if value != expected)
+    matches!(
+        crate::codegen_ay::shared::const_pointer::const_bool(mir_const),
+        Some(value) if value != expected
+    )
 }
 
 fn inline_candidate_successors(body: &rustc_public::mir::Body) -> Option<Vec<Vec<usize>>> {

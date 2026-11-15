@@ -17,6 +17,7 @@
 
 mod apply_closure;
 mod array_cmp;
+mod box_new_payload;
 mod call_outcome;
 mod closure_call;
 mod fn_inline;

@@ -21,11 +21,25 @@
 //! enabling the scalarizer to decompose the store chains into per-index scalar
 //! equalities.
 //!
+//! "Free" is judged per rule, by every occurrence. A var that no relation
+//! application names can still be bound inside its rule: fragment composition
+//! frames an array forward with `(= a__mid_bb4 a)` and then stores into
+//! `a__mid_bb4`. Its unstored lanes are `a`'s, so a `const_array(0)` base
+//! would zero them. That is an under-approximation, and it hid real failures:
+//! `a=[1,2]; while i<2 { a[0]+=1 }; assert!(a[1]==0)` was proved once
+//! the scalarizer kept the loop head's column whole. A base is therefore
+//! replaced only in a rule where it occurs solely as the innermost base of
+//! store chains. Measured over the 1134 CHC corpus units (2026-09-25), what
+//! still qualifies is only the encoder's fresh aggregate bases, whose chains
+//! store every lane of the array, and the memory type and per-allocation
+//! region arrays that `prune_vc_unused_type_arrays` dropped from the relations
+//! because nothing reads them.
+//!
 //! Runs before scalarization in the translation and emit pipelines. The early
 //! pass ensures scalarization sees initialized lanes before later rewrites erase
 //! the array selects needed to recover them.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ay_bindings::{Expr, ExprValue, Sort};
 
@@ -33,12 +47,18 @@ use crate::chc::ChcVc;
 
 /// Normalize free-variable array bases in store chains.
 ///
-/// For each constraint containing a store chain whose innermost base is a
-/// declared Array-sorted var NOT appearing in any relation argument, replace
-/// that base with `const_array(index_sort, default_elem)`.
+/// A base is replaced in a rule only when that rule leaves it unconstrained:
+/// it is a declared Array-sorted var that no relation application names (in
+/// any rule), and EVERY occurrence of it in the rule's constraints is the
+/// innermost base of a store chain. Any other occurrence — an equality such
+/// as the frame identity `(= a__mid_bb4 a)`, a `select`, an argument to an
+/// `ite` — ties its unstored lanes to something, and replacing the base with
+/// `const_array(0)` would force those lanes to zero: an UNDER-approximation
+/// of the rule's states, which hides reachable errors.
 ///
-/// Returns the number of store chain bases normalized.
-pub(super) fn normalize_free_array_bases(vc: &mut ChcVc) -> usize {
+/// Returns the number of store chain bases normalized and the names of the
+/// vars replaced.
+pub(super) fn normalize_free_array_bases(vc: &mut ChcVc) -> (usize, BTreeSet<String>) {
     // Step 1: Collect essential vars — those appearing in any relation app.
     let mut essential: HashSet<String> = HashSet::new();
     for rule in &vc.rules {
@@ -57,65 +77,140 @@ pub(super) fn normalize_free_array_bases(vc: &mut ChcVc) -> usize {
     }
 
     if free_array_vars.is_empty() {
-        return 0;
+        return (0, BTreeSet::new());
     }
 
-    // Step 3: Rewrite store chain bases in all rule constraints.
+    // Step 3: Per rule, rewrite the store chain bases that rule leaves
+    // unconstrained.
     let mut total_normalized = 0;
+    let mut names: BTreeSet<String> = BTreeSet::new();
     for rule in &mut vc.rules {
-        let old_constraints: Vec<Expr> = rule.body.constraints.iter().cloned().collect();
+        let mut uses: HashMap<String, BaseUses> = HashMap::new();
+        for constraint in rule.body.constraints.iter() {
+            count_uses(constraint, &free_array_vars, false, &mut uses);
+        }
+        let replaceable: HashSet<String> = uses
+            .into_iter()
+            .filter(|(_, u)| u.as_base > 0 && u.as_base == u.total)
+            .map(|(name, _)| name)
+            .collect();
+        if replaceable.is_empty() {
+            continue;
+        }
         let mut rule_normalized = 0;
-        let mut new_constraints = Vec::with_capacity(old_constraints.len());
-        for constraint in &old_constraints {
-            let (rewritten, count) = rewrite_free_bases_in_expr(constraint, &free_array_vars);
+        let mut new_constraints = Vec::with_capacity(rule.body.constraints.len());
+        for constraint in rule.body.constraints.iter() {
+            let (rewritten, count) = rewrite_free_bases_in_expr(constraint, &replaceable);
             rule_normalized += count;
             new_constraints.push(rewritten);
         }
-        if rule_normalized > 0 {
-            rule.body.constraints = crate::constraints::Constraints::Owned(new_constraints);
-            total_normalized += rule_normalized;
+        if rule_normalized == 0 {
+            continue;
         }
+        // All or nothing: a base replaced in one place and left raw in
+        // another would decouple the two, so a rule where any replaced name
+        // survives the rewrite keeps its original constraints.
+        let mut survivors: HashSet<String> = HashSet::new();
+        for c in &new_constraints {
+            collect_vars_recursive(c, &mut survivors);
+        }
+        if survivors.iter().any(|name| replaceable.contains(name)) {
+            continue;
+        }
+        rule.body.constraints = crate::constraints::Constraints::Owned(new_constraints);
+        total_normalized += rule_normalized;
+        names.extend(replaceable);
     }
 
-    total_normalized
+    (total_normalized, names)
 }
 
-/// Rewrite an expression, replacing free-var Array bases in store chains
-/// with `const_array` expressions.
-///
-/// Returns the rewritten expression and the number of replacements made.
-fn rewrite_free_bases_in_expr(expr: &Expr, free_vars: &HashSet<String>) -> (Expr, usize) {
+/// How often a candidate var occurs in one rule, and how many of those
+/// occurrences are the innermost base of a store chain.
+#[derive(Default)]
+struct BaseUses {
+    total: usize,
+    as_base: usize,
+}
+
+/// Count occurrences of `candidates` in `expr`. `at_base` is true when `expr`
+/// is the innermost base of a store chain.
+fn count_uses(
+    expr: &Expr,
+    candidates: &HashSet<String>,
+    at_base: bool,
+    uses: &mut HashMap<String, BaseUses>,
+) {
     match expr.value() {
-        ExprValue::Store { array, index, value } => {
-            // Check if the innermost base of this store chain is a free var.
-            if let Some((base_name, base_sort)) = find_store_chain_base(expr) {
-                if free_vars.contains(&base_name) {
-                    if let Some(arr_sort) = base_sort.array_sort() {
-                        let default_elem = make_default_value(&arr_sort.element_sort, &base_name);
-                        let const_arr =
-                            Expr::const_array(arr_sort.index_sort.clone(), default_elem);
-                        return (rebuild_store_chain_with_base(expr, &const_arr), 1);
-                    }
+        ExprValue::Var { name } => {
+            if candidates.contains(name) {
+                let entry = uses.entry(name.clone()).or_default();
+                entry.total += 1;
+                if at_base {
+                    entry.as_base += 1;
                 }
             }
-            // Not a free-base chain — recurse into children.
-            let (new_array, c1) = rewrite_free_bases_in_expr(array, free_vars);
-            let (new_index, c2) = rewrite_free_bases_in_expr(index, free_vars);
-            let (new_value, c3) = rewrite_free_bases_in_expr(value, free_vars);
-            if c1 + c2 + c3 > 0 {
-                (new_array.store(new_index, new_value), c1 + c2 + c3)
-            } else {
-                (expr.clone(), 0)
+        }
+        ExprValue::Store { .. } => {
+            let mut cur = expr;
+            while let ExprValue::Store { array, index, value } = cur.value() {
+                count_uses(index, candidates, false, uses);
+                count_uses(value, candidates, false, uses);
+                cur = array;
+            }
+            count_uses(cur, candidates, true, uses);
+        }
+        _ => {
+            for child in expr.children() {
+                count_uses(child, candidates, false, uses);
             }
         }
+    }
+}
+
+/// Rewrite an expression, replacing the `replace` vars that are store chain
+/// bases with `const_array` expressions. Every store chain is rebuilt with its
+/// indices and values rewritten too, so the replacement reaches every base
+/// occurrence [`count_uses`] counted.
+///
+/// Returns the rewritten expression and the number of replacements made.
+fn rewrite_free_bases_in_expr(expr: &Expr, replace: &HashSet<String>) -> (Expr, usize) {
+    match expr.value() {
+        ExprValue::Store { .. } => {
+            let mut spine: Vec<(&Expr, &Expr)> = Vec::new();
+            let mut cur = expr;
+            while let ExprValue::Store { array, index, value } = cur.value() {
+                spine.push((index, value));
+                cur = array;
+            }
+            let (mut rebuilt, mut count) = match cur.value() {
+                ExprValue::Var { name } if replace.contains(name) => {
+                    match cur.sort().array_sort() {
+                        Some(arr_sort) => {
+                            let default_elem = make_default_value(&arr_sort.element_sort, name);
+                            (Expr::const_array(arr_sort.index_sort.clone(), default_elem), 1)
+                        }
+                        None => (cur.clone(), 0),
+                    }
+                }
+                _ => rewrite_free_bases_in_expr(cur, replace),
+            };
+            for (index, value) in spine.into_iter().rev() {
+                let (new_index, c1) = rewrite_free_bases_in_expr(index, replace);
+                let (new_value, c2) = rewrite_free_bases_in_expr(value, replace);
+                count += c1 + c2;
+                rebuilt = rebuilt.store(new_index, new_value);
+            }
+            if count > 0 { (rebuilt, count) } else { (expr.clone(), 0) }
+        }
         ExprValue::Eq(lhs, rhs) => {
-            let (new_lhs, c1) = rewrite_free_bases_in_expr(lhs, free_vars);
-            let (new_rhs, c2) = rewrite_free_bases_in_expr(rhs, free_vars);
+            let (new_lhs, c1) = rewrite_free_bases_in_expr(lhs, replace);
+            let (new_rhs, c2) = rewrite_free_bases_in_expr(rhs, replace);
             if c1 + c2 > 0 { (new_lhs.eq(new_rhs), c1 + c2) } else { (expr.clone(), 0) }
         }
         ExprValue::Select { array, index } => {
-            let (new_array, c1) = rewrite_free_bases_in_expr(array, free_vars);
-            let (new_index, c2) = rewrite_free_bases_in_expr(index, free_vars);
+            let (new_array, c1) = rewrite_free_bases_in_expr(array, replace);
+            let (new_index, c2) = rewrite_free_bases_in_expr(index, replace);
             if c1 + c2 > 0 { (new_array.select(new_index), c1 + c2) } else { (expr.clone(), 0) }
         }
         _ => {
@@ -127,7 +222,7 @@ fn rewrite_free_bases_in_expr(expr: &Expr, free_vars: &HashSet<String>) -> (Expr
             let mut total_count = 0;
             let mut new_children = Vec::with_capacity(children.len());
             for child in &children {
-                let (rewritten, count) = rewrite_free_bases_in_expr(child, free_vars);
+                let (rewritten, count) = rewrite_free_bases_in_expr(child, replace);
                 if count > 0 {
                     any_changed = true;
                     total_count += count;
@@ -140,28 +235,6 @@ fn rewrite_free_bases_in_expr(expr: &Expr, free_vars: &HashSet<String>) -> (Expr
                 (expr.clone(), 0)
             }
         }
-    }
-}
-
-/// Find the innermost base of a store chain.
-/// Returns `(var_name, var_sort)` if the base is a `Var`.
-fn find_store_chain_base(expr: &Expr) -> Option<(String, Sort)> {
-    match expr.value() {
-        ExprValue::Var { name } => Some((name.clone(), expr.sort().clone())),
-        ExprValue::Store { array, .. } => find_store_chain_base(array),
-        _ => None,
-    }
-}
-
-/// Rebuild a store chain replacing the innermost base.
-fn rebuild_store_chain_with_base(expr: &Expr, new_base: &Expr) -> Expr {
-    match expr.value() {
-        ExprValue::Var { .. } => new_base.clone(),
-        ExprValue::Store { array, index, value } => {
-            let rebuilt_array = rebuild_store_chain_with_base(array, new_base);
-            rebuilt_array.store(index.clone(), value.clone())
-        }
-        _ => expr.clone(),
     }
 }
 

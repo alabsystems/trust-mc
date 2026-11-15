@@ -122,7 +122,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // Extract the source local from all vtable-propagating
                         // rvalue kinds (mirrors extract_vtable_source_local).
                         let src_local = match rvalue {
-                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => Some(p.local),
+                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => Some(p.local),
                             Rvalue::Ref(_, _, place) | Rvalue::CopyForDeref(place) => {
                                 Some(place.local)
                             }
@@ -142,9 +142,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
         }
 
-        // Create vtable state variable pairs for each identified dyn Trait local.
+        // Create vtable state variable pairs for each identified dyn Trait local,
+        // in local order. The pairs become relation columns in creation order,
+        // and `dyn_locals` is a `HashSet` with a per-process random order, so
+        // iterating it directly gave the same harness a different column order
+        // (and a different CHC text and AY obligation digest) on every run
+        // (measured: walker_unchecked_add_signed_dual.rs::safe_multi_impl,
+        // three runs, three source digests).
+        let mut ordered_locals: Vec<usize> = dyn_locals.iter().copied().collect();
+        ordered_locals.sort_unstable();
         let sort = Sort::bitvec(crate::codegen_ay::types::POINTER_WIDTH);
-        for &local_idx in &dyn_locals {
+        for &local_idx in &ordered_locals {
             use std::fmt::Write;
             let mut in_name = String::with_capacity(20);
             in_name.push_str("__vtable_sv_");

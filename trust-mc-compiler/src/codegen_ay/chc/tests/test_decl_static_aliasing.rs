@@ -7,12 +7,7 @@
 // Test code: unwrap/panic are acceptable for assertions
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::collections::HashMap;
-
 use super::common::*;
-use rustc_public::mir::alloc::GlobalAlloc;
-use rustc_public::mir::{Operand, Rvalue, StatementKind};
-use rustc_public::ty::{ConstantKind, TyConstKind};
 
 const STATIC_ALIAS_PROBE: &str = r#"
     #![allow(dead_code)]
@@ -40,49 +35,6 @@ const ARRAY_STATIC_PROBE: &str = r#"
         days[day]
     }
 "#;
-
-fn referenced_static_locals(body: &rustc_public::mir::Body) -> HashMap<String, usize> {
-    let mut locals = HashMap::new();
-
-    for bb in &body.blocks {
-        for stmt in &bb.statements {
-            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
-                continue;
-            };
-            let Operand::Constant(const_op) = (match rhs {
-                Rvalue::Use(op) => op,
-                _ => continue,
-            }) else {
-                continue;
-            };
-
-            let provenance = match const_op.const_.kind() {
-                ConstantKind::Allocated(alloc) if !alloc.provenance.ptrs.is_empty() => {
-                    alloc.provenance.clone()
-                }
-                ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                    TyConstKind::Value(_, alloc) if !alloc.provenance.ptrs.is_empty() => {
-                        alloc.provenance.clone()
-                    }
-                    _ => continue,
-                },
-                _ => continue,
-            };
-
-            let alloc_id = provenance.ptrs[0].1.0;
-            let GlobalAlloc::Static(static_def) = GlobalAlloc::from(alloc_id) else {
-                continue;
-            };
-            let static_name = {
-                use rustc_public::CrateDef;
-                static_def.name().clone()
-            };
-            locals.entry(static_name).or_insert(lhs.local);
-        }
-    }
-
-    locals
-}
 
 #[test]
 fn test_aliased_pointer_statics_share_one_state_var() {

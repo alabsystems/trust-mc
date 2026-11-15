@@ -42,11 +42,31 @@ use bswap::compute_bswap;
 mod cttz;
 use cttz::compute_cttz;
 
+/// Whether `path` names a function these handlers model: a compiler intrinsic
+/// (`core::intrinsics::rotate_left`), a hint (`core::hint::black_box`), or a
+/// method of a numeric type (`core::num::<impl u32>::rotate_left`,
+/// `core::num::nonzero::NonZero::<u32>::leading_zeros`).
+///
+/// The method NAME alone is not enough. `<[T]>::rotate_left(&mut self, mid)`
+/// and `VecDeque::rotate_left` share it, and matching them as the integer
+/// rotation assigned a rotated FAT POINTER to their unit result and left the
+/// slice untouched: `[Some(1), None, Some(3)].rotate_left(1)` then
+/// `assert!(a[0].is_some())` was a clean PROOF of a false assertion
+/// (fix/chc-false-certificates review, e2_enum_swap.rs `rotate_bug`).
+fn is_numeric_bit_path(path: &str) -> bool {
+    ["intrinsics::", "hint::", "num::"].iter().any(|module| path.contains(module))
+        && !path.contains("<impl [")
+        && !path.contains("slice::")
+}
+
 /// Detect bit-manipulation intrinsic from callee path.
 ///
-/// Returns the intrinsic kind if the path matches a known bit intrinsic,
-/// None otherwise.
+/// Returns the intrinsic kind if the path matches a known bit intrinsic of a
+/// numeric type ([`is_numeric_bit_path`]), None otherwise.
 pub(in crate::codegen_ay::chc) fn detect_bit_intrinsic(path: &str) -> Option<BitIntrinsicKind> {
+    if !is_numeric_bit_path(path) {
+        return None;
+    }
     let method = path
         .rsplit("::")
         .find(|segment| !segment.is_empty() && !segment.starts_with('<'))?

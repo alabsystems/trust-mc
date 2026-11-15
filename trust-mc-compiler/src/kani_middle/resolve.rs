@@ -14,16 +14,23 @@
 use crate::kani_middle::stable_fn_def;
 use quote::ToTokens;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{CRATE_DEF_INDEX, DefId, LOCAL_CRATE, LocalDefId, LocalModDefId};
+#[cfg(not(all(trust_toolchain, version("1.101"))))]
+use rustc_hir::def_id::LocalModDefId;
+#[cfg(all(trust_toolchain, version("1.101")))]
+use rustc_hir::def_id::LocalModId as LocalModDefId;
+use rustc_hir::def_id::{CRATE_DEF_INDEX, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{ItemKind, UseKind};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::fast_reject::{self, TreatParams};
+use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::rustc_internal;
 use rustc_public::ty::{
     AssocItem, FnDef, GenericArgKind, GenericArgs, RigidTy, TraitDef, Ty, TyKind,
 };
-use rustc_public::{CrateDef, CrateDefItems};
+// Trust made `associated_items` an inherent method of `TraitDef` / `ImplDef`.
+#[cfg(not(trust_toolchain))]
+use rustc_public::CrateDefItems;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Peekable;
@@ -80,12 +87,24 @@ pub(crate) fn resolve_fn_path<'tcx>(
     match &path.qself {
         // Qualified path for a trait method implementation, like `<Foo as Bar>::bar`.
         Some(QSelf { ty: syn_ty, position, .. }) if *position > 0 => {
+            // `syn` accepts a type-path here without checking the namespace of
+            // its `as` prefix. A module or an inherent type must not masquerade
+            // as the trait of a free/inherent function.
+            let mut trait_path = path.path.clone();
+            trait_path.segments = trait_path.segments.into_iter().take(*position).collect();
+            let trait_id = resolve_path(tcx, current_module, &trait_path)?;
+            validate_kind!(tcx, trait_id, "trait", DefKind::Trait)?;
             // Resolve the self type and DefId of the trait definition method.
             // E.g., in path <usize as SliceIndex<[i32]>>::get_unchecked, ty = `usize` and `trait_fn_id` is the ID of `get_unchecked`
             // in the definition of the `SliceIndex`` trait.
             let ty = type_resolution::resolve_ty(tcx, current_module, syn_ty)?;
             let trait_fn_id = resolve_path(tcx, current_module, &path.path)?;
-            validate_kind!(tcx, trait_fn_id, "function / method", DefKind::Fn | DefKind::AssocFn)?;
+            validate_kind!(tcx, trait_fn_id, "trait method", DefKind::AssocFn)?;
+            if tcx.trait_of_assoc(trait_fn_id) != Some(trait_id) {
+                return Err(ResolveError::InvalidPath {
+                    msg: "qualified method is not owned by the named trait".to_owned(),
+                });
+            }
             // Extract the trait's own generic arguments, e.g. `u32` in
             // `<MyType as Convert<u32>>::convert`, so we can disambiguate between
             // multiple impls of the same trait for the same Self type (#1997).
@@ -244,7 +263,7 @@ impl fmt::Display for ResolveError<'_> {
             ResolveError::UnexpectedType { tcx, item: def_id, expected } => write!(
                 f,
                 "expected {expected}, found {} `{}`",
-                tcx.def_kind(def_id).descr(*def_id),
+                tcx.def_kind(*def_id).descr(*def_id),
                 tcx.def_path_str(*def_id)
             ),
             ResolveError::MissingItem { tcx, base, unresolved } => {
@@ -426,36 +445,43 @@ fn resolve_in_foreign_module(tcx: TyCtxt, foreign_mod: DefId, name: &str) -> Opt
         .find_map(|item| if item.ident.as_str() == name { item.res.opt_def_id() } else { None })
 }
 
-/// Scan all traits in the local crate to check if any of their associated items match `name`.
+/// Scan all available traits for an associated function named `name`.
 /// If so, check if `ty` implements the trait, and return a match if so.
 fn resolve_in_any_trait<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty, name: &str) -> Option<FnResolution> {
-    let matches: Vec<FnResolution> = rustc_public::all_trait_decls()
+    let matches: Vec<_> = rustc_public::all_trait_decls()
         .into_iter()
         .filter_map(|trait_def| {
             resolve_in_trait_def_stable(tcx, trait_def, name).ok().and_then(|item| {
+                let item_id = rustc_internal::internal(tcx, item.def_id.def_id());
+                if tcx.def_kind(item_id) != DefKind::AssocFn {
+                    // A same-name associated const/type is not a function
+                    // candidate, even when its trait has no impl for `ty`.
+                    return None;
+                }
                 // Unqualified name (e.g. bare `convert`): no trait generic args
                 // are written, so rely on Self-type selection only.
-                resolve_in_trait_impl(
-                    tcx,
-                    ty,
-                    rustc_internal::internal(tcx, item.def_id.def_id()),
-                    vec![],
-                )
-                .ok()
+                match resolve_in_trait_impl(tcx, ty, item_id, vec![]) {
+                    Err(ResolveError::MissingTraitImpl { .. }) => None,
+                    result => Some(result),
+                }
             })
         })
         .collect();
     debug!(?name, ?ty, ?matches, "resolve_in_any_trait");
-    if matches.len() == 1 { Some(matches[0]) } else { None }
+    // A selected impl whose concrete identity cannot be retained must not be
+    // dropped in favor of another same-name trait method.
+    match matches.as_slice() {
+        [Ok(resolved)] => Some(*resolved),
+        _ => None,
+    }
 }
 
 /// Resolve the angle-bracketed generic *type* arguments written on a trait
 /// segment (e.g. `u32` in `Convert<u32>`) into rustc_public `GenericArgKind`s.
 ///
 /// Lifetime arguments are dropped (they are erased for instance selection).
-/// If any argument is not a plain type (e.g. a const generic) we conservatively
-/// return an empty list so the caller falls back to Self-only selection rather
-/// than building a malformed argument vector.
+/// Unsupported argument kinds refuse instead of discarding explicit arguments
+/// and accidentally selecting an implementation using different defaults.
 fn resolve_trait_generic_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     current_module: LocalDefId,
@@ -472,7 +498,11 @@ fn resolve_trait_generic_args<'tcx>(
                 resolved.push(GenericArgKind::Type(ty));
             }
             syn::GenericArgument::Lifetime(_) => {}
-            _ => return Ok(vec![]),
+            _ => {
+                return Err(ResolveError::InvalidPath {
+                    msg: "unsupported explicit trait generic argument".to_owned(),
+                });
+            }
         }
     }
     Ok(resolved)
@@ -488,24 +518,79 @@ fn resolve_in_trait_impl(
     trait_generic_args: Vec<GenericArgKind>,
 ) -> Result<FnResolution, ResolveError<'_>> {
     debug!(?ty, ?trait_generic_args, "resolve_in_trait_impl");
+    validate_kind!(tcx, trait_fn_id, "trait method", DefKind::AssocFn)?;
+    if tcx.trait_of_assoc(trait_fn_id).is_none() {
+        return Err(ResolveError::UnexpectedType {
+            tcx,
+            item: trait_fn_id,
+            expected: "trait method",
+        });
+    }
     // Given the `FnDef` of the *definition* of the trait method, see if there exists an Instance
     // that implements that method for `ty`.
-    let trait_fn_fn_def =
-        stable_fn_def(tcx, trait_fn_id).expect("trait function should convert to stable FnDef");
-    // A trait method's generics are `[Self, <trait params...>, <method params...>]`.
-    // The Self type plus any trait params (e.g. `T` in `Convert<T>`) are what
-    // select the impl; method-level params are inferred by `Instance::resolve`.
-    let mut generic_args = vec![GenericArgKind::Type(ty)];
-    generic_args.extend(trait_generic_args);
+    let trait_fn_fn_def = stable_fn_def(tcx, trait_fn_id).ok_or(ResolveError::UnexpectedType {
+        tcx,
+        item: trait_fn_id,
+        expected: "trait method",
+    })?;
+    // Instance::resolve requires every generic argument, including defaults
+    // such as PartialEq<Rhs=Self>. An incomplete vector is a compiler ICE.
+    let generics = tcx.generics_of(trait_fn_id);
+    let mut supplied = trait_generic_args.into_iter();
+    let mut generic_args = Vec::with_capacity(generics.count());
+    for index in 0..generics.count() {
+        use rustc_middle::ty::GenericParamDefKind as Kind;
+        let param = generics.param_at(index, tcx);
+        if index >= generics.parent_count && supplied.len() != 0 {
+            // Explicit trait arguments cannot spill into method parameters.
+            return Err(ResolveError::MissingTraitImpl { tcx, trait_fn_id, ty });
+        }
+        let arg = match param.kind {
+            Kind::Lifetime => GenericArgKind::Lifetime(rustc_public::ty::Region {
+                kind: rustc_public::ty::RegionKind::ReErased,
+            }),
+            Kind::Type { .. } if index == 0 => GenericArgKind::Type(ty),
+            Kind::Type { has_default, .. } => {
+                if let Some(arg) = supplied.next() {
+                    arg
+                } else if has_default {
+                    let prefix = GenericArgs(generic_args.clone());
+                    let args = rustc_internal::internal(tcx, &prefix);
+                    let default = crate::rustc_compat::skip_normalization(
+                        tcx.type_of(param.def_id).instantiate(tcx, args),
+                    );
+                    GenericArgKind::Type(rustc_internal::stable(default))
+                } else {
+                    return Err(ResolveError::MissingTraitImpl { tcx, trait_fn_id, ty });
+                }
+            }
+            _ => return Err(ResolveError::MissingTraitImpl { tcx, trait_fn_id, ty }),
+        };
+        generic_args.push(arg);
+    }
+    if supplied.next().is_some() {
+        return Err(ResolveError::MissingTraitImpl { tcx, trait_fn_id, ty });
+    }
     let desired_generic_args = GenericArgs(generic_args);
     let exists = Instance::resolve(trait_fn_fn_def, &desired_generic_args);
 
-    // If such an Instance exists, return *its* FnDef (i.e., the FnDef inside the impl block for this `ty`)
+    // Stub maps retain only FnDef, not the selected instance's arguments. A
+    // shared default or generic impl body would therefore replace every
+    // instantiation of that definition, beyond this concrete selector. Keep
+    // explicit whole-definition `Trait::method` paths available, but refuse
+    // these selectors until the stub map can preserve instance identity.
     exists.map_or(Err(ResolveError::MissingTraitImpl { tcx, trait_fn_id, ty }), |inst| {
-        Ok(FnResolution::FnImpl {
-            def: inst.ty().kind().fn_def().expect("instance should have fn_def").0,
-            ty,
-        })
+        let def = inst.ty().kind().fn_def().expect("instance should have fn_def").0;
+        let def_id = rustc_internal::internal(tcx, def.def_id());
+        if tcx.generics_of(def_id).requires_monomorphization(tcx) {
+            return Err(ResolveError::InvalidPath {
+                msg:
+                    "concrete trait selectors cannot target a shared generic function definition; \
+                      use `Trait::method` only when whole-definition selection is intended"
+                        .to_owned(),
+            });
+        }
+        Ok(FnResolution::FnImpl { def, ty })
     })
 }
 
@@ -536,8 +621,29 @@ fn resolve_relative(tcx: TyCtxt, current_module: LocalModDefId, name: &str) -> R
     let mut glob_imports = vec![];
     let result = tcx.hir_module_free_items(current_module).find_map(|item_id| {
         let item = tcx.hir_item(item_id);
+        // Modern HIR retains grouped imports as a tree. Visit every leaf in
+        // source order: an explicit alias resolves before the collected glob
+        // candidates, just as the flattened HIR did on the pinned seal.
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if let ItemKind::Use(tree) = item.kind {
+            let mut pending = vec![tree];
+            while let Some(tree) = pending.pop() {
+                match tree.kind {
+                    UseKind::Single(ident) if ident.as_str() == name => {
+                        return tree.prefix.res.present_items().find_map(|res| res.opt_def_id());
+                    }
+                    UseKind::Glob => glob_imports.extend(tree.prefix.res.present_items()),
+                    UseKind::Nested { items } => {
+                        pending.extend(items.iter().rev().map(|(tree, _, _)| *tree));
+                    }
+                    UseKind::Single(_) => {}
+                }
+            }
+            return None;
+        }
         if item.kind.ident().is_some_and(|ident| ident.as_str() == name) {
             match item.kind {
+                #[cfg(not(all(trust_toolchain, version("1.101"))))]
                 ItemKind::Use(use_path, UseKind::Single(_)) => {
                     use_path.res.present_items().find_map(|res| res.opt_def_id())
                 }
@@ -557,6 +663,7 @@ fn resolve_relative(tcx: TyCtxt, current_module: LocalModDefId, name: &str) -> R
                     }
                 }
             }
+            #[cfg(not(all(trust_toolchain, version("1.101"))))]
             if let ItemKind::Use(use_path, UseKind::Glob) = item.kind {
                 // Do not immediately try to resolve the path using this glob,
                 // since paths resolved via non-globs take precedence.
@@ -702,7 +809,7 @@ fn resolve_in_type_def<'tcx>(
     let candidates: Vec<DefId> = tcx
         .inherent_impls(type_id)
         .iter()
-        .flat_map(|impl_id| tcx.associated_item_def_ids(impl_id))
+        .flat_map(|impl_id| tcx.associated_item_def_ids(*impl_id))
         .copied()
         .filter(|item| is_item_name(tcx, *item, name))
         .collect();
@@ -724,7 +831,7 @@ fn resolve_in_type_def<'tcx>(
             // non-enum: usize
             let invalid_path_err = |generic_args, candidates: Vec<DefId>| -> ResolveError {
                 let paths: Vec<_> =
-                    candidates.iter().map(|def_id| tcx.def_path_str(def_id)).collect();
+                    candidates.iter().map(|def_id| tcx.def_path_str(*def_id)).collect();
                 ResolveError::InvalidPath {
                     msg: format!(
                         "the generic arguments {} are invalid. The available implementations are: \n{}",
@@ -761,7 +868,7 @@ fn resolve_in_type_def<'tcx>(
                             "Got multiple refined candidates {:?}",
                             refined_candidates
                                 .iter()
-                                .map(|def_id| tcx.def_path_str(def_id))
+                                .map(|def_id| tcx.def_path_str(*def_id))
                                 .collect::<Vec<String>>()
                         ),
                     }
@@ -839,7 +946,7 @@ where
         let item = impls
             .iter()
             .find_map(|item_impl| {
-                tcx.associated_item_def_ids(item_impl)
+                tcx.associated_item_def_ids(*item_impl)
                     .iter()
                     .copied()
                     .find(|item| is_item_name(tcx, *item, &name))
@@ -924,6 +1031,127 @@ fn last_two_items_of_path_match(item_path: &str, generic_args: &str, name: &str)
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    mod modern_grouped_imports {
+        use super::super::*;
+        use rustc_public::{CompilerError, run_with_tcx};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn native_grouped_aliases_and_local_items_shadow_globs() {
+            const SOURCE: &str = r#"
+                #![allow(dead_code)]
+                mod chosen {
+                    pub fn source_alias() -> u8 { 1 }
+                    pub mod nested { pub fn source_nested() -> u8 { 2 } }
+                }
+                mod globbed {
+                    pub fn renamed() -> u8 { 11 }
+                    pub fn inner() -> u8 { 12 }
+                    pub fn glob_only() -> u8 { 13 }
+                    pub fn shadowed() -> u8 { 14 }
+                }
+                mod imports {
+                    use crate::globbed::*;
+                    use crate::chosen::{source_alias as renamed, nested::{source_nested as inner}};
+                    pub fn shadowed() -> u8 { 3 }
+                    pub fn observed() -> u8 { renamed() + inner() + glob_only() + shadowed() }
+                }
+            "#;
+            let temp = tempfile::TempDir::new().expect("native resolver fixture directory");
+            let src = temp.path().join("lib.rs");
+            std::fs::write(&src, SOURCE).expect("write native resolver fixture");
+            let args = vec![
+                "rustc".to_owned(),
+                src.to_string_lossy().into_owned(),
+                "--crate-type=lib".to_owned(),
+                "--crate-name=grouped_import_resolution_probe".to_owned(),
+                "--edition=2024".to_owned(),
+                "--out-dir".to_owned(),
+                temp.path().to_string_lossy().into_owned(),
+            ];
+            let observed = Arc::new(AtomicBool::new(false));
+            let completed = Arc::clone(&observed);
+            let result = run_with_tcx!(&args, |tcx| {
+                let root = LocalModDefId::new_unchecked(rustc_hir::def_id::CRATE_DEF_ID);
+                let module = tcx
+                    .hir_module_free_items(root)
+                    .map(|id| tcx.hir_item(id))
+                    .find(|item| item.kind.ident().is_some_and(|ident| ident.as_str() == "imports"))
+                    .expect("compiler-owned imports module")
+                    .owner_id
+                    .def_id;
+                let nested_group_observed = tcx
+                    .hir_module_free_items(LocalModDefId::new_unchecked(module))
+                    .map(|id| tcx.hir_item(id))
+                    .any(|item| {
+                        matches!(item.kind, ItemKind::Use(tree)
+                            if matches!(tree.kind, UseKind::Nested { items }
+                                if items.iter().any(|(child, _, _)| matches!(child.kind, UseKind::Nested { .. }))))
+                    });
+                assert!(
+                    nested_group_observed,
+                    "exercise real nested UseTree HIR, not a flat surrogate"
+                );
+                // Match exact compiler-owned ancestry, not diagnostic path
+                // spelling (which may omit the local crate root).
+                let definition = |path: &str| {
+                    let matches: Vec<_> = tcx
+                        .mir_keys(())
+                        .iter()
+                        .map(|id| id.to_def_id())
+                        .filter(|id| {
+                            if tcx.def_kind(*id) != DefKind::Fn {
+                                return false;
+                            }
+                            let root = rustc_hir::def_id::CRATE_DEF_ID.to_def_id();
+                            let mut current = *id;
+                            for segment in path.rsplit("::") {
+                                if current == root
+                                    || (current != *id && tcx.def_kind(current) != DefKind::Mod)
+                                    || !tcx
+                                        .opt_item_name(current)
+                                        .is_some_and(|name| name.as_str() == segment)
+                                {
+                                    return false;
+                                }
+                                current = tcx.parent(current);
+                            }
+                            current == root
+                        })
+                        .collect();
+                    assert_eq!(matches.len(), 1, "independent source definition {path}");
+                    matches[0]
+                };
+                for (name, expected, decoy) in [
+                    ("renamed", "chosen::source_alias", "globbed::renamed"),
+                    ("inner", "chosen::nested::source_nested", "globbed::inner"),
+                    ("shadowed", "imports::shadowed", "globbed::shadowed"),
+                ] {
+                    let actual = resolve_fn(tcx, module, name).expect("explicit source binding");
+                    assert_eq!(actual, definition(expected));
+                    assert_ne!(actual, definition(decoy), "an earlier glob must not shadow {name}");
+                }
+                assert_eq!(
+                    resolve_fn(tcx, module, "glob_only").expect("glob-only source binding"),
+                    definition("globbed::glob_only"),
+                );
+                for wrong_name in ["missing_name", "source_alias", "source_nested"] {
+                    assert!(
+                        matches!(resolve_fn(tcx, module, wrong_name),
+                        Err(ResolveError::MissingItem { unresolved, .. }) if unresolved == wrong_name),
+                        "missing and pre-alias names must not resolve: {wrong_name}"
+                    );
+                }
+                completed.store(true, Ordering::Relaxed);
+                std::ops::ControlFlow::<(), ()>::Continue(())
+            });
+            assert!(result.is_ok() || matches!(result, Err(CompilerError::Skipped)), "{result:?}");
+            assert!(observed.load(Ordering::Relaxed), "the native resolution callback must finish");
+        }
+    }
+
     mod simple_last_two_items_of_path_match {
         use crate::kani_middle::resolve::last_two_items_of_path_match;
 

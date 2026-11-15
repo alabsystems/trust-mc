@@ -8,6 +8,10 @@
 //! across encodings. CHC-specific helper-body exceptions live here so BMC does
 //! not inherit them implicitly.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::mir::TerminatorKind;
 use rustc_public::ty::{RigidTy, TyKind};
 
@@ -85,7 +89,9 @@ fn ty_is_small_inline_aggregate(ty: rustc_public::ty::Ty) -> bool {
             let fields = variant.fields();
             !fields.is_empty()
                 && fields.len() <= 2
-                && fields.iter().all(|field| ty_is_inline_scalar(field.ty_with_args(&args)))
+                && fields
+                    .iter()
+                    .all(|field| mono_ty::field_ty(field, &args).is_some_and(ty_is_inline_scalar))
         }
         _ => false,
     }
@@ -162,7 +168,7 @@ fn body_is_small_ref_receiver_helper(body: &rustc_public::mir::Body) -> bool {
                 let Ok(instance) = rustc_public::mir::mono::Instance::resolve(def, &args) else {
                     return false;
                 };
-                let Some(callee_body) = instance.body() else {
+                let Some(callee_body) = instance.callee_body() else {
                     return false;
                 };
                 let callee_effective = count_effective_blocks(&callee_body);

@@ -123,6 +123,17 @@ pub(in crate::codegen_ay) struct AYConfig {
     /// vacuity is adjudicated by `probe_harness_reachable`, which does not read
     /// these per-check flags, so the V4 gate is unaffected.
     pub(in crate::codegen_ay) assertion_reach_checks: bool,
+    /// Run the bounded straight-line discharge on the CHC system
+    /// (`chc::discharge_straightline_safety`).
+    ///
+    /// The discharge only replaces a system it has already proven UNSAT with
+    /// another trivially-UNSAT one, so turning it off never changes a verdict;
+    /// it leaves the full pre-discharge encoding in place for inspection. The
+    /// switch belongs to one compilation: production sets it from the
+    /// `TRUST_MC_NO_STRAIGHTLINE_DISCHARGE=1` diagnostic lever, and an
+    /// encoding-inspection test sets it on the context it owns, so no
+    /// concurrent compilation in the same process ever reads another's choice.
+    pub(in crate::codegen_ay) chc_straightline_discharge: bool,
 }
 
 impl Default for AYConfig {
@@ -155,6 +166,7 @@ impl Default for AYConfig {
             // richer UNREACHABLE annotation; the driver sets it from the user's
             // `--assertion-reach-checks` / `--no-assertion-reach-checks` choice.
             assertion_reach_checks: true,
+            chc_straightline_discharge: true,
         }
     }
 }
@@ -177,6 +189,8 @@ impl AYConfig {
     /// ## BMC (non-CHC) mode (`use_chc = false`)
     /// - Returns `"QF_AUFBV"` when no datatypes are present.
     /// - Returns `"ALL"` when datatypes are present (most solvers support this).
+    /// - The finalizers widen a non-overridden `"QF_AUFBV"` to `"ALL"` when a
+    ///   term uses floating point (`emitter::upgrade_logic_for_floating_point`).
     ///
     /// # Arguments
     /// * `has_datatypes` - Whether algebraic datatypes are declared in the program.

@@ -262,5 +262,5 @@ fn proof_report_input_note() -> String {
 }
 
 fn proof_report_progress_command() -> String {
-    "proof_report_command cargo run --manifest-path tools/replacement-audit/Cargo.toml --locked --bin replacement-progress -- --require-complete --report reports/compiletest-per-harness-latest-trust_mc.json".to_string()
+    "proof_report_command targo --unverified run --manifest-path tools/replacement-audit/Cargo.toml --locked --bin replacement-progress -- --require-complete --report reports/compiletest-per-harness-latest-trust_mc.json".to_string()
 }

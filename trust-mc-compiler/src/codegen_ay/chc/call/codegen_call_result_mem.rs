@@ -7,11 +7,14 @@
 //! Reconstructs flattened destinations through their post-assignment output
 //! locals before storing them to typed memory.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
 use rustc_public::mir::Place;
-use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::debug;
 
 use crate::args::ChcTrackLevel;
@@ -46,7 +49,11 @@ pub(in crate::codegen_ay::chc) fn build_call_result_memory_bridge_constraints(
         };
         value
     } else {
-        result_expr.clone()
+        // Design 4 D: a slice slot's memory copy gets the same guard as the
+        // slot itself. Callers that guard first pass a packed value, which this
+        // leaves unchanged, so both views share one fresh length.
+        let dest_ty = ctx.body.locals()[dest_local].ty;
+        ctx.guard_slice_len_slot_write(dest_ty, result_expr.clone(), "call_result_memory_bridge")
     };
     let Some(addr_loc) = ctx.translate_ref_to_address(&local_place, &bridge_modified) else {
         return Vec::new();
@@ -156,48 +163,42 @@ pub(in crate::codegen_ay::chc) fn try_decompose_flattened_enum_field_stores(
             addr_expr.clone()
         };
 
-        // Resolve generic Param types (e.g., Param(0) → u8 for Result<u8, u8>)
-        // using the ADT's own GenericArgs. Without this, stores go to
-        // mem_param_0 instead of mem_u8.
-        let raw_field_ty = variant_0_fields[payload_idx].ty();
-        let field_ty = match raw_field_ty.kind() {
-            TyKind::Param(param_ty) => args
-                .0
-                .get(param_ty.index as usize)
-                .and_then(|arg| match arg {
-                    GenericArgKind::Type(resolved) => Some(*resolved),
-                    _ => None,
-                })
-                .unwrap_or(raw_field_ty),
-            _ => raw_field_ty,
+        // Rule A (`shared::mono_ty::field_ty`): the payload's type at the ADT's
+        // own arguments (`u8` for `Result<u8, u8>`; a shallow read stored to
+        // mem_param_0). A payload whose type does not instantiate is not stored.
+        let Some(field_ty) = mono_ty::field_ty(&variant_0_fields[payload_idx], &args) else {
+            continue;
         };
         constraints.extend(ctx.build_memory_store_untyped(field_addr, field_expr, field_ty));
     }
 
-    // Store the discriminant tag byte.
-    if let Some(discr_expr) = ctx.flattened_local_field_expr(dest_local, 0, modified_locals) {
-        let discr_offset = ctx.get_field_offset(local_ty, 0);
-
-        if let Some(offset) = discr_offset {
-            let discr_addr = if offset > 0 {
-                addr_expr.clone().bvadd(Expr::bitvec_const(offset as i64, POINTER_WIDTH))
+    // Store the tag in its memory image (rustc layout): every tag byte to
+    // the `u8` view, and a multi-byte tag also whole to its integer view.
+    if let Some(image) = flattened_enum_tag_image(ctx, dest_local, local_ty, modified_locals) {
+        let byte_addr = |k: u64| {
+            let off = image.offset + k;
+            if off > 0 {
+                addr_expr.clone().bvadd(Expr::bitvec_const(off as u128, POINTER_WIDTH))
             } else {
                 addr_expr.clone()
-            };
-
-            // Convert Bool discriminant to BV8 for storage in mem_u8.
-            let discr_bv8 = if discr_expr.sort().is_bool() {
-                Expr::ite(discr_expr, Expr::bitvec_const(1u64, 8), Expr::bitvec_const(0u64, 8))
-            } else if discr_expr.sort().bitvec_width() == Some(8) {
-                discr_expr
-            } else if let Some(w) = discr_expr.sort().bitvec_width() {
-                if w < 8 { discr_expr.zero_extend(8 - w) } else { discr_expr.extract(7, 0) }
-            } else {
-                return;
-            };
-
-            let u8_ty = rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8);
-            constraints.extend(ctx.build_memory_store_untyped(discr_addr, discr_bv8, u8_ty));
+            }
+        };
+        let u8_ty = rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8);
+        let fold =
+            |e: Expr| trust_mc_core::chc_const_prop::eval::try_eval_to_const(&e).unwrap_or(e);
+        for k in 0..image.size {
+            let byte = fold(image.value.clone().extract(8 * k as u32 + 7, 8 * k as u32));
+            constraints.extend(ctx.build_memory_store_untyped(byte_addr(k), byte, u8_ty));
+        }
+        let whole_ty = match image.size {
+            2 => Some(rustc_public::ty::UintTy::U16),
+            4 => Some(rustc_public::ty::UintTy::U32),
+            8 => Some(rustc_public::ty::UintTy::U64),
+            _ => None,
+        };
+        if let Some(uint) = whole_ty {
+            let ty = rustc_public::ty::Ty::unsigned_ty(uint);
+            constraints.extend(ctx.build_memory_store_untyped(byte_addr(0), fold(image.value), ty));
         }
     }
 
@@ -205,4 +206,206 @@ pub(in crate::codegen_ay::chc) fn try_decompose_flattened_enum_field_stores(
         dest_local,
         field_count, "Part of #3963: decomposed flattened enum fields to type-indexed memory"
     );
+}
+
+/// A flattened enum tag's memory image: `size` bytes at `offset` from the
+/// enum's address, `value` their little-endian bits.
+struct EnumTagImage {
+    offset: u64,
+    size: u64,
+    value: Expr,
+}
+
+/// The memory image of flattened enum local `dest_local`'s tag, from the
+/// enum's rustc layout and the local's discriminant VALUE
+/// ([`ChcCtx::flattened_local_discriminant`]).
+///
+/// - A direct tag holds the active variant's discriminant value, at the
+///   tag's width (`#[repr(u8)] enum Disc { Val(u8) = 7, Nothing = 2 }` is
+///   byte 7 or 2).
+/// - A niche tag holds `niche_start + (v - niche_variants.start)` for a niche
+///   variant `v`, and the untagged variant's own payload bytes otherwise
+///   (`Option<bool>`: `None` is 2, `Some(b)` is `b`). Those bytes are the
+///   payload's image when its one flattened payload slot has one, else a
+///   fresh value recorded with its identity
+///   (`sound_havoc::ENUM_TAG_IMAGE_PAYLOAD_UNKNOWN`), so no counterexample that reads
+///   them is certified.
+///
+/// Before, every flattened tag was stored as one byte `ite(fld0, 1, 0)`,
+/// whatever the encoding or the local's tag convention: an explicit
+/// discriminant, a `Result` (whose `fld0` names `Ok`, variant 0) and every
+/// niche-encoded enum read through a `*const u8` saw a wrong byte, so
+/// `bug_tag_disc_sym`, `bug_opt_bool_none_byte` and
+/// `bug_opt_nonzero_some_byte` verified and their safe twins were certified
+/// false failures (review of fix/chc-lost-writes, lostwrite track round 3,
+/// finding 3). `None` for a layout with no tag (`Single`), a tag wider than
+/// 64 bits, or a local whose discriminant does not translate.
+fn flattened_enum_tag_image(
+    ctx: &mut ChcCtx<'_, '_>,
+    dest_local: usize,
+    local_ty: rustc_public::ty::Ty,
+    modified_locals: &HashSet<usize>,
+) -> Option<EnumTagImage> {
+    use crate::rustc_public_bridge::IndexedVal;
+    use rustc_abi::VariantIdx as InternalVariantIdx;
+    use rustc_public::abi::{FieldsShape, Scalar, TagEncoding, VariantsShape};
+    use rustc_public::rustc_internal;
+    use rustc_public::target::MachineInfo;
+
+    let TyKind::RigidTy(RigidTy::Adt(def, args)) = local_ty.kind() else {
+        return None;
+    };
+    let layout = local_ty.layout().ok()?;
+    let shape = layout.shape();
+    let VariantsShape::Multiple { tag, tag_encoding, tag_field, .. } = &shape.variants else {
+        return None;
+    };
+    let FieldsShape::Arbitrary { offsets } = &shape.fields else {
+        return None;
+    };
+    let offset = offsets.get(*tag_field)?.bytes() as u64;
+    let Scalar::Initialized { value: tag_primitive, .. } = tag else {
+        return None;
+    };
+    let size = tag_primitive.size(&MachineInfo::target()).bytes() as u64;
+    let bits = u32::try_from(size.checked_mul(8)?).ok()?;
+    if bits == 0 || bits > POINTER_WIDTH {
+        return None;
+    }
+    let discr = ctx.flattened_local_discriminant(dest_local, modified_locals)?;
+    let at_width = |e: Expr| if bits == POINTER_WIDTH { e } else { e.extract(bits - 1, 0) };
+    let value = match tag_encoding {
+        TagEncoding::Direct => at_width(discr),
+        TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+            let untagged = untagged_variant.to_index();
+            let internal_def = rustc_internal::internal(ctx.tcx, def);
+            let discr_of = |v: usize| {
+                let d = internal_def
+                    .discriminant_for_variant(ctx.tcx, InternalVariantIdx::from_usize(v));
+                crate::codegen_ay::chc::stmt::codegen_stmt_aggregate_adt::sign_extend_discr_val(
+                    d.val,
+                    d.ty,
+                    ctx.tcx,
+                    POINTER_WIDTH,
+                )
+            };
+            let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+            let niche_values: Vec<(u128, u128)> = (niche_variants.start().to_index()
+                ..=niche_variants.end().to_index())
+                .filter(|&v| v != untagged)
+                .map(|v| {
+                    let rel = (v - niche_variants.start().to_index()) as u128;
+                    (discr_of(v), rel.wrapping_add(*niche_start) & mask)
+                })
+                .collect();
+            let payload = untagged_payload_niche_image(
+                ctx,
+                dest_local,
+                local_ty,
+                &def,
+                &args,
+                untagged,
+                offset,
+                size,
+                modified_locals,
+            )
+            .unwrap_or_else(|| {
+                let name =
+                    crate::codegen_ay::chc::chc_fresh_name("__enum_tag_image_payload_unknown");
+                crate::codegen_ay::chc::codegen_ctx::Havoc::mint(
+                    ctx,
+                    crate::codegen_ay::chc::codegen_ctx::sound_havoc::ENUM_TAG_IMAGE_PAYLOAD_UNKNOWN,
+                    name,
+                    ay_bindings::Sort::bitvec(bits),
+                )
+            });
+            niche_values.into_iter().fold(payload, |acc, (dv, nv)| {
+                Expr::ite(
+                    discr.clone().eq(Expr::bitvec_const(dv, POINTER_WIDTH)),
+                    Expr::bitvec_const(nv, bits),
+                    acc,
+                )
+            })
+        }
+    };
+    Some(EnumTagImage { offset, size, value })
+}
+
+/// The untagged variant's bytes at a niche tag `[tag_offset, tag_offset +
+/// tag_size)`, sliced from the byte image of its payload when the variant
+/// has one field, the local one flattened payload slot (`fld1`), and that
+/// field covers the tag; `None` otherwise.
+#[allow(clippy::too_many_arguments)]
+fn untagged_payload_niche_image(
+    ctx: &mut ChcCtx<'_, '_>,
+    dest_local: usize,
+    local_ty: rustc_public::ty::Ty,
+    def: &rustc_public::ty::AdtDef,
+    args: &rustc_public::ty::GenericArgs,
+    untagged: usize,
+    tag_offset: u64,
+    tag_size: u64,
+    modified_locals: &HashSet<usize>,
+) -> Option<Expr> {
+    if ctx.flattened_field_count(dest_local) != 2 {
+        return None;
+    }
+    let variants = def.variants();
+    let fields = variants.get(untagged)?.fields();
+    if fields.len() != 1 {
+        return None;
+    }
+    let field_ty = mono_ty::field_ty(&fields[0], args)?;
+    let field_off = ctx.get_variant_field_offset(local_ty, untagged, 0)?;
+    let field_size = ctx.get_type_size(field_ty)? as u64;
+    let rel = tag_offset.checked_sub(field_off)?;
+    if rel.checked_add(tag_size)? > field_size {
+        return None;
+    }
+    let payload = ctx.flattened_local_field_expr(dest_local, 1, modified_locals)?;
+    let image = if payload.sort().bitvec_width() == u32::try_from(field_size * 8).ok()
+        && transparent_scalar_newtype(ctx, field_ty, field_size)
+    {
+        // A one-field wrapper of a primitive (`NonZeroU8` holds a `u8`) is
+        // carried as that primitive's bits, which are its image.
+        payload
+    } else {
+        ctx.scalar_le_byte_image(&payload, Some(field_ty), field_size as usize)?
+    };
+    if image.sort().bitvec_width()? != u32::try_from(field_size * 8).ok()? {
+        return None;
+    }
+    let lo = u32::try_from(rel * 8).ok()?;
+    let hi = u32::try_from((rel + tag_size) * 8 - 1).ok()?;
+    Some(image.extract(hi, lo))
+}
+
+/// Whether `ty` is a chain of one-field structs ending in a primitive integer,
+/// `char` or `bool` of `size` bytes (`NonZero<u8>` -> `NonZeroU8Inner` -> `u8`),
+/// so its value's bits are its memory image.
+fn transparent_scalar_newtype(
+    ctx: &ChcCtx<'_, '_>,
+    ty: rustc_public::ty::Ty,
+    size: u64,
+) -> bool {
+    let mut current = ty;
+    for _ in 0..8 {
+        match current.kind() {
+            TyKind::RigidTy(RigidTy::Int(_) | RigidTy::Uint(_) | RigidTy::Char | RigidTy::Bool) => {
+                return current != ty && ctx.get_type_size(current) == usize::try_from(size).ok();
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args))
+                if def.kind() == rustc_public::ty::AdtKind::Struct =>
+            {
+                let variants = def.variants();
+                let [variant] = variants.as_slice() else { return false };
+                let fields = variant.fields();
+                let [field] = fields.as_slice() else { return false };
+                let Some(field_ty) = mono_ty::field_ty(field, &args) else { return false };
+                current = field_ty;
+            }
+            _ => return false,
+        }
+    }
+    false
 }

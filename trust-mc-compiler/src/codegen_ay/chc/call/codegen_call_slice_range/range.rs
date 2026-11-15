@@ -13,12 +13,12 @@ use crate::codegen_ay::provenance::Val;
 use crate::codegen_ay::types::POINTER_WIDTH;
 use trust_mc_core::chc::{Rule, RuleBody};
 
+use super::super::ChcCtx;
 use super::super::chc_call_context::ChcCallContext;
 use super::super::codegen_call_coerce::emit_sound_fallback_goto;
 use super::super::codegen_call_slice_helpers::{
     ResolvedSliceBacking, SLICE_BACKING_REBASE_MAX_ELEMS,
 };
-use super::super::{ChcCtx, RelationApp};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     pub(in crate::codegen_ay::chc) fn codegen_call_slice_range_index(
@@ -98,9 +98,48 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return;
         };
 
+        // A `RangeInclusive` slices `start'..end + 1`, where `start'` is
+        // `end + 1` once the range is exhausted (`SliceIndex for
+        // RangeInclusive<usize>`, `into_slice_range`): it is reversed only
+        // when `start' > end + 1`, so `&a[2..=1]` is an empty slice, and an
+        // exhausted range is empty. Both used to be read as `start..=end`
+        // whatever the exhaustion, and `start > end` panicked (walker
+        // fail-closed repair round 5, `range_literal_stale_dual.rs`). The
+        // `end >= len` bound check below stays on the inclusive end, which
+        // also catches `end == usize::MAX`.
+        let (start_bv, end_excl_bv) = if inclusive {
+            let exhausted = range_local
+                .and_then(|local| self.range_inclusive_exhausted(local, modified_locals));
+            let Some(exhausted) = exhausted else {
+                debug!(
+                    fn_name = %self.fn_name,
+                    "CHC slice range: RangeInclusive exhaustion unresolved; fallback"
+                );
+                emit_sound_fallback_goto(
+                    self,
+                    from_app,
+                    target,
+                    modified_locals,
+                    &[dest_local],
+                    stmt_constraints,
+                );
+                return;
+            };
+            let end_excl = end_bv.clone().bvadd(Expr::bitvec_const(1, POINTER_WIDTH));
+            (Expr::ite(exhausted, end_excl.clone(), start_bv), end_excl)
+        } else {
+            (start_bv, end_bv.clone())
+        };
+
         // Bounds guard: start > end -> error (reversed range).
-        let reversed = start_bv.clone().bvugt(end_bv.clone());
-        let error_app = RelationApp::new("error", Vec::new());
+        let reversed = start_bv.clone().bvugt(end_excl_bv.clone());
+        let error_app = self.register_error_head(
+            // A slice range out of bounds (or reversed) panics: an `assertion`-class
+            // property, so `should_panic` can stand on it. `bb` is metadata only.
+            trust_mc_core::violation::PropertyKind::Assertion,
+            target,
+            Some("slice index out of range".to_string()),
+        );
         let body =
             RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [reversed]);
         self.vc.add_rule(Rule::new(body, error_app.clone()));
@@ -130,6 +169,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let body =
                 RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, [oob]);
             self.vc.add_rule(Rule::new(body, error_app));
+        } else {
+            // FAIL CLOSED — the same repair 091ed3dd3 made in `range_to.rs` and
+            // `range_from.rs`, which this sibling did not receive.
+            //
+            // The property above covers TWO obligations: the reversed range and
+            // the out-of-bounds end. The reversed rule is emitted
+            // unconditionally, so `error_pN` is derivable no matter what happens
+            // here. That makes this leak STRICTLY WORSE than the two already
+            // fixed: there the property was left ruleless, which at least a
+            // ruleless-property gate could notice. Here the OOB obligation is
+            // dropped while the head stays alive, the driver's lost-error-rules
+            // gate never fires, and `chc_success_properties` reports the property
+            // Success — so a genuinely out-of-bounds `&s[a..b]` is PROVED.
+            //
+            // Emit the conservative rule instead — error derivable whenever
+            // control reaches here — so the check can only ever be reported
+            // FAILED, never proved. Gated by
+            // `slice_range_unresolved_backing_{bug,safe}.rs::range_full_*`.
+            let body = RuleBody::from_base_and_extra(Some(from_app.clone()), stmt_constraints, []);
+            self.vc.add_rule(Rule::new(body, error_app));
         }
 
         // Register subslice data in side tables.
@@ -137,11 +196,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.ref_resolution.const_ref_values.insert(dest_local, backing.data.as_expr().clone());
             self.ref_resolution.subslice_offset.insert(dest_local, effective_start.clone());
 
-            let subslice_len = if inclusive {
-                end_bv.bvsub(start_bv).bvadd(Expr::bitvec_const(1, POINTER_WIDTH))
-            } else {
-                end_bv.bvsub(start_bv)
-            };
+            let subslice_len = end_excl_bv.bvsub(start_bv);
             self.ref_resolution.subslice_len.insert(dest_local, subslice_len);
 
             debug!(
@@ -249,6 +304,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Covers heap allocations (Box deref) where source address resolution
         // fails but identical subslice operations should share a data pointer.
         let cache_key = self.subslice_cache_key(slice_arg, rebase_backing.offset.as_expr());
+        debug!(
+            fn_name = %self.fn_name,
+            dest_local,
+            source_addr_resolved = addr_override.is_some(),
+            ?cache_key,
+            offset = %rebase_backing.offset.as_expr(),
+            "CHC slice range: subslice data address sources"
+        );
         if addr_override.is_none() {
             if let Some(key) = &cache_key {
                 addr_override = self.ref_resolution.subslice_addr_cache.get(key).cloned();

@@ -40,7 +40,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// `int_lift`: when true, keep Int operands in Int domain for invariant
     /// synthesis (#112 Direction 2). Overflow detected via Int range checks.
     /// Note: Div/Rem/Shl/Shr fall through to BV path when int_lift is active (Part of #3463).
-    fn checked_binop_result_overflow(
+    pub(in crate::codegen_ay::chc) fn checked_binop_result_overflow(
         op: BinOp,
         lhs: Expr,
         rhs: Expr,

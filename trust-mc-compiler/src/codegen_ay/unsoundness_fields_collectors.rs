@@ -178,9 +178,10 @@ pub(super) fn collect_fail_closed_fields() -> (
     Option<HeapCheckUnknownLayoutInfo>,
 ) {
     let assert_count = get_chc_assert_untranslatable_count();
+    let assert_per_harness = crate::codegen_ay::take_assert_untranslatable_by_fn();
     let assert_untranslatable = if assert_count > 0 {
         warn!(assert_count, "CHC conservative error rules for untranslatable assertions");
-        Some(AssertUntranslatableInfo { count: assert_count })
+        Some(AssertUntranslatableInfo { count: assert_count, per_harness: assert_per_harness })
     } else {
         None
     };

@@ -150,6 +150,10 @@ pub fn non_empty_zst_index_eq_unit() -> bool {
 /// Test slice equality (PartialEq) dispatches through stub pipeline.
 #[test]
 fn test_mir_slice_eq_dispatch() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     with_test_ay_ctx_for_source(SLICE_DISPATCH_PROBE, |mut ctx| {
         let info = build_codegen_for_fn_info(&mut ctx, "slice_eq");
         // PartialEq on slices involves length check + element comparison

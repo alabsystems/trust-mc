@@ -13,13 +13,11 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use os_info::Info;
 
 use crate::cmd::AutoRun;
 
-/// Timeout for nix-instantiate operations (2 minutes).
-const NIX_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout for patchelf operations (30 seconds per file).
 const PATCHELF_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -40,10 +38,8 @@ pub(crate) fn setup_os_hacks(kani_dir: &Path, os: &Info) -> Result<()> {
 }
 
 /// On NixOS, the dynamic linker does not live at the standard path, and so our downloaded
-/// pre-built binaries need patching.
-/// In addition, the C++ standard library (needed by the kissat SAT solver) also does not
-/// have a standard path, and so we need to inject an rpath into that binary to get it
-/// to successfully link at runtime.
+/// pre-built binaries need patching. (The bundle no longer ships upstream Kani's kissat
+/// SAT solver, which also needed a C++ standard library rpath: trust-mc's solver is ay.)
 fn setup_nixos_patchelf(kani_dir: &Path) -> Result<()> {
     // Encode our assumption that we're working on x86 here, because when we add ARM
     // support, we need to look for a different path.
@@ -69,24 +65,9 @@ fn setup_nixos_patchelf(kani_dir: &Path) -> Result<()> {
         .context("Couldn't read $NIX_CC/nix-support/dynamic-linker")?;
     let interp = interp_raw.trim();
 
-    // Find the correct path to link C++ stdlib:
-    // `rpath=$(nix-instantiate --eval -E "(import <nixpkgs> {}).stdenv.cc.cc.lib.outPath")/lib`
-    // Use timeout to prevent hanging on slow nix evaluation.
-    let rpath_output = run_nix_instantiate()?;
-    let rpath_raw = std::str::from_utf8(&rpath_output)?;
-    // The output is in quotes, remove them:
-    let rpath_prefix = rpath_raw.trim().trim_matches('"');
-    let rpath = format!("{rpath_prefix}/lib");
-
     let patch_interp = |file: &Path| -> Result<()> {
         Command::new("patchelf")
             .args(["--set-interpreter", interp])
-            .arg(file)
-            .run_with_timeout(PATCHELF_TIMEOUT)
-    };
-    let patch_rpath = |file: &Path| -> Result<()> {
-        Command::new("patchelf")
-            .args(["--set-rpath", &rpath])
             .arg(file)
             .run_with_timeout(PATCHELF_TIMEOUT)
     };
@@ -96,55 +77,6 @@ fn setup_nixos_patchelf(kani_dir: &Path) -> Result<()> {
     for filename in &["trust-mc-compiler", "trust-mc-driver"] {
         patch_interp(&bin.join(filename))?;
     }
-    let kissat = bin.join("kissat");
-    patch_interp(&kissat)?;
-    patch_rpath(&kissat)?;
 
     Ok(())
-}
-
-/// Run nix-instantiate with a timeout to find C++ stdlib path.
-///
-/// Returns the stdout bytes on success, or an error if the command fails or times out.
-fn run_nix_instantiate() -> Result<Vec<u8>> {
-    use std::process::Stdio;
-    use std::sync::mpsc;
-
-    let child = Command::new("nix-instantiate")
-        .args(["--eval", "-E", "(import <nixpkgs> {}).stdenv.cc.cc.lib.outPath"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    #[cfg(unix)]
-    let child_pid = child.id();
-
-    let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(NIX_TIMEOUT) {
-        Ok(result) => {
-            let output = result?;
-            if !output.status.success() {
-                bail!("Failed to find C++ standard library with `nix-instantiate`");
-            }
-            Ok(output.stdout)
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            #[cfg(unix)]
-            {
-                unsafe {
-                    libc::kill(child_pid as i32, libc::SIGKILL);
-                }
-            }
-            bail!("nix-instantiate timed out after {}s", NIX_TIMEOUT.as_secs())
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("nix-instantiate thread panicked unexpectedly")
-        }
-    }
 }

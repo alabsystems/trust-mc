@@ -74,7 +74,7 @@ pub(crate) const TOPICS: &[Topic] = &[
     Topic {
         name: "cargo",
         aliases: &["package", "cargo-trust-mc", "targo"],
-        title: "verifying a Cargo package with `cargo trust-mc`",
+        title: "verifying a Cargo package with `targo trust-mc`",
         body: CARGO,
     },
     Topic {
@@ -91,7 +91,15 @@ pub(crate) const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "install",
-        aliases: &["installation", "setup-guide", "sysroot", "discovery", "build"],
+        aliases: &[
+            "installation",
+            "setup-guide",
+            "sysroot",
+            "discovery",
+            "build",
+            "env",
+            "environment",
+        ],
         title: "engine, sysroot, solver: where they live, how they are found",
         body: INSTALL,
     },
@@ -268,7 +276,7 @@ A harness is a zero-argument function marked #[kani::proof]. Inside it you:
     assert!(y < 10);                 // 4. what must hold
 
 trust-mc then checks that no input satisfying the assumptions makes an
-assertion — or any built-in check — fail. `cargo build` never sees the
+assertion — or any built-in check — fail. A plain build never sees the
 harness if you guard it with #[cfg(kani)]; a single file needs no guard.
 
 Inputs
@@ -374,10 +382,11 @@ Outcomes
   UNKNOWN  out of time, or the invariant needs theories the engine cannot
            synthesize. Reported as FAILED with \"CHC verification: ay-chc
            inconclusive\", [AY:UNKNOWN_REASON:...] (Timeout, SolverError,
-           FalseProofRejected, ...) and an [AY:UNKNOWN-CATEGORY] line naming
-           the bucket: PDR invariant synthesis timeout, >=2 Array-sorted state
-           parameters (memory-heavy loops), solver error, no error rule
-           encoded, uncategorized. Never a proof.
+           BudgetExhausted, FalseProofRejected, ...) and an
+           [AY:UNKNOWN-CATEGORY] line naming the bucket: PDR invariant
+           synthesis timeout, >=2 Array-sorted state parameters (memory-heavy
+           loops), solver error, no error rule encoded, per-harness budget
+           exhausted, uncategorized. Never a proof.
 
 When to use it
   * loops whose trip count comes from kani::any() (while i < n)
@@ -446,7 +455,14 @@ Verdict line, one per harness
   VERIFICATION:- FAILED                    a counterexample — OR a demoted
                  proof — OR a CHC UNKNOWN. The marker lines tell them apart.
   VERIFICATION:- INCONCLUSIVE (no checks)  the harness produced NO
-                 obligations at all, so nothing was verified — not a pass
+                 obligations at all and the compiler could not certify why,
+                 so an obligation may have been dropped — not a pass
+  VERIFICATION:- SUCCESSFUL (no checks — compiler-certified obligation-free)
+                 no obligations, and the compiler's walk saw every reachable
+                 statement and terminator and found no obligation site: exit
+                 0, as under Kani, with [AY:VACUOUS:no-checks] and the proof
+                 qualifier no_checks=compiler_certified_obligation_free in
+                 place of clean. Nothing was proved; nothing could fail.
   VERIFICATION:- INCONCLUSIVE (solver undecided ...)
                  real obligations, but no verdict inside the budget (bounded
                  runs). Try --ay-chc.
@@ -474,7 +490,29 @@ Marker lines ([AY:...], machine-readable, printed even with --quiet)
                                    `warning:` lines before you go hunting.
   [AY:CTREX_CAT:Unknown]           no counterexample at all: inconclusive;
                                    [AY:UNKNOWN_REASON:Timeout|UndecidedModel|
-                                   SolverError|PreSolveDeadline|...] says why
+                                   SolverError|PreSolveDeadline|
+                                   BudgetExhausted|DriverTimeout|
+                                   CompileTimeout|...] says why; exactly one
+                                   per harness that reached no verdict.
+                                   BudgetExhausted: the harness's own deadline
+                                   was spent before the deciding stage could
+                                   start (time, not capability); DriverTimeout
+                                   and CompileTimeout: the process watchdog
+                                   fired, during solving or before codegen
+  [AY:STAGE_SKIPPED:<stage>:BudgetExhausted]
+                                   a stage after the main solve (acyclic-bmc,
+                                   bmc-crosscheck, reach-probe, cover-probe,
+                                   chc-cover-check, chc-vacuity-probe,
+                                   two-lane-retry) was not
+                                   started for want of deadline; the verdict
+                                   stands on what was decided, and whatever
+                                   the stage would have added stays
+                                   undetermined
+  [AY:EXTERNAL_AY_FALLBACK:...]    after a native CHC UNKNOWN, what became of
+                                   the external `ay` proof retry: not-eligible,
+                                   skipped-budget-bound, skipped-budget-
+                                   exhausted, skipped-disabled, or
+                                   attempted:proved|unproved|error
   [AY:DEMOTION_REASONS:...]        a PROOF was downgraded to FAILED because
                                    the encoding fell back somewhere it must
                                    not; the \"warning: UNSOUND:\" lines before
@@ -543,12 +581,12 @@ Ways to fool yourself
 const CARGO: &str = "\
 Inside a Cargo package the same engine verifies the whole crate graph:
 
-    cargo trust-mc                     every harness in the package
-    cargo trust-mc --harness NAME      one harness (substring match)
-    cargo trust-mc list                harnesses and contracts
-    cargo trust-mc --tests             also compile #[cfg(test)] code and
+    targo trust-mc                     every harness in the package
+    targo trust-mc --harness NAME      one harness (substring match)
+    targo trust-mc list                harnesses and contracts
+    targo trust-mc --tests             also compile #[cfg(test)] code and
                                        dev-dependencies (harnesses in tests/)
-    cargo trust-mc --workspace / -p NAME / --features ...   as in cargo
+    targo trust-mc --workspace / -p NAME / --features ...   as in cargo
 
 Dependencies are compiled by trust-mc-compiler as well (with cfg(kani) set),
 so harnesses can reach into them. Guard harnesses so plain builds ignore them:
@@ -568,13 +606,13 @@ wins over both):
     [package.metadata.kani.unstable]
     function-contracts = true
 
-`cargo trust-mc --help` lists every option; the verify options and
-subcommands are the same as the single-file form. `targo trust-mc` is the
-Trust-toolchain spelling of the same command.
+`targo trust-mc --help` lists every option; the verify options and
+subcommands are the same as the single-file form. `cargo trust-mc` is the
+same command for a stock-Rust user.
 
 Engine discovery is shared with `trust-mc`: a local build
-(cargo run --release -p build-trust-mc -- build-dev --release) serves both,
-and `cargo trust-mc setup` installs a release bundle (explain install).
+(targo --unverified build-dev --release) serves both, and
+`targo trust-mc setup` installs a release bundle (explain install).
 ";
 
 const KANI: &str = "\
@@ -595,15 +633,20 @@ Deliberate differences
   * Unbounded proofs: --ay-chc (explain chc). Kani has no equivalent.
   * Fail-closed verdicts: proofs that relied on encoding fallbacks are
     demoted; all-unreachable harnesses are VACUOUS or INCONCLUSIVE; one
-    that produced NO checks is INCONCLUSIVE rather than a pass (Kani
-    reports success);
+    that produced NO checks is INCONCLUSIVE rather than a pass unless the
+    compiler certified it obligation-free, and then it is SUCCESSFUL
+    (no checks — compiler-certified obligation-free) with exit 0 — Kani's
+    verdict for the shape — carrying [AY:VACUOUS:no-checks] and a non-clean
+    proof qualifier, never a bare SUCCESSFUL;
     logics AY cannot validate are UNVALIDATED; every run carries [AY:...]
     marker lines. A run with no input file exits 2, not 0 -- nothing was
     verified, so nothing succeeded.
   * Reports agree with the exit code: a harness that fails without any single
     property failing (VACUOUS, INCONCLUSIVE) still leaves a finding in
-    --sarif, under trust_mc.harness.vacuous / .no_checks. An empty report
-    means an empty report, never a run that failed elsewhere.
+    --sarif, under trust_mc.harness.vacuous / .no_checks, and the certified
+    no-checks success leaves a note under .no_checks. An empty report means
+    an empty report, never a run that failed elsewhere and never a harness
+    that had nothing to check.
   * --fail-fast counts what it already verified. Stopping at the first
     failure does not un-verify the harnesses that passed before it, so they
     stay in the summary; only the failure that triggered the stop is
@@ -613,14 +656,15 @@ Deliberate differences
     otherwise and reports the unwinding assertion (explain bmc).
   * Extra flags: --timeout, --ay-chc*, --sarif, --proof-summary-json,
     --config-free, --fail-on-unvalidated-success, --allow-vacuous,
-    --strict-vacuity, --conformance-harness, --version-authority.
+    --strict-vacuity, --allow-unpinned-ay, --conformance-harness,
+    --version-authority.
   * Binaries: trust-mc, cargo-trust-mc, targo-trust-mc. `kani` and
     `cargo kani` are not installed (the engine still understands those
     identities for Kani's own test corpus).
   * trust-mc additions: #[kani::harness] (parameters are the inputs),
     kani::value_view, TrustMcMap (-Z symbolic-collections), stub sets.
 
-Migrating a Kani project: replace `cargo kani` with `cargo trust-mc`; drop
+Migrating a Kani project: replace `cargo kani` with `targo trust-mc`; drop
 CBMC-only flags; for unbounded loops try --ay-chc before raising bounds.
 ";
 
@@ -652,7 +696,7 @@ every one; `trust-mc list --help`, `autoharness --help`, ... for subcommands)
                --debug, --sarif FILE, --proof-summary-json FILE,
                --output-into-files, --keep-temps, --message-format human|json
   policy       --fail-fast, --fail-on-unvalidated-success, --allow-vacuous,
-               --strict-vacuity, --conformance-harness NAME
+               --strict-vacuity, --allow-unpinned-ay, --conformance-harness NAME
   features     -Z <feature>: unstable-options, concrete-playback,
                source-coverage (--coverage), stubbing, function-contracts,
                loop-contracts, autoharness, quantifiers, uninit-checks,
@@ -672,7 +716,7 @@ const INSTALL: &str = "\
 Three pieces must be present for a verification run:
 
   1. the engine: trust-mc-driver and, beside it, trust-mc-compiler (a rustc
-     driver that links the pinned nightly's librustc_driver)
+     driver that links the Trust toolchain's librustc_driver)
   2. the library sysroot, built by that compiler: lib/ (std and the kani
      crate compiled for verification), playback/lib (concrete playback),
      no_core/lib (verify-std)
@@ -689,23 +733,78 @@ what it found:
     ${KANI_HOME:-~/.kani}/kani-<VERSION>/bin/trust-mc-driver   (a release
         bundle, installed by `trust-mc setup`)
 
-Building from a checkout (needs rustup; rust-toolchain.toml pins the nightly
-and the rustc-dev / rust-src components it needs):
+Building from a checkout (rust-toolchain.toml pins the Trust toolchain,
+which carries the rustc internals trust-mc-compiler links; a seal without
+standard-library sources takes them from a trust checkout, see
+`--trust-checkout` in tools/build-trust-mc):
 
-    cargo run --release -p build-trust-mc -- build-dev --release
-    cargo install --path .      # trust-mc, cargo-trust-mc, targo-trust-mc
+    targo --unverified build-dev --release
+    targo --unverified install --path .
+        (installs trust-mc, cargo-trust-mc and targo-trust-mc)
 
 The solver: build `ay` in a sibling checkout of alabsystems/ay
 
-    cd ../ay && cargo build --release -p ay --features cli
+    cd ../ay && targo --unverified build --release -p ay --features cli
     export PATH=\"$PWD/target/release:$PATH\"
 
-`trust-mc doctor` checks that the binary's commit matches the AY the engine
-links (bounded verdicts come from the binary, CHC verdicts from the link).
+The engine runs $TRUST_MC_AY_BIN when it is set, otherwise `ay` on PATH, and
+refuses a binary whose `ay --version` build commit is not the AY commit the
+workspace pins: bounded verdicts, cover checks and the external CHC fallback
+all come from that binary. --allow-unpinned-ay (or
+TRUST_MC_ALLOW_UNPINNED_AY=1) runs it anyway; every harness then prints
+[AY:SOLVER_PIN_MISMATCH:...] and every success is SUCCESSFUL (UNVALIDATED).
+`trust-mc doctor` reports an off-pin binary as not ready, with the fix.
 
 Environment: TRUST_MC_SYSROOT (engine + sysroot directory), KANI_HOME (bundle
-root), TRUST_MC_LOG=trust_mc_driver=debug (engine logging),
-TRUST_MC_DRIVER_WATCHDOG_DISABLE (no wall-clock watchdog).
+root), TRUST_MC_AY_BIN (the `ay` binary), TRUST_MC_ALLOW_UNPINNED_AY=1 (run an
+off-pin `ay`), TRUST_MC_LOG=trust_mc_driver=debug (engine logging),
+TRUST_MC_DRIVER_WATCHDOG_DISABLE (no wall-clock watchdog),
+TRUST_MC_DRIVER_WATCHDOG_COMPILE_ALLOWANCE_S (how much wall clock the
+post-codegen watchdog restart may add, default 20 -- lower it under a runner
+whose own kill is tighter than 5x --harness-timeout + 30s),
+TRUST_MC_AY_MEMORY_LIMIT_MB (cap on the in-process ay solver's RSS, in MiB;
+only ever lowers ay's default of half the host's RAM, clamped to [2 GB, 64 GB]),
+TRUST_MC_JOBS=N (N drivers share that half: each is capped at phys / (2N),
+same clamp; a corpus runner exports it with its --jobs),
+TRUST_MC_EXTERNAL_AY_FALLBACK=skip-budget-bound|always|never (the external
+`ay` proof retry after a native CHC UNKNOWN: `skip-budget-bound`, the
+default, does not retry a budget-bound Timeout / BudgetExhausted one --
+measured to spend wall clock for proofs that score outside parity, because
+this path returns only the anonymous chc.0 check; `always` retries every
+eligible UNKNOWN that has budget left; `never` is the other counterfactual;
+the [AY:EXTERNAL_AY_FALLBACK:...] marker counts what each policy does),
+TRUST_MC_STAGE_TIMINGS=1 (one [AY:STAGE_MS:<stage>:<ms>:<outcome>] line on
+stderr per finished stage: compile, acyclic-witness, per-property-batch,
+acyclic-bmc, bmc-crosscheck, chc-vacuity-probe, external-ay-fallback, run-ay,
+two-lane-retry),
+TRUST_MC_CHC_BMC_CROSSCHECK=always (re-run the whole-problem BMC cross-check
+on a per-property CHC verdict; by default it is skipped there, because AY
+validated every row and the driver re-validated every proved model),
+TRUST_MC_CHC_ACYCLIC_BMC_ORDER=first (try the acyclic-BMC shortcut before the
+per-property batch; by default it runs only when the batch did not decide),
+TRUST_MC_CHC_ROWS_AFTER_REFUTATION=solve (keep solving per-property rows after
+one refutes; by default they are recorded as skipped-after-refutation, since
+the report names only the first refuted row).
+
+Per-property batch: rows share what is left of one batch budget; a second
+pass gives what the first left over to the rows that ran out of budget (marker
+lines end with [second pass]); a proved row's model is re-validated after the
+rows, on the harness deadline when every row proved and inside one batch
+budget otherwise, where a row it cannot fund is not credited
+([validation budget]).
+
+Budget: one deadline per harness, 5x --harness-timeout + 5s, sitting 10s
+inside the driver's wall-clock watchdog. Every stage after the main solve --
+the acyclic-BMC shortcut, the BMC cross-check of a verdict, the external `ay`
+retry, the reachability, cover and CHC vacuity probes, the loop-contract
+two-lane retry --
+budgets against what is LEFT of that deadline and prints
+[AY:STAGE_SKIPPED:<stage>:BudgetExhausted] instead of starting when less than
+its floor remains, so a harness ends by a typed UNKNOWN before the watchdog
+can fire. The watchdog restarts its clock when codegen completes (compilation
+does not eat the solve budget, up to the compile allowance above); a fire
+before that point is [AY:UNKNOWN_REASON:CompileTimeout], after it
+[AY:UNKNOWN_REASON:DriverTimeout].
 ";
 
 const EXIT_CODES: &str = "\
@@ -770,7 +869,7 @@ const QUICKSTART: &str = "\
    [AY:CTREX_CAT:...] line says whether it is a real counterexample, a
    demoted proof, or an inconclusive solve.
 
-7. Moving to a Cargo package: cargo trust-mc (explain cargo).
+7. Moving to a Cargo package: targo trust-mc (explain cargo).
 ";
 
 #[cfg(test)]
@@ -845,10 +944,13 @@ mod tests {
 }
 
 const LIMITS: &str = "\
-Verification that does not go through yet. Every entry here was measured, and
-every one FAILS CLOSED — you get a demotion or an inconclusive verdict,
-never a false proof. The point of this page is that you can check it before
-spending an afternoon on a bug that is ours rather than yours.
+Verification that does not go through yet. Every entry here was measured.
+Every entry FAILS CLOSED — you get a demotion or an inconclusive verdict,
+never a false proof. (A defect that gives a FALSE PROOF would be listed apart,
+under a Known UNSOUND heading, so that nobody trusts it while it is being
+fixed; there is no such entry right now.) The point of this page is that you
+can check it before spending an afternoon on a bug that is ours rather than
+yours.
 
 How to tell a limitation from your bug — the marker lines say which:
 
@@ -882,23 +984,32 @@ Known limitations
                 (pointee_synthesis_fallback). -Z symbolic-collections does
                 not change any of this.
   ? on None     Reading a `Some` payload on a branch that provably cannot run.
-                With a statically-known None, `if let Some(v) = o` and
-                `match o { Some(v) => ..v.. }` both come back FAILED and
-                demoted (DEMOTION_REASONS:unconstrained_assignment); `x?`
-                inside a function called with None instead spends the whole
-                budget and returns INCONCLUSIVE, tagged
-                UNKNOWN_QUALITY:EncodingGap:unconstrained_assignment. All
-                three are BMC only: --ay-chc proves every one of them. A
-                SYMBOLIC Option is fine in either mode.
-                `None.map(..)` demotes under BMC for the reason above, but
-                --ay-chc PROVES it, and so does `and_then`, a bare
-                `let f = |x| ..; f(n)`, an FnMut that mutates its capture, a
-                closure passed through a higher-order fn, and a Box<dyn Fn>.
+                With a statically-known None, `if let Some(v) = o`,
+                `match o { Some(v) => ..v.. }`, `x?` inside a function
+                called with None, `None.map(..)` and `and_then(..)` all come
+                back FAILED and demoted under BMC
+                (DEMOTION_REASONS:unconstrained_assignment). Use --ay-chc:
+                it proves every one of those five, CLEAN, and refutes each
+                FALSE variant with [AY:CTREX_CAT:Genuine], so the proofs are
+                discriminating rather than vanished obligations. A SYMBOLIC
+                Option fed through `x?` proves in BOTH lanes.
+                (Re-measured 2026-09-14. Until the joined-`==` referent fixes
+                landed, --ay-chc declined `x?`, `None.map(..)` and
+                `and_then(..)` with a translation drop
+                (call_dispatch_fallback), because the `.is_none()` read the
+                Option back through a reference that lost its referent when
+                more than one branch had assigned it. The workarounds that
+                entry named — `matches!(o.map(..), None)`, and
+                `let m = o.map(..); let c = m;` then `c.is_none()` — still
+                prove; you no longer need them.)
                 Closures are no longer the --ay-chc boundary they once were.
-                What still declines is a closure inside a stdlib ITERATOR
-                chain: `a.iter().map(..).sum()` comes back FAILED with a
-                translation drop, and that one BMC gets right. Neither lane
-                dominates the other here.
+                A bare `let f = |x| ..; f(n)`, an FnMut that mutates its
+                capture, a closure passed through a higher-order fn and a
+                Box<dyn Fn> all prove under --ay-chc, and each FALSE variant
+                fails. What still declines is a closure inside a stdlib
+                ITERATOR chain: `a.iter().map(..).sum()` comes back FAILED
+                with a translation drop, and that one BMC gets right.
+                Neither lane dominates the other here.
   Vec elements  Use --ay-chc. Under BMC `Vec::from(&[T])` carries its LENGTH
                 but leaves the ELEMENTS over-approximated, so proofs about
                 what a Vec contains do not go through. --ay-chc models the

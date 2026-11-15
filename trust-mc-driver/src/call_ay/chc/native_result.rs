@@ -15,6 +15,7 @@ use trust_mc_metadata::HarnessMetadata;
 
 use crate::property_model::{CheckStatus, Property, PropertyId, RawSourceLocation};
 use crate::session::KaniSession;
+use crate::verification_provenance::SolverUnknownReason;
 use crate::verification_result::{FailedProperties, ProofCrosscheck, VerificationStatus};
 
 use super::smt_analysis::smt_has_recursive_unwind_assertion;
@@ -43,18 +44,34 @@ macro_rules! solver_stdout {
 }
 
 impl KaniSession {
-    /// Interpret a trivially safe CHC system where no rule derives `error`.
+    /// Interpret a CHC system that queries `error` while no rule derives it,
+    /// or whose every per-property query AY pruned away.
     ///
-    /// When the CHC system queries `error` but no rule can produce it, the
-    /// system is trivially safe without invoking the solver. This avoids
-    /// wasting solver budget on problems with many array-sorted variables
-    /// where the encoding eliminated all assertion paths.
+    /// No solver answers here. If the harness registered any checked
+    /// obligation, the error rules were LOST from the encoding, not
+    /// discharged, and the result fails closed as INCONCLUSIVE with
+    /// `[AY:UNKNOWN_REASON:LostErrorRules]` ([`lost_error_rules_result`]).
+    /// A discharge the compiler proved keeps an explicit `(=> false error)`
+    /// obligation and is interpreted by `interpret_chc_false_error_safe`, not
+    /// here. Only a harness that registered no checked obligation keeps the
+    /// old interpretation: an empty report the no-checks gate settles, or
+    /// covers adjudicated by their own SAT checks.
     pub(super) fn interpret_chc_trivial_safe(
         &self,
         smt_file: &std::path::Path,
         smt_content: &str,
         harness: &HarnessMetadata,
+        deadline: crate::deadline::Deadline,
     ) -> anyhow::Result<ChcSolverResult> {
+        // SOUNDNESS: registered checks with no error derivation are lost
+        // checks. This path used to print `[AY:PROOF]` and list every
+        // registered check SUCCESS without a solver, which the compiler's
+        // straight-line discharge refuses for exactly this shape (#67).
+        if crate::ay_parse::vc_artifact::artifact_may_register_checked_obligations(
+            &crate::ay_parse::vc_artifact_path_for_smt(smt_file),
+        ) {
+            return Ok(lost_error_rules_result(smt_file, smt_content, harness));
+        }
         let status = VerificationStatus::Success;
         let failed_props = FailedProperties::None;
         let proof_crosscheck = ProofCrosscheck::NotRun;
@@ -85,8 +102,12 @@ impl KaniSession {
         if !cover_names.is_empty() {
             let vc_artifact_path = crate::ay_parse::vc_artifact_path_for_smt(smt_file);
             let location_map = crate::ay_parse::load_vc_artifact(&vc_artifact_path);
-            let sat_results =
-                self.check_cover_satisfiability_for_chc(smt_content, &cover_names, smt_file);
+            let sat_results = self.check_cover_satisfiability_for_chc(
+                smt_content,
+                &cover_names,
+                smt_file,
+                deadline,
+            );
             let cover_properties = crate::ay_parse::build_cover_properties_from_sat_checks(
                 &cover_names,
                 &sat_results,
@@ -96,6 +117,7 @@ impl KaniSession {
         }
 
         Self::apply_vacuous_checks_marker(smt_content, &mut properties);
+        self.apply_chc_vacuity_probe(smt_content, smt_file, &mut properties, deadline);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, _) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -109,6 +131,7 @@ impl KaniSession {
         solver_stdout!("[AY:PROOF] CHC verification: property proven (trivially safe)");
 
         Ok(ChcSolverResult {
+            solver_unknown_reason: None,
             status,
             failed_properties: failed_props,
             properties,
@@ -116,6 +139,7 @@ impl KaniSession {
             proof_qualifiers: vec![TRIVIAL_SAFE_NO_ERROR_RULE_QUALIFIER.to_string()],
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
+            exact_counterexample: false,
         })
     }
 
@@ -142,6 +166,102 @@ impl KaniSession {
         }
     }
 
+    /// CHC-side V4 vacuity: re-status a would-be proof whose every check SITE
+    /// the solver proves unreachable.
+    ///
+    /// `apply_vacuous_checks_marker` above covers only what the COMPILER can
+    /// decide structurally (`straightline_proof`'s exit-block walk). A
+    /// SEMANTIC contradiction — `assume(x.is_nan() && x > 0.0)` — leaves the
+    /// block graph intact, so that marker never fires and every check came back
+    /// `SUCCESS` with `[AY:PROOF_QUALIFIERS:clean]` while the BMC lane, which
+    /// probes (`call_ay::probe_harness_reachable`), reported `VACUOUS`. Two
+    /// lanes, one source program, opposite verdicts, and the CHC one fail-OPEN
+    /// on the project's own `--allow-vacuous` default.
+    ///
+    /// This runs the same question through the CHC encoding — see
+    /// `vacuity_probe` for why a decided `unsat` there cannot be a false
+    /// vacuity report — and produces the ONE shape the V4 gate in
+    /// `harness_runner` keys on: every non-cover check `Unreachable`.
+    ///
+    /// Only a would-be CLEAN proof is probed (every non-cover check `Success`),
+    /// and only a decided "no check site reachable" changes anything.
+    pub(super) fn apply_chc_vacuity_probe(
+        &self,
+        smt_content: &str,
+        smt_file: &std::path::Path,
+        properties: &mut [Property],
+        deadline: crate::deadline::Deadline,
+    ) {
+        let mut probeable = false;
+        for property in properties.iter() {
+            if property.is_cover_property() {
+                continue;
+            }
+            if property.status != CheckStatus::Success {
+                // A check the solver already decided FAILED, or one the marker
+                // above already re-statused UNREACHABLE: not the clean-proof
+                // shape this probe is for.
+                return;
+            }
+            probeable = true;
+        }
+        if !probeable {
+            return;
+        }
+        // Budgeted against what is left of the per-harness deadline, like
+        // every other post-solve probe: below the useful floor it is skipped
+        // with the typed `[AY:STAGE_SKIPPED:chc-vacuity-probe:…]` marker, and
+        // a skipped probe answers exactly what an undecided one does (it
+        // changes nothing).
+        let Some(budget) = self.probe_stage_budget("chc-vacuity-probe", deadline) else {
+            return;
+        };
+        let probe_started = std::time::Instant::now();
+        let Some(probe) = super::vacuity_probe::build_chc_reachability_probe(smt_content) else {
+            let outcome = super::vacuity_probe::ProbeOutcome::Undetermined;
+            crate::stage_timing::record("chc-vacuity-probe", probe_started, outcome.label());
+            return;
+        };
+        // The common answer — a check site IS reachable — changes nothing, yet
+        // cost the external `ay` up to its whole budget (13.3 s of 15 s,
+        // undecided, on `history/simple_pass` at ay 6818b5d06). A checked
+        // in-process derivation (`vacuity_witness`) settles it first, within a
+        // bounded slice. It can only ever answer "reachable", never
+        // "unreachable", so it cannot mint or hide a vacuity report.
+        let witness_slice = std::cmp::min(budget / 5, super::vacuity_probe::WITNESS_SLICE_CAP);
+        if let Some(outcome) = super::vacuity_probe::certified_probe_witness(
+            &probe,
+            witness_slice,
+            self.args.common_args.verbose,
+        ) {
+            crate::stage_timing::record("chc-vacuity-probe", probe_started, outcome.label());
+            return;
+        }
+        // No certificate: the external probe runs with the budget it has always
+        // had, re-clamped to what the witness left of the harness deadline, so
+        // an unsuccessful search never shortens the probe below one per-call
+        // timeout while the deadline has room.
+        let Some(budget) = self.probe_stage_budget("chc-vacuity-probe", deadline) else {
+            let outcome = super::vacuity_probe::ProbeOutcome::Undetermined;
+            crate::stage_timing::record("chc-vacuity-probe", probe_started, outcome.label());
+            return;
+        };
+        let outcome = self.probe_chc_check_sites_reachable(&probe, smt_file, budget);
+        crate::stage_timing::record("chc-vacuity-probe", probe_started, outcome.label());
+        if outcome != super::vacuity_probe::ProbeOutcome::NoCheckSiteReachable {
+            return;
+        }
+        for property in properties.iter_mut() {
+            if !property.is_cover_property() && property.status == CheckStatus::Success {
+                property.status = CheckStatus::Unreachable;
+            }
+        }
+        solver_stdout!(
+            "[AY:CHC-VACUITY-PROBE:no-reachable-check-site] every check site is provably \
+             unreachable — the proof is vacuous"
+        );
+    }
+
     /// Interpret a compiler-discharged CHC system that preserves an explicit
     /// false-bodied `error` obligation.
     pub(super) fn interpret_chc_false_error_safe(
@@ -149,6 +269,7 @@ impl KaniSession {
         smt_file: &std::path::Path,
         smt_content: &str,
         harness: &HarnessMetadata,
+        deadline: crate::deadline::Deadline,
     ) -> anyhow::Result<ChcSolverResult> {
         let status = VerificationStatus::Success;
         let failed_props = FailedProperties::None;
@@ -179,8 +300,12 @@ impl KaniSession {
         if !cover_names.is_empty() {
             let vc_artifact_path = crate::ay_parse::vc_artifact_path_for_smt(smt_file);
             let location_map = crate::ay_parse::load_vc_artifact(&vc_artifact_path);
-            let sat_results =
-                self.check_cover_satisfiability_for_chc(smt_content, &cover_names, smt_file);
+            let sat_results = self.check_cover_satisfiability_for_chc(
+                smt_content,
+                &cover_names,
+                smt_file,
+                deadline,
+            );
             let cover_properties = crate::ay_parse::build_cover_properties_from_sat_checks(
                 &cover_names,
                 &sat_results,
@@ -190,6 +315,7 @@ impl KaniSession {
         }
 
         Self::apply_vacuous_checks_marker(smt_content, &mut properties);
+        self.apply_chc_vacuity_probe(smt_content, smt_file, &mut properties, deadline);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, _) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -203,6 +329,7 @@ impl KaniSession {
         solver_stdout!("[AY:PROOF] CHC verification: property proven (false error obligation)");
 
         Ok(ChcSolverResult {
+            solver_unknown_reason: None,
             status,
             failed_properties: failed_props,
             properties,
@@ -210,6 +337,7 @@ impl KaniSession {
             proof_qualifiers: Vec::new(),
             proof_transcript_metadata: None,
             native_full_verification_verdict: None,
+            exact_counterexample: false,
         })
     }
 
@@ -226,6 +354,7 @@ impl KaniSession {
         _demoted_fallback_count: usize,
         proof_transcript_metadata: Option<serde_json::Value>,
         native_full_verification_verdict: Option<trust_mc_core::FullVerificationVerdict>,
+        deadline: crate::deadline::Deadline,
     ) -> anyhow::Result<ChcSolverResult> {
         if self.args.common_args.verbose {
             let model = verified_inv.model();
@@ -272,8 +401,12 @@ impl KaniSession {
             if !cover_names.is_empty() {
                 let vc_artifact_path = crate::ay_parse::vc_artifact_path_for_smt(smt_file);
                 let location_map = crate::ay_parse::load_vc_artifact(&vc_artifact_path);
-                let sat_results =
-                    self.check_cover_satisfiability_for_chc(smt_content, &cover_names, smt_file);
+                let sat_results = self.check_cover_satisfiability_for_chc(
+                    smt_content,
+                    &cover_names,
+                    smt_file,
+                    deadline,
+                );
                 if self.args.common_args.verbose {
                     solver_stdout!(
                         "[AY:COVER_CHC] {} cover properties checked via secondary SAT query (native)",
@@ -290,6 +423,7 @@ impl KaniSession {
         }
 
         Self::apply_vacuous_checks_marker(smt_content, &mut properties);
+        self.apply_chc_vacuity_probe(smt_content, smt_file, &mut properties, deadline);
         let outcome = classify_chc_outcome(false, status, failed_props);
         let (status, failed_props, properties, outcome) = apply_recursion_unwind_verdict(
             has_recursive_unwind,
@@ -319,6 +453,7 @@ impl KaniSession {
         }
 
         Ok(ChcSolverResult {
+            solver_unknown_reason: None,
             status,
             failed_properties: failed_props,
             properties,
@@ -326,6 +461,7 @@ impl KaniSession {
             proof_qualifiers: Vec::new(),
             proof_transcript_metadata,
             native_full_verification_verdict,
+            exact_counterexample: false,
         })
     }
 
@@ -333,6 +469,16 @@ impl KaniSession {
     ///
     /// Handles 0-step counterexample cross-check fallback and recursion unwind
     /// verdict adjustment.
+    ///
+    /// `correlated_relations` carries per-property `error_p{id}` relations the
+    /// SOLVE SEAM identified independently of the counterexample trace. The
+    /// per-property lane needs it: its sliced obligation problem no longer
+    /// routes the trace through `error_p{id}` (that clause is outside the
+    /// query's cone of influence once the query has been unfolded), so the
+    /// trace-walk below finds nothing and the report would fall back to a
+    /// single unattributed failure. AY's stable obligation label is the
+    /// authority there. Additive only — a relation named by the trace is still
+    /// reported, and an empty set reproduces the previous behaviour exactly.
     pub(super) fn interpret_chc_unsafe(
         &self,
         verified_cex: ay::chc::VerifiedCounterexample,
@@ -342,6 +488,7 @@ impl KaniSession {
         harness: &HarnessMetadata,
         proof_transcript_metadata: Option<serde_json::Value>,
         native_full_verification_verdict: Option<trust_mc_core::FullVerificationVerdict>,
+        correlated_relations: &HashSet<String>,
     ) -> anyhow::Result<ChcSolverResult> {
         let cex = verified_cex.counterexample();
         if self.args.common_args.verbose {
@@ -373,6 +520,10 @@ impl KaniSession {
                 }
             }
         }
+        // Union in the seam-correlated relations (see the doc comment): the
+        // per-property lane knows WHICH obligation was refuted even when the
+        // sliced trace cannot say so.
+        failing_relations.extend(correlated_relations.iter().cloned());
 
         // When the counterexample names one or more per-property relations we
         // report those as FAILURE and the rest as UNDETERMINED (sound — an
@@ -384,9 +535,15 @@ impl KaniSession {
         // Derive `failed_properties` from the ACTUAL failing property class,
         // not a hard-coded `PanicsOnly`. A memory_safety / pointer_dereference /
         // UB counterexample must be `Other` (→ FAILED under #[should_panic]);
-        // only genuine assertion/panic failures are `PanicsOnly`. When the
-        // counterexample names no per-property relation (direct `error` head,
-        // e.g. a panic call), treat it as a panic — matching the prior default.
+        // only genuine assertion/panic failures are `PanicsOnly`.
+        //
+        // A counterexample that names no per-property relation reached a bare
+        // `error` head and is reported as the anonymous `chc.0` check. It keeps the
+        // prior `PanicsOnly` class so an ordinary harness's genuine counterexample
+        // stays certified; what it can NEVER do is stand as the expected panic of a
+        // `should_panic` harness, because nothing identifies it as a panic rather than
+        // an unreachable terminator, an undefined foreign call or an unsupported
+        // construct. `harness_runner`'s V7 gate enforces that for every lane.
         let failed_class = match &per_property {
             Some(props) => crate::ay_parse::determine_failed_from_properties(props),
             None => FailedProperties::PanicsOnly,
@@ -418,6 +575,7 @@ impl KaniSession {
             Some(harness.pretty_name.as_str()),
         );
         Ok(ChcSolverResult {
+            solver_unknown_reason: None,
             status,
             failed_properties: failed_props,
             properties,
@@ -425,6 +583,13 @@ impl KaniSession {
             proof_qualifiers: Vec::new(),
             proof_transcript_metadata,
             native_full_verification_verdict,
+            // DELIBERATELY false on AY's own `Unsafe`. The counterexample here
+            // is a solver model, and the driver has a separate lane that
+            // adjudicates it (strict certification / checked replay); the flag
+            // means "the DRIVER derived the error itself", which is true only
+            // of `interpret_chc_trivial_unsafe`. Leaving it false keeps this
+            // path byte-identical to its pre-flag behaviour.
+            exact_counterexample: false,
         })
     }
 }
@@ -516,5 +681,64 @@ impl KaniSession {
                 harness.pretty_name
             );
         }
+    }
+}
+
+/// The fail-closed result for registered checks that reach no `error`
+/// derivation: INCONCLUSIVE, every registered check `UNDETERMINED`, no proof
+/// qualifier, reason [`SolverUnknownReason::LostErrorRules`].
+///
+/// Covers are listed `UNDETERMINED` too: they are not SAT-checked here, because
+/// an encoding that lost its error rules may have lost the transitions a cover
+/// needs as well, and an `UNSATISFIABLE` cover read off it would be a claim.
+pub(super) fn lost_error_rules_result(
+    smt_file: &std::path::Path,
+    smt_content: &str,
+    harness: &HarnessMetadata,
+) -> ChcSolverResult {
+    let mut properties = super::property_report::chc_undetermined_properties(smt_file, harness)
+        .unwrap_or_else(|| {
+            vec![Property {
+                description: Cow::Borrowed(
+                    "CHC verification: registered checks lost from the encoding — no rule derives \
+                     error",
+                ),
+                property_id: PropertyId { fn_name: None, class: Cow::Borrowed("chc"), id: 0 },
+                source_location: RawSourceLocation {
+                    column: None,
+                    file: None,
+                    function: None,
+                    line: None,
+                },
+                status: CheckStatus::Undetermined,
+                trace: None,
+            }]
+        });
+    let cover_names = crate::smt_io::extract_cover_declarations_from_content(smt_content);
+    if !cover_names.is_empty() {
+        let location_map =
+            crate::ay_parse::load_vc_artifact(&crate::ay_parse::vc_artifact_path_for_smt(smt_file));
+        let undecided = vec![None; cover_names.len()];
+        properties.extend(crate::ay_parse::build_cover_properties_from_sat_checks(
+            &cover_names,
+            &undecided,
+            location_map.as_ref(),
+        ));
+    }
+    solver_stdout!(
+        "[AY:UNKNOWN] CHC verification: registered checks but no rule derives error — lost \
+         checks, not proved checks (no solver ran)"
+    );
+    ChcSolverResult {
+        status: VerificationStatus::Failure,
+        failed_properties: FailedProperties::Other,
+        properties,
+        proof_crosscheck: ProofCrosscheck::NotRun,
+        proof_qualifiers: Vec::new(),
+        proof_transcript_metadata: None,
+        native_full_verification_verdict: None,
+        solver_unknown_reason: Some(SolverUnknownReason::LostErrorRules),
+        // No solver ran, so nothing was derived: the fail-closed reading.
+        exact_counterexample: false,
     }
 }

@@ -10,6 +10,7 @@
 //! VTable tracking logic: `codegen_stmt_assign_simple_vtable.rs`
 //! Collection propagation: `codegen_stmt_assign_simple_collection.rs`
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -24,7 +25,7 @@ use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width
 
 use super::codegen_expr_signedness::ExprSignedness;
 use super::stmt_accumulator::StmtAccumulator;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 use crate::codegen_ay::chc::call::codegen_call_kani_model::CallKaniModel;
 
 // Re-export for codegen_stmt/mod.rs which imports extract_vtable_source_local.
@@ -54,7 +55,7 @@ fn ty_is_nonzero(ty: &rustc_public::ty::Ty) -> bool {
 
 fn rvalue_copies_nonzero_local(rhs: &Rvalue, locals: &[rustc_public::mir::LocalDecl]) -> bool {
     let place = match rhs {
-        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
         | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => place,
         _ => return false,
     };
@@ -149,7 +150,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // local's datum, so the address is about to be coerced
                         // to the destination's width and become a value; the
                         // wave-11 tag ends at that crossing.
-                        self.translate_ref_to_address(place, acc.modified).map(Loc::into_expr)
+                        self.translate_ref_to_address(place, acc.modified)
+                            .map(Loc::into_expr)
+                            // Design 4 C: a borrow of an unsized place carries
+                            // its length on this lane too.
+                            .map(|addr| self.pack_unsized_borrow_len(place, addr, acc.modified))
                     }
                     _ => None,
                 };
@@ -158,7 +163,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 } else if let Some(promoted_addr) =
                     self.try_promoted_const_ref_array_address_fallback(rhs, &rhs_expr, local_idx)
                 {
-                    coerce_bitvec_width_safe(promoted_addr, out_width, SignExtension::ZeroExtend)
+                    // Design 4: a promoted constant slice or `str` written into
+                    // a wide slot carries its length. The bare promoted address
+                    // was zero-extended, so a reader of the slot saw length 0.
+                    match self.promoted_const_slice_len(rhs, local_idx, acc.modified) {
+                        Some(len) => self.pack_slice_slot(promoted_addr, len),
+                        None => coerce_bitvec_width_safe(
+                            promoted_addr,
+                            out_width,
+                            SignExtension::ZeroExtend,
+                        ),
+                    }
                 } else if let Some(selected) =
                     self.try_array_element_select_for_deref(rhs, &rhs_expr, &out_sort, acc.modified)
                 {
@@ -178,9 +193,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         out_sort,
                         sym_name
                     );
-                    self.record_sound_fallback_reason("assign_sort_mismatch_bv");
+                    let booked = self.record_sound_fallback_reason("assign_sort_mismatch_bv");
                     self.encode.local_signedness.remove(&local_idx);
-                    declare_pending_var(sym_name, out_sort.clone())
+                    Havoc::booked(booked, sym_name, out_sort.clone())
                 }
             } else {
                 let sym_name = chc_fresh_name("__ssa_init_assign");
@@ -194,10 +209,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     out_sort,
                     sym_name
                 );
-                self.record_sound_fallback_reason("assign_sort_mismatch_nonbv");
+                let booked = self.record_sound_fallback_reason("assign_sort_mismatch_nonbv");
                 self.encode.local_signedness.remove(&local_idx);
-                declare_pending_var(sym_name, out_sort.clone())
+                Havoc::booked(booked, sym_name, out_sort.clone())
             };
+            // Design 4 D: the write boundary of a slice slot, on the value
+            // AFTER coercion (the fallbacks above widen thin addresses). Every
+            // `ite` leaf whose high half is extension padding gets a counted
+            // fresh length, so no reader takes the padding as a length.
+            let coerced_rhs = self.guard_slice_len_slot_write(
+                self.body.locals()[local_idx].ty,
+                coerced_rhs,
+                "statement_assign",
+            );
             let out_var = Expr::var(&*out_name, out_sort);
 
             // Fix #2055: SSA replace + block-local env update.
@@ -329,7 +353,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Extract the base pointer local from Use(Copy/Move(Deref place)).
         let ptr_local = match rhs {
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                 if matches!(p.projection.first(), Some(ProjectionElem::Deref)) =>
             {
                 p.local
@@ -396,7 +420,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Extract the Place from Use(Copy/Move).
         let place = match rhs {
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => p,
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..) => p,
             _ => return None,
         };
 
@@ -450,7 +474,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Extract the ref local from Use(Copy/Move(*_ref)) pattern.
         let ref_local = match rhs {
-            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                 if matches!(p.projection.first(), Some(ProjectionElem::Deref)) =>
             {
                 p.local

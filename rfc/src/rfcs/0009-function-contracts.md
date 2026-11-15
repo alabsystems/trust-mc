@@ -883,32 +883,26 @@ times larger than what they expect the function will touch).
 
 ---
 
-[^gate]: Enforced gates means all uses of constructs (functions, annotations,
     macros) in this RFC are an error.
 
-[^simple-unsoundness]: The main remaining threat to soundness in the use of
     contracts, as defined in this proposal, is the reliance on user-supplied
     harnesses for contract checking (explained in item 2 of [user
     experience](#user-experience)). A more thorough discussion on the dangers
     and potential remedies can be found in the [future](#future-possibilities)
     section.
 
-[^write-set-recursion]: For inductively defined types the write set inference
     will only add the first "layer" to the write set. If you wish to modify
     deeper layers of a recursive type an explicit `modifies` clause is required.
 
-[^inferred-footprint]: While inferred memory footprints are sound for both safe
     and unsafe Rust certain features in unsafe rust (e.g. `RefCell`) get
     inferred incorrectly and will lead to a failing contract check.
 
-[^slice-exprs]: Slice indices can be place expressions referencing function
     arguments, constants and integer arithmetic expressions. Take for example
     this `Vec` method (places simplified vs. actual implementation in `std`):
     `fn truncate(&mut self, len: usize)`. A relatively precise contract for this
     method can be achieved with slice indices like so:
     `#[modifies(self.buf[len..self.len], self.len)]`
 
-[^assigns-encapsulation-breaking]: Breaking the `pub` encapsulation has
     unfortunate side effects because it means the contract depends on non-public
     elements which are not expected to be stable and can drastically change even
     in minor versions. For instance if your project depends on crate `a` which
@@ -926,14 +920,12 @@ times larger than what they expect the function will touch).
     explicitly nail down the exact minor version of `b` which defeats the whole
     purpose of semantic versioning.
 
-[^external-contract-checking-expectations]: Contracts for functions from
     external crates (crates from outside the workspace, which is not quite the
     definition of `extern crate` in Rust) are not checked by default. The
     expectation is that the library author providing the contract has performed
     this check. See also [open question](#open-questions) for a discussion on
     defaults and checking external contracts.
 
-[^stubcheck]: Kani cannot report the occurrence of a contract function to check
     in abstracted functions as errors, because the mechanism is needed to verify
     mutually recursive functions.
 

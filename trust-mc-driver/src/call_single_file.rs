@@ -6,10 +6,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use trust_mc_metadata::UnstableFeature;
 
-use crate::session::KaniSession;
+use crate::session::trustc_route::{CODEGEN_BACKEND_FLAG, TRUST_VERIFY_OFF};
+use crate::session::{CompilerRoute, KaniSession};
 use crate::util::args::{KaniArg, RustcArg};
 
 pub(crate) struct LibConfig {
@@ -69,6 +71,17 @@ impl KaniSession {
         flags
     }
 
+    /// The `--check-version` a Trustc-route compile adds when its engine flags would
+    /// otherwise carry none (a standalone file, the std-verification build): the
+    /// trustc-hosted backend refuses a session without it (`hosted_args_refusal` in
+    /// trust-mc-compiler). DevCli adds nothing, so its argv stays byte for byte.
+    pub(crate) fn route_check_version_flags(&self) -> Vec<KaniArg> {
+        match self.route {
+            crate::session::CompilerRoute::Trustc { .. } => vec![check_version()],
+            crate::session::CompilerRoute::DevCli => Vec::new(),
+        }
+    }
+
     /// The `kani-compiler`-specific arguments that should be passed only to the local crate
     /// being compiled.
     pub(crate) fn kani_compiler_local_flags(&self) -> Vec<KaniArg> {
@@ -123,7 +136,7 @@ impl KaniSession {
         if self.args.common_args.unstable_features.contains(UnstableFeature::UninitChecks) {
             // Automatically enable shadow memory, since the version of uninitialized memory checks
             // without non-determinism depends on it.
-            flags.push("-Z ghost-state".into());
+            flags.push(KaniArg::flag_value("-Z", "ghost-state"));
             flags.push("--ub-check=uninit".into());
         }
 
@@ -136,7 +149,7 @@ impl KaniSession {
         }
 
         for harness in &self.args.harnesses {
-            flags.push(format!("--harness {harness}").into());
+            flags.push(KaniArg::flag_value("--harness", harness.clone()));
         }
 
         if self.args.exact {
@@ -149,7 +162,7 @@ impl KaniSession {
         // sound effect frame), while a symbol nobody supplied keeps Kani's
         // fail-closed `assert(false)`.
         for c_lib in &self.args.c_lib {
-            flags.push(format!("--c-lib {}", c_lib.display()).into());
+            flags.push(KaniArg::flag_value("--c-lib", c_lib.display().to_string()));
         }
 
         if let Some(args) = &self.autoharness_compiler_flags {
@@ -165,10 +178,10 @@ impl KaniSession {
         if self.args.backend == Backend::AY {
             // Pass loop unwinding configuration for AY bounded loop unrolling.
             if let Some(default_unwind) = self.args.default_unwind {
-                flags.push(format!("--default-unwind {default_unwind}").into());
+                flags.push(KaniArg::flag_value("--default-unwind", default_unwind.to_string()));
             }
             if let Some(unwind) = self.args.unwind {
-                flags.push(format!("--unwind {unwind}").into());
+                flags.push(KaniArg::flag_value("--unwind", unwind.to_string()));
             }
 
             if self.args.ay_chc_debug {
@@ -249,6 +262,13 @@ impl KaniSession {
             if self.args.extra_pointer_checks {
                 flags.push("--extra-pointer-checks".into());
             }
+
+            // Per-harness translation budget. Without it a translation that
+            // loops runs until the process watchdog, which hard-exits and takes
+            // every other harness in the file down with it.
+            if let Some(ms) = translation_timeout_ms(self.args.harness_timeout) {
+                flags.push(format!("--translation-timeout-ms={ms}").into());
+            }
         }
 
         flags.extend(self.args.common_args.unstable_features.as_arguments().map(KaniArg::from));
@@ -258,7 +278,17 @@ impl KaniSession {
 
     /// This function generates all rustc configurations required by our AY codegen.
     pub(crate) fn kani_rustc_flags(&self, lib_config: LibConfig) -> Vec<RustcArg> {
-        let mut flags: Vec<_> = base_rustc_flags(lib_config);
+        self.kani_rustc_flags_with(lib_config, ambient_rustflags().as_deref())
+    }
+
+    /// [`Self::kani_rustc_flags`] with the ambient `RUSTFLAGS` passed in, so the
+    /// composition is a pure function of the session and can be golden-tested.
+    pub(crate) fn kani_rustc_flags_with(
+        &self,
+        lib_config: LibConfig,
+        rustflags: Option<&str>,
+    ) -> Vec<RustcArg> {
+        let mut flags: Vec<_> = base_rustc_flags_with(lib_config, rustflags);
         // Default: panic=abort eliminates unwind paths. When ay_panic_unwind is
         // enabled, use panic=unwind to preserve cleanup blocks for verifying
         // Drop impls during panic unwinding. Part of #3301.
@@ -322,9 +352,21 @@ impl KaniSession {
             flags.push("debug-assertions=off".into());
         }
 
-        // This argument will select the Kani flavour of the compiler. It will be removed before
-        // rustc driver is invoked.
-        flags.push("--kani-compiler".into());
+        match &self.route {
+            CompilerRoute::DevCli => {
+                // This argument will select the Kani flavour of the compiler. It will be removed
+                // before rustc driver is invoked.
+                flags.push("--kani-compiler".into());
+            }
+            CompilerRoute::Trustc { backend, .. } => {
+                // Selecting the trust-mc backend is what puts canonical trustc in Kani mode
+                // (T1-D1); harness units compile with Trust verification off (T1-D6).
+                let mut select = OsString::from(CODEGEN_BACKEND_FLAG);
+                select.push(backend.as_os_str());
+                flags.push(select.into());
+                flags.push(TRUST_VERIFY_OFF.into());
+            }
+        }
 
         flags
     }
@@ -332,6 +374,19 @@ impl KaniSession {
 
 /// Common flags used for compiling user code for verification and playback flow.
 pub(crate) fn base_rustc_flags(lib_config: LibConfig) -> Vec<RustcArg> {
+    base_rustc_flags_with(lib_config, ambient_rustflags().as_deref())
+}
+
+/// The `RUSTFLAGS` value the compile commands inherit from the driver's environment.
+pub(crate) fn ambient_rustflags() -> Option<String> {
+    std::env::var("RUSTFLAGS").ok()
+}
+
+/// [`base_rustc_flags`] with the ambient `RUSTFLAGS` passed in explicitly.
+pub(crate) fn base_rustc_flags_with(
+    lib_config: LibConfig,
+    rustflags: Option<&str>,
+) -> Vec<RustcArg> {
     let mut flags = [
         "-C",
         "overflow-checks=on",
@@ -359,11 +414,19 @@ pub(crate) fn base_rustc_flags(lib_config: LibConfig) -> Vec<RustcArg> {
 
     // e.g. compiletest will set 'compile-flags' here and we should pass those down to rustc
     // and we fail in `tests/kani/Match/match_bool.rs`
-    if let Ok(str) = std::env::var("RUSTFLAGS") {
-        flags.extend(str.split(' ').map(RustcArg::from));
+    if let Some(str) = rustflags {
+        flags.extend(rustflags_tokens(str).map(RustcArg::from));
     }
 
     flags
+}
+
+/// The argv tokens a `RUSTFLAGS` value contributes to a compile: split on single
+/// spaces, exactly as [`base_rustc_flags_with`] forwards them. The Trustc route's
+/// refusal of route-owned options (`trustc_route::refuse_route_owned_rustflags`)
+/// inspects these same tokens, so it judges exactly what rustc would receive.
+pub(crate) fn rustflags_tokens(rustflags: &str) -> impl Iterator<Item = &str> {
+    rustflags.split(' ')
 }
 
 /// Function that returns a `--check-version` argument to be added to the compiler flags.
@@ -372,4 +435,41 @@ pub(crate) fn base_rustc_flags(lib_config: LibConfig) -> Vec<RustcArg> {
 /// See <https://github.com/model-checking/kani/issues/2140> for more context.
 fn check_version() -> KaniArg {
     format!("--check-version={}", env!("CARGO_PKG_VERSION")).into()
+}
+
+/// The per-harness translation budget forwarded to the compiler as
+/// `--translation-timeout-ms`: the harness timeout itself. The compiler lets a
+/// single harness use up to twice that and caps the whole codegen stage (see
+/// `codegen_ay::translation_deadline::per_harness_budget`), which keeps every
+/// harness's translation inside the watchdog's `5T + grace + (n - 1)T`.
+/// `None` (no harness timeout, or a zero one) sends no budget, as before.
+pub(crate) fn translation_timeout_ms(
+    harness_timeout: Option<crate::args::Timeout>,
+) -> Option<u64> {
+    let budget = std::time::Duration::from(harness_timeout?);
+    let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    (ms > 0).then_some(ms)
+}
+
+#[cfg(test)]
+mod translation_timeout_tests {
+    use super::translation_timeout_ms;
+    use crate::args::Timeout;
+    use std::str::FromStr;
+
+    #[test]
+    fn no_harness_timeout_sends_no_budget() {
+        assert_eq!(translation_timeout_ms(None), None);
+    }
+
+    #[test]
+    fn budget_is_the_harness_timeout_in_ms() {
+        assert_eq!(translation_timeout_ms(Some(Timeout::from_str("15s").unwrap())), Some(15_000));
+        assert_eq!(translation_timeout_ms(Some(Timeout::from_str("2m").unwrap())), Some(120_000));
+    }
+
+    #[test]
+    fn zero_timeout_sends_no_budget() {
+        assert_eq!(translation_timeout_ms(Some(Timeout::from_str("0").unwrap())), None);
+    }
 }

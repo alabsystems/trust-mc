@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::model::Verdict;
+use crate::spec::SpecIndex;
 use crate::suites::Suite;
 
 /// How a discovered test must be executed.
@@ -51,6 +52,10 @@ pub struct Discovered {
     pub flags: Vec<String>,
     /// `// compile-flags:` exported via `RUSTFLAGS`.
     pub rustflags: Vec<String>,
+    /// `// cbmc-flags:` — CBMC-only tuning Kani's compiletest forwards as
+    /// `-Zunstable-options --cbmc-args …` (`run_kani`, runtest.rs). Consumed
+    /// by the Kani engine only; the AY backend has nothing to feed them to.
+    pub cbmc_flags: Vec<String>,
     /// Execution lane.
     pub kind: EntryKind,
     /// The Kani expected-output file governing this test, if any (resolved
@@ -60,11 +65,52 @@ pub struct Discovered {
     /// a **compile failure** (Kani itself fails to build the file), not a
     /// verification failure. A matching trust-mc compile error is parity.
     pub check_fail: bool,
+    /// Upstream Kani's compiletest never runs this unit: its path carries
+    /// `fixme` or `ignore` ([`compiletest_ignores`]), or the generated spec
+    /// classifies it `fixme`. Such a unit is scored in the `fixme` column
+    /// outside the parity denominator; a `missed_bug` on it still counts.
+    pub upstream_ignored: bool,
+}
+
+/// compiletest ignores every test whose PATH contains `fixme`, or else
+/// `ignore` (`tools/compiletest/src/header.rs:191-198`,
+/// `make_test_description`: `file_path.contains("fixme")` /
+/// `file_path.contains("ignore")`). The path it tests is the test file's — a
+/// directory component counts (`expected/intrinsics/sub_with_overflow_ice_fixme/…`),
+/// and so does a cargo unit's expected-file name. The rule is applied to the
+/// checkout-relative `tests/<suite>/<rel>`, so the checkout's own location
+/// can never tag or untag a unit.
+///
+/// The one exception is compiletest's `kani-fixme` mode (header.rs:201-217),
+/// whose suite name itself contains `fixme`: there the BASE NAME decides — a
+/// base name with `fixme` runs (expected to fail), one with `ignore` or
+/// neither is ignored.
+pub fn compiletest_ignores(suite: &str, rel: &str) -> bool {
+    if suite == "kani-fixme" {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        return !base.contains("fixme");
+    }
+    let path = format!("tests/{suite}/{rel}");
+    path.contains("fixme") || path.contains("ignore")
+}
+
+/// Is `<suite>/<rel>` a unit upstream never runs: compiletest's path rule OR
+/// the spec's `fixme` class. Either source tags; neither can untag.
+pub fn upstream_ignored(suite: &str, rel: &str, spec: Option<&SpecIndex>) -> bool {
+    compiletest_ignores(suite, rel) || spec.is_some_and(|s| s.is_fixme(suite, rel))
 }
 
 /// Walk one suite directory and return every runnable test: harness-bearing
 /// single `.rs` entry files plus cargo units for `Cargo.toml`-owned dirs.
+/// `upstream_ignored` is tagged by compiletest's path rule alone; see
+/// [`discover_suite_with`] to cross-check the generated spec as well.
 pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
+    discover_suite_with(kani_tests, suite, None)
+}
+
+/// [`discover_suite`], tagging `upstream_ignored` from the path rule OR the
+/// spec's `fixme` class when a spec is given.
+pub fn discover_suite_with(kani_tests: &Path, suite: &Suite, spec: Option<&SpecIndex>) -> Vec<Discovered> {
     let root = kani_tests.join(suite.name);
     let mut out = Vec::new();
     if !root.is_dir() {
@@ -89,6 +135,7 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
         path: PathBuf,
         flags: Vec<String>,
         rustflags: Vec<String>,
+        cbmc_flags: Vec<String>,
         header_fail: bool,
         check_fail: bool,
         harness_count: usize,
@@ -109,7 +156,7 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
         if !is_proof_entry(&src) {
             continue;
         }
-        let (flags, rustflags) = parse_flags(&src);
+        let (flags, rustflags, cbmc_flags) = parse_flags(&src);
         // Paths go relative to the CHECKOUT root (`<kani>`), not the suite
         // root: the child is spawned with the checkout as its cwd, which is
         // why sibling headers spell `tests/kani/ForeignItems/lib.c`.
@@ -122,9 +169,10 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
             path: path.to_path_buf(),
             flags,
             rustflags,
+            cbmc_flags,
             header_fail: header_expects_fail(&src),
             check_fail: header_expects_check_fail(&src),
-            harness_count: src.matches("#[kani::proof").count().max(1),
+            harness_count: count_harness_attrs(&src).max(1),
         });
     }
 
@@ -134,27 +182,31 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
         let expected_content =
             expected.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
         let expected_verdict = expected_content.as_deref().and_then(expected_file_verdict);
-        // Verdict-indeterminate expected file whose content is a compile
-        // diagnostic: the oracle is "compilation fails" (check_fail), same
-        // machinery as the `kani-check-fail` directive.
+        let rel = rel_of(&e.path, &root);
+        // Verdict-indeterminate expected file whose only content is a compile
+        // diagnostic or a Kani ICE: the oracle is "compilation fails"
+        // (check_fail), same machinery as the `kani-check-fail` directive, and
+        // never Success (`compile_fail_basis`).
         let compile_error_oracle = !e.header_fail
-            && expected_verdict.is_none()
-            && expected_content.as_deref().is_some_and(expected_is_compile_error);
+            && expected_content.as_deref().is_some_and(|c| compile_fail_basis(suite.name, &rel, c).is_some());
         let oracle = if e.header_fail || compile_error_oracle {
             Verdict::Fail
         } else {
             expected_verdict.unwrap_or(Verdict::Success)
         };
+        let ignored = upstream_ignored(suite.name, &rel, spec);
         out.push(Discovered {
             suite: suite.name.to_string(),
-            rel: rel_of(&e.path, &root),
+            rel,
             abs: e.path.clone(),
             oracle,
             flags: e.flags,
             rustflags: e.rustflags,
+            cbmc_flags: e.cbmc_flags,
             kind: EntryKind::SingleFile { harness_count: e.harness_count },
             expected_path: expected,
             check_fail: e.check_fail || compile_error_oracle,
+            upstream_ignored: ignored,
         });
     }
 
@@ -172,13 +224,16 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
             .collect();
         expected_files.sort();
         if expected_files.is_empty() {
+            let rel = rel_of(&pkg.join("Cargo.toml"), &root);
+            let ignored = upstream_ignored(suite.name, &rel, spec);
             out.push(Discovered {
                 suite: suite.name.to_string(),
-                rel: rel_of(&pkg.join("Cargo.toml"), &root),
+                rel,
                 abs: pkg.join("Cargo.toml"),
                 oracle: Verdict::Success,
                 flags: Vec::new(),
                 rustflags: Vec::new(),
+                cbmc_flags: Vec::new(),
                 kind: EntryKind::CargoPackage {
                     manifest_dir: pkg.clone(),
                     harness: None,
@@ -186,6 +241,7 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
                 },
                 expected_path: None,
                 check_fail: false,
+                upstream_ignored: ignored,
             });
             continue;
         }
@@ -195,8 +251,8 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
             } else {
                 exp.file_stem().and_then(|s| s.to_str()).map(str::to_string)
             };
-            let oracle = match oracle_from_expected_file(&exp) {
-                Ok(v) => v,
+            let content = match std::fs::read_to_string(&exp) {
+                Ok(c) => c,
                 Err(err) => {
                     // FAIL CLOSED. This file EXISTS (enumeration just yielded it),
                     // so an unreadable one is a corpus-integrity failure, not a
@@ -213,20 +269,31 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
                     continue;
                 }
             };
+            let rel = rel_of(&exp, &root);
+            let ignored = upstream_ignored(suite.name, &rel, spec);
+            // A compile-fail expected file is a compile-fail oracle here too.
+            let check_fail = compile_fail_basis(suite.name, &rel, &content).is_some();
+            let oracle = if check_fail {
+                Verdict::Fail
+            } else {
+                expected_file_verdict(&content).unwrap_or(Verdict::Success)
+            };
             out.push(Discovered {
                 suite: suite.name.to_string(),
-                rel: rel_of(&exp, &root),
+                rel,
                 abs: exp.clone(),
                 oracle,
                 flags: Vec::new(),
                 rustflags: Vec::new(),
+                cbmc_flags: Vec::new(),
                 kind: EntryKind::CargoPackage {
                     manifest_dir: pkg.clone(),
                     harness,
                     harness_count,
                 },
                 expected_path: Some(exp),
-                check_fail: false,
+                check_fail,
+                upstream_ignored: ignored,
             });
         }
     }
@@ -243,6 +310,64 @@ pub fn discover_suite(kani_tests: &Path, suite: &Suite) -> Vec<Discovered> {
 
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     out
+}
+
+/// How the discovered units were tagged `upstream_ignored`, for the run and
+/// inventory banners: the two sources are printed separately so a unit only
+/// one of them names is visible.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpstreamIgnoredReport {
+    /// Every tagged unit, `<suite>/<rel>`, sorted.
+    pub units: Vec<String>,
+    /// Tagged by compiletest's path rule.
+    pub by_path_rule: usize,
+    /// Tagged by the spec's `fixme` class (0 without a spec).
+    pub by_spec: usize,
+    /// Named by the spec but not by the path rule.
+    pub spec_only: Vec<String>,
+    /// Named by the path rule but not by the spec (empty without a spec).
+    pub path_only: Vec<String>,
+}
+
+impl UpstreamIgnoredReport {
+    pub fn of(found: &[Discovered], spec: Option<&SpecIndex>) -> Self {
+        let mut r = UpstreamIgnoredReport::default();
+        for d in found.iter().filter(|d| d.upstream_ignored) {
+            let id = format!("{}/{}", d.suite, d.rel);
+            let by_path = compiletest_ignores(&d.suite, &d.rel);
+            let by_spec = spec.is_some_and(|s| s.is_fixme(&d.suite, &d.rel));
+            r.by_path_rule += usize::from(by_path);
+            r.by_spec += usize::from(by_spec);
+            if by_spec && !by_path {
+                r.spec_only.push(id.clone());
+            }
+            if by_path && !by_spec && spec.is_some() {
+                r.path_only.push(id.clone());
+            }
+            r.units.push(id);
+        }
+        r.units.sort();
+        r.spec_only.sort();
+        r.path_only.sort();
+        r
+    }
+
+    /// One line for the console.
+    pub fn banner(&self) -> String {
+        let mut s = format!(
+            "{} upstream-ignored unit(s) (compiletest path rule {}, spec fixme class {})",
+            self.units.len(),
+            self.by_path_rule,
+            self.by_spec
+        );
+        if !self.spec_only.is_empty() {
+            s.push_str(&format!("; spec-only: {}", self.spec_only.join(", ")));
+        }
+        if !self.path_only.is_empty() {
+            s.push_str(&format!("; path-rule-only: {}", self.path_only.join(", ")));
+        }
+        s
+    }
 }
 
 fn rel_of(path: &Path, root: &Path) -> String {
@@ -262,7 +387,7 @@ fn is_expected_file(p: &Path) -> bool {
             || p.extension().and_then(|x| x.to_str()) == Some("expected"))
 }
 
-/// Count `#[kani::proof…]` attributes across a package's `.rs` files.
+/// Count harness attributes across a package's `.rs` files.
 fn count_package_harnesses(pkg: &Path) -> usize {
     let mut n = 0;
     for entry in WalkDir::new(pkg).into_iter().filter_map(Result::ok) {
@@ -271,17 +396,50 @@ fn count_package_harnesses(pkg: &Path) -> usize {
             continue;
         }
         if let Ok(src) = std::fs::read_to_string(path) {
-            n += src.matches("#[kani::proof").count();
+            n += count_harness_attrs(&src);
         }
     }
     n
 }
 
+/// Count the harness attributes in `src`, in every spelling the corpus
+/// uses: `#[kani::proof]`, `#[kani::proof_for_contract(f)]`, the
+/// `cfg`-guarded `#[cfg_attr(kani, kani::proof)]` /
+/// `#[cfg_attr(kani, kani::proof, kani::unwind(3))]` /
+/// `#[cfg_attr(kani, kani::proof_for_contract(f))]` forms, and a bare
+/// `#[proof]` after `use kani::proof`. A `#[kani::should_panic]` decorates
+/// one of these and is not a harness of its own.
+///
+/// Until 2026-09-12 only the `#[kani::proof` prefix was counted, so a file
+/// whose every harness is spelled `#[cfg_attr(kani, kani::proof)]` was not
+/// discovered at all: eight verification-scope files (one `expected`, seven
+/// `kani`) were missing from the denominator.
+pub fn count_harness_attrs(src: &str) -> usize {
+    let mut n = 0;
+    for (idx, _) in src.match_indices("kani::proof") {
+        let before = src[..idx].trim_end();
+        if before.ends_with("#[") {
+            n += 1;
+            continue;
+        }
+        // `#[cfg_attr(<predicate>, … , kani::proof…)]`: the attribute opened
+        // at the last `#[` is a `cfg_attr(` and this path follows a comma.
+        if before.ends_with(',') && before.rsplit("#[").next().is_some_and(|a| a.trim_start().starts_with("cfg_attr(")) {
+            n += 1;
+        }
+    }
+    n + src.matches("#[proof]").count()
+}
+
 /// A file is a verdict-bearing entry if it declares at least one Kani proof
-/// harness. `#[kani::proof` matches both `proof` and `proof_for_contract`;
-/// the macro-expanded `kani::proof]` form is also accepted.
+/// harness in any spelling [`count_harness_attrs`] knows, the macro-expanded
+/// `kani::proof]` form, or a `#[kani::should_panic]` (which only ever
+/// decorates a proof harness).
 fn is_proof_entry(src: &str) -> bool {
-    src.contains("#[kani::proof") || src.contains("kani::proof]") || src.contains("#[proof]")
+    count_harness_attrs(src) > 0
+        || src.contains("kani::proof]")
+        || src.contains("#[kani::should_panic")
+        || src.contains("kani::should_panic)")
 }
 
 /// Explicit fail directives in the test header win over any expected file.
@@ -491,6 +649,111 @@ fn expected_is_compile_error(content: &str) -> bool {
     content.contains("error: aborting due to") || content.contains("error[E")
 }
 
+/// Why an expected file is a compile-fail oracle (`compile_fail_basis`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileFailBasis {
+    /// A rustc-style diagnostic: an `error[E…]` / `error:` line (or rustc's
+    /// abort line), or the bare `error` level token.
+    Diagnostic,
+    /// Kani's internal-compiler-error banner.
+    KaniIce,
+    /// A message-only diagnostic listed in `quarantine::COMPILE_FAIL_ORACLES`.
+    Manifest,
+}
+
+/// The Kani ICE banner, or rustc's: an expected file that quotes one expects
+/// the compiler to panic, so a panic in the output is that diagnostic.
+pub fn expected_is_kani_ice(content: &str) -> bool {
+    content.contains("Kani unexpectedly panicked") || content.contains("internal compiler error")
+}
+
+/// A line of Kani's VERIFICATION output (a check, a harness banner, a verdict
+/// or a summary), as opposed to a compile-time diagnostic.
+fn is_verification_output_line(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "Checking harness",
+        "Status:",
+        "- Status:",
+        "Description:",
+        "- Description:",
+        "Location:",
+        "- Location:",
+        "VERIFICATION",
+        "Verification Time",
+        "Verification failed for",
+        "Complete -",
+        "Manual Harness Summary",
+        "SUMMARY:",
+        "** ",
+    ];
+    const TOKENS: &[&str] = &["SUCCESS", "FAILURE", "UNDETERMINED", "UNREACHABLE", "SATISFIED", "UNSATISFIABLE"];
+    PREFIXES.iter().any(|p| line.starts_with(p)) || TOKENS.contains(&line)
+}
+
+/// Is this expected file a **compile-fail oracle**: verdict-indeterminate,
+/// and its only content a compile-time diagnostic or a Kani ICE?
+///
+/// * `Diagnostic` — some line is an `error:` / `error[E…]` diagnostic (or the
+///   bare `error` level), or the file carries rustc's `error[E` / `error:
+///   aborting due to` text, and no line is verification output. This also
+///   covers kani-compiler and kani-driver refusals that print at `error`
+///   level (`expected/unwind-flags-conflict`): Kani refuses to verify either
+///   way, so no verification verdict can meet the oracle.
+/// * `KaniIce` — the file quotes `Kani unexpectedly panicked` / `internal
+///   compiler error` and no verification output.
+/// * `Manifest` — a message-only diagnostic, which nothing in the file marks
+///   as one, listed with upstream evidence in
+///   `quarantine::COMPILE_FAIL_ORACLES` and still carrying its quote.
+///
+/// `warning:`-only files, CBMC runtime messages and report lines stay
+/// verdict-indeterminate text (default Success oracle): Kani verifies those
+/// units. A file with any verdict marker is never a compile-fail oracle.
+pub fn compile_fail_basis(suite: &str, rel: &str, content: &str) -> Option<CompileFailBasis> {
+    if expected_file_verdict(content).is_some() {
+        return None;
+    }
+    let lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim().trim_end_matches('\\').trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() || lines.iter().any(|l| is_verification_output_line(l)) {
+        return None;
+    }
+    if expected_is_kani_ice(content) {
+        return Some(CompileFailBasis::KaniIce);
+    }
+    if expected_is_compile_error(content)
+        || lines.iter().any(|l| l.starts_with("error:") || l.starts_with("error[E") || *l == "error")
+    {
+        return Some(CompileFailBasis::Diagnostic);
+    }
+    crate::quarantine::compile_fail_oracle(suite, rel)
+        .filter(|e| content.contains(e.expected_quote))
+        .map(|_| CompileFailBasis::Manifest)
+}
+
+/// The `(oracle, check_fail)` a unit recorded under an older scorer has under
+/// the compile-fail rule, from its logged expected content — what discovery
+/// derives today, so `rescore` and `run` agree. A unit already a compile-fail
+/// oracle, or already a fail oracle (a `kani-*-fail` header, which discovery
+/// never turns into a compile-fail oracle, or an oracle fixup), is unchanged.
+pub fn rederive_oracle(
+    suite: &str,
+    rel: &str,
+    oracle: Verdict,
+    check_fail: bool,
+    expected: Option<&str>,
+) -> (Verdict, bool) {
+    if check_fail || oracle == Verdict::Fail {
+        return (oracle, check_fail);
+    }
+    match expected {
+        Some(content) if compile_fail_basis(suite, rel, content).is_some() => (Verdict::Fail, true),
+        _ => (oracle, check_fail),
+    }
+}
+
 /// Kani declares a test's C dependencies through two channels: the
 /// `// kani-flags:` header, and — in older tests — prose only, in the form its
 /// own docs use: `//! kani <test>.rs -- lib.c`. Only the header channel was
@@ -553,11 +816,13 @@ fn augment_prose_c_lib(
     flags
 }
 
-/// Parse `// kani-flags:` (→ verifier flags) and `// compile-flags:` (→
-/// RUSTFLAGS) directives, mirroring `tools/compiletest` header parsing.
-fn parse_flags(src: &str) -> (Vec<String>, Vec<String>) {
+/// Parse `// kani-flags:` (→ verifier flags), `// compile-flags:` (→
+/// RUSTFLAGS) and `// cbmc-flags:` (→ `--cbmc-args`, Kani engine only)
+/// directives, mirroring `tools/compiletest` header parsing.
+fn parse_flags(src: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut flags = Vec::new();
     let mut rustflags = Vec::new();
+    let mut cbmc_flags = Vec::new();
     for line in src.lines() {
         let t = line.trim_start();
         let body = t
@@ -569,9 +834,11 @@ fn parse_flags(src: &str) -> (Vec<String>, Vec<String>) {
             flags.extend(v.split_whitespace().map(str::to_string));
         } else if let Some(v) = body.strip_prefix("compile-flags:") {
             rustflags.extend(v.split_whitespace().map(str::to_string));
+        } else if let Some(v) = body.strip_prefix("cbmc-flags:") {
+            cbmc_flags.extend(v.split_whitespace().map(str::to_string));
         }
     }
-    (flags, rustflags)
+    (flags, rustflags, cbmc_flags)
 }
 
 #[cfg(test)]
@@ -885,6 +1152,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Every verdict-indeterminate expected file whose only content is a
+    /// diagnostic or a Kani ICE is a compile-fail oracle, whatever the
+    /// diagnostic's origin; verification output, warnings and runtime text are
+    /// not; a message-only diagnostic needs its manifest entry AND its quote.
+    #[test]
+    fn diagnostic_and_ice_expected_files_are_compile_fail_oracles() {
+        use CompileFailBasis as B;
+        let basis = |rel: &str, c: &str| compile_fail_basis("expected", rel, c);
+        assert_eq!(basis("a.rs", "error: Using the proof_for_contract attribute requires activating the unstable `function-contracts` feature\n"), Some(B::Diagnostic));
+        assert_eq!(basis("a.rs", "error: Nested calls to `old` are prohibited\n#[kani::ensures(|result| old(*ptr + old(1)) == *ptr)]\n"), Some(B::Diagnostic));
+        assert_eq!(basis("a.rs", "error\n"), Some(B::Diagnostic), "the bare level token");
+        assert_eq!(basis("a.rs", "error: failed to resolve `foo`\n       mod2::foo\\\n       mod1::foo\n|\n| #[kani::stub(foo, stub)]\n"), Some(B::Diagnostic));
+        assert_eq!(basis("a.rs", "error: Conflicting flags: unwind flags provided to kani and in --cbmc-args.\n"), Some(B::Diagnostic));
+        assert_eq!(basis("a.rs", "Kani unexpectedly panicked during compilation.\n"), Some(B::KaniIce));
+        // Not compile-fail: warnings, CBMC runtime text, report lines, verdicts.
+        assert_eq!(basis("a.rs", "warning: Multiple occurrences of `stub_verified(one)`.\n"), None);
+        assert_eq!(basis("a.rs", "`kani::forall` has an unbounded (~2^64) range; SAT solvers may diverge\n"), None);
+        assert_eq!(basis("a.rs", "too many addressed objects: maximum number of objects is set to 2^n=32\n"), None);
+        assert_eq!(basis("a.rs", "Verification Time:\n"), None);
+        assert_eq!(basis("a.rs", "error: x\nStatus: SUCCESS\n"), None, "verification output next to the diagnostic");
+        assert_eq!(basis("a.rs", "error: x\nVERIFICATION:- FAILED\n"), None, "a verdict wins");
+        // Message-only: only the listed unit, only with its quote.
+        assert_eq!(basis("assert-arg-error/test.rs", "cannot find value `foo` in this scope\n"), Some(B::Manifest));
+        assert_eq!(basis("assert-arg-error/test.rs", "something else entirely\n"), None, "the quote guards the entry");
+        assert_eq!(basis("other/test.rs", "cannot find value `foo` in this scope\n"), None);
+        // rederive: Success -> (Fail, check_fail); a fail or check-fail oracle is kept.
+        assert_eq!(rederive_oracle("expected", "a.rs", V::Success, false, Some("error: x\n")), (V::Fail, true));
+        assert_eq!(rederive_oracle("expected", "a.rs", V::Success, false, Some("warning: x\n")), (V::Success, false));
+        assert_eq!(rederive_oracle("expected", "a.rs", V::Fail, false, Some("error: x\n")), (V::Fail, false));
+        assert_eq!(rederive_oracle("expected", "a.rs", V::Success, false, None), (V::Success, false));
+
+        // Discovery applies it to single files and cargo units alike.
+        let root = tmpdir("cf-oracle");
+        let dir = root.join("expected/assert-arg-error");
+        write(&dir.join("test.rs"), PROOF);
+        write(&dir.join("expected"), "cannot find value `foo` in this scope\n");
+        let ice = root.join("expected/ice");
+        write(&ice.join("main.rs"), PROOF);
+        write(&ice.join("expected"), "Kani unexpectedly panicked during compilation.\n");
+        let found = discover_suite(&root, suite());
+        for d in &found {
+            assert_eq!((d.oracle, d.check_fail), (V::Fail, true), "{}", d.rel);
+        }
+        assert_eq!(found.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A determinate verification verdict in the expected file wins over any
     /// quoted compile-error text: the compile-fail oracle only applies to
     /// verdict-indeterminate expected files.
@@ -932,6 +1246,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The three header channels land in their own fields: `kani-flags` go to
+    /// the verifier verbatim, `compile-flags` become RUSTFLAGS, and
+    /// `cbmc-flags` (the ten corpus files that carry them) are kept apart so
+    /// only the Kani engine forwards them as `--cbmc-args`.
+    #[test]
+    fn header_channels_are_kept_apart() {
+        let (flags, rustflags, cbmc) = parse_flags(
+            "// kani-flags: -Z unstable-options --default-unwind 3\n\
+             // compile-flags: --edition 2021\n\
+             // cbmc-flags: --unwinding-assertions\n\
+             #[kani::proof]\nfn f() {}\n",
+        );
+        assert_eq!(flags, vec!["-Z", "unstable-options", "--default-unwind", "3"]);
+        assert_eq!(rustflags, vec!["--edition", "2021"]);
+        assert_eq!(cbmc, vec!["--unwinding-assertions"]);
+        let root = tmpdir("cbmcflags");
+        let dir = root.join("kani/Unwind");
+        write(&dir.join("a.rs"), "// cbmc-flags: --bounds-check\n#[kani::proof]\nfn a() {}\n");
+        let found = discover_suite(&root, suites::lookup("kani").unwrap());
+        assert_eq!(found[0].cbmc_flags, vec!["--bounds-check"]);
+        assert!(found[0].flags.is_empty(), "cbmc-flags never leak into kani-flags");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `// kani-check-fail` (compile-fail oracle) is recorded separately from
     /// `// kani-verify-fail`, and single-file entries carry their harness
     /// count for outer-watchdog scaling.
@@ -956,6 +1294,111 @@ mod tests {
         assert_eq!(b.oracle, V::Fail);
         assert!(!b.check_fail, "kani-verify-fail is not a compile-fail oracle");
         assert_eq!(b.kind, EntryKind::SingleFile { harness_count: 1 });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every harness spelling the corpus uses is discovered and counted:
+    /// the `cfg_attr(kani, kani::proof)` family (the eight files that were
+    /// missing from the denominator), `proof_for_contract`, and a
+    /// `should_panic`-decorated proof; a `use kani::proof;` import and a
+    /// comment are not harnesses.
+    #[test]
+    fn every_harness_spelling_is_discovered_and_counted() {
+        assert_eq!(count_harness_attrs("#[kani::proof]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[kani::proof_for_contract(f)]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[cfg_attr(kani, kani::proof)]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[cfg_attr(kani,kani::proof)]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[cfg_attr(kani, kani::proof, kani::unwind(3))]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[cfg_attr(kani, kani::unwind(3), kani::proof)]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[cfg_attr(kani, kani::proof_for_contract(f))]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("#[kani::proof]\n#[kani::should_panic]\nfn a() {}\n#[kani::proof]\nfn b() {}\n"), 2);
+        assert_eq!(count_harness_attrs("use kani::proof;\n#[proof]\nfn a() {}\n"), 1);
+        assert_eq!(count_harness_attrs("use kani::proof;\nfn a() {}\n"), 0);
+        assert!(!is_proof_entry("fn main() { kani::proof_stuff(); }\n"));
+        assert!(is_proof_entry("#[cfg_attr(kani, kani::proof)]\nfn a() {}\n"));
+        assert!(is_proof_entry("#[cfg_attr(kani, kani::should_panic)]\n#[cfg_attr(kani, kani::proof)]\nfn a() {}\n"));
+
+        let root = tmpdir("cfgattr");
+        let dir = root.join("kani/CfgAttr");
+        write(&dir.join("guarded.rs"), "#[cfg_attr(kani, kani::proof)]\nfn a() {}\n#[cfg_attr(kani, kani::proof, kani::unwind(3))]\nfn b() {}\n");
+        write(&dir.join("plain.rs"), "fn a() {}\n");
+        let found = discover_suite(&root, suites::lookup("kani").unwrap());
+        let rels: Vec<&str> = found.iter().map(|d| d.rel.as_str()).collect();
+        assert_eq!(rels, vec!["CfgAttr/guarded.rs"]);
+        assert_eq!(found[0].kind, EntryKind::SingleFile { harness_count: 2 });
+        assert_eq!(found[0].oracle, V::Success);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// compiletest's path rule, applied to the checkout-relative path: a
+    /// `fixme` / `ignore` file name, a directory component, or a cargo unit's
+    /// expected-file name tags the unit; the checkout's own location never
+    /// does; nothing else does.
+    #[test]
+    fn compiletest_path_rule_tags_fixme_and_ignore_anywhere_in_the_test_path() {
+        assert!(compiletest_ignores("expected", "loop-contract/fixme_box.rs"));
+        assert!(compiletest_ignores("kani", "SizeAndAlignOfDst/main_assert_fixme.rs"));
+        assert!(compiletest_ignores("expected", "function-contract/history/ui/noncopy_ignore.rs"));
+        assert!(compiletest_ignores("expected", "intrinsics/sub_with_overflow_ice_fixme/main.rs"), "a directory component counts");
+        assert!(compiletest_ignores("std-checks", "core/fixme_mem.expected"), "a cargo unit's expected file counts");
+        assert!(!compiletest_ignores("kani", "PointerOffset/wrap.rs"));
+        assert!(!compiletest_ignores("expected", "function-contract/modifies/field_replace_pass.rs"));
+        // The rule reads `tests/<suite>/<rel>`, never the checkout's own
+        // location, so a checkout under `…/kd-fixme-oracle/…` tags nothing.
+        assert!(!compiletest_ignores("kani", "Plain/ok.rs"));
+        // `kani-fixme` mode: the base name decides, not the suite's own name.
+        assert!(!compiletest_ignores("kani-fixme", "Asm/main_fixme.rs"), "a fixme base name runs in kani-fixme mode");
+        assert!(compiletest_ignores("kani-fixme", "Asm/main.rs"), "a regular test is ignored in kani-fixme mode");
+        assert!(compiletest_ignores("kani-fixme", "Helpers/vtable_utils_ignore.rs"));
+    }
+
+    /// Discovery tags `upstream_ignored` from the path rule alone, and from
+    /// the spec's `fixme` class when a spec is given; either source tags and
+    /// neither untags, and the report says which source named each unit.
+    #[test]
+    fn upstream_ignored_is_tagged_by_path_rule_or_spec() {
+        let root = tmpdir("upstream-ignored");
+        let dir = root.join("kani/Tag");
+        write(&dir.join("fixme_a.rs"), PROOF);
+        write(&dir.join("b_ignore.rs"), PROOF);
+        write(&dir.join("plain.rs"), PROOF);
+        write(&dir.join("spec_says_so.rs"), PROOF);
+        let kani = suites::lookup("kani").unwrap();
+
+        // Path rule alone.
+        let found = discover_suite(&root, kani);
+        let by_rel: std::collections::HashMap<_, _> = found.iter().map(|d| (d.rel.as_str(), d)).collect();
+        assert!(by_rel["Tag/fixme_a.rs"].upstream_ignored);
+        assert!(by_rel["Tag/b_ignore.rs"].upstream_ignored);
+        assert!(!by_rel["Tag/plain.rs"].upstream_ignored);
+        assert!(!by_rel["Tag/spec_says_so.rs"].upstream_ignored);
+        let report = UpstreamIgnoredReport::of(&found, None);
+        assert_eq!(report.units, vec!["kani/Tag/b_ignore.rs", "kani/Tag/fixme_a.rs"]);
+        assert_eq!((report.by_path_rule, report.by_spec), (2, 0));
+        assert!(report.spec_only.is_empty() && report.path_only.is_empty(), "no spec: nothing to cross-check");
+
+        // With a spec that names one more unit and omits one the path rule tags.
+        let spec = SpecIndex::parse(
+            "{\"id\":\"kani/Tag/spec_says_so.rs\",\"suite\":\"kani\",\"classification\":\"fixme\",\"ignored\":null}\n\
+             {\"id\":\"kani/Tag/fixme_a.rs\",\"suite\":\"kani\",\"classification\":\"fixme\",\"ignored\":\"fixme test\"}\n\
+             {\"id\":\"kani/Tag/plain.rs\",\"suite\":\"kani\",\"classification\":\"verdict-spec\",\"ignored\":null}\n",
+            "r",
+            PathBuf::from("/s/units.jsonl"),
+        )
+        .unwrap();
+        let found = discover_suite_with(&root, kani, Some(&spec));
+        let by_rel: std::collections::HashMap<_, _> = found.iter().map(|d| (d.rel.as_str(), d)).collect();
+        assert!(by_rel["Tag/spec_says_so.rs"].upstream_ignored, "the spec tags");
+        assert!(by_rel["Tag/b_ignore.rs"].upstream_ignored, "the spec cannot untag the path rule");
+        assert!(!by_rel["Tag/plain.rs"].upstream_ignored);
+        let report = UpstreamIgnoredReport::of(&found, Some(&spec));
+        assert_eq!(report.units.len(), 3);
+        assert_eq!((report.by_path_rule, report.by_spec), (2, 2));
+        assert_eq!(report.spec_only, vec!["kani/Tag/spec_says_so.rs"]);
+        assert_eq!(report.path_only, vec!["kani/Tag/b_ignore.rs"]);
+        let banner = report.banner();
+        assert!(banner.starts_with("3 upstream-ignored unit(s) (compiletest path rule 2, spec fixme class 2)"), "{banner}");
+        assert!(banner.contains("spec-only: kani/Tag/spec_says_so.rs") && banner.contains("path-rule-only: kani/Tag/b_ignore.rs"), "{banner}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

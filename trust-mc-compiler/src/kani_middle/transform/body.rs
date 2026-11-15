@@ -283,7 +283,10 @@ impl MutableBody {
         let span = source.span(&self.blocks);
         let ret_ty = rvalue.ty(&self.locals).expect("rvalue should have type in locals");
         let result = self.new_local(ret_ty, span, Mutability::Not);
-        let stmt = Statement { kind: StatementKind::Assign(Place::from(result), rvalue), span };
+        let stmt = crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(result), rvalue),
+            span,
+        );
         self.insert_stmt(stmt, source, position);
         result
     }
@@ -297,7 +300,7 @@ impl MutableBody {
         position: InsertPosition,
     ) {
         let span = source.span(&self.blocks);
-        let stmt = Statement { kind: StatementKind::Assign(place, rvalue), span };
+        let stmt = crate::rustc_compat::mir_statement(StatementKind::Assign(place, rvalue), span);
         self.insert_stmt(stmt, source, position);
     }
 
@@ -346,7 +349,7 @@ impl MutableBody {
             target: Some(new_bb),
             unwind: UnwindAction::Terminate,
         };
-        let terminator = Terminator { kind, span };
+        let terminator = crate::rustc_compat::mir_terminator(kind, span);
         self.insert_terminator(source, position, terminator);
     }
 
@@ -375,7 +378,7 @@ impl MutableBody {
             target: Some(new_bb),
             unwind: UnwindAction::Terminate,
         };
-        let terminator = Terminator { kind, span };
+        let terminator = crate::rustc_compat::mir_terminator(kind, span);
         self.insert_terminator(source, position, terminator);
     }
 
@@ -478,10 +481,10 @@ impl MutableBody {
         // basic block.
         let target = get_mut_target_ref(&mut bb.terminator);
         *target = split_bb_idx;
-        let new_term = Terminator {
-            kind: TerminatorKind::Goto { target: inserted_bb_idx },
-            span: source.span(&self.blocks),
-        };
+        let new_term = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: inserted_bb_idx },
+            source.span(&self.blocks),
+        );
         self.split_bb(source, position, new_term);
         self.blocks.push(bb);
     }
@@ -568,10 +571,10 @@ impl MutableBody {
                         *source = SourceInstruction::Statement { idx: 0, bb: new_bb_idx };
                         let new_bb = BasicBlock {
                             statements: vec![new_stmt],
-                            terminator: Terminator {
-                                kind: TerminatorKind::Goto { target: *target_bb },
+                            terminator: crate::rustc_compat::mir_terminator(
+                                TerminatorKind::Goto { target: *target_bb },
                                 span,
-                            },
+                            ),
                         };
                         *target_bb = new_bb_idx;
                         self.blocks.push(new_bb);
@@ -591,7 +594,7 @@ impl MutableBody {
     /// Keep all the locals untouched, so they can be reused by the passes if needed.
     pub(crate) fn clear_body(&mut self, kind: TerminatorKind) {
         self.blocks.clear();
-        let terminator = Terminator { kind, span: self.span };
+        let terminator = crate::rustc_compat::mir_terminator(kind, self.span);
         self.blocks.push(BasicBlock { statements: Vec::default(), terminator });
     }
 
@@ -729,8 +732,8 @@ pub(crate) enum SourceInstruction {
 impl SourceInstruction {
     pub(crate) fn span(&self, blocks: &[BasicBlock]) -> Span {
         match *self {
-            SourceInstruction::Statement { idx, bb } => blocks[bb].statements[idx].span,
-            SourceInstruction::Terminator { bb } => blocks[bb].terminator.span,
+            SourceInstruction::Statement { idx, bb } => mir_span!(blocks[bb].statements[idx]),
+            SourceInstruction::Terminator { bb } => mir_span!(blocks[bb].terminator),
         }
     }
 
@@ -808,12 +811,13 @@ pub(crate) trait MutMirVisitor {
             | StatementKind::SetDiscriminant { .. }
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
-            | StatementKind::Retag(_, _)
             | StatementKind::PlaceMention(_)
             | StatementKind::AscribeUserType { .. }
             | StatementKind::Coverage(_)
             | StatementKind::ConstEvalCounter
             | StatementKind::Nop => {}
+            #[cfg(not(trust_toolchain))]
+            StatementKind::Retag(_, _) => {}
         }
     }
 
@@ -861,14 +865,19 @@ pub(crate) trait MutMirVisitor {
             Rvalue::Repeat(op, _) => {
                 self.visit_operand(op);
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(op, _) => self.visit_operand(op),
-            Rvalue::UnaryOp(_, op) | Rvalue::Use(op) => {
+            Rvalue::UnaryOp(_, op) | Rvalue::Use(op, ..) => {
                 self.visit_operand(op);
             }
             Rvalue::AddressOf(..) => {}
             Rvalue::CopyForDeref(_) | Rvalue::Discriminant(_) | Rvalue::Len(_) => {}
             Rvalue::Ref(..) => {}
+            // Like `Ref`, a reborrow names a place and carries no operand to visit.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(..) => {}
             Rvalue::ThreadLocalRef(_) => {}
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(..) => {}
         }
     }

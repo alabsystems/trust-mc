@@ -53,7 +53,7 @@ fn progress_cli_reports_complete_fixture() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("KANI_REPLACEMENT_PROGRESS status=COMPLETE"));
-    assert!(stdout.contains("replacement_progress_command cargo run"));
+    assert!(stdout.contains("replacement_progress_command targo --unverified run"));
     assert!(stdout.contains(
         "authority_expectations commit=0123456789abcdef0123456789abcdef01234567 commit_source=cli"
     ));

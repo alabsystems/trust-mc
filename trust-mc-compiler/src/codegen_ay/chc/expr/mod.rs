@@ -12,16 +12,19 @@
 pub(super) use super::{
     ChcCtx, FieldProjection, UnknownProjectionPolicy, chc_debug_enabled, codegen_ctx,
     codegen_decl_flatten, codegen_stmt_aggregate_adt, codegen_stmt_projection, codegen_types,
-    codegen_types_adt_sort, collect_field_projections, constant_index_offset, memory_model, names,
+    collect_field_projections, constant_index_offset, memory_model, names,
 };
 
 pub(super) mod codegen_expr;
 pub(super) mod codegen_expr_array_eq;
 pub(super) mod codegen_expr_assert;
 pub(super) mod codegen_expr_assert_simplify;
+pub(super) mod codegen_expr_box_deref;
+pub(super) mod codegen_expr_box_origin;
 pub(super) mod codegen_expr_constant;
 pub(in crate::codegen_ay) mod codegen_expr_constant_payload;
 pub(super) mod codegen_expr_deref;
+pub(super) mod codegen_expr_deref_array_byte;
 pub(super) mod codegen_expr_deref_field;
 pub(super) mod codegen_expr_deref_field_offset;
 pub(super) mod codegen_expr_deref_field_validity;
@@ -33,6 +36,7 @@ pub(super) mod codegen_expr_deref_static;
 pub(super) mod codegen_expr_deref_subslice;
 pub(super) mod codegen_expr_detect;
 pub(super) mod codegen_expr_env;
+pub(super) mod codegen_expr_flat_struct_path;
 pub(super) mod codegen_expr_flattened;
 pub(super) mod codegen_expr_flattened_coroutine;
 pub(super) mod codegen_expr_flattened_index;
@@ -42,3 +46,4 @@ pub(super) mod codegen_expr_heap_span;
 pub(super) mod codegen_expr_reconstruct;
 pub(super) mod codegen_expr_reconstruct_flattened;
 pub(super) mod codegen_expr_signedness;
+pub(super) mod codegen_expr_string_vec_view;

@@ -9,10 +9,11 @@
 //! nested calls keeps the task-slot path compact and lets vtable attachment
 //! happen at the call site instead of inside the callee MIR body.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::{BTreeMap, HashMap};
 
 use super::super::ChcCtx;
-use super::super::codegen_ctx::{chc_fresh_name, declare_pending_var};
+use super::super::codegen_ctx::chc_fresh_name;
 use super::super::codegen_types::CodegenTypes;
 use super::super::inline_shared::PlaceResolver;
 use super::InlineReturn;
@@ -28,8 +29,7 @@ pub(in crate::codegen_ay::chc) fn is_option_like_sort(sort: &Sort) -> bool {
         return false;
     };
 
-    let option_named =
-        dt.name == "Option" || dt.name.starts_with("Option_") || dt.name.ends_with("::Option");
+    let option_named = crate::codegen_ay::names::is_option_sort_name(&dt.name);
     if option_named {
         return true;
     }
@@ -76,9 +76,16 @@ fn option_payload_sort_for_result(option_sort: &Sort) -> Option<Sort> {
     .then(|| ctor.fields[1].sort.clone())
 }
 
-fn fresh_guarded_option_as_mut_payload(dest_sort: &Sort) -> Option<Expr> {
+/// `Option::as_mut`'s payload is a reference to the option's payload slot, an
+/// address the model does not pin: a booked havoc (Rule E).
+fn fresh_guarded_option_as_mut_payload(ctx: &mut ChcCtx<'_, '_>, dest_sort: &Sort) -> Option<Expr> {
     let payload_sort = option_payload_sort_for_result(dest_sort)?;
-    Some(declare_pending_var(chc_fresh_name("option_as_mut_ref"), payload_sort))
+    Some(Havoc::mint(
+        ctx,
+        sound_havoc::UNTRACKED_POINTER_VALUE,
+        chc_fresh_name("option_as_mut_ref"),
+        payload_sort,
+    ))
 }
 
 pub(in crate::codegen_ay::chc) fn shape_option_as_mut_result(
@@ -93,12 +100,45 @@ pub(in crate::codegen_ay::chc) fn shape_option_as_mut_result(
     // `Option<T>::as_mut` returns a mutable reference to the option payload slot,
     // not the stored `T` value. Without payload-slot address/provenance, reusing
     // the receiver payload is unsound even when both encode as BV64.
-    let payload = fresh_guarded_option_as_mut_payload(dest_sort)?;
+    let payload = fresh_guarded_option_as_mut_payload(ctx, dest_sort)?;
     let some_expr = ctx.make_some_expr_for_option(payload, dest_sort)?;
     let none_expr = ctx.make_none_expr_for_option(dest_sort)?;
     let is_some = ctx.option_is_some(receiver);
     ctx.record_aggregate_gap("option_as_mut_payload_unconstrained");
     Some(Expr::ite(is_some, some_expr, none_expr))
+}
+
+/// One of the two inherent methods of core's `Option` the option-state models
+/// describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::codegen_ay::chc) enum CoreOptionStateMethod {
+    /// `Option::<T>::as_mut(&mut self) -> Option<&mut T>`.
+    AsMut,
+    /// `Option::<T>::take(&mut self) -> Option<T>`: `*self` becomes `None`.
+    Take,
+}
+
+/// Which of core's `Option::as_mut`/`Option::take` `callee_path` names, by its
+/// def path (`core::option::Option::<T>::take`, printed through `std`). The
+/// option-state models replace the call with core's semantics without walking
+/// a body, so a method that only shares the NAME must not reach them: a user
+/// trait implemented for an `Option` type prints as `<Option<u8> as Peek>::take`
+/// and an inherent method of another type as `Slot::take`, and their bodies
+/// can write anything or nothing
+/// (tools/soundness-duals/option_take_by_name_dual.rs).
+pub(in crate::codegen_ay::chc) fn core_option_state_method(
+    callee_path: &str,
+) -> Option<CoreOptionStateMethod> {
+    let rest = callee_path
+        .strip_prefix("core::option::Option::<")
+        .or_else(|| callee_path.strip_prefix("std::option::Option::<"))?;
+    if rest.ends_with(">::as_mut") {
+        Some(CoreOptionStateMethod::AsMut)
+    } else if rest.ends_with(">::take") {
+        Some(CoreOptionStateMethod::Take)
+    } else {
+        None
+    }
 }
 
 pub(in crate::codegen_ay::chc) fn try_inline_option_state_call(
@@ -111,10 +151,7 @@ pub(in crate::codegen_ay::chc) fn try_inline_option_state_call(
     local_exprs: &HashMap<usize, Expr>,
     resolver: &PlaceResolver<'_>,
 ) -> Option<InlineReturn> {
-    let is_option_state_call = callee_path.ends_with("::as_mut") || callee_path.ends_with("::take");
-    if !callee_path.contains("Option") || !is_option_state_call {
-        return None;
-    }
+    let method = core_option_state_method(callee_path)?;
     if args.len() != 1 && translated_args.len() != 1 {
         return None;
     }
@@ -122,30 +159,27 @@ pub(in crate::codegen_ay::chc) fn try_inline_option_state_call(
     let receiver =
         option_receiver_expr(ctx, args, translated_args, outer_body, local_exprs, resolver)?;
 
-    if callee_path.ends_with("::as_mut") {
-        let dest_sort = destination
-            .ty(outer_body.locals())
-            .ok()
-            .map(|ty| ctx.resolve_body_ty(ty))
-            .and_then(ChcCtx::translate_ty)?;
-        return Some(InlineReturn::value_only(shape_option_as_mut_result(
-            ctx, receiver, &dest_sort,
-        )?));
+    match method {
+        CoreOptionStateMethod::AsMut => {
+            let dest_sort = destination
+                .ty(outer_body.locals())
+                .ok()
+                .map(|ty| ctx.resolve_body_ty(ty))
+                .and_then(ChcCtx::translate_ty)?;
+            Some(InlineReturn::value_only(shape_option_as_mut_result(ctx, receiver, &dest_sort)?))
+        }
+        CoreOptionStateMethod::Take => {
+            let none_expr = ctx.make_none_expr_for_option(receiver.sort())?;
+            let alias_updates = BTreeMap::from([(1usize, none_expr)]);
+            Some(InlineReturn {
+                value: receiver,
+                vtable: None,
+                alloc_id: None,
+                alias_updates,
+                deferred_checks: Vec::new(),
+            })
+        }
     }
-
-    if callee_path.ends_with("::take") {
-        let none_expr = ctx.make_none_expr_for_option(receiver.sort())?;
-        let alias_updates = BTreeMap::from([(1usize, none_expr)]);
-        return Some(InlineReturn {
-            value: receiver,
-            vtable: None,
-            alloc_id: None,
-            alias_updates,
-            deferred_checks: Vec::new(),
-        });
-    }
-
-    None
 }
 
 #[cfg(test)]

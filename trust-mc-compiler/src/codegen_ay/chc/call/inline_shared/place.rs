@@ -8,6 +8,8 @@
 //! Provides `resolve_place`, `inline_operand_to_expr`, `inline_ref_place_to_expr`,
 //! and closure-capture / local-projection resolution helpers.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::mir::{LocalDecl, Operand, Place, ProjectionElem};
 use rustc_public::ty::{RigidTy, TyKind};
 use std::collections::HashMap;
@@ -55,7 +57,7 @@ pub(in crate::codegen_ay) fn deref_is_identity_on_value_dt(
     let ay_bindings::SortInner::Datatype(dt) = expr.sort().inner() else {
         return false;
     };
-    if !dt.name.starts_with("Closure_") {
+    if !crate::codegen_ay::names::is_closure_sort_name(&dt.name) {
         return false;
     }
     let Some(pointee_sort) = <ChcCtx<'_, '_> as CodegenTypes>::translate_ty(pointee_ty) else {
@@ -128,6 +130,14 @@ pub(in crate::codegen_ay) fn inline_ref_place_to_expr<'tcx, 'body>(
     // for Ref rvalues like `&(*_1).0` in closure bodies.
     if matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
         if let Some(root) = local_exprs.get(&place.local) {
+            let source = Operand::Copy(Place { local: place.local, projection: vec![] });
+            if ctx.inline_walk_operand_is_referent(&source) {
+                // A value-bound reference contains T, even when T happens to
+                // have an address's sort. A reborrow must not mint a pointer
+                // out of those element bits.
+                return resolve_place(ctx, local_exprs, place, resolver, locals)
+                    .map(InlineRefExpr::Transparent);
+            }
             let current_ty_opt = locals.get(place.local).and_then(|decl| {
                 match ctx.resolve_body_ty(decl.ty).kind() {
                     TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
@@ -262,6 +272,10 @@ pub(in crate::codegen_ay) fn inline_operand_to_expr<'tcx, 'body>(
         Operand::Constant(const_op) => {
             ctx.translate_constant_referent(const_op).or_else(|| ctx.translate_constant(const_op))
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(checks) => {
+            Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(checks)))
+        }
     }
 }
 
@@ -275,6 +289,27 @@ pub(in crate::codegen_ay) fn resolve_place(
 ) -> Option<Expr> {
     if place.projection.is_empty() {
         return local_exprs.get(&place.local).cloned();
+    }
+    // This is an actual current capture read established at its typed
+    // binder/aggregate, not identity decoding of the reference's address.
+    if let Some(value) = ctx.readonly_capture_field_value(place, locals) {
+        return Some(value);
+    }
+    // Phase 0 of the dyn-walker write/read design (inline_walk_guard.rs): a
+    // read through a deref inside an inline walk after a write, of a stale
+    // self-field snapshot, or of an address-bound reference fails closed,
+    // whichever resolver would have answered it.
+    if let Some(havoc) = super::super::inline_walk_guard::guard_inline_projected_read(
+        ctx,
+        local_exprs,
+        place,
+        resolver,
+        locals,
+    ) {
+        return Some(havoc);
+    }
+    if let Some(value) = ctx.native_dyn_field_value(locals, place, local_exprs) {
+        return Some(value);
     }
     match resolver {
         PlaceResolver::Captures(captures) => resolve_capture_field(place, captures, local_exprs)
@@ -436,6 +471,11 @@ fn resolve_local_projections(
                     return None;
                 }
                 current_ty = current_ty.and_then(|ty| array_element_ty(ctx, ty));
+                // A datatype element is stored packed (`flatten_dt_array_element`):
+                // unpack it, as the field-map resolver does.
+                if let Some(elem_ty) = current_ty {
+                    current = ctx.try_unflatten_bv_to_datatype(current, elem_ty);
+                }
                 downcast_variant = None;
             }
             // Part of #3188: ConstantIndex is the compile-time-known variant
@@ -455,6 +495,9 @@ fn resolve_local_projections(
                     return None;
                 }
                 current_ty = current_ty.and_then(|ty| array_element_ty(ctx, ty));
+                if let Some(elem_ty) = current_ty {
+                    current = ctx.try_unflatten_bv_to_datatype(current, elem_ty);
+                }
                 downcast_variant = None;
             }
             // Part of #3188: OpaqueCast is a transparent MIR annotation for

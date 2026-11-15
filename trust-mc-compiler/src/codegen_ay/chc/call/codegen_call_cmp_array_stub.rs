@@ -9,6 +9,9 @@
 //! comparison dispatcher. Reuse the fixed-array lexicographic helpers here so
 //! the stub path stays precise instead of falling back.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
@@ -138,7 +141,7 @@ fn extract_array_len_from_ty(
         TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
             let variants = adt_def.variants();
             if variants.len() == 1 && variants[0].fields().len() == 1 {
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 extract_array_len_from_ty(field_ty, elem_ty)
             } else {
                 None
@@ -159,7 +162,7 @@ fn extract_fixed_array_len(ty: rustc_public::ty::Ty) -> Option<usize> {
         TyKind::RigidTy(RigidTy::Adt(adt_def, args)) => {
             let variants = adt_def.variants();
             if variants.len() == 1 && variants[0].fields().len() == 1 {
-                let field_ty = variants[0].fields()[0].ty_with_args(&args);
+                let field_ty = mono_ty::field_ty(&variants[0].fields()[0], &args)?;
                 extract_fixed_array_len(field_ty)
             } else {
                 None

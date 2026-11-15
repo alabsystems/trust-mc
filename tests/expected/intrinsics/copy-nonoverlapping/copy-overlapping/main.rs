@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 // Check that `copy_nonoverlapping` fails if the `src`/`dst` regions overlap.
+#![feature(core_intrinsics)]
+
 #[kani::proof]
 fn test_copy_nonoverlapping_with_overlap() {
     let arr: [i32; 3] = [0, 1, 0];

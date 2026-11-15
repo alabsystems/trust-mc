@@ -18,10 +18,11 @@ use trust_mc_metadata::{
     PtrMetadataUnconstrainedInfo, RoundingAssertionBypassInfo, SignednessFallbackInfo,
     SortHarmonizeFreshVarInfo, StaticInitIncompleteInfo, StoreDroppedTransitionInfo,
     StubApproximationInfo, TypeSortFallbackInfo, UnconstrainedAssignmentInfo, UnhandledCallInfo,
-    UnsupportedConstructFallbackInfo, VecFieldFallbackInfo,
+    UnstubbedAbstractionInfo, UnsupportedConstructFallbackInfo, VecFieldFallbackInfo,
 };
 
 use super::chc::take_inferable_summary_names_by_fn;
+use super::diagnostics::take_unstubbed_abstraction_count;
 use super::store_coercion::take_bmc_store_coercion_fallback_count;
 use super::unsoundness_per_harness::take_per_harness_accumulator;
 use super::{
@@ -66,6 +67,8 @@ pub(crate) struct UnsoundnessFields {
     pub(crate) into_option_drops: Option<IntoOptionDropInfo>,
     pub(crate) internal_workarounds: Option<InternalWorkaroundInfo>,
     pub(crate) abstracted_fallbacks: Option<AbstractedFallbackInfo>,
+    /// D1 (2026-09-14): unstubbed abstractions recorded at reachability.
+    pub(crate) unstubbed_abstractions: Option<UnstubbedAbstractionInfo>,
     pub(crate) vec_field_fallbacks: Option<VecFieldFallbackInfo>,
     pub(crate) pointee_synthesis_fallbacks: Option<PointeeSynthesisFallbackInfo>,
     pub(crate) unsupported_construct_fallbacks: Option<UnsupportedConstructFallbackInfo>,
@@ -193,6 +196,7 @@ impl_has_per_harness!(
     IntoOptionDropInfo,
     InternalWorkaroundInfo,
     AbstractedFallbackInfo,
+    UnstubbedAbstractionInfo,
     AssumeDroppedTransitionInfo,
     IteratorUnsoundnessInfo,
     BigIntUnsoundnessInfo,
@@ -276,6 +280,21 @@ pub(crate) fn collect_unsoundness_fields() -> UnsoundnessFields {
     merge_ph(&mut into_option_drops, ph.into_option_drop);
     merge_ph(&mut internal_workarounds, ph.internal_workaround);
     merge_ph(&mut abstracted_fallbacks, ph.abstracted_fallback);
+    // D1: unresolved reachability abstractions after exact callsite reconciliation. Both
+    // halves come from the same monotone counter, so the crate total and the
+    // per-harness map are consistent by construction.
+    let unstubbed_abstraction_count = take_unstubbed_abstraction_count();
+    let mut unstubbed_abstractions = (unstubbed_abstraction_count > 0
+        || !ph.unstubbed_abstraction.is_empty())
+    .then(|| {
+        warn!(
+            unstubbed_abstraction_count,
+            "stdlib functions abstracted with no stub and no handler; their results are \
+             unconstrained, so a counterexample over one is an over-approximation (D1)"
+        );
+        UnstubbedAbstractionInfo { count: unstubbed_abstraction_count, ..Default::default() }
+    });
+    merge_ph(&mut unstubbed_abstractions, ph.unstubbed_abstraction);
     merge_ph(&mut assume_dropped_transitions, ph.assume_dropped_transition);
     merge_ph(&mut vec_field_fallbacks, ph.vec_field_fallback);
     merge_ph(&mut pointee_synthesis_fallbacks, ph.pointee_synthesis_fallback);
@@ -498,6 +517,7 @@ pub(crate) fn collect_unsoundness_fields() -> UnsoundnessFields {
         into_option_drops,
         internal_workarounds,
         abstracted_fallbacks,
+        unstubbed_abstractions,
         vec_field_fallbacks,
         pointee_synthesis_fallbacks,
         unsupported_construct_fallbacks,

@@ -515,12 +515,20 @@ fn test_mir_realloc_moved_branch_copies_type_array_prefix() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_realloc_copy");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: heap writes and reads at
+        // constant offsets are scalarized (7faa74cf9) and write-only arrays eliminated
+        // (85da41dad), removing `obj_valid__out` and `mem_i32__out` from the translated VC.
+        let vc = pre_pass_vc(ChcCtx::new(
             ctx.tcx,
             &body,
             "probe_realloc_copy",
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert!(!vc.rules.is_empty(), "VC should have rules for realloc copy pattern");
 
@@ -664,11 +672,28 @@ fn test_mir_std_alloc_realloc_grow_full_shape_has_no_chc_fallbacks() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
         assert!(!vc.relations.is_empty() && !vc.rules.is_empty());
-        assert!(vc_rules_contain_var(&vc, "obj_valid__out"), "should reach precise realloc model");
-        assert!(vc_rules_contain_var(&vc, "obj_size__out"), "should constrain obj_size (dealloc)");
+        // Constant-index scalarization (7faa74cf9) renames obj_valid/obj_size updates to
+        // per-lane outputs (obj_valid_at_<idx>__out); accept either form, as the sibling
+        // realloc tests in this file do.
+        assert!(vc_rules_contain_var_out(&vc, "obj_valid"), "should reach precise realloc model");
+        assert!(vc_rules_contain_var_out(&vc, "obj_size"), "should constrain obj_size (dealloc)");
         assert!(vc.relations.iter().any(|r| r.name == "error"), "should encode dealloc error");
         assert!(any_constraint_str(&vc, |c| c.contains("#x0000002a")), "should retain write(42)");
-        assert!(any_constraint_str(&vc, |c| c.contains("#x00000063")), "should retain write(99)");
+        // The tail write new_ptr.add(1).write(99) is never read back, so write-only
+        // array elimination (3f5a9c4ac, 85da41dad) removes it from the translated VC.
+        // The lowering is checked on the pre-pass VC, full frame as mir_to_chc encodes first.
+        let pre = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            name,
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
+        assert!(any_constraint_str(&pre, |c| c.contains("#x00000063")), "should encode write(99)");
         let fb = get_chc_fallback_counts().get(name).copied().unwrap_or(0);
         assert_eq!(fb, 0, "should not increment CHC fallback count, got {fb}");
         let drops = take_translation_drop_by_fn();
@@ -754,15 +779,14 @@ fn test_translate_alloc_call_missing_args_fail_closed() {
                 stub
             );
         }
+        // RustDealloc with NO pointer-typed argument has nothing to invalidate: since
+        // dbc927890 the pointer argument is chosen by type (allocator_pointer_arg_idx), and
+        // none present records dealloc_pointer_arg_unresolved and fails closed. Fix #2758's
+        // symbolic fallback applies when a pointer is present but size/align are not.
+        // RustRealloc and Layout stubs fail closed too.
+        for stub in
+            [StubKind::RustDealloc, StubKind::RustRealloc, StubKind::LayoutSize, StubKind::LayoutAlign]
         {
-            let result = chc_ctx.translate_alloc_call(StubKind::RustDealloc, &[], &modified_locals);
-            assert!(
-                result.is_some(),
-                "RustDealloc should return symbolic fallback to preserve obj_valid (Fix #2758)",
-            );
-        }
-        // RustRealloc and Layout stubs still fail closed.
-        for stub in [StubKind::RustRealloc, StubKind::LayoutSize, StubKind::LayoutAlign] {
             let result = chc_ctx.translate_alloc_call(stub, &[], &modified_locals);
             assert!(
                 result.is_none(),

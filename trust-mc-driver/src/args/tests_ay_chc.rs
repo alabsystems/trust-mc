@@ -227,6 +227,30 @@ fn check_ay_chc_no_retry_with_ay_chc() {
 }
 
 #[test]
+fn check_ay_chc_deterministic_requires_ay_chc() {
+    expect_validation_error("kani test.rs --ay-chc-deterministic", ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn check_ay_chc_deterministic_is_off_by_default() {
+    // Adaptive parallel stays the default for ordinary runs; determinism is an
+    // explicit gate input, never something a plain `--ay-chc` run opts into.
+    let args = StandaloneArgs::try_parse_from("kani file.rs --ay-chc".split_whitespace()).unwrap();
+    assert!(matches!(args.verify_opts.validate(), Ok(())));
+    assert!(!args.verify_opts.ay_chc_deterministic);
+}
+
+#[test]
+fn check_ay_chc_deterministic_with_ay_chc() {
+    let args = StandaloneArgs::try_parse_from(
+        "kani file.rs --ay-chc --ay-chc-deterministic".split_whitespace(),
+    )
+    .unwrap();
+    assert!(matches!(args.verify_opts.validate(), Ok(())));
+    assert!(args.verify_opts.ay_chc_deterministic);
+}
+
+#[test]
 fn check_ay_chc_bounded_unroll_requires_ay_chc() {
     expect_validation_error("kani test.rs --ay-chc-bounded-unroll", ErrorKind::ArgumentConflict);
 }

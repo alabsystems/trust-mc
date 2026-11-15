@@ -44,7 +44,9 @@ fn test_reg_level_scalar_deref_store() {
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "scalar_store", ChcConfig::default());
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the ref-target write is never read back, so dead-scalar pruning
+        // (6b811318f) and orphan pruning remove its return self-transition from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         let transition_rule_count = vc.rules.iter().filter(|r| r.body.relation.is_some()).count();
 
@@ -85,7 +87,9 @@ fn test_reg_level_struct_field_deref_store() {
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "set_field", ChcConfig::default());
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the ref-target write is never read back, so dead-scalar pruning
+        // (6b811318f) and orphan pruning remove its return self-transition from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         let transition_rule_count = vc.rules.iter().filter(|r| r.body.relation.is_some()).count();
 
@@ -120,7 +124,9 @@ fn test_reg_level_multiple_field_writes() {
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "set_both", ChcConfig::default());
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the field writes are never read back, so dead-scalar pruning
+        // (6b811318f) and orphan pruning remove the return self-transition from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         let transition_rule_count = vc.rules.iter().filter(|r| r.body.relation.is_some()).count();
         assert!(!vc.rules.is_empty(), "Multiple field writes should produce rules");
         // Part of #3052: Return terminator self-transition captures store constraints.
@@ -511,7 +517,9 @@ fn test_reg_level_copy_nonoverlapping_symbolic_updates_dst_u8() {
         let body = instance.body().expect("function body");
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_copy_dynamic", ChcConfig::default());
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the guarded store chain over constant indices 0..4 is scalarized into
+        // per-lane scalars (7faa74cf9, 948cc5d4e), removing `store` from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         assert!(
@@ -556,7 +564,9 @@ fn test_reg_level_copy_nonoverlapping_symbolic_updates_dst_bool() {
         let body = instance.body().expect("function body");
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "probe_copy_dynamic_bool", ChcConfig::default());
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the guarded store chain over constant indices 0..4 is scalarized into
+        // per-lane scalars (7faa74cf9, 948cc5d4e), removing `store` from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         assert!(
@@ -602,7 +612,9 @@ fn test_mem_level_deref_field_store() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the heap write is never read back, so write-only array elimination
+        // (85da41dad) removes the store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         assert!(!vc.rules.is_empty(), "Mem-level struct field deref store should produce rules");
         // Semantic: Mem-level field store should use store() for memory write
@@ -643,7 +655,9 @@ fn test_reg_level_ref_target_array_store_pattern() {
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "ref_array_element", ChcConfig::default());
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: const-folding and dead single-use scalar pruning (6b811318f) remove
+        // the constant-index and bounds-check `__out` equalities from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         assert!(!vc.rules.is_empty(), "Reg-level ref→array store should produce rules");
         // Assert specific guard constraints emitted for the array-index branch.
         assert!(
@@ -721,8 +735,10 @@ fn test_track_level_comparison_for_deref_store() {
         let body = instance.body().expect("function body");
 
         // Reg level
+        // Pre-pass VCs at both levels: nothing reads `*r` after the write, so write-only
+        // array elimination (85da41dad) removes the Mem-level store from `translate()`.
         let chc_ctx_reg = ChcCtx::new(ctx.tcx, &body, "assign_ref", ChcConfig::default());
-        let (vc_reg, _) = chc_ctx_reg.translate();
+        let vc_reg = pre_pass_vc(chc_ctx_reg);
 
         // Mem level
         let chc_ctx_mem = ChcCtx::new(
@@ -731,7 +747,7 @@ fn test_track_level_comparison_for_deref_store() {
             "assign_ref",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
-        let (vc_mem, _) = chc_ctx_mem.translate();
+        let vc_mem = pre_pass_vc(chc_ctx_mem);
 
         // Both should produce non-empty VCs
         assert!(!vc_reg.rules.is_empty(), "Reg-level VC should have rules");
@@ -774,7 +790,9 @@ fn test_reg_level_constant_index_store() {
 
         let chc_ctx = ChcCtx::new(ctx.tcx, &body, "set_first", ChcConfig::default());
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: const-folding and dead single-use scalar pruning (6b811318f) remove
+        // the constant-index and bounds-check `__out` equalities from `translate()`.
+        let vc = pre_pass_vc(chc_ctx);
         assert!(!vc.rules.is_empty(), "Constant index store should produce rules");
         // Assert concrete guard/index constraints (rather than generic '=' tokens).
         assert!(
@@ -855,7 +873,9 @@ fn test_mem_level_nested_struct_field_write() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the heap write is never read back, so write-only array elimination
+        // (85da41dad) removes the store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
         assert!(
             !vc.rules.is_empty(),
@@ -1208,7 +1228,9 @@ fn test_mem_level_struct_from_call_deref_store() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the heap write is never read back, so write-only array elimination
+        // (85da41dad) removes the store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         assert!(!vc.rules.is_empty(), "Struct-from-call deref store should produce rules");
@@ -1259,7 +1281,9 @@ fn test_mem_level_tuple_deref_store_decomposes() {
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
 
-        let (vc, _needs_mem_promote) = chc_ctx.translate();
+        // Pre-pass VC: the per-field heap stores are never read back, so write-only array
+        // elimination (85da41dad) removes them from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
 
         assert!(!vc.rules.is_empty(), "Tuple deref store should produce rules");
 

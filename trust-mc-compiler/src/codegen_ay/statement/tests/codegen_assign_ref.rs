@@ -105,7 +105,7 @@ fn test_codegen_assign_ref_non_reference_constant_does_not_create_synthetic_poin
             body.blocks.iter().flat_map(|bb| bb.statements.iter()).any(|stmt| {
                 matches!(
                     &stmt.kind,
-                    StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c)))
+                    StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..))
                         if !matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..)))
                 )
             });
@@ -148,7 +148,7 @@ fn test_codegen_assign_ref_copy_move_propagates_pointee_mapping() {
         let expected_pointee: Arc<str> = Arc::from("manual_ref_target");
         codegen.ref_pointees.insert(Arc::from(src_base), Arc::clone(&expected_pointee));
 
-        let rhs = Rvalue::Use(Operand::Copy(src_place));
+        let rhs = rvalue_use!(Rvalue::Use(Operand::Copy(src_place)));
         codegen.track_copy_move_ref_pointees(&dst_place, &rhs);
 
         assert_eq!(
@@ -211,7 +211,7 @@ fn test_codegen_assign_ref_copy_move_propagates_nested_pointee_mapping() {
             .ref_pointees
             .insert(Arc::from(format!("{src_base}_field_0")), Arc::clone(&expected_pointee));
 
-        let rhs = Rvalue::Use(Operand::Copy(src_place));
+        let rhs = rvalue_use!(Rvalue::Use(Operand::Copy(src_place)));
         codegen.track_copy_move_ref_pointees(&dst_place, &rhs);
 
         assert_eq!(

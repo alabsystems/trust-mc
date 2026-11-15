@@ -38,6 +38,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified_locals: &HashSet<usize>,
     ) -> Option<Expr> {
         let &static_vec_idx = self.ref_resolution.static_ref_to_state_idx.get(&local_idx)?;
+        let whole = self.static_state_current(static_vec_idx, modified_locals)?;
+        // D6: a constant pointer into a live static at an offset names a PART
+        // of the static's value (`decl::static_path`), not the whole of it.
+        match self.ref_resolution.static_ref_paths.get(&local_idx) {
+            Some(path) => Self::select_static_path(whole, path),
+            None => Some(whole),
+        }
+    }
+
+    /// The value the static state variable `static_vec_idx` holds at this
+    /// point of the rule: the block's own write (`local_expr_env` / the output
+    /// variable), or — for a FIXED static only — its initializer literal, or
+    /// the input state variable.
+    pub(in crate::codegen_ay::chc) fn static_state_current(
+        &self,
+        static_vec_idx: usize,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        let local_idx = usize::MAX - static_vec_idx;
         let track_key = usize::MAX - static_vec_idx;
 
         if let Some(env_expr) = self.encode.local_expr_env.get(&track_key) {
@@ -94,11 +113,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let remaining_projs = &place.projection[deref_idx + 1..];
         let mut current = self.resolve_static_ref_root_expr(local_idx, modified_locals)?;
 
+        // A pointer re-typed away from the static (`GM.as_ptr() as *const u16`
+        // for `GM: MaybeUninit<[u16; 2]>`, `addr_of!(G) as *const u16` for `G:
+        // [u16; 2]`) is still mapped to the static's state variable, but its
+        // pointee is not the static's value: answering `*p` with the whole
+        // value gave the `u16` read an array, certified Genuine (review of
+        // fix/chc-lost-writes round 3, finding 2). Only a pointee encoded
+        // like the value reads it; any other goes to the memory image.
+        let (pointee_ty, is_ref) = Self::deref_ref_ty(self.body.locals()[local_idx].ty);
+        if is_ref && Self::translate_ty(pointee_ty).is_some_and(|sort| sort != *current.sort()) {
+            debug!(local_idx, "CHC: *static through a re-typed pointer; memory path answers");
+            return None;
+        }
+
         if remaining_projs.is_empty() {
             return Some(current);
         }
 
-        let (pointee_ty, is_ref) = Self::deref_ref_ty(self.body.locals()[local_idx].ty);
         if !is_ref {
             return None;
         }

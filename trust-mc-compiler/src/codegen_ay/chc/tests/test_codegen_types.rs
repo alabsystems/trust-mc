@@ -957,10 +957,16 @@ fn test_is_opaque_alloc_infra_infallible_is_opaque() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let sig = fn_sig_by_suffix(ctx.tcx, "probe_infallible");
         let ty = sig.inputs()[0];
-        if let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() {
-            assert!(ChcCtx::is_opaque_alloc_infra(def), "Infallible should be opaque alloc infra");
-        } else {
-            panic!("Infallible should be an ADT type");
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => {
+                assert!(ChcCtx::is_opaque_alloc_infra(def), "Infallible's enum is opaque infra");
+            }
+            // Current native core aliases Infallible to ! instead of an
+            // empty enum. It goes through the Never rule, not ADT dispatch.
+            TyKind::RigidTy(RigidTy::Never) => {
+                assert!(ChcCtx::translate_ty(ty).unwrap().is_bool());
+            }
+            other => panic!("Infallible must remain uninhabited: {other:?}"),
         }
     });
 }

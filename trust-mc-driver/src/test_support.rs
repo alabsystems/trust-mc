@@ -64,6 +64,7 @@ pub(crate) fn test_result(
         proof_transcript_metadata: None,
         native_full_verification_verdict: None,
         harness_feasibility: Default::default(),
+        chc_exact_counterexample: false,
     }
 }
 
@@ -163,6 +164,7 @@ pub(crate) fn test_metadata_all(
         into_option_drops: None,
         internal_workarounds: None,
         abstracted_fallbacks: None,
+        unstubbed_abstractions: None,
         vec_field_fallbacks: None,
         pointee_synthesis_fallbacks: None,
         unsupported_construct_fallbacks: None,

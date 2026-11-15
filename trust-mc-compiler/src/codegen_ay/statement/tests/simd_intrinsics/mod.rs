@@ -20,6 +20,7 @@
 //! - `dispatch_routes`: `dispatch_simd()` routing and guard behavior
 
 use super::*;
+use crate::codegen_ay::test_support::local_sort_name;
 
 mod dispatch_routes;
 mod handler_arithmetic;
@@ -100,6 +101,19 @@ fn assigned_expr_for_place(
 
 fn constraint_count(codegen: &StatementCodegen<'_, '_, '_>) -> usize {
     codegen.ctx.bmc_vc.constraints.len()
+}
+
+/// Every constraint emitted since `before`, one per line.
+///
+/// Array-backed SIMD results (3bb5d0e53) assert one `select(simd_arr, i) = lane_i`
+/// equality per lane and then bind `dest = mk(simd_arr)` LAST, so the lane
+/// arithmetic is in the constraints before the final one, not in it.
+fn constraints_text_since(codegen: &StatementCodegen<'_, '_, '_>, before: usize) -> String {
+    codegen.ctx.bmc_vc.constraints[before..]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn latest_constraint_text(codegen: &StatementCodegen<'_, '_, '_>) -> String {

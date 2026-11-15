@@ -195,15 +195,11 @@ fn test_zst_array_memory_store_and_load_use_canonical_value() {
         );
 
         let type_key = chc_ctx.type_key_for_body_ty(array_ty);
-        let store_chain = chc_ctx
-            .heap_state
-            .get_store_chain(&type_key)
-            .expect("ZST array store should update the type-indexed store chain");
-        let stored_elem_sort =
-            &store_chain.sort().array_sort().expect("store chain array").element_sort;
+        // A zero-sized write changes no bytes: build_memory_store returns early for a
+        // ZST (0752d519c) instead of storing a canonical cell, so no chain is created.
         assert!(
-            stored_elem_sort.is_bool(),
-            "typed heap stores ZST arrays through a canonical Bool cell"
+            chc_ctx.heap_state.get_store_chain(&type_key).is_none(),
+            "ZST array store must not write the type-indexed store chain"
         );
 
         let loaded = chc_ctx

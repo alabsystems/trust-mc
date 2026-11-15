@@ -4,6 +4,8 @@
 //
 //! Multi-resume coroutine sequencing helpers for CHC call dispatch.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::Expr;
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::CrateDef;
@@ -12,7 +14,7 @@ use rustc_public::mir::{AggregateKind, Body, Operand, Rvalue, StatementKind, Ter
 use rustc_public::rustc_internal;
 use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind, VariantIdx};
 
-use super::super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::super::codegen_ctx::globals::chc_fresh_name;
 use super::{ChcCtx, DispatchCallContext};
 use crate::codegen_ay::chc::codegen_stmt_aggregate_adt::sign_extend_discr_val;
 use crate::codegen_ay::types::{
@@ -97,11 +99,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let yielded_now = Expr::ite(
             known_state.clone(),
             last_yield_guard.not(),
-            declare_pending_var(chc_fresh_name("__coro_yield_choice"), bool_sort()),
+            Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_COROUTINE_STATE,
+                chc_fresh_name("__coro_yield_choice"),
+                bool_sort(),
+            ),
         );
         let next_discr = ite_cases(
             known_cases,
-            declare_pending_var(chc_fresh_name("__coro_next_discr"), discr_sort),
+            Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_COROUTINE_STATE,
+                chc_fresh_name("__coro_next_discr"),
+                discr_sort,
+            ),
         );
         let updated = coroutine_discriminant_update(&receiver_root, next_discr)?;
         let (out_name, out_sort) = self.state_var_mgr.output_state_vars.get(receiver_state_idx)?;
@@ -307,12 +319,15 @@ fn resolve_coroutine_body(func: &Operand, ctx: &ChcCtx<'_, '_>) -> Option<Body> 
             _ => None,
         })
         .and_then(|ty| match ty.kind() {
-            TyKind::RigidTy(RigidTy::Coroutine(coroutine_def, _)) => coroutine_def.body(),
+            // With the unit's `#[kani::stub]`s applied, as `callee_body` does.
+            TyKind::RigidTy(RigidTy::Coroutine(coroutine_def, _)) => {
+                coroutine_def.body().map(crate::kani_middle::transform::apply_unit_stubs)
+            }
             _ => None,
         })
         .or_else(|| {
             let instance = Instance::resolve(def, &substs).ok()?;
-            instance.body()
+            instance.callee_body()
         })
 }
 

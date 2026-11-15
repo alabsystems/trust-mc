@@ -1,0 +1,13 @@
+# Reconstructed transcript: the chc-m1 unit log (trust-mc 04d4e4e67, --ay-chc) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_upcast...
+[AY:VACUOUS:no-checks] check_upcast: the harness produced no verification conditions
+[AY:PROOF] CHC verification: property proven (false error obligation)
+[AY:PROOF_QUALIFIERS:no_checks=compiler_certified_obligation_free]
+SUMMARY:
+ ** 0 of 0 failed
+
+VERIFICATION:- SUCCESSFUL (no checks — compiler-certified obligation-free)
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Complete - 1 successfully verified harnesses, 0 failures, 1 total.

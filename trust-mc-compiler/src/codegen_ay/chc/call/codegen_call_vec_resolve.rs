@@ -25,6 +25,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Strategy order:
     /// 1. Direct sidecar len_var on arg_local
     /// 2. Trace through ref_targets, then sidecar
+    /// 2b. The argument's own pointer metadata, where the canonical
+    ///    `PtrMetadata` resolver knows it
     /// 3. slice_to_vec_local → sidecar
     /// 4. iter_to_collection_local → sidecar
     /// 5. Direct fld_len read from Vec's AY Datatype (for Vecs received as
@@ -56,6 +58,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if let Some(len_var) = self.collections.len_state.get_len_var(resolved).cloned() {
                 return Some(self.collection_current_len(&len_var));
             }
+        }
+
+        // Strategy 2b: the argument's own pointer metadata, from the resolver
+        // `PtrMetadata` itself uses (`resolve_ptr_metadata_known`): the static
+        // length of an unsized `&[T; N]`, a subslice's length, a raw slice's
+        // `len` argument, a flattened wide pointer's metadata word. Without
+        // it `v.extend_from_slice(&a)` for a symbolic `a: [u8; 3]` took a
+        // fresh length, and `v.len() == 3` failed (walker fail-closed review,
+        // round 1 of the repair after the merge with main,
+        // `range_extend_index_dual.rs` `s2`). Round 1 read the static length
+        // of whatever array local the reference targets instead, which is
+        // the whole array for `&*ptr::slice_from_raw_parts(a.as_ptr(), 2)`
+        // too: `v.extend_from_slice(s); v[3]` verified clean where Kani fails
+        // (round 2, `slice_arg_len_dual.rs`). Only a slice or `str` pointer
+        // asks: the resolver answers 0 for a thin one.
+        if Self::operand_is_slice_or_str_pointer(arg, self.body.locals())
+            && let Some(len) = self.resolve_ptr_metadata_known(arg, modified_locals)
+        {
+            return Some(len);
         }
 
         // Collect candidate Vec locals from strategies 3 and 4 for sidecar + fallback.
@@ -116,6 +137,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         None
     }
 
+    /// Is `operand` a reference or raw pointer to a slice or `str`?
+    fn operand_is_slice_or_str_pointer(
+        operand: &Operand,
+        locals: &[rustc_public::mir::LocalDecl],
+    ) -> bool {
+        use rustc_public::ty::{RigidTy, TyKind};
+        let Ok(ty) = operand.ty(locals) else {
+            return false;
+        };
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => {
+                matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str))
+            }
+            _ => false,
+        }
+    }
+
     /// Read the `fld_len` field directly from a Vec's AY Datatype expression.
     ///
     /// This is the fallback for Vecs that were not created in the current
@@ -160,6 +198,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Part of #4057: Check if a type is `Vec<T>` or `&Vec<T>` (possibly nested refs).
+    /// Does the last projection of a reference target name a field whose
+    /// type is a reference or raw pointer (not the pointee held by value)?
+    pub(in crate::codegen_ay::chc) fn field_projection_holds_reference(
+        proj: Option<&ProjectionElem>,
+    ) -> bool {
+        use rustc_public::ty::{RigidTy, TyKind};
+        matches!(
+            proj,
+            Some(ProjectionElem::Field(_, ty))
+                if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)))
+        )
+    }
+
     pub(in crate::codegen_ay::chc) fn is_vec_or_ref_to_vec(ty: rustc_public::ty::Ty) -> bool {
         use rustc_public::CrateDef;
         use rustc_public::ty::{RigidTy, TyKind};

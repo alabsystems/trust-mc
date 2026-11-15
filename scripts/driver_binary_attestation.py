@@ -179,7 +179,7 @@ def attest_driver_binary(
             [str(driver), "--version-authority"],
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             timeout=30,
             check=False,
         )
@@ -190,8 +190,11 @@ def attest_driver_binary(
     if result.returncode != 0:
         raise DriverAttestationError(
             f"{driver} --version-authority exited {result.returncode}: "
-            f"{result.stdout.strip()}"
+            f"{result.stdout.strip()} {result.stderr.strip()}"
         )
+    # The machine-readable protocol is stdout only. Runtime diagnostics (for
+    # example the configured AY memory cap) remain recorded, but cannot add
+    # authority fields or turn malformed/missing stdout into an attestation.
     fields = parse_authority_output(result.stdout)
     for field in ("trust_mc_dirty", "ay_linked_dirty"):
         if fields[field] not in {"0", "1"}:
@@ -216,6 +219,7 @@ def attest_driver_binary(
         "ay_linked_sha": fields["ay_linked_sha"].lower(),
         "ay_linked_dirty": fields["ay_linked_dirty"] == "1",
         "ay_authority": fields["ay_authority"],
+        "diagnostic_stderr": result.stderr,
     }
     failures = validate_attestation(
         attestation,

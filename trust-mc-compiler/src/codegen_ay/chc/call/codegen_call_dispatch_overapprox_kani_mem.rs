@@ -7,6 +7,9 @@
 //! Keeps the main dispatch module under the file-size guard while localizing the
 //! packed-value validity encoding added for Part of #3470.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue};
 
 use super::{ChcCtx, dyn_coercion};
@@ -127,6 +130,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         let (access_predicate, access_overapprox) =
             self.compute_kani_mem_access_predicate(ptr_expr.clone(), pointee_ty, require_alignment);
+        if !access_overapprox && matches!(access_predicate.value(), ExprValue::BoolConst(false)) {
+            // Expired storage is inaccessible independently of its old value.
+            // Do not inspect value validity in an allocation known to be dead.
+            return (access_predicate, false);
+        }
         let (validity_predicate, validity_overapprox) = self
             .compute_kani_mem_valid_value_predicate_with_hint(
                 ptr_expr,
@@ -248,7 +256,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         })
     }
 
-    fn compute_kani_mem_access_predicate(
+    pub(in crate::codegen_ay::chc) fn compute_kani_mem_access_predicate(
         &mut self,
         ptr_expr: Expr,
         pointee_ty: rustc_public::ty::Ty,
@@ -283,12 +291,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return (predicate, true);
         };
 
-        // Part of #3930: When the obj_id resolves to a known stack local,
-        // skip the obj_valid[obj_id] check. Stack locals are always valid
-        // (constrained by the entry rule), but the obj_valid array may not
-        // be correctly threaded through all CHC state variables for functions
-        // that don't otherwise use heap operations. Using concrete sizes
-        // instead of array lookups avoids solver failures on packed structs.
+        // A known stack allocation has a concrete size, but its lifetime must
+        // still include this access. Use the same statement-sensitive storage
+        // liveness as same_allocation; entry allocation alone is insufficient
+        // after StorageDead or an inlined callee's return.
         let const_obj_id = Self::const_obj_id_u32(&obj_id);
         let local_idx = const_obj_id.and_then(|id| self.heap_state.local_idx_for_obj_id(id));
         let local_ty_size = local_idx
@@ -296,10 +302,23 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .and_then(|local_decl| self.get_type_size(local_decl.ty))
             .and_then(|size| u32::try_from(size).ok());
 
+        if let Some(local_idx) = local_idx.filter(|_| local_ty_size.is_some()) {
+            match self.stack_local_is_live(local_idx) {
+                Some(true) => {}
+                Some(false) => return (Expr::bool_const(false), false),
+                None => {
+                    self.record_sound_fallback_reason("kani_mem_stack_liveness_unknown");
+                    return (Expr::bool_const(true), true);
+                }
+            }
+        }
+
         if local_ty_size.is_none() {
             // Non-stack pointer: need obj_valid check from heap metadata.
             self.mark_heap_metadata_read();
-            predicate = predicate.and(self.current_obj_valid_array().select(obj_id.clone()));
+            let (live, uncertain) = self.same_allocation_live_obj_predicate(obj_id.clone());
+            predicate = predicate.and(live);
+            overapproximated |= uncertain;
 
             // Part of #4249: Null pointer check. obj_id=0 is reserved for null
             // (alloc IDs start at 2 — see collect_null_obj_size_constraint).
@@ -428,7 +447,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let mut predicate = Expr::bool_const(true);
                 let mut overapproximated = false;
                 for (field_idx, field) in variants[0].fields().iter().enumerate() {
-                    let field_ty = field.ty_with_args(&args);
+                    let Some(field_ty) = mono_ty::field_ty(field, &args) else {
+                        // A field whose type does not instantiate: its validity
+                        // is not modelled, an over-approximation like the ones
+                        // below.
+                        overapproximated = true;
+                        continue;
+                    };
                     // Try SSA extraction for scalar validity-bearing fields
                     if let Some(local_idx) = ssa_local {
                         if let Some(field_expr) =
@@ -804,7 +829,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return (Expr::bool_const(false), false);
             }
             if let Some(local_idx) = self.heap_state.local_idx_for_obj_id(id1) {
-                return match self.same_allocation_stack_local_live(local_idx) {
+                return match self.stack_local_is_live(local_idx) {
                     Some(true) => {
                         // Part of #72: the kani_core model (models.rs:73-78)
                         // is same object AND in bounds of that object. Equal
@@ -902,7 +927,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return (Expr::bool_const(false), false);
             }
             if let Some(local_idx) = self.heap_state.local_idx_for_obj_id(id) {
-                return match self.same_allocation_stack_local_live(local_idx) {
+                return match self.stack_local_is_live(local_idx) {
                     Some(live) => (Expr::bool_const(live), false),
                     None => {
                         self.record_sound_fallback_reason("same_allocation_stack_liveness_unknown");
@@ -925,7 +950,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
             let is_stack_obj_id = obj_id.clone().eq(Expr::bitvec_const(stack_id as u64, 32));
             non_stack_obj_id = non_stack_obj_id.and(is_stack_obj_id.clone().not());
-            let Some(live) = self.same_allocation_stack_local_live(local_idx) else {
+            let Some(live) = self.stack_local_is_live(local_idx) else {
                 self.record_sound_fallback_reason("same_allocation_stack_liveness_unknown");
                 return (Expr::bool_const(true), true);
             };
@@ -935,13 +960,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         let heap_metadata_valid = non_stack_obj_id.and(metadata_valid);
         (non_null.and(stack_valid.or(heap_metadata_valid)), false)
-    }
-
-    fn same_allocation_stack_local_live(&self, local_idx: usize) -> Option<bool> {
-        if self.current_encode_bb >= self.liveness.dead_locals_at_entry.len() {
-            return None;
-        }
-        Some(!self.liveness.dead_locals.contains(&local_idx))
     }
 
     fn simple_operand_local(op: &Operand) -> Option<usize> {

@@ -11,15 +11,16 @@
 //! Pointer offset extracted to `codegen_stmt_rvalue_offset.rs` per #3920.
 //! Ref/AddressOf and Cast dispatch extracted to `codegen_stmt_rvalue_ref/` per #3199.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
-use rustc_public::CrateDef;
-use rustc_public::mir::alloc::GlobalAlloc;
 use rustc_public::mir::{
-    AggregateKind, BorrowKind, CastKind, NullOp, Operand, Place, PointerCoercion, ProjectionElem,
-    RawPtrKind, RuntimeChecks, Rvalue, UnOp,
+    AggregateKind, BorrowKind, CastKind, Operand, Place, PointerCoercion, ProjectionElem,
+    RawPtrKind, Rvalue, UnOp,
 };
+#[cfg(not(trust_toolchain))]
+use rustc_public::mir::{NullOp, RuntimeChecks};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
@@ -29,7 +30,7 @@ use crate::codegen_ay::chc::call::codegen_call_ptr_identity::trace_pointer_ident
 use crate::codegen_ay::types::{ptr_sort, ty_to_bv_width};
 
 use super::ChcCtx;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_expr_signedness::ExprSignedness;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -49,7 +50,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: Option<usize>,
     ) -> Option<Expr> {
         match rvalue {
-            Rvalue::Use(operand) => {
+            Rvalue::Use(operand, ..) => {
                 // Part of #4163: Propagate subslice_len through Use(Copy/Move).
                 if let Some(dest) = dest_local {
                     let src_local = match operand {
@@ -94,12 +95,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         Some(TyKind::RigidTy(RigidTy::Float(_)))
                     )
                 {
-                    let sign_mask = match int_bv_width {
-                        32 => Expr::bitvec_const(0x8000_0000_i128, 32),
-                        64 => Expr::bitvec_const(0x8000_0000_0000_0000_u64 as i128, 64),
-                        _ => return self.translate_unop(*op, expr, int_bv_width, is_signed),
-                    };
-                    Some(expr.bvxor(sign_mask))
+                    crate::codegen_ay::float_arithmetic::bv_float_neg(expr, int_bv_width)
                 } else {
                     self.translate_unop(*op, expr, int_bv_width, is_signed)
                 }
@@ -107,6 +103,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // Part of #3044: dispatch on CastKind instead of wildcarding it.
             // Cast dispatch extracted to `codegen_stmt_rvalue_ref/` per #3199.
             Rvalue::Cast(kind, operand, target_ty) => {
+                // A reference made by transmute from a pointer into a static
+                // or a constant allocation must be dereferenceable, as `&*p`
+                // must (`codegen_stmt_rvalue_offset_const_access.rs`).
+                if matches!(kind, CastKind::Transmute)
+                    && let Operand::Copy(src) | Operand::Move(src) = operand
+                    && src.projection.is_empty()
+                {
+                    self.emit_const_object_transmuted_ref_check(
+                        src.local,
+                        *target_ty,
+                        modified_locals,
+                    );
+                }
                 // Part of #4163: Propagate subslice_len through all Cast variants.
                 if let Some(dest) = dest_local {
                     let src_local = match operand {
@@ -185,7 +194,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         self.record_fallback();
                     }
                 }
+                // rustc's own null and alignment checks read a pointer's offset
+                // bits only, the same in every mode Kani uses: not a far
+                // pointer observation (heap/stack_address.rs).
+                let check_cast = dest_local.is_some_and(|d| self.is_rustc_check_cast_dest(d));
+                let suppressed = self.far_observation_suppressed.replace(check_cast);
                 let result = self.translate_rvalue_cast(kind, operand, target_ty, modified_locals);
+                self.far_observation_suppressed.set(suppressed);
                 // Part of #3768 Layer 2: Also try DST metadata propagation.
                 if matches!(
                     kind,
@@ -220,14 +235,44 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 "subslice_len: propagated through Ref");
                         }
                     } else {
-                        self.clear_path_insensitive_ref_metadata(dest);
+                        self.clear_borrow_metadata_keeping_exact_edge(dest, place);
                     }
                 }
                 self.register_collection_elem_field_ref(dest_local, place);
+                // A reference into dead storage is UB on creation, even when
+                // the only read of it is unmodeled (format-args). AddressOf is
+                // deliberately not checked: `&raw const (*p)` is not UB.
+                self.emit_ref_into_dead_storage_check(place, modified_locals);
+                self.fail_close_reborrow_of_path_merged_pointer(place);
+                // `&*p` into a static or constant allocation: the object bound
+                // (`codegen_stmt_rvalue_offset_const_object`).
+                self.emit_const_object_reborrow_check(place, modified_locals);
+                // `&*ptr` with `ptr: *const [T]` / `*const str`: the reference
+                // is valid only for the pointer's whole metadata extent.
+                self.emit_raw_slice_ref_extent_check(place, modified_locals);
                 let is_shared = matches!(borrow_kind, BorrowKind::Shared | BorrowKind::Fake(_));
+                // Design 4 C: a borrow of an unsized slice-like place carries
+                // its length; the address lanes above produce a thin address.
                 self.translate_ref_or_addressof(place, is_shared, modified_locals)
+                    .map(|value| self.pack_unsized_borrow_len(place, value, modified_locals))
             }
             Rvalue::AddressOf(raw_ptr_kind, place) => {
+                // Reg references contain their referent's value. A raw
+                // address observes physical identity, so replay this host
+                // body in the existing address-bearing memory model instead
+                // of reusing those element bits as a pointer.
+                let raw_identity = matches!(place.projection.as_slice(), [ProjectionElem::Deref])
+                    && matches!(
+                        self.resolve_body_ty(self.body.locals()[place.local].ty).kind(),
+                        TyKind::RigidTy(RigidTy::RawPtr(..))
+                    );
+                // Bare &raw *raw_ptr is an identity even for a null,
+                // dangling or misaligned pointer. It performs no load and
+                // must not acquire reference-validity obligations on replay.
+                if self.track_level < crate::args::ChcTrackLevel::Ptr && !raw_identity {
+                    self.needs_mem_promote = true;
+                    return None;
+                }
                 // Part of #4163: Propagate subslice_len through AddressOf.
                 if let Some(dest) = dest_local {
                     if self.path_insensitive_metadata_copy_is_unique(place.local, dest) {
@@ -237,12 +282,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             self.ref_resolution.subslice_len.insert(dest, len);
                         }
                     } else {
-                        self.clear_path_insensitive_ref_metadata(dest);
+                        self.clear_borrow_metadata_keeping_exact_edge(dest, place);
                     }
                 }
                 self.register_collection_elem_field_ref(dest_local, place);
+                if raw_identity {
+                    return self.translate_place_with_modified(
+                        &Place { local: place.local, projection: vec![] },
+                        modified_locals,
+                    );
+                }
                 let is_shared = matches!(raw_ptr_kind, RawPtrKind::Const);
                 self.translate_ref_or_addressof(place, is_shared, modified_locals)
+                    .map(|value| self.pack_unsized_borrow_len(place, value, modified_locals))
             }
             Rvalue::Len(place) => self.translate_rvalue_len(place, modified_locals),
             Rvalue::Aggregate(kind, operands) => {
@@ -307,6 +359,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 result
             }
             Rvalue::Discriminant(place) => self.translate_discriminant(place, modified_locals),
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(operand, ty) => {
                 self.translate_rvalue_shallow_init_box(operand, *ty, modified_locals)
             }
@@ -379,23 +432,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Rvalue::ThreadLocalRef(item) => {
                 // Part of #4068: Under the single-thread assumption (matching Kani),
                 // ThreadLocalRef is equivalent to a static pointer. Resolve the
-                // CrateItem's DefId to the static address already materialized by
-                // codegen_decl_static.rs via static_address_exprs.
-                let item_def_id = rustc_public::rustc_internal::internal(self.tcx, item.def_id());
-                let resolved = self.ref_resolution.static_address_exprs.iter().find_map(
-                    |(&alloc_id, addr_expr)| {
-                        if let GlobalAlloc::Static(static_def) = GlobalAlloc::from(alloc_id) {
-                            let static_def_id = rustc_public::rustc_internal::internal(
-                                self.tcx,
-                                static_def.def_id(),
-                            );
-                            if static_def_id == item_def_id {
-                                return Some(addr_expr.clone());
-                            }
-                        }
-                        None
-                    },
-                );
+                // CrateItem to the static's ONE object (`global_objects`), keyed
+                // by its definition.
+                let resolved = rustc_public::mir::mono::StaticDef::try_from(*item)
+                    .ok()
+                    .and_then(|def| {
+                        self.object_base(
+                            &crate::codegen_ay::shared::const_pointer::TargetKey::Static(def),
+                        )
+                    })
+                    .map(|addr| addr.into_expr());
                 if let Some(addr) = resolved {
                     debug!("CHC: ThreadLocalRef resolved to static address (single-thread model)");
                     Some(addr)
@@ -404,24 +450,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     warn!(
                         "CHC: ThreadLocalRef static address not found — sound over-approximation"
                     );
-                    self.record_sound_fallback_reason("thread_local_ref_unresolved");
+                    let booked = self.record_sound_fallback_reason("thread_local_ref_unresolved");
                     let name = chc_fresh_name("__thread_local_nondet");
-                    Some(declare_pending_var(name, ptr_sort()))
+                    Some(Havoc::booked(booked, name, ptr_sort()))
                 }
             }
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(null_op) => {
                 // RuntimeChecks control conditional UB/overflow/contract checking at runtime.
                 // In verification mode:
-                // - UbChecks: Return true so MIR-generated UB assertions are reachable.
-                //   Fixes #3299: returning false made Assert terminators for
-                //   AddUnchecked/SubUnchecked/MulUnchecked dead, producing false PROOF.
+                // - UbChecks: false, as Kani (see `rustc_compat::runtime_checks_value`).
                 // - ContractChecks: Return true (enable contract checking)
                 // - OverflowChecks: Return false (verification handles overflow explicitly)
                 // Part of #1840
                 match null_op {
                     NullOp::RuntimeChecks(RuntimeChecks::UbChecks) => {
-                        debug!("CHC translate_rvalue: UbChecks -> true (#3299)");
-                        Some(Expr::bool_const(true))
+                        debug!("CHC translate_rvalue: UbChecks -> false (Kani parity)");
+                        Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(
+                            &RuntimeChecks::UbChecks,
+                        )))
                     }
                     NullOp::RuntimeChecks(RuntimeChecks::ContractChecks) => {
                         debug!("CHC translate_rvalue: ContractChecks -> true");
@@ -432,6 +479,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         Some(Expr::bool_const(false))
                     }
                 }
+            }
+            // Trust: user-ADT reborrowing has no CHC encoding (see
+            // `trust_reborrow`). Record the fail-close reason and return
+            // `None`, so the caller takes its unsupported-rvalue path.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(..) => {
+                self.record_reborrow_unsupported("translate_rvalue_with_modified");
+                None
             }
         }
     }

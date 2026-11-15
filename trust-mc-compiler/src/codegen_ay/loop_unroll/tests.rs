@@ -16,9 +16,7 @@ use super::unroll::{
     compute_effective_unwind_depth, natural_loop, remap_target, remap_unwind_action,
 };
 use super::{LoopUnrollError, unroll_cfg_loops};
-use rustc_public::mir::{
-    BasicBlock, Body, LocalDecl, Mutability, Terminator, TerminatorKind, UnwindAction,
-};
+use rustc_public::mir::{BasicBlock, Body, LocalDecl, Mutability, TerminatorKind, UnwindAction};
 
 /// Create dummy Span/Ty handles for unit tests that run without a rustc compiler session.
 ///
@@ -39,7 +37,7 @@ fn synthetic_body_with_unreachable_blocks(block_count: usize) -> Body {
     let ty = dummy_ty();
     let block_template = BasicBlock {
         statements: Vec::new(),
-        terminator: Terminator { kind: TerminatorKind::Unreachable, span },
+        terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, span),
     };
     let locals = vec![LocalDecl { ty, span, mutability: Mutability::Mut }];
     Body::new(vec![block_template; block_count], locals, 0, Vec::new(), None, span)
@@ -841,7 +839,10 @@ fn synthetic_body_with_loop(body_blocks: usize) -> Body {
             // Last block: back-edge to block 1 (loop header)
             TerminatorKind::Goto { target: 1 }
         };
-        blocks.push(BasicBlock { statements: Vec::new(), terminator: Terminator { kind, span } });
+        blocks.push(BasicBlock {
+            statements: Vec::new(),
+            terminator: crate::rustc_compat::mir_terminator(kind, span),
+        });
     }
     let locals = vec![LocalDecl { ty, span, mutability: Mutability::Mut }];
     Body::new(blocks, locals, 0, Vec::new(), None, span)

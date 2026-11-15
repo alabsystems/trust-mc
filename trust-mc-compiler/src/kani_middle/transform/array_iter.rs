@@ -62,12 +62,24 @@ const MAX_FINITE_ARRAY_ITER_UNROLL: usize = 8;
 /// Detects for-loops over arrays and transforms them to simple indexed loops,
 /// eliminating the need for full iterator infrastructure.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ArrayIterUnrollPass;
+pub(crate) struct ArrayIterUnrollPass {
+    /// The declared unwind bound under which Kani's unwinding assertions are
+    /// on (`#[kani::unwind(U)]`, `--unwind`, `--default-unwind`): the unit's
+    /// smallest, then the bound of each harness as it is translated
+    /// (`set_harness_declared_unwind`); `None` when there is none.
+    declared_unwind: Option<u32>,
+}
 
 impl ArrayIterUnrollPass {
     /// Create a new array iteration unroll pass.
     pub(crate) fn new() -> Self {
-        ArrayIterUnrollPass
+        ArrayIterUnrollPass { declared_unwind: None }
+    }
+
+    /// The pass for a unit whose smallest declared unwind bound (with
+    /// unwinding assertions on) is `declared_unwind`.
+    pub(crate) fn with_declared_unwind(declared_unwind: Option<u32>) -> Self {
+        ArrayIterUnrollPass { declared_unwind }
     }
 }
 
@@ -91,6 +103,10 @@ impl TransformPass for ArrayIterUnrollPass {
             || query_db.args().unstable_features.iter().any(|f| f == "array-iter-unroll")
     }
 
+    fn set_harness_declared_unwind(&mut self, declared_unwind: Option<u32>) {
+        self.declared_unwind = declared_unwind;
+    }
+
     fn transform(&mut self, _tcx: TyCtxt, body: Body, instance: Instance) -> (bool, Body) {
         debug!("ArrayIterUnrollPass::transform for {:?}", instance.name());
 
@@ -106,7 +122,7 @@ impl TransformPass for ArrayIterUnrollPass {
         let mut transformed = false;
 
         for loop_info in &array_loops {
-            if transform_array_loop(&mut mutable_body, loop_info) {
+            if transform_array_loop(&mut mutable_body, loop_info, self.declared_unwind) {
                 transformed = true;
                 debug!(
                     "Transformed array loop: array={:?}, len={}, is_zst={}, into_iter_bb={}",
@@ -219,7 +235,7 @@ fn find_array_for_loops(body: &Body) -> Vec<ArrayForLoop> {
                     body_bb: loop_structure.body_bb,
                     iter_local,
                     option_local: loop_structure.option_local,
-                    span: block.terminator.span,
+                    span: mir_span!(block.terminator),
                 });
             } else if array_len == 0 {
                 // Zero-length array: find the exit point and create a simplified loop info
@@ -243,7 +259,7 @@ fn find_array_for_loops(body: &Body) -> Vec<ArrayForLoop> {
                         body_bb: exit_bb,
                         iter_local,
                         option_local: 0, // Not used for zero-length
-                        span: block.terminator.span,
+                        span: mir_span!(block.terminator),
                     });
                 }
             }
@@ -401,6 +417,8 @@ fn detect_array_into_iter(
                 return None;
             }
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => return None,
     };
 
     // Get the destination local (the iterator)
@@ -584,8 +602,12 @@ fn find_option_branches(
 }
 
 /// Transform an array for-loop to direct indexed iteration.
-fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> bool {
-    if try_transform_array_loop_without_symbolic_index(body, loop_info) {
+fn transform_array_loop(
+    body: &mut MutableBody,
+    loop_info: &ArrayForLoop,
+    declared_unwind: Option<u32>,
+) -> bool {
+    if try_transform_array_loop_without_symbolic_index(body, loop_info, declared_unwind) {
         return true;
     }
 
@@ -618,20 +640,22 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
         // Just add _idx = 0 at the end
         let zero_const =
             MirConst::try_from_uint(0u128, UintTy::Usize).expect("zero should fit in usize");
-        let zero_rvalue = Rvalue::Use(Operand::Constant(ConstOperand {
+        let zero_rvalue = rvalue_use!(Rvalue::Use(Operand::Constant(ConstOperand {
             span: loop_info.span,
             user_ty: None,
             const_: zero_const,
-        }));
-        into_iter_block.statements.push(Statement {
-            kind: StatementKind::Assign(Place::from(idx_local), zero_rvalue),
-            span: loop_info.span,
-        });
+        })));
+        into_iter_block.statements.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(idx_local), zero_rvalue),
+            loop_info.span,
+        ));
 
         // Replace terminator with goto
         if let Some(target) = original_target {
-            into_iter_block.terminator =
-                Terminator { kind: TerminatorKind::Goto { target }, span: loop_info.span };
+            into_iter_block.terminator = crate::rustc_compat::mir_terminator(
+                TerminatorKind::Goto { target },
+                loop_info.span,
+            );
         }
     }
 
@@ -645,16 +669,16 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
         // _cond = _idx < N
         let idx_operand = Operand::Copy(Place::from(idx_local));
         let lt_rvalue = Rvalue::BinaryOp(BinOp::Lt, idx_operand, len_operand);
-        next_block.statements.push(Statement {
-            kind: StatementKind::Assign(Place::from(cond_local), lt_rvalue),
-            span: loop_info.span,
-        });
+        next_block.statements.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(cond_local), lt_rvalue),
+            loop_info.span,
+        ));
 
         // Replace terminator with goto to switch block
-        next_block.terminator = Terminator {
-            kind: TerminatorKind::Goto { target: loop_info.switch_bb },
-            span: loop_info.span,
-        };
+        next_block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: loop_info.switch_bb },
+            loop_info.span,
+        );
     }
 
     // Step 3: Replace Option switch with condition switch
@@ -672,13 +696,13 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
         // Clear any statements in the switch block (discriminant computation)
         switch_block.statements.clear();
 
-        switch_block.terminator = Terminator {
-            kind: TerminatorKind::SwitchInt {
+        switch_block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::SwitchInt {
                 discr: Operand::Copy(Place::from(cond_local)),
                 targets: new_targets,
             },
-            span: loop_info.span,
-        };
+            loop_info.span,
+        );
     }
 
     // Step 4: In body block, replace Option unwrap with array indexing
@@ -699,8 +723,8 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
                 // Preserve whether the original operand was Copy or Move for soundness.
                 // Non-Copy types (e.g., String) must use Move to transfer ownership.
                 let (source_place, is_copy) = match rvalue {
-                    Rvalue::Use(Operand::Copy(p)) => (Some(p), true),
-                    Rvalue::Use(Operand::Move(p)) => (Some(p), false),
+                    Rvalue::Use(Operand::Copy(p), ..) => (Some(p), true),
+                    Rvalue::Use(Operand::Move(p), ..) => (Some(p), false),
                     _ => (None, false), // external enum: Rvalue
                 };
 
@@ -739,7 +763,7 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
                         } else {
                             Operand::Move(indexed_place)
                         };
-                        *rvalue = Rvalue::Use(operand);
+                        *rvalue = rvalue_use!(Rvalue::Use(operand));
                     }
                 }
             }
@@ -755,10 +779,10 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
         });
         let idx_operand = Operand::Copy(Place::from(idx_local));
         let add_rvalue = Rvalue::BinaryOp(BinOp::Add, idx_operand, one_operand);
-        body_block.statements.push(Statement {
-            kind: StatementKind::Assign(Place::from(idx_local), add_rvalue),
-            span: loop_info.span,
-        });
+        body_block.statements.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(Place::from(idx_local), add_rvalue),
+            loop_info.span,
+        ));
     }
 
     true
@@ -767,19 +791,31 @@ fn transform_array_loop(body: &mut MutableBody, loop_info: &ArrayForLoop) -> boo
 fn try_transform_array_loop_without_symbolic_index(
     body: &mut MutableBody,
     loop_info: &ArrayForLoop,
+    declared_unwind: Option<u32>,
 ) -> bool {
     if loop_info.array_len == 0 {
         debug!(
             "Zero-length array transform: replacing into_iter at bb{} with goto to exit bb{}",
             loop_info.into_iter_bb, loop_info.exit_bb
         );
-        body.block_mut(loop_info.into_iter_bb).terminator = Terminator {
-            kind: TerminatorKind::Goto { target: loop_info.exit_bb },
-            span: loop_info.span,
-        };
+        body.block_mut(loop_info.into_iter_bb).terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: loop_info.exit_bb },
+            loop_info.span,
+        );
         return true;
     }
+    // The straight-line chain has no loop left for the bounded unroll to
+    // check. Kani's `for x in array` loop passes its header N + 1 times and
+    // fails `unwinding assertion loop 0` under `#[kani::unwind(U)]` once
+    // N >= U; the chain verified such a harness clean (walker fail-closed
+    // review 6 round 2, finding 1 follow-up: `ai_for_n4_u4_assert_bug`,
+    // SUCCESSFUL on main). Under a declared bound the chain is used only
+    // where the loop stays within it; otherwise the indexed loop below keeps
+    // the loop, and its unwinding assertion.
+    let within_declared_unwind =
+        declared_unwind.is_none_or(|unwind| (loop_info.array_len as u64) < u64::from(unwind));
     loop_info.array_len <= MAX_FINITE_ARRAY_ITER_UNROLL
+        && within_declared_unwind
         && try_transform_array_loop_finite_unrolled(body, loop_info)
 }
 
@@ -816,10 +852,10 @@ fn try_transform_array_loop_finite_unrolled(
 
     {
         let into_iter_block = body.block_mut(loop_info.into_iter_bb);
-        into_iter_block.terminator = Terminator {
-            kind: TerminatorKind::Goto { target: mapped_block(&maps[0], loop_info.body_bb) },
-            span: loop_info.span,
-        };
+        into_iter_block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Goto { target: mapped_block(&maps[0], loop_info.body_bb) },
+            loop_info.span,
+        );
     }
 
     for iteration in 0..loop_info.array_len {
@@ -1004,7 +1040,7 @@ fn remap_finite_unroll_terminator(
         TerminatorKind::Abort => TerminatorKind::Abort,
         TerminatorKind::InlineAsm { .. } => term.kind.clone(),
     };
-    Terminator { kind, span: term.span }
+    crate::rustc_compat::mir_terminator(kind, mir_span!(term))
 }
 
 fn replace_option_unwraps_with_const_array_read(
@@ -1018,8 +1054,8 @@ fn replace_option_unwraps_with_const_array_read(
         };
 
         let (source_place, is_copy) = match rvalue {
-            Rvalue::Use(Operand::Copy(p)) => (Some(p), true),
-            Rvalue::Use(Operand::Move(p)) => (Some(p), false),
+            Rvalue::Use(Operand::Copy(p), ..) => (Some(p), true),
+            Rvalue::Use(Operand::Move(p), ..) => (Some(p), false),
             _ => (None, false),
         };
 
@@ -1048,7 +1084,7 @@ fn replace_option_unwraps_with_const_array_read(
 
         let operand =
             if is_copy { Operand::Copy(indexed_place) } else { Operand::Move(indexed_place) };
-        *rvalue = Rvalue::Use(operand);
+        *rvalue = rvalue_use!(Rvalue::Use(operand));
     }
 }
 
@@ -1118,11 +1154,12 @@ fn eliminate_iterator_infrastructure(body: &mut MutableBody, loop_info: &ArrayFo
         if let TerminatorKind::Drop { place, target, .. } = &block.terminator.kind {
             if iter_locals.contains(&place.local) && place.projection.is_empty() {
                 let target = *target;
-                let span = block.terminator.span;
+                let span = mir_span!(block.terminator);
                 debug!("Eliminating iterator drop at bb{}: local=_{}", bb_idx, place.local);
 
                 let block = body.block_mut(bb_idx);
-                block.terminator = Terminator { kind: TerminatorKind::Goto { target }, span };
+                block.terminator =
+                    crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, span);
             }
         }
     }
@@ -1142,13 +1179,15 @@ fn eliminate_iterator_infrastructure(body: &mut MutableBody, loop_info: &ArrayFo
 
             if is_iter_call {
                 let goto_target = target.unwrap_or(0); // 0 = entry block fallback
-                let span = block.terminator.span;
+                let span = mir_span!(block.terminator);
                 debug!("Eliminating iterator call at bb{}", bb_idx);
 
                 let block = body.block_mut(bb_idx);
                 block.statements.clear();
-                block.terminator =
-                    Terminator { kind: TerminatorKind::Goto { target: goto_target }, span };
+                block.terminator = crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Goto { target: goto_target },
+                    span,
+                );
             }
         }
     }

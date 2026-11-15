@@ -74,6 +74,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let prefix = collection_name.to_ascii_lowercase();
             let name = self.ctx.fresh_name_with_suffix(&prefix, "insert");
             let result = self.ctx.declare_var(&name, bool_sort());
+            self.ctx.bmc_sound_havoc("set_insert_untracked");
             self.assign_value_to_place(destination, result);
             if let Some(base) = self.get_map_base_from_ref(&args[0]) {
                 let len_name = crate::codegen_ay::names::len_name(&base);
@@ -113,6 +114,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let prefix = collection_name.to_ascii_lowercase();
             let name = self.ctx.fresh_name_with_suffix(&prefix, "contains");
             let result = self.ctx.declare_var(&name, bool_sort());
+            self.ctx.bmc_sound_havoc("set_contains_untracked");
             self.assign_value_to_place(destination, result);
         }
         target
@@ -153,6 +155,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let prefix = collection_name.to_ascii_lowercase();
             let name = self.ctx.fresh_name_with_suffix(&prefix, "remove");
             let result = self.ctx.declare_var(&name, bool_sort());
+            self.ctx.bmc_sound_havoc("set_remove_untracked");
             self.assign_value_to_place(destination, result);
             if let Some(base) = self.get_map_base_from_ref(&args[0]) {
                 let len_name = crate::codegen_ay::names::len_name(&base);
@@ -192,6 +195,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let prefix = collection_name.to_ascii_lowercase();
         let name = self.ctx.fresh_name_with_suffix(&prefix, "len");
         let len = self.ctx.declare_var(&name, ptr_sort());
+        self.ctx.bmc_sound_havoc("set_len_untracked");
         self.assign_value_to_place(destination, len);
         target
     }
@@ -224,6 +228,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let prefix = collection_name.to_ascii_lowercase();
         let name = self.ctx.fresh_name_with_suffix(&prefix, "is_empty");
         let is_empty = self.ctx.declare_var(&name, bool_sort());
+        self.ctx.bmc_sound_havoc("set_is_empty_untracked");
         self.assign_value_to_place(destination, is_empty);
         target
     }

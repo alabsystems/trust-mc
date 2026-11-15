@@ -2349,7 +2349,7 @@ fn test_dangling_ptr_add_extra_checks_emits_provenance_error_rule() {
         let cfg_extra = ChcConfig { extra_pointer_checks: true, ..ChcConfig::default() };
         let vc = mir_to_chc(ctx.tcx, &body, "probe_dangling_add", cfg_extra);
 
-        let error_rule_count = vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let error_rule_count = vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert!(
             error_rule_count >= 1,
             "extra_pointer_checks dangling+add must emit >=1 error rule, got {}",
@@ -2357,7 +2357,7 @@ fn test_dangling_ptr_add_extra_checks_emits_provenance_error_rule() {
         );
 
         let has_obj_valid_select_in_error =
-            vc.rules.iter().filter(|r| r.head.name == "error").any(|rule| {
+            vc.rules.iter().filter(|r| is_error_check_rule(r)).any(|rule| {
                 rule_contains_expr(rule, |expr| match expr.value() {
                     ExprValue::Select { array, .. } => matches!(
                         array.value(),
@@ -2378,7 +2378,7 @@ fn test_dangling_ptr_add_extra_checks_emits_provenance_error_rule() {
         let vc_default = mir_to_chc(ctx.tcx, &body, "probe_dangling_add", cfg_default);
 
         let default_error_count =
-            vc_default.rules.iter().filter(|r| r.head.name == "error").count();
+            vc_default.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert!(
             default_error_count < error_rule_count,
             "default config should have fewer error rules ({}) than extra_pointer_checks ({})",
@@ -2386,7 +2386,7 @@ fn test_dangling_ptr_add_extra_checks_emits_provenance_error_rule() {
             error_rule_count
         );
         assert!(
-            !vc_default.rules.iter().filter(|r| r.head.name == "error").any(|rule| {
+            !vc_default.rules.iter().filter(|r| is_error_check_rule(r)).any(|rule| {
                 rule_contains_expr(rule, |expr| match expr.value() {
                     ExprValue::Select { array, .. } => matches!(
                         array.value(),

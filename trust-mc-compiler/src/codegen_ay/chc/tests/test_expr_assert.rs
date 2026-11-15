@@ -89,7 +89,7 @@ fn test_emit_assert_error_rule_shared_appends_violation_to_shared_base() {
         let from_app = RelationApp::new(&from_rel, state_args);
 
         let shared_constraints: Arc<[Expr]> = vec![Expr::bool_const(true)].into();
-        let before = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
 
         chc_ctx.emit_assert_error_rule_shared(
             &from_app,
@@ -100,14 +100,14 @@ fn test_emit_assert_error_rule_shared_appends_violation_to_shared_base() {
             None,
         );
 
-        let after = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let after = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(after, before + 1, "shared assert helper must emit one error rule");
 
         let error_rule = chc_ctx
             .vc
             .rules
             .iter()
-            .rfind(|r| r.head.name == "error")
+            .rfind(|r| is_error_check_rule(r))
             .expect("expected emitted error rule");
         assert_eq!(
             error_rule.body.constraints.len(),

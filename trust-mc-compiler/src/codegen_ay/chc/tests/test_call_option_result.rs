@@ -858,10 +858,14 @@ fn test_inline_single_payload_enum_return_equality_proves_without_fallbacks() {
 
     with_test_ay_ctx_for_source(INLINE_SINGLE_PAYLOAD_ENUM_RETURN_PROBE, |ctx| {
         let track_configs = [
-            ("reg", ChcConfig::default()),
+            ("reg", ChcConfig { straightline_discharge: true, ..ChcConfig::default() }),
             (
                 "mem",
-                ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+                ChcConfig {
+                    track_level: crate::args::ChcTrackLevel::Mem,
+                    straightline_discharge: true,
+                    ..ChcConfig::default()
+                },
             ),
         ];
 

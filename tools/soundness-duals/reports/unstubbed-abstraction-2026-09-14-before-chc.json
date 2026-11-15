@@ -1,0 +1,496 @@
+{
+  "provenance": {
+    "ay": {
+      "build_commit": "4cadc2bf1deda68e08ac0e2a45a4939ab411d73d",
+      "cargo_toml_pin": "4cadc2bf1deda68e08ac0e2a45a4939ab411d73d",
+      "path": "~/Library/Caches/trust-mc-ay-cli-4cadc2bf1/release/ay",
+      "pin_match": true,
+      "version": "ay 0.26.0+build.9607.4cadc2bf1deda68e08ac0e2a45a4939ab411d73d@2026-09-13T02:35:56Z"
+    },
+    "bundle": {
+      "checkout_at_run": null,
+      "compiler_sha256": "58b73776e91a11e7c22287c366573b5c48f411ba65c7fc2cf323c431d83016eb",
+      "dir": "$SCRATCH/phase13/unknowns/bundle-pre",
+      "driver_mtime_utc": "2026-09-15T02:00:02+00:00",
+      "driver_sha256": "feb4c59f25b648ff87c8c8cca53d6d85adc940f5379138a30ae2dd5805b8aefa",
+      "driver_version": "trust-mc 0.6.0"
+    },
+    "config": {
+      "env": {
+        "PATH_first": "~/Library/Caches/trust-mc-ay-cli-4cadc2bf1/release",
+        "RUSTFLAGS": "-Awarnings",
+        "TRUST_MC_SYSROOT": "$SCRATCH/phase13/unknowns/bundle-pre"
+      },
+      "harness_timeout_s": 30,
+      "inherited_env": {},
+      "jobs": 3,
+      "kinds": [],
+      "lanes": [
+        "chc"
+      ],
+      "only": [
+        "chc_exact_ctrex",
+        "unstubbed_abstraction"
+      ],
+      "strict": false,
+      "wall_timeout_rule": "180 + harnesses * (2 * 30 + 30) seconds per file"
+    },
+    "finished_at_utc": "2026-09-15T02:03:23+00:00",
+    "host": {
+      "cpu_count": 10,
+      "load_average_end": [
+        25.4,
+        28.25,
+        21.85
+      ],
+      "load_average_start": [
+        24.93,
+        29.4,
+        21.7
+      ],
+      "platform": "macOS-26.6.2-arm64-arm-64bit",
+      "python": "3.12.14"
+    },
+    "manifest": {
+      "changed_during_run": false,
+      "path": "tools/soundness-duals/manifest.toml",
+      "sha256": "32490d672481ca69d54cfd00ebb6d23976f24fa70b12a64a3ba2fb69f5fc13c1"
+    },
+    "runtime_seconds": 67.9,
+    "started_at_utc": "2026-09-15T02:02:15+00:00",
+    "trust_mc": {
+      "dirty": true,
+      "dirty_tracked_paths": 1,
+      "head": "b586ba0324ffb71ab38f39fc5c6cfed1bb9e6a61",
+      "path": "~/trust-mc-unknowns",
+      "untracked_paths": 2
+    },
+    "trust_mc_changed_during_run": false
+  },
+  "rows": [
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large)`, all six checks UNDETERMINED, 0.8s \u2014 for the BUG file and its safe twin alike, so it is the raw-pointer `offset` query shape and not the verdict (the safe twin carries no `isize::MAX` and memouts identically, 0.9s); measured 2026-09-14 on the m4/unknown-burndown baseline bundle (driver befda7870b2e) BEFORE and AFTER the G8 routing change, which touches the CHC lane only. chc is green on all four rows both ways",
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_offset_overflows_isize",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": false,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large)`, all six checks UNDETERMINED, 0.8s \u2014 for the BUG file and its safe twin alike, so it is the raw-pointer `offset` query shape and not the verdict (the safe twin carries no `isize::MAX` and memouts identically, 0.9s); measured 2026-09-14 on the m4/unknown-burndown baseline bundle (driver befda7870b2e) BEFORE and AFTER the G8 routing change, which touches the CHC lane only. chc is green on all four rows both ways",
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_offset_overflows_isize_from_any_index",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_dual.rs",
+      "property": "overflow",
+      "property_ok": false,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-failure",
+      "covers": [],
+      "ctrex_category": "Unknown",
+      "detail": "failed-on-safe",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large)`, all six checks UNDETERMINED, 0.8s \u2014 for the BUG file and its safe twin alike, so it is the raw-pointer `offset` query shape and not the verdict (the safe twin carries no `isize::MAX` and memouts identically, 0.9s); measured 2026-09-14 on the m4/unknown-burndown baseline bundle (driver befda7870b2e) BEFORE and AFTER the G8 routing change, which touches the CHC lane only. chc is green on all four rows both ways",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: ay-chc inconclusive"
+        ]
+      ],
+      "harness": "safe_offset_from_any_index_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:proved",
+        "CHC-ROW:unknown",
+        "CHC-ROW:unknown"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 9,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": null,
+      "detail": "successful",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large)`, all six checks UNDETERMINED, 0.8s \u2014 for the BUG file and its safe twin alike, so it is the raw-pointer `offset` query shape and not the verdict (the safe twin carries no `isize::MAX` and memouts identically, 0.9s); measured 2026-09-14 on the m4/unknown-burndown baseline bundle (driver befda7870b2e) BEFORE and AFTER the G8 routing change, which touches the CHC lane only. chc is green on all four rows both ways",
+      "expected": "SUCCESSFUL",
+      "failed_checks": [],
+      "harness": "safe_offset_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "PROOF",
+        "PROOF_TRANSCRIPT_METADATA:v1",
+        "NATIVE_PROOF_GRADE:rejected:replay_not_replayable",
+        "PROOF_QUALIFIERS:clean"
+      ],
+      "needs_review": null,
+      "path": "chc_exact_ctrex_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [],
+      "soundness": false,
+      "verdict": "SUCCESSFUL",
+      "verdict_line": "VERIFICATION:- SUCCESSFUL"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_assertion_false_on_every_abstracted_value",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "unstubbed_abstraction_dual.rs",
+      "property": "assertion",
+      "property_ok": true,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "match",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "failed",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+      "expected": "FAILED",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "bug_offset_runs_past_the_allocation",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "unstubbed_abstraction_dual.rs",
+      "property": "memory-safety",
+      "property_ok": false,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "genuine-on-safe",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+      "expected": "NOT_GENUINE",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "safe_mutex_held_while_offset_stays_in_bounds",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "unstubbed_abstraction_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    },
+    {
+      "check_expectations": [],
+      "checks": 1,
+      "class": "false-certificate",
+      "covers": [],
+      "ctrex_category": "Genuine",
+      "detail": "genuine-on-safe",
+      "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+      "expected": "NOT_GENUINE",
+      "failed_checks": [
+        [
+          "chc.0",
+          "CHC verification: error reachable (exact CHC derivation)"
+        ]
+      ],
+      "harness": "safe_mutex_read_matches_stored_value",
+      "kind": "dual",
+      "known_red": false,
+      "known_red_class": null,
+      "lane": "chc",
+      "markers": [
+        "CTREX",
+        "CTREX_CAT:Genuine"
+      ],
+      "needs_review": null,
+      "path": "unstubbed_abstraction_safe.rs",
+      "property": null,
+      "property_ok": null,
+      "property_seen": [
+        "assertion"
+      ],
+      "soundness": false,
+      "verdict": "FAILED",
+      "verdict_line": "VERIFICATION:- FAILED"
+    }
+  ],
+  "runs": [
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "chc_exact_ctrex_dual.rs",
+      "seconds": 0.2,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "chc_exact_ctrex_safe.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "chc_exact_ctrex_safe.rs",
+      "seconds": 67.6,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "unstubbed_abstraction_dual.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "unstubbed_abstraction_dual.rs",
+      "seconds": 0.3,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    },
+    {
+      "command": [
+        "trust-mc-driver",
+        "unstubbed_abstraction_safe.rs",
+        "-Z",
+        "unstable-options",
+        "--harness-timeout=30s",
+        "--ay-chc"
+      ],
+      "exit_code": 1,
+      "lane": "chc",
+      "path": "unstubbed_abstraction_safe.rs",
+      "seconds": 0.4,
+      "timed_out": false,
+      "unlisted_harnesses": [],
+      "wall_limit_s": 360
+    }
+  ],
+  "schema": "trust-mc.soundness-dual-gate-report/v2",
+  "summary": {
+    "decided_rows": 8,
+    "false_certificate_rows": [
+      {
+        "class": "false-certificate",
+        "detail": "genuine-on-safe",
+        "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+        "harness": "safe_mutex_held_while_offset_stays_in_bounds",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "chc",
+        "path": "unstubbed_abstraction_safe.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "genuine-on-safe",
+        "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+        "harness": "safe_mutex_read_matches_stored_value",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "chc",
+        "path": "unstubbed_abstraction_safe.rs"
+      }
+    ],
+    "gate": "fail",
+    "gate_reasons": [
+      "gating-rows"
+    ],
+    "gating_rows": [
+      {
+        "class": "false-certificate",
+        "detail": "genuine-on-safe",
+        "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+        "harness": "safe_mutex_held_while_offset_stays_in_bounds",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "chc",
+        "path": "unstubbed_abstraction_safe.rs"
+      },
+      {
+        "class": "false-certificate",
+        "detail": "genuine-on-safe",
+        "evidence": "bmc-lane: the bounded lane memouts on this shape \u2014 `VERIFICATION:- INCONCLUSIVE (solver ran out of memory \u2014 bounded query too large; try a smaller unwind bound or --ay-chc)` with `[AY:UNKNOWN_REASON:Memout]` \u2014 for the SAFE file and its bug twin alike, so it is the raw-pointer `offset` query shape and not the verdict; the same shape memouts in chc_exact_ctrex_{dual,safe}.rs, which carry no Mutex at all. Measured 2026-09-14 on this branch BEFORE and AFTER the D1 unstubbed-abstraction fix, which touches metadata and the CTREX classifier, not the bounded lane: all four bmc rows are byte-identical both ways. chc decides all four rows both ways",
+        "harness": "safe_mutex_read_matches_stored_value",
+        "known_red": false,
+        "known_red_class": null,
+        "lane": "chc",
+        "path": "unstubbed_abstraction_safe.rs"
+      }
+    ],
+    "known_red_class_changed": [],
+    "known_red_now_green": [],
+    "needs_review": [],
+    "per_lane": {
+      "chc": {
+        "error": 0,
+        "false-certificate": 2,
+        "false-failure": 1,
+        "match": 5,
+        "missed-bug": 0,
+        "property_mismatch": 3,
+        "total": 8,
+        "unclassified": 0,
+        "unknown": 0
+      }
+    },
+    "soundness_rows": []
+  }
+}

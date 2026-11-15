@@ -1,0 +1,38 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+# librustc_codegen_trust_mc.dylib: the trust-mc engine as an external rustc
+# codegen backend. Canonical trustc loads it with -Zcodegen-backend=<abs path>
+# (T1-D1/D3); a future seal ships it under
+# lib/rustlib/<host>/codegen-backends/ (T1-D4).
+#
+# The dylib is bound to the exact librustc_driver it was built against. It
+# carries no rpath and no -Cprefer-dynamic: trustc has already loaded its driver
+# when it dlopens this file.
+
+[package]
+name = "trust-mc-backend"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "rustc_codegen_trust_mc"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+# The same engine feature set trust-mc-compiler selects (default-features =
+# false plus `ay`), so one cargo invocation builds one engine rlib.
+trust-mc-engine = { path = "../trust-mc-engine", default-features = false, features = ["ay"] }
+
+[package.metadata.rust-analyzer]
+# This package uses rustc crates.
+rustc_private = true
+
+[lints]
+workspace = true

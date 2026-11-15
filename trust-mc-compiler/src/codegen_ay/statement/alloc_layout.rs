@@ -135,20 +135,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Codegen `Layout::is_size_align_valid(size, align) -> bool`.
     ///
-    /// Validates that size and alignment form a valid layout.
-    /// For verification, we assume all layouts constructed by safe code are valid.
-    ///
-    /// ENSURES: destination receives Bool(true)
+    /// Safe callers may supply invalid values; this is a checked predicate,
+    /// not an invariant of its inputs.
     pub(super) fn codegen_layout_is_size_align_valid(
         &mut self,
+        args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
-        // Return true - safe Rust guarantees valid layouts
-        let result = Expr::bool_const(true);
+        let size = self.codegen_operand(args.first()?)?;
+        let align = self.codegen_operand(args.get(1)?)?;
+        let result = Self::checked_layout_validity(size, align)?;
         self.assign_value_to_place(destination, result);
-        debug!("codegen_layout_is_size_align_valid: returned true");
         target
+    }
+
+    /// The core `Layout` contract: a nonzero power-of-two alignment, with
+    /// `size` rounded up to that alignment no larger than `isize::MAX`.
+    /// For such an alignment, core expresses the last condition as
+    /// `size <= (isize::MAX + 1) - align`, avoiding rounded-size overflow.
+    fn checked_layout_validity(size: Expr, align: Expr) -> Option<Expr> {
+        if size.sort() != &ptr_sort() || align.sort() != &ptr_sort() {
+            return None;
+        }
+        let zero = Expr::bitvec_const(0, POINTER_WIDTH);
+        let one = Expr::bitvec_const(1, POINTER_WIDTH);
+        let isize_bound = Expr::bitvec_const(1u128 << (POINTER_WIDTH - 1), POINTER_WIDTH);
+        let nonzero = align.clone().eq(zero.clone()).not();
+        let power_of_two = align.clone().bvand(align.clone().bvsub(one)).eq(zero);
+        let size_fits = size.bvule(isize_bound.bvsub(align));
+        Some(nonzero.and(power_of_two).and(size_fits))
     }
 
     /// Codegen `Layout::from_size_align_unchecked(size, align) -> Layout`.
@@ -342,20 +358,54 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
     /// Codegen `Layout::from_size_align(size, align) -> Result<Layout, LayoutError>`.
     ///
-    /// Creates a Layout after validating size and alignment.
-    /// For verification, we assume all layouts are valid (safe Rust guarantee)
-    /// and return Ok(Layout), identical to `from_size_align_unchecked`.
-    ///
-    /// REQUIRES: args.len() >= 2 (size, align)
-    /// ENSURES: destination receives Layout Datatype with (fld_size, fld_align)
+    /// Preserve the actual Result datatype and both checked outcomes. A bare
+    /// Layout here makes an inlined unwrap read an unconstrained discriminant.
     pub(super) fn codegen_layout_from_size_align(
         &mut self,
         args: &[Operand],
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
-        // Safe variant delegates to unchecked — validation is assumed to pass
-        self.codegen_layout_from_size_align_unchecked(args, destination, target)
+        let size = self.codegen_operand(args.first()?)?;
+        let align = self.codegen_operand(args.get(1)?)?;
+        let valid = Self::checked_layout_validity(size.clone(), align.clone())?;
+        let layout = self.create_layout_struct(size, align);
+
+        // Check the complete declared signature before changing the destination.
+        // In particular, Err contains the fieldless LayoutError, represented by
+        // the same false Bool as an ordinary fieldless struct construction.
+        let result_sort = self.infer_sort_from_place(destination)?;
+        let dt = result_sort.datatype_sort()?;
+        if dt.constructors.len() != 2 {
+            return None;
+        }
+        let ok_name = Self::find_result_constructor(&result_sort, "Ok", &dt.name)?;
+        let err_name = Self::find_result_constructor(&result_sort, "Err", &dt.name)?;
+        let ok_ctor = dt.constructors.iter().find(|ctor| ctor.name == ok_name)?;
+        let err_ctor = dt.constructors.iter().find(|ctor| ctor.name == err_name)?;
+        if ok_ctor.fields.len() != 1
+            || ok_ctor.fields[0].sort != *layout.sort()
+            || err_ctor.fields.len() != 1
+            || !err_ctor.fields[0].sort.is_bool()
+        {
+            return None;
+        }
+        let ok = Expr::datatype_constructor(&dt.name, ok_name, vec![layout], result_sort.clone());
+        let err = Expr::datatype_constructor(
+            &dt.name,
+            err_name,
+            vec![Expr::bool_const(false)],
+            result_sort.clone(),
+        );
+        self.assign_value_to_place(destination, Expr::ite(valid, ok, err));
+        self.kill_variant_facts_for_place(destination);
+        self.kill_discriminant_bridges_for_place(destination);
+        // Old flattened views cannot describe this new native value. Use the
+        // existing declared-havoc/demotion path if any unmatched views remain;
+        // deleting a view silently could leave a borrowed slot stale.
+        let dest_base = self.ssa_base_name(destination);
+        self.store_flattened_components(&dest_base, Vec::new());
+        target
     }
 
     /// Codegen `Layout::calculate_layout_for(n) -> Option<(Layout, usize)>`.

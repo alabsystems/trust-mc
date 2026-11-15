@@ -9,8 +9,12 @@
 //! variables for mutable statics. This enables CHC to model reads
 //! and writes through `static mut` references.
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::CrateDef;
-use rustc_public::mir::alloc::{AllocId, GlobalAlloc};
+use rustc_public::mir::mono::StaticDef;
 use rustc_public::mir::{Operand, Rvalue, StatementKind};
 use tracing::debug;
 
@@ -21,6 +25,7 @@ use crate::codegen_ay::ptr_repr::{PtrRepr, PtrSlot};
 use super::ChcCtx;
 use super::codegen_decl_static_alloc::AllocScalar;
 use super::codegen_types::CodegenTypes;
+use crate::codegen_ay::shared::const_pointer::{self, ConstRead, ConstTarget, TargetKey};
 
 /// Part of #4066: Returns true when a static name belongs to the
 /// uninit-check shadow memory infrastructure (`-Z uninit-checks`).
@@ -36,6 +41,13 @@ use super::codegen_types::CodegenTypes;
 /// complex entry-rule constraints that cause the CHC solver to
 /// struggle with invariant synthesis (~20s overhead on trivial
 /// harnesses like `access_padding_init`).
+/// Sound-fallback reason (FailClose): a constant pointer into a LIVE static at
+/// an offset (or at another type) that no static place path names. Its read
+/// would come from typed memory, which a store through the static's state
+/// variable never reaches, so no verdict may rest on it (D6).
+pub(in crate::codegen_ay::chc) const CONST_PTR_INTO_LIVE_STATIC: &str =
+    "const_ptr_into_live_static";
+
 pub(in crate::codegen_ay::chc) fn is_uninit_shadow_static(name: &str) -> bool {
     name.contains("MEM_INIT_STATE") || name.contains("ARGUMENT_BUFFER")
 }
@@ -70,18 +82,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ///
     /// Part of #428: Enable CHC encoding of `static mut` accesses.
     pub(in crate::codegen_ay::chc) fn collect_static_state_vars(&mut self) {
-        use rustc_public::ty::{ConstantKind, TyConstKind};
+        use rustc_public::ty::{RigidTy, TyKind};
 
-        // Part of #3496 Bug C: Dedup by alloc_id, not static_name.
-        // Two named statics (FOO, BAR) may alias the same underlying allocation.
-        // Using alloc_id as key ensures they share one state variable, so writes
-        // through one are visible to reads through the other.
+        // Part of #3496 Bug C: one state variable per static, keyed by its
+        // definition (the identity `const_pointer::TargetKey` uses), so every
+        // constant pointer to it — from any body — shares it.
         let mut discovered_statics: Vec<(String, rustc_public::ty::Ty, usize)> = Vec::new(); // (name, ty, vec_idx)
-        let mut alloc_to_vec_idx: std::collections::HashMap<AllocId, usize> =
+        let mut def_to_vec_idx: std::collections::HashMap<StaticDef, usize> =
             std::collections::HashMap::new();
 
-        // Collect (dest_local, alloc_id) tuples for second-pass local mapping.
-        let mut local_to_alloc: Vec<(usize, AllocId)> = Vec::new();
+        // Collect (dest_local, static, offset, pointee) for second-pass local
+        // mapping.
+        let mut local_to_static: Vec<(usize, StaticDef, u64, rustc_public::ty::Ty)> = Vec::new();
 
         for bb_data in &self.body.blocks {
             for stmt in &bb_data.statements {
@@ -90,35 +102,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 };
                 // Match: _N = Use(Constant(ptr_with_static_provenance))
                 let const_op = match rhs {
-                    Rvalue::Use(Operand::Constant(c)) => c,
+                    Rvalue::Use(Operand::Constant(c), ..) => c,
                     _ => continue, // external enum: Rvalue
                 };
 
                 let mir_const = &const_op.const_;
-                // Extract provenance from the constant allocation.
-                // We need to handle both ConstantKind variants that can contain allocations.
-                let alloc_provenance = match mir_const.kind() {
-                    ConstantKind::Allocated(alloc) => {
-                        if alloc.provenance.ptrs.is_empty() {
-                            continue;
-                        }
-                        alloc.provenance.clone()
-                    }
-                    ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                        TyConstKind::Value(_, alloc) => {
-                            if alloc.provenance.ptrs.is_empty() {
-                                continue;
-                            }
-                            alloc.provenance.clone()
-                        }
-                        _ => continue, // external enum: TyConstKind
-                    },
-                    _ => continue, // external enum: ConstantKind
+                // N5: only a POINTER-TYPED constant (`&T`, `*const T`, `*mut T`,
+                // thin or fat) is a constant pointer, and its pointer is the
+                // relocation at its own byte 0 (`const_pointer`). A constant
+                // VALUE that merely contains a pointer (`[*const u32; 2]` of
+                // two fields of a static) is a value whose slots follow the
+                // slot clause; mapping it to the static's state variable made
+                // `_6 = const PTRS` an alias of `PAIR`.
+                if !matches!(
+                    mir_const.ty().kind(),
+                    TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..))
+                ) {
+                    continue;
+                }
+                let Some(ptr) =
+                    const_pointer::const_bytes(mir_const).and_then(|b| b.stored_pointer(0))
+                else {
+                    continue;
                 };
-
-                // Check if the provenance points to a GlobalAlloc::Static
-                let alloc_id = alloc_provenance.ptrs[0].1.0;
-                let GlobalAlloc::Static(static_def) = GlobalAlloc::from(alloc_id) else {
+                let ConstTarget::Static(static_def) = ptr.kind() else {
+                    continue;
+                };
+                let Some(const_pointee) = Self::deref_pointee_ty(mir_const.ty()) else {
                     continue;
                 };
 
@@ -147,10 +157,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     "CHC: found static reference in MIR (#428)"
                 );
 
-                // Create state variable if we haven't seen this alloc_id yet.
-                // Part of #3496 Bug C: dedup by alloc_id so aliased statics share one var.
+                // Create the state variable on first sight of this static.
                 if let std::collections::hash_map::Entry::Vacant(e) =
-                    alloc_to_vec_idx.entry(alloc_id)
+                    def_to_vec_idx.entry(static_def)
                 {
                     let Some(sort) = Self::translate_ty(static_ty) else {
                         debug!(
@@ -167,7 +176,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let out_name = crate::codegen_ay::names::out_name(&in_name);
 
                     self.push_state_var_pair(&in_name, &out_name, sort.clone());
-                    if is_mutable_static {
+                    self.ref_resolution.static_state_ty.insert(vec_idx, static_ty);
+                    // LIVE: its value can change (`static mut`, or an
+                    // interior-mutable type an `&` can write).
+                    if is_mutable_static || self.ty_has_interior_mut(static_ty) {
                         self.ref_resolution.mutable_static_state_idxs.insert(vec_idx);
                     }
                     // A linked C definition can reach an EXPORTED static by
@@ -237,22 +249,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Part of #3496: For pointer-typed statics whose allocations contain
                     // provenance (pointers to inner statics), resolve the target to a
                     // concrete address instead of reading raw bytes (which are zero).
-                    // A foreign (`extern "C" { static X: T; }`) static has no
-                    // MIR initializer body — calling `eval_initializer()` on it
-                    // triggers a rustc `span_bug` panic that `.ok()` cannot
-                    // catch (SIGABRT/exit 101). Guard it: a foreign static must
-                    // be modelled as nondet (it could hold ANY value), which is
-                    // exactly the None-path below (static left unconstrained).
-                    // NEVER substitute zero here — that would let `assert X != 1`
-                    // pass as a FALSE proof.
-                    let init_alloc_opt = if self.tcx.is_foreign_item(static_def_id) {
-                        None
-                    } else {
-                        static_def.eval_initializer().ok()
-                    };
+                    // The static's own bytes come from
+                    // `const_pointer::target_bytes`, which declines a foreign
+                    // (`extern "C" { static X: T; }`) static — it has no MIR
+                    // initializer body, and evaluating one triggers a rustc
+                    // `span_bug` panic that `.ok()` cannot catch
+                    // (SIGABRT/exit 101) — and a still-generic one. A foreign
+                    // static must be modelled as nondet (it could hold ANY
+                    // value), which is exactly the None-path below (static
+                    // left unconstrained). NEVER substitute zero here — that
+                    // would let `assert X != 1` pass as a FALSE proof.
+                    let init_alloc_opt = const_pointer::target_bytes(
+                        self.tcx,
+                        &const_pointer::TargetKey::Static(static_def),
+                    )
+                    .map(|(bytes, _)| bytes);
+                    // Every pointer slot of the initializer names its target as
+                    // read at the slot's pointee type (D2's read set).
+                    if let Some(ref bytes) = init_alloc_opt {
+                        self.note_pointer_slots(bytes, static_ty, 0);
+                    }
                     let mut init_expr_opt = init_alloc_opt
                         .as_ref()
-                        .and_then(|alloc| self.static_init_from_alloc(alloc, &sort, static_ty));
+                        .and_then(|bytes| self.static_init_from_alloc(bytes, &sort, static_ty));
 
                     // A foreign static has no MIR initializer — but a
                     // `--c-lib` translation unit may DEFINE the object
@@ -286,14 +305,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         init_expr_opt =
                             Some(Val::of_value(ay_bindings::Expr::bitvec_const(wrapped, width)));
                     }
-                    let mut seed_metadata = if is_mutable_static || contract_havoc {
+                    // A referent seed pins reads to the initializer: only a
+                    // FIXED static's value may be decoded.
+                    let mut seed_metadata = if is_mutable_static
+                        || contract_havoc
+                        || self.ty_has_interior_mut(static_ty)
+                    {
                         None
                     } else {
                         init_expr_opt.clone().and_then(|init_expr| {
                             self.static_seed_metadata_for_value(
                                 static_ty,
                                 init_expr,
-                                init_alloc_opt.as_ref(),
+                                init_alloc_opt.as_ref().map(|bytes| bytes.len()),
                             )
                         })
                     };
@@ -311,27 +335,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         // Which pointer shape did `translate_ty` declare for
                         // this static? A *representation* question about the
                         // slot, asked once. Whether the slot holds a pointer at
-                        // all is decided on the next line, by the allocation's
-                        // own relocation table — not by this width.
+                        // all is decided on the next line, by the relocation at
+                        // the static's own byte 0 — not by this width.
                         && let Some(ptr_slot) = PtrSlot::of_sort(&sort)
-                        && let Some(ref alloc) = init_alloc_opt
-                        && !alloc.provenance.ptrs.is_empty()
+                        && let Some(ref static_bytes) = init_alloc_opt
+                        && static_bytes.stored_pointer(0).is_some()
                     {
-                        let target_alloc_id = alloc.provenance.ptrs[0].1.0;
                         // Derive the pointee type from the static's type
                         // (e.g., &mut i32 → i32, *mut i32 → i32).
                         let pointee_ty = Self::deref_ref_ty(static_ty).0;
+                        // D9: the seed is the window the static's OWN pointer
+                        // names, and its length the static's own metadata word.
                         if !is_mutable_static
-                            && let Some(metadata) = self
-                                .resolve_pointer_static_seed_metadata(target_alloc_id, pointee_ty)
+                            && let Some(metadata) =
+                                self.resolve_pointer_static_seed_metadata(static_bytes, pointee_ty)
                         {
                             seed_metadata = Some(metadata);
                         }
+                        let pointer_static_fixed =
+                            !is_mutable_static && !self.ty_has_interior_mut(static_ty);
                         if let Some(resolved_data_ptr) = self.resolve_pointer_static_init(
-                            target_alloc_id,
+                            static_bytes,
                             pointee_ty,
                             &static_name,
                             vec_idx,
+                            pointer_static_fixed,
                         ) {
                             let repr = match ptr_slot {
                                 PtrSlot::Thin => Some(PtrRepr::Thin(resolved_data_ptr)),
@@ -354,19 +382,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                     // static unconstrained, which is booked
                                     // below as `static_init_incomplete` — a
                                     // sound widening.
-                                    let ptr_bytes =
-                                        (crate::codegen_ay::types::POINTER_WIDTH / 8) as usize;
-                                    Self::read_composite_from_bytes(
-                                        &alloc.bytes,
-                                        ptr_bytes,
-                                        &ay_bindings::Sort::bitvec(
-                                            crate::codegen_ay::types::POINTER_WIDTH,
-                                        ),
-                                    )
-                                    .map(|metadata_expr| {
+                                    static_bytes.stored_word(const_pointer::PTR_BYTES).map(|len| {
                                         PtrRepr::from_declared_roles(
                                             resolved_data_ptr,
-                                            Val::of_value(metadata_expr),
+                                            Val::of_value(ay_bindings::Expr::bitvec_const(
+                                                u128::from(len),
+                                                crate::codegen_ay::types::POINTER_WIDTH,
+                                            )),
                                         )
                                     })
                                 }
@@ -443,21 +465,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         );
                     }
 
-                    // Part of #3496 Bug B: create unique concrete address for each static
-                    // so that pointer comparisons like `&A != &B` can be decided.
-                    // Uses the same obj_id address scheme as heap allocations:
-                    // addr = obj_id(BV32) ++ offset(BV32), with offset=0.
-                    if let Some(obj_id) = self.heap_state.next_alloc_id() {
-                        // Freshly minted object base: an address by
-                        // construction, which is what makes this the right
-                        // place — and the only place — to say so.
+                    // Part of #3496 Bug B: the static's ONE object (D1,
+                    // `global_objects`), so pointer comparisons like `&A != &B`
+                    // can be decided. `mint_object` returns the object the
+                    // shared walk already minted for it: this is a lookup, and
+                    // cannot give the static a second object (R10a).
+                    if let Some(obj_id) = self.mint_object(TargetKey::Static(static_def)) {
                         let addr = Loc::of_address(
-                            ay_bindings::Expr::bitvec_const(obj_id as i128, 32)
-                                .concat(ay_bindings::Expr::bitvec_const(0i128, 32)),
+                            crate::codegen_ay::chc::decl::global_objects::object_base_for(obj_id),
                         );
-                        self.ref_resolution
-                            .static_address_exprs
-                            .insert(alloc_id, addr.as_expr().clone());
+                        self.ref_resolution.static_state_idx_by_obj.insert(obj_id, vec_idx);
+                        self.ref_resolution.registered_static_memory.insert(static_def);
 
                         // Part of #3793: Record static layout metadata so the entry rule
                         // emits obj_size[obj_id] = size. Family 3 also threads the
@@ -485,7 +503,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         if !(contract_havoc && is_mutable_static)
                             && let Some(init_value) = init_expr_opt.clone()
                         {
-                            self.register_static_memory_init_entries(static_ty, init_value, addr);
+                            self.register_static_memory_init_entries(
+                                static_ty,
+                                init_value,
+                                addr,
+                                is_mutable_static,
+                            );
                             debug!(
                                 vec_idx,
                                 static_name = %static_name,
@@ -497,7 +520,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     debug!(
                         vec_idx,
                         static_name = %static_name,
-                        ?alloc_id,
                         "CHC: created state variable for static (#3496)"
                     );
 
@@ -505,15 +527,57 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     discovered_statics.push((static_name.clone(), static_ty, vec_idx));
                 }
 
-                local_to_alloc.push((lhs.local, alloc_id));
+                local_to_static.push((lhs.local, static_def, ptr.offset(), const_pointee));
             }
         }
 
-        // Map locals to their static state variable indices (by alloc_id).
-        for (dest_local, alloc) in &local_to_alloc {
-            if let Some(&vec_idx) = alloc_to_vec_idx.get(alloc) {
+        // Map locals to their static state variable indices (D6). A constant
+        // pointer names the static's WHOLE value only at offset 0 with the
+        // static's own type. Otherwise it names a part of it: a FIXED static's
+        // part is folded from its initializer window (Pass 4); a LIVE static's
+        // part is its state variable along the static place path, and with no
+        // such path the lane cannot name its live state and fails closed.
+        for (dest_local, static_def, offset, pointee) in &local_to_static {
+            let Some(&vec_idx) = def_to_vec_idx.get(static_def) else { continue };
+            let Some(&static_ty) = self.ref_resolution.static_state_ty.get(&vec_idx) else {
+                continue;
+            };
+            if *offset == 0
+                && crate::codegen_ay::chc::decl::static_path::same_ty_modulo_regions(
+                    *pointee, static_ty,
+                )
+            {
                 self.map_static_local_to_state_idx(*dest_local, vec_idx);
                 debug!(dest_local, vec_idx, "CHC: mapped local to static state var (#428)");
+                continue;
+            }
+            if !self.ref_resolution.mutable_static_state_idxs.contains(&vec_idx) {
+                debug!(
+                    dest_local,
+                    vec_idx, offset, "CHC: const ptr into a fixed static folds (D6)"
+                );
+                continue;
+            }
+            match crate::codegen_ay::chc::decl::static_path::static_path(
+                static_ty, *offset, *pointee,
+            ) {
+                Some(path) => {
+                    self.map_static_local_to_state_idx(*dest_local, vec_idx);
+                    self.ref_resolution.static_ref_paths.insert(*dest_local, path);
+                    debug!(
+                        dest_local,
+                        vec_idx, offset, "CHC: const ptr into a live static via its path (D6)"
+                    );
+                }
+                None => {
+                    debug!(
+                        dest_local,
+                        vec_idx,
+                        offset,
+                        "CHC: const ptr into a live static has no path — fail closed (D6)"
+                    );
+                    self.record_sound_fallback_reason(CONST_PTR_INTO_LIVE_STATIC);
+                }
             }
         }
 
@@ -541,12 +605,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// (leftover params) conservatively counts as interior-mutable: the
     /// fail direction must be MORE havoc, never a pin.
     pub(in crate::codegen_ay::chc) fn ty_has_interior_mut(&self, ty: rustc_public::ty::Ty) -> bool {
-        use rustc_middle::ty::TypeVisitableExt;
-        let internal_ty = rustc_public::rustc_internal::internal(self.tcx, ty);
-        if internal_ty.has_param() {
-            return true; // fail toward havoc
-        }
-        !internal_ty.is_freeze(self.tcx, rustc_middle::ty::TypingEnv::fully_monomorphized())
+        // One copy of the test: `foreign_defs::ty_has_interior_mut` (a type
+        // with unresolved parameters fails toward havoc there).
+        crate::codegen_ay::foreign_defs::ty_has_interior_mut(self.tcx, ty)
     }
 
     /// P2-S1: pins only the Freeze (non-UnsafeCell) parts of an interior-mut
@@ -584,8 +645,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         rust_ty: rustc_public::ty::Ty,
         init_expr: ay_bindings::Expr,
     ) -> Option<ay_bindings::Expr> {
-        use super::codegen_types_adt_sort::CodegenTypesAdtSort;
-        use crate::codegen_ay::chc::{chc_fresh_name, declare_pending_var};
+        use crate::codegen_ay::chc::chc_fresh_name;
         use rustc_public::ty::{RigidTy, TyKind};
 
         if !self.ty_has_interior_mut(rust_ty) {
@@ -608,19 +668,19 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut field_terms = Vec::with_capacity(ctor.fields.len());
         for (field_idx, field_def) in variant.fields().iter().enumerate() {
             let field = ctor.fields.get(field_idx)?;
-            let field_ty =
-                <ChcCtx as CodegenTypesAdtSort>::resolve_generic_ty(field_def.ty(), &args)
-                    .unwrap_or_else(|| field_def.ty());
+            // The static's concrete arguments, instantiated and normalized by
+            // rustc (see `register_static_memory_init_entries`: the manual
+            // substitution's generic fallback was the R12 ICE).
+            let field_ty = mono_ty::field_ty(&field_def, &args)?;
             let init_field =
                 init_expr.clone().field_select(&dt.name, &field.name, field.sort.clone());
             let term = match self.contract_partial_pin_term(field_ty, init_field) {
                 Some(term) => term,
                 // Interior-mutable slot: fresh universally-quantified rule
                 // var — the entry rule then holds for EVERY value (havoc).
-                None => declare_pending_var(
-                    chc_fresh_name("__contract_static_havoc"),
-                    field.sort.clone(),
-                ),
+                None => {
+                    ExactVar::nondet(chc_fresh_name("__contract_static_havoc"), field.sort.clone())
+                }
             };
             field_terms.push(term);
         }
@@ -636,7 +696,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     // sort_alignment, sort_default_expr moved to codegen_decl_static_alloc.rs
     // (Part of #4196 file-size compliance).
     // Allocation-aware const readers also live in codegen_decl_static_alloc.rs.
-    // resolve_pointer_static_init, static_init_from_alloc,
-    // read_array_with_flatten live in codegen_decl_static_init.rs.
+    // resolve_pointer_static_init and static_init_from_alloc live in
+    // codegen_decl_static_init.rs, the layout reader in
+    // codegen_decl_static_layout.rs.
     // Callee static pre-scan lives in codegen_decl_static_callee.rs (#4014).
 }

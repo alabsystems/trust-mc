@@ -14,6 +14,9 @@
 //! enabling efficient SMT constraint generation.
 
 use super::*;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Determine signedness for a binary operation from operand types.
@@ -93,7 +96,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             return Some(false); // ZST — no data to compare
                         }
                         if fields.len() == 1 {
-                            if let Some(inner) = Self::ty_signedness(fields[0].ty()) {
+                            if let Some(inner) =
+                                mono_ty::field_ty(&fields[0], args).and_then(Self::ty_signedness)
+                            {
                                 return Some(inner);
                             }
                         }

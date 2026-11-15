@@ -7,14 +7,17 @@
 //! Extracted from include!() to proper module via extension trait pattern.
 //! Part of #2306: include!() to proper module migration.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, ExprValue};
 
 use super::chc_call_context::ChcCallContext;
 use super::codegen_call_coerce::CallCoerce;
 use super::codegen_rules::CodegenRules;
+use super::codegen_types::CodegenTypes;
 use super::{ChcCtx, RelationApp, chc_debug_enabled, codegen_expr_heap};
 use crate::codegen_ay::stubs::StubKind;
 use rustc_public::mir::{CastKind, Operand, PointerCoercion, Rvalue, StatementKind};
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 /// Extension trait for heap allocation call handling on `ChcCtx`.
@@ -245,7 +248,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) {
         let prev_suppress = self.suppress_heap_store_checks;
         self.suppress_heap_store_checks = true;
-        self.emit_boxnew_value_stores(bb_idx, args, ptr_expr, modified_locals, extra_constraints);
+        // A fresh allocation's initializer writes the whole view and the
+        // field view of the payload together (`heap_unsize_alias.rs`).
+        self.with_coherent_object_stores(|ctx| {
+            ctx.emit_boxnew_value_stores(bb_idx, args, ptr_expr, modified_locals, extra_constraints)
+        });
         self.suppress_heap_store_checks = prev_suppress;
         extra_constraints.append(&mut self.heap_state.drain_store_chains(&self.diagnostics));
     }
@@ -337,6 +344,189 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             cx.stmt_constraints,
             shadow_constraints,
         );
+    }
+
+    /// `<Global as Allocator>::allocate(&self, layout)` and `Global::alloc_impl(&self,
+    /// layout, zeroed)`: `Ok` of the allocation, never `Err`.
+    ///
+    /// Allocation does not fail under Kani (`--no-malloc-may-fail`, the
+    /// `translate_rust_alloc` contract; the BMC lane's
+    /// `codegen_allocator_allocate` returns the success case too). Leaving the
+    /// `Result` free made its `Err` arm reachable, and that arm is
+    /// `handle_alloc_error`, a diverging block the encoder routes to the
+    /// anonymous `error` head: every `vec![..]` and `Box::new_uninit` reported
+    /// a counterexample through an allocation failure that cannot happen.
+    /// `cell_register_review_dual.rs::bug_vec_cell_with_local_cell` took that
+    /// path instead of its assertion (check-not-reported), and its safe twin
+    /// failed on it.
+    ///
+    /// A layout of concrete non-zero size is a fresh heap object
+    /// (`translate_rust_alloc`, with its precondition checks). Any other layout
+    /// keeps an unconstrained pointer inside the `Ok`: a zero-size request
+    /// returns a dangling pointer that is no object, and a symbolic one may
+    /// be zero. Returns `false` when the destination cannot be built, and the
+    /// caller keeps its unconstrained-result fallback.
+    pub(in crate::codegen_ay::chc) fn codegen_call_allocator_allocate_ok(
+        &mut self,
+        bb_idx: usize,
+        cx: &ChcCallContext<'_>,
+    ) -> bool {
+        let dest_local = cx.destination.local;
+        if !cx.destination.projection.is_empty() {
+            return false;
+        }
+        let Some(dest) = self.allocate_ok_destination(dest_local) else { return false };
+        let Some(layout_arg) = cx.args.get(1) else { return false };
+        let zeroed = match cx.stub {
+            StubKind::AllocatorAllocate => Some(false),
+            // `alloc_impl(&self, layout, zeroed: bool)`.
+            _ => cx
+                .args
+                .get(2)
+                .and_then(|arg| self.translate_operand_with_modified(arg, cx.modified_locals))
+                .and_then(|zeroed| match zeroed.value() {
+                    ExprValue::BoolConst(b) => Some(*b),
+                    _ => None,
+                }),
+        };
+        let concrete_size = self
+            .resolve_layout_operand_expr(layout_arg, cx.modified_locals)
+            .and_then(Self::extract_layout_size_align)
+            .and_then(|(size, _)| Self::try_extract_concrete_usize(&size))
+            .or_else(|| {
+                self.trace_arg_to_layout_pair(layout_arg).and_then(|(size, _)| size.try_into().ok())
+            });
+        debug!(?concrete_size, ?zeroed, "CHC: Allocator::allocate layout");
+        let concrete_nonzero_size = concrete_size.is_some_and(|size| size != 0);
+        let payload_sort = dest.payload_sort().clone();
+        let alloc = match (concrete_nonzero_size, zeroed) {
+            (true, Some(zeroed)) => {
+                let stub = if zeroed { StubKind::RustAllocZeroed } else { StubKind::RustAlloc };
+                self.translate_rust_alloc(
+                    stub,
+                    std::slice::from_ref(layout_arg),
+                    cx.modified_locals,
+                )
+                .and_then(|alloc| {
+                    let ptr = alloc.result.clone()?;
+                    (*ptr.sort() == payload_sort).then_some((stub, ptr, alloc))
+                })
+            }
+            _ => None,
+        };
+        let (payload, alloc) = match alloc {
+            Some((stub, ptr, alloc)) => (ptr, Some((stub, alloc))),
+            None => (
+                Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_POINTER_VALUE,
+                    super::chc_fresh_name("__allocate_ok_ptr"),
+                    payload_sort,
+                ),
+                None,
+            ),
+        };
+        let mut constraints = Vec::new();
+        match dest {
+            AllocateOkDestination::Flattened { tag, .. } => {
+                if !self.constrain_flattened_fields_for_call(
+                    dest_local,
+                    &[Some(tag), Some(payload)],
+                    &mut constraints,
+                ) {
+                    return false;
+                }
+            }
+            AllocateOkDestination::Datatype { result_sort, .. } => {
+                let Some(ok) = self.build_result_ok_expr(payload, &result_sort) else {
+                    return false;
+                };
+                let Some((_, dest_var)) = self.resolve_destination(dest_local) else {
+                    return false;
+                };
+                let Some(eq) = self.make_coerced_eq_constraint(
+                    &dest_var,
+                    ok,
+                    &result_sort,
+                    dest_local,
+                    "codegen_call_allocator_allocate_ok",
+                ) else {
+                    return false;
+                };
+                constraints.push(eq);
+            }
+        }
+        let mut alloc_obj_id = None;
+        if let Some((stub, alloc)) = alloc {
+            if self.memory_safety_checks {
+                for check in alloc.safety_checks {
+                    self.emit_error_rule_for_condition(
+                        cx.from_app,
+                        check,
+                        cx.stmt_constraints,
+                        bb_idx,
+                    );
+                }
+            }
+            constraints.extend(alloc.heap_constraints);
+            self.append_alloc_shadow_constraints(stub, alloc.alloc_obj_id, &mut constraints);
+            alloc_obj_id = alloc.alloc_obj_id;
+        }
+        debug!(
+            dest_local,
+            ?alloc_obj_id,
+            "CHC: Allocator::allocate -> Ok (allocation never fails)"
+        );
+        self.record_alloc_dest(dest_local, alloc_obj_id);
+        self.emit_alloc_pending_checks(cx.from_app, cx.stmt_constraints, cx.target);
+        let new_output_args = self.build_output_args(cx.modified_locals, &[dest_local]);
+        self.emit_goto_rule_extra(
+            cx.from_app,
+            cx.target,
+            &new_output_args,
+            cx.stmt_constraints,
+            constraints,
+        );
+        true
+    }
+
+    /// How an `allocate` destination of type `Result<NonNull<[u8]>, AllocError>`
+    /// is represented, and the value its `Ok` tag takes there. `None` for any
+    /// other representation (the caller keeps its fallback).
+    fn allocate_ok_destination(&mut self, dest_local: usize) -> Option<AllocateOkDestination> {
+        let dest_ty = self.resolve_body_ty(self.body.locals().get(dest_local)?.ty);
+        let TyKind::RigidTy(RigidTy::Adt(def, _)) = dest_ty.kind() else { return None };
+        if def.kind() != rustc_public::ty::AdtKind::Enum || def.variants().len() != 2 {
+            return None;
+        }
+        // `Result::Ok` is variant 0, discriminant 0.
+        if self.flatten.flattened_tuple_locals.contains(&dest_local) {
+            let field_count = self.flatten.flattened_local_field_count.get(&dest_local).copied();
+            debug!(dest_local, ?field_count, "CHC: Allocator::allocate flattened destination");
+            // `(is_ok, payload)` or `(is_ok, ok_val, err_val)`
+            // (`codegen_decl_state_vars_locals_flatten.rs`): `Ok`'s value is
+            // slot 1 either way.
+            if !matches!(field_count, Some(2 | 3)) {
+                return None;
+            }
+            let vec_idx = self.try_state_idx_for_local(dest_local)?;
+            let (_, tag_sort) = self.state_var_mgr.output_state_vars.get(vec_idx)?.clone();
+            let (_, payload_sort) = self.state_var_mgr.output_state_vars.get(vec_idx + 1)?.clone();
+            let (true_val, false_val) = self.infer_flattened_discr(dest_local);
+            debug!(?tag_sort, ?payload_sort, true_val, false_val, "CHC: Allocator::allocate tag");
+            if !tag_sort.is_bool() {
+                return None;
+            }
+            let tag = match (true_val, false_val) {
+                (0, _) => Expr::bool_const(true),
+                (_, 0) => Expr::bool_const(false),
+                _ => return None,
+            };
+            return Some(AllocateOkDestination::Flattened { tag, payload_sort });
+        }
+        let result_sort = Self::translate_ty(dest_ty)?;
+        let payload_sort = Self::result_ok_inner_sort(&result_sort)?;
+        Some(AllocateOkDestination::Datatype { result_sort, payload_sort })
     }
 
     /// Record allocation tracking for a destination local (#3012, #3273).
@@ -673,10 +863,43 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     self.translate_boxnew_payload_operand(source_operand, modified_locals)
                 });
         }
+        // A cast between an integer and a pointer changes the value in Kani's
+        // address layout (heap/stack_address.rs: an integer is an address, not
+        // an identity term), so its source operand is not the payload: taken
+        // as one, `Box::new((1usize << 32) as *const u32)` stored the integer
+        // as the identity term, which named object 1, and the read through
+        // the stored pointer verified clean where Kani reports an invalid
+        // integer address (`t5_int_ptr_carried.rs::bug_via_box_then_alloc_k1`,
+        // round 3 review probes; on main f61920d1a too). Such a cast is
+        // translated as the rvalue it is, with the integer-to-pointer lane.
+        let int_pointer_cast = match &rhs {
+            Rvalue::Cast(
+                CastKind::PointerWithExposedProvenance | CastKind::PointerExposeAddress,
+                ..,
+            ) => true,
+            Rvalue::Cast(kind @ CastKind::Transmute, source_operand, target) => source_operand
+                .ty(self.body.locals())
+                .ok()
+                .map(|src| self.resolve_body_ty(src))
+                .is_some_and(|src| {
+                    let target = self.resolve_body_ty(*target);
+                    crate::codegen_ay::chc::heap::stack_address::cast_exposes_address(
+                        kind, src, target,
+                    ) || crate::codegen_ay::chc::heap::stack_address::transmute_makes_pointer_from_integer(
+                        kind, src, target,
+                    )
+                }),
+            _ => false,
+        };
+        if int_pointer_cast {
+            return self.translate_rvalue_with_modified(&rhs, modified_locals, Some(src_local));
+        }
         if let Some(expr) = match &rhs {
-            Rvalue::Cast(_, source_operand, _)
-            | Rvalue::Use(source_operand)
-            | Rvalue::ShallowInitBox(source_operand, _) => {
+            Rvalue::Cast(_, source_operand, _) | Rvalue::Use(source_operand, ..) => {
+                self.translate_boxnew_payload_operand(source_operand, modified_locals)
+            }
+            #[cfg(not(trust_toolchain))]
+            Rvalue::ShallowInitBox(source_operand, _) => {
                 self.translate_boxnew_payload_operand(source_operand, modified_locals)
             }
             _ => None,
@@ -772,7 +995,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     }
                     super::super::dyn_coercion::find_dyn_trait_tail_ty(self, ty)?;
                     match rhs {
-                        Rvalue::Cast(_, source_operand, _) | Rvalue::Use(source_operand) => {
+                        Rvalue::Cast(_, source_operand, _) | Rvalue::Use(source_operand, ..) => {
                             source_operand.ty(self.body.locals()).ok()
                         }
                         _ => None,
@@ -877,5 +1100,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return None;
         };
         self.translate_operand_with_modified(&source_operand, modified_locals)
+    }
+}
+
+/// The representation of an `allocate` destination (`Result<NonNull<[u8]>,
+/// AllocError>`): flattened to (tag, payload) state slots, or one datatype
+/// value.
+enum AllocateOkDestination {
+    Flattened { tag: Expr, payload_sort: ay_bindings::Sort },
+    Datatype { result_sort: ay_bindings::Sort, payload_sort: ay_bindings::Sort },
+}
+
+impl AllocateOkDestination {
+    fn payload_sort(&self) -> &ay_bindings::Sort {
+        match self {
+            AllocateOkDestination::Flattened { payload_sort, .. }
+            | AllocateOkDestination::Datatype { payload_sort, .. } => payload_sort,
+        }
     }
 }

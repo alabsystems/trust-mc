@@ -147,6 +147,19 @@ pub fn resolve_ctor_name(sort: &Sort, fallback_sort_name: &str) -> String {
     sort.datatype_default_constructor().map_or_else(|| cons_name(fallback_sort_name), str::to_owned)
 }
 
+/// The datatype name a value of `sort` is constructed under: the name the sort
+/// itself carries, or `fallback` for a sort that is not a datatype.
+///
+/// A value is built in the sort it has, so its constructor (and a variant
+/// constructor's scoped name) is named from that sort, never from a name
+/// computed beside it. `infer_adt_sort` answers some ADTs with a MODEL sort
+/// (`Layout`, `RawVec`, ...) whose name is not the ADT's path-derived
+/// [`super::adt_sort_name`] (`core_alloc_Layout`), and a constructor named by
+/// the latter is a datatype-name mismatch ay refuses.
+pub fn constructor_datatype_name(sort: &Sort, fallback: &str) -> String {
+    sort.datatype_name().unwrap_or(fallback).to_owned()
+}
+
 /// Discriminant (first-element) access name: `{base}.0`.
 ///
 /// Used for Option/Result discriminant access and checked-arithmetic overflow

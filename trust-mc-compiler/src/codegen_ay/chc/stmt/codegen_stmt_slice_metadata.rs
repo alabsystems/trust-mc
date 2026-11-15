@@ -64,6 +64,86 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.ref_resolution.clear_path_insensitive_ref_metadata(local);
     }
 
+    /// [`Self::clear_path_insensitive_ref_metadata`] for the destination of a
+    /// borrow `dest = &place` (or `&raw place`) whose borrowed local or
+    /// destination has several producers, keeping the one fact that holds on
+    /// every path: WHICH storage the borrow names.
+    ///
+    /// A place with no `Deref` and no index projection names the same storage
+    /// whatever statement produced the borrowed local's VALUE, so the points-at
+    /// edge the pre-pass recorded for a sole-producer `dest` stays exact, and
+    /// reads and writes through it use that local's own path-sensitive state.
+    /// What one producer alone decides (a decoded constant, a slice length or
+    /// offset, collection or allocation facts) is dropped as before.
+    ///
+    /// Dropping the edge as well sent every use of a borrowed joined local to
+    /// the address lane: `core::mem::swap(&mut o, &mut q)` could not name its
+    /// targets and left both locals unchanged, and a later `o == None`, read
+    /// through typed memory refreshed from that stale state, was proved false
+    /// (tools/soundness-duals/negative/review_r18_mutate_then_compare.rs).
+    pub(in crate::codegen_ay::chc) fn clear_borrow_metadata_keeping_exact_edge(
+        &mut self,
+        dest: usize,
+        place: &Place,
+    ) {
+        let names_fixed_storage = place
+            .projection
+            .iter()
+            .all(|proj| matches!(proj, ProjectionElem::Field(..) | ProjectionElem::Downcast(_)));
+        let kept = self.ref_resolution.ref_targets.get(&dest).cloned().filter(|target| {
+            names_fixed_storage
+                && target.local == place.local
+                && target.projections == place.projection
+                // A single producer, or several that are all this same borrow
+                // (loop unwinding duplicates `_14 = &mut _12` into every copy of
+                // the body). Either way the reference names this one place on
+                // every path; dropping the edge here left `Iterator::next`
+                // reading the reference's raw pointer and failing closed.
+                && (!self.local_has_multiple_whole_definitions(dest)
+                    || self.whole_definitions_all_borrow_place(dest, place))
+        });
+        self.clear_path_insensitive_ref_metadata(dest);
+        if let Some(target) = kept {
+            debug!(
+                dest,
+                referent = place.local,
+                "borrow of a multi-producer local: exact points-at edge kept, value facts dropped"
+            );
+            self.ref_resolution.ref_targets.insert(dest, target);
+        }
+    }
+
+    /// Record that `dest` loses the VALUE fact (`const_ref_values` or
+    /// `const_ref_slice_views`) that `source` carries, because the copy is not
+    /// the unique path-insensitive producer of `dest`.
+    ///
+    /// A value fact stands in for the referent: the `Option<&T>` returned by the
+    /// slice `Iterator::next` stub stores the ELEMENT in its payload slot, not an
+    /// address, and `*payload` resolves only through `const_ref_values`. Once the
+    /// fact is gone, `dest`'s state variable still holds that element, and the
+    /// Mem-level load would select the typed memory array at an "address" equal to
+    /// the element's value: a cell no rule wrote, whose free value was certified
+    /// Genuine (expected/loop-backedge/test.rs, where loop unwinding gives
+    /// `_11 = copy ((_5 as Some).0)` one producer per unwound copy). The deref
+    /// cascade fails closed for such a local instead.
+    fn record_dropped_deref_value_fact(
+        &mut self,
+        source_local: usize,
+        dest_local: usize,
+        source: &'static str,
+    ) {
+        let resolution = &self.ref_resolution;
+        if resolution.const_ref_values.contains_key(&source_local)
+            || resolution.const_ref_slice_views.contains_key(&source_local)
+        {
+            debug!(
+                source_local,
+                dest_local, source, "propagate_ref_metadata: value fact dropped for an ambiguous producer"
+            );
+            self.ref_resolution.deref_value_fact_dropped.insert(dest_local);
+        }
+    }
+
     /// Propagate statement-level ref side tables across Copy/Move/Cast/Offset assignments.
     pub(in crate::codegen_ay::chc) fn propagate_ref_metadata(
         &mut self,
@@ -75,7 +155,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         offset_mode: RefMetadataOffsetMode,
     ) {
         if !self.path_insensitive_metadata_copy_is_unique(source_local, dest_local) {
+            // Identical unwound copies of the same payload copy agree on the
+            // slot fact; `keep_agreeing_payload_value_fact` keeps it only when it
+            // holds on every path (codegen_stmt_payload_value_fact.rs).
+            if let Some(fact) = self.keep_agreeing_payload_value_fact(source_local, dest_local) {
+                self.clear_path_insensitive_ref_metadata(dest_local);
+                debug!(
+                    source_local,
+                    dest_local, source, "propagate_ref_metadata: agreeing producers keep the payload value fact"
+                );
+                self.ref_resolution.const_ref_values.insert(dest_local, fact);
+                return;
+            }
+            self.record_dropped_deref_value_fact(source_local, dest_local, source);
             self.clear_path_insensitive_ref_metadata(dest_local);
+            // Exception for the EXACT points-at edge only: when every producer
+            // of `dest` is this same copy of `source`, and `source`'s edge is
+            // path-insensitive, `dest` names that place on every path. Value
+            // facts stay dropped. Without this, the unwound `_21 = copy _15`
+            // before `RangeIteratorImpl::spec_next(move _21)` lost the edge
+            // and the range advance failed closed
+            // (expected/loop-backedge/test.rs: RangeSpecNext translation failed).
+            if self.whole_definitions_all_same_copy_of(dest_local, source_local)
+                && let Some(ref_target) =
+                    self.ref_resolution.ref_targets.get(&source_local).cloned()
+            {
+                debug!(
+                    source_local,
+                    dest_local, source, "propagate_ref_metadata: identical-copy producers keep the exact edge"
+                );
+                self.ref_resolution.ref_targets.insert(dest_local, ref_target);
+                if mark_forwarded {
+                    self.ref_resolution.call_forwarded_raw_ptrs.insert(dest_local);
+                }
+                return;
+            }
             debug!(
                 source_local,
                 dest_local, source, "propagate_ref_metadata: ambiguous whole-local producer"
@@ -94,6 +208,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.ref_resolution.ref_targets.insert(dest_local, ref_target);
             copied_any = true;
             copied_ref_target = true;
+        } else {
+            self.ref_resolution.ref_targets.remove(&dest_local);
+            self.ref_resolution.call_forwarded_raw_ptrs.remove(&dest_local);
         }
         if copied_ref_target && mark_forwarded {
             self.ref_resolution.call_forwarded_raw_ptrs.insert(dest_local);
@@ -117,28 +234,54 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 },
             );
             copied_any = true;
+        } else {
+            self.ref_resolution.collection_elem_field_refs.remove(&dest_local);
         }
-        if let Some(value) = self.ref_resolution.const_ref_values.get(&source_local).cloned() {
+        // D10: a value fact (and a discriminant fact) describes exactly one
+        // window. `Copy` is a zero delta: copied. A KNOWN nonzero delta
+        // (`Accumulate`) re-indexes an array fact and re-decodes any other at
+        // the moved window; an unknown one (`Remove`) carries no fact, and the
+        // memory path (seeded whole, D2) answers.
+        let known_delta: Option<i128> = match &offset_mode {
+            RefMetadataOffsetMode::Copy => Some(0),
+            RefMetadataOffsetMode::Accumulate(addend) => {
+                Self::const_usize_from_expr(addend).and_then(|d| i128::try_from(d).ok())
+            }
+            RefMetadataOffsetMode::Remove => None,
+        };
+        let moved_value =
+            known_delta.and_then(|d| self.moved_const_value_fact(source_local, dest_local, d));
+        if let Some(value) = moved_value {
             self.ref_resolution.const_ref_values.insert(dest_local, value);
             copied_any = true;
             copied_value = true;
+        } else {
+            self.ref_resolution.const_ref_values.remove(&dest_local);
         }
-        if let Some(&discr) = self.ref_resolution.const_ref_discriminants.get(&source_local) {
+        if known_delta == Some(0)
+            && let Some(&discr) = self.ref_resolution.const_ref_discriminants.get(&source_local)
+        {
             self.ref_resolution.const_ref_discriminants.insert(dest_local, discr);
             copied_any = true;
             copied_discriminant = true;
+        } else {
+            self.ref_resolution.const_ref_discriminants.remove(&dest_local);
         }
-        if let Some(promoted_obj_id) =
-            self.ref_resolution.const_ref_promoted_obj_ids.get(&source_local).copied()
+        if let Some(object) =
+            known_delta.and_then(|d| self.moved_const_ref_object(source_local, d))
         {
-            self.ref_resolution.const_ref_promoted_obj_ids.insert(dest_local, promoted_obj_id);
+            self.ref_resolution.const_ref_objects.insert(dest_local, object);
             copied_any = true;
             copied_promoted_obj_id = true;
+        } else {
+            self.ref_resolution.const_ref_objects.remove(&dest_local);
         }
         if let Some(len) = self.ref_resolution.subslice_len.get(&source_local).cloned() {
             self.ref_resolution.subslice_len.insert(dest_local, len);
             copied_any = true;
             copied_len = true;
+        } else {
+            self.ref_resolution.subslice_len.remove(&dest_local);
         }
         if let Some(slice_view) =
             self.ref_resolution.const_ref_slice_views.get(&source_local).cloned()
@@ -146,6 +289,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.ref_resolution.const_ref_slice_views.insert(dest_local, slice_view);
             copied_any = true;
             copied_slice_view = true;
+        } else {
+            self.ref_resolution.const_ref_slice_views.remove(&dest_local);
         }
 
         let offset_action = match offset_mode {
@@ -157,6 +302,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     copied_any = true;
                     "copy"
                 } else {
+                    self.ref_resolution.subslice_offset.remove(&dest_local);
                     "none"
                 }
             }
@@ -209,7 +355,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         dest_local: usize,
     ) {
         if !self.path_insensitive_metadata_copy_is_unique(ref_place.local, dest_local) {
-            self.clear_path_insensitive_ref_metadata(dest_local);
+            // Same rule as the rvalue lane: the borrow still names fixed storage.
+            self.clear_borrow_metadata_keeping_exact_edge(dest_local, ref_place);
             return;
         }
         if let [ProjectionElem::Deref, ProjectionElem::Field(field_idx, field_ty)] =

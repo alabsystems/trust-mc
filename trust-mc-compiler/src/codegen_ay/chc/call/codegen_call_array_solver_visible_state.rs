@@ -333,7 +333,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     continue;
                 }
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.local == struct_local
                             && src.projection.len() == 1
                             && matches!(src.projection[0], ProjectionElem::Field(..)) =>
@@ -347,7 +347,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     {
                         ref_locals.insert(dest.local);
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if ref_locals.contains(&src.local)
                             && src.projection.len() == 1
                             && matches!(src.projection[0], ProjectionElem::Deref) =>
@@ -386,7 +386,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     continue;
                 }
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         aliases.insert(dest.local, src.local);
@@ -429,7 +429,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     continue;
                 }
                 match rvalue {
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if struct_roots.contains(&src.local)
                             && src.projection.len() == 1
                             && matches!(
@@ -449,7 +449,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     {
                         ref_locals.insert(dest.local);
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if ref_locals.contains(&src.local)
                             && src.projection.len() == 1
                             && matches!(src.projection[0], ProjectionElem::Deref) =>

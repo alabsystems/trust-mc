@@ -612,11 +612,11 @@ fn test_coroutine_dispatch_prefers_inline_body_complete_and_yielded_paths() {
 
             let smt = emit_chc(&chc_ctx.vc).to_string();
             assert!(
-                smt.contains("Yielded_CoroutineState_i32_i32"),
+                spells_variant_ctor(&smt, "Yielded", COROUTINE_STATE, "_i32_i32"),
                 "inline coroutine dispatch should still encode the Yielded arm; smt={smt}"
             );
             assert!(
-                smt.contains("Complete_CoroutineState_i32_i32"),
+                spells_variant_ctor(&smt, "Complete", COROUTINE_STATE, "_i32_i32"),
                 "inline coroutine dispatch should encode the Complete arm instead of the old Yielded-only fallback; smt={smt}"
             );
             break;

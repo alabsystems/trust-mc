@@ -189,7 +189,7 @@ fn find_deref_downcast_field_place(
             }
 
             let source_places: Vec<&Place> = match rvalue {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::Ref(_, _, place)
                 | Rvalue::AddressOf(_, place)
                 | Rvalue::CopyForDeref(place)
@@ -225,7 +225,7 @@ fn find_last_deref_downcast_field_place(
             }
 
             let source_places: Vec<&Place> = match rvalue {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::Ref(_, _, place)
                 | Rvalue::AddressOf(_, place)
                 | Rvalue::CopyForDeref(place)
@@ -250,15 +250,16 @@ fn test_translate_place_with_modified_redirects_temp_ref_enum_payload() {
     let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = crate::codegen_ay::take_place_translation_drop_count();
-    let _ = crate::codegen_ay::take_unsupported_field_projection_count();
-
     with_test_ay_ctx_for_source(TEMP_REF_ENUM_PAYLOAD_SOURCE, |ctx| {
         let fn_name = "probe_temp_ref_option_payload";
         let instance = find_instance_by_suffix(ctx.tcx, fn_name);
         let body = instance.body().expect("body");
         let mut chc_ctx = ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default());
         chc_ctx.declare_block_relations();
+        // This translation's own counters: the process-global take_* counters are also moved
+        // by concurrently running tests that do not hold METADATA_COUNTER_MUTEX.
+        let before_place_drops = chc_ctx.diagnostics.place_translation_drop.get();
+        let before_field_projections = chc_ctx.diagnostics.unsupported_field_projection.get();
 
         let place = find_deref_downcast_field_place(&body)
             .expect("probe_temp_ref_option_payload should contain a Deref+Downcast+Field read");
@@ -271,18 +272,17 @@ fn test_translate_place_with_modified_redirects_temp_ref_enum_payload() {
             Some(32),
             "Option<i32> payload read through temp ref should translate to a bv32 payload"
         );
+        assert_eq!(
+            chc_ctx.diagnostics.place_translation_drop.get(),
+            before_place_drops,
+            "temp-ref enum payload read should not increment place_translation_drop"
+        );
+        assert_eq!(
+            chc_ctx.diagnostics.unsupported_field_projection.get(),
+            before_field_projections,
+            "temp-ref enum payload read should not increment unsupported_field_projection"
+        );
     });
-
-    assert_eq!(
-        crate::codegen_ay::take_place_translation_drop_count(),
-        0,
-        "temp-ref enum payload read should not increment place_translation_drop"
-    );
-    assert_eq!(
-        crate::codegen_ay::take_unsupported_field_projection_count(),
-        0,
-        "temp-ref enum payload read should not increment unsupported_field_projection"
-    );
 }
 
 #[test]
@@ -489,8 +489,8 @@ fn test_volatile_load_emits_obj_valid_error_rule() {
 
         assert_vc_structure(&vc, "probe_volatile_load", body.blocks.len());
 
-        let error_rules: Vec<_> =
-            vc.rules.iter().filter(|rule| rule.head.name == "error").collect();
+        // BSEM-18: validity checks are error_p{id} rules; skip their bridges.
+        let error_rules: Vec<_> = vc.rules.iter().filter(|rule| is_error_check_rule(rule)).collect();
         assert!(
             !error_rules.is_empty(),
             "volatile_load probe should emit at least one error rule for pointer validity"
@@ -499,7 +499,10 @@ fn test_volatile_load_emits_obj_valid_error_rule() {
         let has_obj_valid_check = error_rules.iter().any(|rule| {
             rule.body.constraints.iter().any(|constraint| {
                 let text = constraint.to_string();
-                text.contains("obj_valid") && text.contains("select")
+                // obj_valid is seeded const_array(true) and never written in this probe,
+                // so its select folds to `true` (f49f19459) and the guard renders as
+                // `(not true)`. Accept that exact fold as the validity check.
+                (text.contains("obj_valid") && text.contains("select")) || text == "(not true)"
             })
         });
         assert!(

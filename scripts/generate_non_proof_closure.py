@@ -77,8 +77,8 @@ def build_closure(inventory: dict[str, Any], inventory_name: str) -> dict[str, o
                 "expected": expected,
                 "disposition": "expected-fail",
                 "justification": (
-                    "expected non-PROOF verdict carried by the test's `expected` "
-                    f"output file (survey disposition: {expected})"
+                    "expected non-PROOF verdict from the frozen source oracle "
+                    f"(annotation or expected output; survey disposition: {expected})"
                 ),
             }
         )

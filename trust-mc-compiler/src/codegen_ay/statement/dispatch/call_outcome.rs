@@ -26,14 +26,23 @@ impl CallDispatchOutcome {
         }
     }
 
-    /// Convert a legacy `Option<Option<BasicBlockIdx>>` dispatcher result.
-    /// Outer None = miss, inner None = diverge, inner Some = continue.
-    pub(in crate::codegen_ay::statement) fn from_nested_target(
+    /// Convert a stub encoder's `Option<Option<BasicBlockIdx>>` for a call whose
+    /// MIR return target is `target`. An inner `None` on a call that returns is
+    /// an ENCODING FAILURE: mapping it to `Diverge` dropped the successor edge,
+    /// and the successor block was then entered as reachable with an empty
+    /// environment, every read a free value with no record
+    /// (kani/Realloc/two_reallocs.rs, kani/Vectors/vector_extend_bytes.rs,
+    /// certified Genuine). It is the unsupported-call fallback instead. A call
+    /// with no return target really diverges.
+    pub(in crate::codegen_ay::statement) fn from_nested_target_for_call(
         result: Option<Option<BasicBlockIdx>>,
+        target: Option<BasicBlockIdx>,
     ) -> Self {
         match result {
-            Some(target) => Self::from_handled_target(target),
             None => Self::Miss,
+            Some(Some(bb)) => Self::Continue(bb),
+            Some(None) if target.is_some() => Self::FallthroughToUnsupported,
+            Some(None) => Self::Diverge,
         }
     }
 

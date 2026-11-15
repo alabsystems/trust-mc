@@ -170,12 +170,12 @@ if [[ "$REPLACEMENT_PUBLIC" -eq 1 || "$REPLACEMENT_PLAN" -eq 1 ]]; then
         exec "$AY_PYTHON_BIN" "$SCRIPT_DIR/replacement_public_runner.py" --plan-only
     fi
 
-    TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
+    TRUST_MC_TARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" targo)"
     REPLACEMENT_DRIVER="${TRUST_MC_TEST_BIN:-${KANI_TEST_BIN:-}}"
     if [[ "$SKIP_BUILD" -eq 0 ]]; then
-        log "building trust-mc (cargo build-dev) ..."
-        ( cd "$REPO_ROOT" && "$TRUST_MC_CARGO" build-dev ) \
-            || die "cargo build-dev failed"
+        log "building trust-mc (targo --unverified build-dev) ..."
+        ( cd "$REPO_ROOT" && "$TRUST_MC_TARGO" --unverified build-dev ) \
+            || die "targo --unverified build-dev failed"
     fi
     if [[ -z "$REPLACEMENT_DRIVER" ]]; then
         for candidate in \
@@ -204,7 +204,7 @@ SUITE="${SUITE:-expected}"
 # --------------------------------------------------------------------------
 # Prerequisite checks — fail clearly rather than silently proceeding.
 # --------------------------------------------------------------------------
-TRUST_MC_CARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" cargo)"
+TRUST_MC_TARGO="$("$SCRIPT_DIR/resolve-trust-tool.sh" targo)"
 
 COMPILETEST_DIR="${REPO_ROOT}/tools/compiletest"
 [[ -f "${COMPILETEST_DIR}/Cargo.toml" ]] \
@@ -234,9 +234,9 @@ mkdir -p "$BUILD_BASE"
 TRUST_MC_BIN="${TRUST_MC_TEST_BIN:-${KANI_TEST_BIN:-}}"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    log "building trust-mc (cargo build-dev) ..."
-    ( cd "$REPO_ROOT" && "$TRUST_MC_CARGO" build-dev ) \
-        || die "cargo build-dev failed"
+    log "building trust-mc (targo --unverified build-dev) ..."
+    ( cd "$REPO_ROOT" && "$TRUST_MC_TARGO" --unverified build-dev ) \
+        || die "targo --unverified build-dev failed"
 fi
 
 # If the caller did not pin a verifier binary, prefer the build-dev-installed
@@ -316,7 +316,7 @@ done
 run_compiletest() {
     # $1: extra flag (e.g. --dry-run) or empty.
     local extra="$1"
-    local -a cmd=( "$TRUST_MC_CARGO" run --quiet -p compiletest -- "${CT_ARGS[@]}" )
+    local -a cmd=( "$TRUST_MC_TARGO" --unverified run --quiet -p compiletest -- "${CT_ARGS[@]}" )
     [[ -n "$extra" ]] && cmd+=( "$extra" )
     if [[ "$USE_CHC" -eq 1 && -z "$extra" && "$WATCHDOG_TIMEOUT" -gt 0 ]] \
         && command -v timeout >/dev/null 2>&1; then

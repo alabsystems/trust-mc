@@ -6,6 +6,7 @@
 //!
 //! Extracted from `stubs_hashmap_translate.rs` — Part of #4206.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -19,7 +20,7 @@ use super::codegen_types::CodegenTypes;
 use super::types::{bool_sort, int_sort};
 use super::{
     ChcCtx, UnknownProjectionPolicy, chc_fresh_name, codegen_decl_flatten,
-    collect_field_projections, declare_pending_var, record_type_sort_fallback,
+    collect_field_projections, record_type_sort_fallback,
 };
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -74,10 +75,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         // Part of #3447: Record that HashMap data array is fully unconstrained
         // (argument resolution failed — entire data array is symbolic).
-        self.record_sound_fallback_reason("hashmap_data_symbolic_fallback");
+        let booked = self.record_sound_fallback_reason("hashmap_data_symbolic_fallback");
         let sym_name = chc_fresh_name("hashmap_data");
         let sym_sort = Sort::array(key_sort, val_sort);
-        Some(declare_pending_var(sym_name, sym_sort))
+        Some(Havoc::booked(booked, sym_name, sym_sort))
     }
 
     /// Resolve the data array for a struct-embedded HashMap/BTreeMap.
@@ -410,6 +411,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -479,7 +482,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     return None;
                 }
                 match rhs {
-                    rustc_public::mir::Rvalue::Use(c @ Operand::Constant(_)) => {
+                    rustc_public::mir::Rvalue::Use(c @ Operand::Constant(_), ..) => {
                         found = Some(c.clone());
                     }
                     _ => return None,

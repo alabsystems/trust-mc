@@ -121,7 +121,6 @@ Filename                                             Regions    Missed Regions  
 TOTAL                                                      9                 3    66.67%           3                 1    66.67%          14                 4    71.43%           0                 0         -
 ```
 
-[^note-source]: The LLVM project refers to their own coverage feature as
    *source-based code coverage*. It is not rare to see the term *region
    coverage* being used instead to refer to the same thing. That is because
    LLVM's source-based code coverage feature can report coverage for code
@@ -244,7 +243,6 @@ This time, the command will generate a `coverage-report` folder including a
 browsable HTML webpage that highlights the regions covered in the source
 according to the coverage results in `my-coverage.kanicov`.
 
-[^note-export]: The `llvm-cov` tool includes the option
    [`gcov`](https://llvm.org/docs/CommandGuide/llvm-cov.html#llvm-cov-gcov) to
    export into GCC's coverage format [Gcov](https://en.wikipedia.org/wiki/Gcov),
    and the option
@@ -252,10 +250,8 @@ according to the coverage results in `my-coverage.kanicov`.
    to export into the LCOV format. These may be good options to consider for
    `kani-cov` in the future but we should focus on basic formats for now.
 
-[^note-exclude]: Options to exclude certain coverage results (e.g, from the
    standard library) will likely be part of this option.
 
-[^note-snapshot]: Coverage mappings essentially provide a snapshot of the source
    code reports for items that otherwise are unreachable or have been sliced
    away during the compilation process.
 
@@ -366,11 +362,9 @@ represents the counter expressions that we just discussed.
 Other variants such as `SpanMarker` or `BlockMarker` are not relevant to this
 work since they should have been erased after the `InstrumentCoverage` pass.
 
-[^note-coverage-info]: It is important to note that the `rustc_public` interface does
    not include `FunctionCoverageInfo` in function bodies. Because of that, we
    need to pull it from the internal `rustc` function bodies.
 
-[^note-physical-counter]: By *physical counter*, we refer to a global program
    variable that is initialized to zero and incremented by one each time that
    the execution passes through.
 
@@ -462,13 +456,11 @@ src/main.rs (test_cov)
 > section), which would save us the need to attach code region data to the
 > coverage checks.**
 
-[^note-opaque-coverage]: The Rust compiler uses the `Opaque` type to prevent
 others from interfacing with unstable types (e.g., the `Coverage` type
 [here](https://github.com/rust-lang/rust/blob/f7eefec4e03f5ba723fbc04d94dbc1203b7c9bff/compiler/stable_mir/src/mir/body.rs#L389)).
 Nonetheless, this can be worked around by serializing its contents and parsing
 it back into an internal data type.
 
-[^note-expression-integration]: We could follow an alternative approach where we
 do not instrument each coverage statement, but only those that correspond to
 physical counters. Unfortunately, doing so would lead to incorrect coverage
 results due to the arithmetic nature of expression-based counters. We elaborate
@@ -513,14 +505,12 @@ In addition, Kani will produce two types of coverage results:
  only do this if the program is composed of a single source
  file[^note-conditional-report].
 
-[^note-kanimap]: Note that the `.kanimap` generation isn't implemented in
    [#3119](https://github.com/model-checking/kani/pull/3119). The [draft
    implementation of
    `kani-cov`](https://github.com/model-checking/kani/pull/3121) simply reads
    the source files referred to by the code coverage checks, but it doesn't get
    information about code trimmed out by the MIR linker.
 
-[^note-conditional-report]: In other words, standalone `kani` would always emit
 these terminal-based reports, but `cargo kani` would not unless the project
 contains a single Rust file (for example, `src/main.rs`).
 
@@ -536,7 +526,6 @@ based on the Gcov format. The Gcov format is line-based so it's not able
 to report region coverage results.
 In other words, it's not as advanced nor precise as the source-based implementation.
 
-[^note-benchmarks]: Actual performance benchmarks to follow in
    [#3119](https://github.com/model-checking/kani/pull/3119).
 
 ## Open questions

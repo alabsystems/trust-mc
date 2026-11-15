@@ -24,6 +24,141 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Updates environment mapping for lhs
     /// ENSURES: Handles pointer derefs, checked ops, and aggregates
     pub(super) fn codegen_assign(&mut self, lhs: &Place, rhs: &Rvalue) {
+        self.guard_box_pointer_store(lhs);
+        // A store to the storage itself (no deref) replaces its value: a pointee
+        // entry the handler does not re-insert describes the previous value, so
+        // it is poisoned rather than silently reused (`ref_pointee_table`).
+        let reassigned = (!lhs.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)))
+            .then(|| self.ssa_base_name(lhs));
+        let generation = self.ref_pointees.generation();
+        let check = lhs
+            .projection
+            .is_empty()
+            .then(|| self.bmc_box_pointer_check_casts.get(&lhs.local).copied())
+            .flatten();
+        let previous = std::mem::replace(&mut self.bmc_box_pointer_check_alignment, check);
+        self.codegen_assign_inner(lhs, rhs);
+        self.bmc_box_pointer_check_alignment = previous;
+        if let Some(key) = reassigned {
+            self.ref_pointees.poison_stale_since(&key, generation);
+        }
+        self.poison_pointer_rebound_through_deref(lhs, generation);
+        self.refresh_address_taken_image(lhs);
+    }
+
+    /// A POINTER VALUE stored THROUGH a dereference into a sub-place rebinds
+    /// what that slot points at, and the `ref_pointees` entries this lane keeps
+    /// were recorded from the BORROWS in the body: `let r = &mut h;
+    /// (*r).p = &mut y; *h.p = 9; assert!(y == 2)` verified SUCCESSFUL with
+    /// `[AY:PROOF_QUALIFIERS:clean]` because `*h.p` still resolved through the
+    /// pointer the field held BEFORE the store (fourth adversarial review of
+    /// m3/soundness-fixes-2, 2026-09-14, defect M3/D4 — the BMC half).
+    ///
+    /// The handlers that DO record the new binding (`h.p = &mut y` with no
+    /// dereference, an aggregate built from a reference) run first and leave the
+    /// table's generation moved, so this only fires where nothing was recorded.
+    /// Anything it cannot re-bind exactly is poisoned AND records a fail-closed
+    /// reason: a kept entry names the pre-store referent.
+    fn poison_pointer_rebound_through_deref(&mut self, lhs: &Place, generation: u64) {
+        if lhs.projection.len() < 2
+            || !matches!(lhs.projection.first(), Some(ProjectionElem::Deref))
+        {
+            return;
+        }
+        let carries_pointer =
+            lhs.ty(self.body.locals()).into_option().is_some_and(Self::ty_carries_a_pointer_value);
+        if !carries_pointer {
+            return;
+        }
+        if self.ref_pointees.generation() != generation {
+            // A handler recorded the new binding while encoding this store.
+            return;
+        }
+        let root_place = Place { local: lhs.local, projection: vec![] };
+        let ptr_base = self.ssa_base_name(&root_place);
+        let Some(pointee_base) = self.resolved_stack_pointee_base(&ptr_base) else {
+            return;
+        };
+        warn!(
+            ?lhs,
+            %pointee_base,
+            "BMC: a pointer stored through a dereference rebinds its target — fail closed"
+        );
+        let now = self.ref_pointees.generation();
+        self.ref_pointees.poison_stale_since(&pointee_base, now);
+        self.ctx.unsupported_with_fallback(
+            "pointer_stored_through_deref_rebinds_target",
+            format!("{pointee_base}: a pointer value was stored into a slot of it"),
+        );
+    }
+
+    /// Keep the BYTE IMAGE of an address-taken local in step with a store into
+    /// one of its sub-places.
+    ///
+    /// `get_or_create_address_symbol` materializes a local into byte memory
+    /// when its address is taken (#1246), and every raw-pointer read loads from
+    /// that image. A store into a FIELD or an ELEMENT updates only the local's
+    /// register, so the image kept the old bytes: `let mut s = S { x: 0, y: 0 };
+    /// let p: *mut u8 = &mut s.x; s.x = 9; assert!(unsafe { *p } == 0)`
+    /// verified SUCCESSFUL in BMC and the safe twin was FAILED
+    /// [AY:CTREX_CAT:Genuine] (adversarial review of m3/soundness-fixes-2,
+    /// 2026-09-14; red on main too — and the same for an array element).
+    /// The whole-local store path has its own write-backs; a store THROUGH a
+    /// dereference writes memory itself, so neither is re-done here.
+    ///
+    /// Re-storing the local's new value is EXACT, so this costs no proof. When
+    /// the value cannot be read back the image is left stale, and that fails
+    /// closed rather than silently disagreeing with the register lane.
+    fn refresh_address_taken_image(&mut self, lhs: &Place) {
+        if lhs.projection.is_empty()
+            || lhs.projection.iter().any(|p| matches!(p, ProjectionElem::Deref))
+        {
+            return;
+        }
+        let root_place = Place { local: lhs.local, projection: vec![] };
+        let base = self.ssa_base_name(&root_place);
+        let leaf_base = self.ssa_base_name(lhs);
+        let addr = self.addr_symbols.get(base.as_str()).cloned();
+        // The sub-place's OWN name is what a reference to it points at
+        // (`ref_pointees[p] = ..._field_0`), and a read through that reference
+        // resolves THAT name — not the root the store updated.
+        let leaf_tracked = self.env_lookup(leaf_base.as_str()).is_some();
+        if addr.is_none() && !leaf_tracked {
+            return;
+        }
+        if let Some(addr) = addr {
+            let Some(value) = self.codegen_place(&root_place) else {
+                self.ctx.unsupported_with_fallback(
+                    "address-taken local image not refreshed",
+                    format!("{base}: the local has no value after a store into it"),
+                );
+                return;
+            };
+            let ty = root_place.ty(self.body.locals()).into_option();
+            let materialized =
+                ty.is_some_and(|ty| self.try_materialize_array_to_memory(&addr, &value, ty));
+            if !materialized {
+                self.store_memory_bytes_on_path(addr, value, "address-taken local image refresh");
+            }
+            debug!("refreshed the byte image of address-taken local {base}");
+        }
+        if leaf_tracked {
+            let Some(leaf_value) = self.codegen_place(lhs) else {
+                self.ctx.unsupported_with_fallback(
+                    "referenced sub-place not refreshed",
+                    format!("{leaf_base}: no value after a store into it"),
+                );
+                return;
+            };
+            let ssa = self.ssa_name_from_base(&leaf_base, true);
+            let var = self.ctx.declare_var(&ssa, leaf_value.sort().clone());
+            self.assert_ssa_def(var.clone(), leaf_value, &leaf_base);
+            self.env_update(leaf_base.clone(), var);
+            debug!("refreshed the referenced sub-place {leaf_base}");
+        }
+    }
+
+    fn codegen_assign_inner(&mut self, lhs: &Place, rhs: &Rvalue) {
         // #408: Skip ZST assignments — ZSTs have no runtime representation.
         if let Some(lhs_ty) = lhs.ty(self.body.locals()).into_option()
             && Self::is_zst_type(lhs_ty)
@@ -31,6 +166,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             debug!("codegen_assign: skipping ZST assignment to {:?}", lhs);
             return;
         }
+
+        // FC-06 (BMC): classify a store through a deref against the innermost
+        // modifies frame BEFORE dispatch, so every store shape below is
+        // attributed (accused, certified, frame-local, or failed closed) no
+        // matter which handler encodes it. See `statement::modifies_frame`.
+        self.bmc_modifies_check_deref_store(lhs);
 
         // SwitchInt→variant bridge (Effort 2, #3017): maintain the discriminant-scrutinee
         // side table for bare-local destinations. ANY write to the local first
@@ -46,6 +187,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
 
+        // A store through a pointer with no tracked pointee cannot reach the
+        // stack local it may address (`mark_untracked_deref_store`).
+        self.mark_untracked_deref_store(lhs);
+
         // Handle raw pointer deref on LHS: *ptr = value stores to memory (#24).
         if self.try_codegen_assign_raw_ptr_deref(lhs, rhs) {
             return;
@@ -53,6 +198,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Handle reference deref assignment: *ref = value for mutable references (#484).
         if self.try_codegen_assign_ref_deref(lhs, rhs) {
+            return;
+        }
+
+        if self.try_codegen_assign_ref_deref_index(lhs, rhs) {
             return;
         }
 
@@ -72,7 +221,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 self.codegen_assign_checked_binary_op(lhs, *op, l, r);
                 return;
             }
-            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => {
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
                 if self.try_codegen_tuple_copy(lhs, src) {
                     return;
                 }
@@ -121,6 +270,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // Fall through to generic path if workaround fails
             }
             // #1210: ShallowInitBox heap_pointees propagation.
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(Operand::Copy(src_place) | Operand::Move(src_place), _ty) => {
                 let src_base = self.root_ssa_base_name(src_place);
                 let dst_base = self.root_ssa_base_name(lhs);
@@ -174,6 +324,35 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return;
         }
 
+        // A store into a place that nests an element index inside another index
+        // or a field on a LOCAL (`g[i][j] = v`, `a[i].buf[k] = v`): rebuild the
+        // local from the leaf outwards.
+        if self.try_codegen_assign_nested_place(lhs, rhs) {
+            return;
+        }
+
+        // A store under a dereference or an index that no handler above consumed
+        // would bind a register named for the projection while the storage it
+        // denotes never changes: `let r: &mut [[u8; 2]; 2] = &mut g; r[i][1] = 9;
+        // assert!(g[i][1] == 0)` and `g[1][0] = 9; assert!(g[1][0] == 0)` verified
+        // SUCCESSFUL and the safe twins FAILED with a Genuine counterexample
+        // (main 31793ccc3). The generic path below is only exact for a local and
+        // the flattened fields of a local, so any other place fails closed here.
+        if lhs.projection.iter().any(|p| {
+            matches!(
+                p,
+                ProjectionElem::Deref
+                    | ProjectionElem::Index(_)
+                    | ProjectionElem::ConstantIndex { .. }
+                    | ProjectionElem::Subslice { .. }
+            )
+        }) {
+            self.ctx.unsupported_with_fallback(
+                "generic store to a place under a dereference or an index",
+                format!("{lhs:?}"),
+            );
+        }
+
         // --- Generic assignment path ---
         let lhs_name = self.ssa_name(lhs, true);
 
@@ -213,7 +392,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
         }
 
-        self.env_update(base_name.clone(), lhs_expr);
+        self.env_update(base_name.clone(), lhs_expr.clone());
+        self.mirror_untracked_ref_deref_store(lhs, &lhs_expr);
         self.track_repeat_array_value(&base_name, rhs);
 
         // --- Post-assignment tracking ---
@@ -223,6 +403,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Track cast-related propagation
         self.track_cast_propagation(lhs, &lhs_name, rhs);
+
+        // A sub-slice view with a nonzero start keeps that fact through copies
+        // and reborrows, so the consumer guard can see it at the call site.
+        self.propagate_shifted_subslice_view(&base_name, rhs);
 
         // Track reference pointees for Ref/AddressOf rvalues
         self.track_ref_pointees(lhs, rhs);
@@ -236,7 +420,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // #3133: Propagate heap_pointees through Copy/Move chains.
         // Fallback for cases where ref_pointees propagation doesn't cover
         // the full chain (e.g., ShallowInitBox, Box unwrap patterns).
-        if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rhs {
+        if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rhs {
             // Part of #4112 follow-up: whole-value copies of flattened Option-like
             // enums (#2076) must carry the piecewise `{src}.0` discriminant and
             // `{src}_variant_V_field_F` payload entries to the new base. Otherwise
@@ -325,7 +509,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.repeat_array_values.remove(base_name);
             return;
         };
-        let elem_expr = self.resolve_concrete_expr(&elem_expr);
+        let elem_expr = self.repeat_element_value(operand, &elem_expr);
         if elem_expr.sort().is_datatype() {
             self.repeat_array_values.insert(std::sync::Arc::from(base_name), (elem_expr, len));
         } else {

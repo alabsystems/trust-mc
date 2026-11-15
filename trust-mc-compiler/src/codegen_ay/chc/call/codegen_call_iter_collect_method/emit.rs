@@ -10,6 +10,7 @@
 //!
 //! Part of #3348: iter-map-collect encoding for bv_bitblast operations.
 
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use tracing::debug;
 
@@ -67,10 +68,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         // Create the symbolic data array and add forall constraint.
-        let data = super::super::declare_pending_var(
-            format!("icm_data_{dest_local}"),
-            result_data_sort.clone(),
-        );
+        let data = ExactVar::defined(format!("icm_data_{dest_local}"), result_data_sort.clone());
 
         let idx = Expr::var(closure.idx_var_name.clone(), ptr_sort());
         let in_range = idx.clone().bvult(len_bv.clone());
@@ -169,8 +167,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if self.collections.projection_locals.get(&dest_local).copied()
             == Some(CollectionProjectionKind::Vec)
         {
-            let ptr =
-                super::super::declare_pending_var(format!("icm_ptr_{dest_local}"), ptr_sort());
+            let ptr = Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("icm_ptr_{dest_local}"),
+                ptr_sort(),
+            );
             return self.constrain_projected_vec_fields_for_call(
                 dest_local,
                 super::super::codegen_call_vec_ops::ProjectedVecState {
@@ -197,8 +199,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Case 2: Direct Vec DT.
         if dt.constructors.first().is_some_and(|c| c.has_field(vec_layout::FLD_LEN)) {
             let dt_name = out_sort.datatype_name().expect("has datatype_sort");
-            let ptr =
-                super::super::declare_pending_var(format!("icm_ptr_{dest_local}"), ptr_sort());
+            let ptr = Havoc::mint(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("icm_ptr_{dest_local}"),
+                ptr_sort(),
+            );
             constraints.push(Self::build_vec_datatype_eq(
                 dt_name,
                 vec![ptr, len_bv.clone(), len_bv.clone(), data.clone()],
@@ -246,8 +252,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 continue;
             }
             let inner_dt_name = field.sort.datatype_name().expect("has datatype_sort");
-            let vec_ptr =
-                super::super::declare_pending_var(format!("icm_ptr_{dest_local}"), ptr_sort());
+            let vec_ptr = Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_POINTER_VALUE,
+                format!("icm_ptr_{dest_local}"),
+                ptr_sort(),
+            );
 
             let vec_expr = Expr::datatype_constructor(
                 inner_dt_name,
@@ -267,7 +277,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if Some(fi) == vec_field_idx {
                         vec_expr.clone()
                     } else {
-                        super::super::declare_pending_var(
+                        Havoc::mint_deferred(
+                            self,
+                            sound_havoc::UNTRACKED_COLLECTION_STATE,
                             format!("icm_fld{fi}_{dest_local}"),
                             f.sort.clone(),
                         )

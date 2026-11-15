@@ -64,9 +64,15 @@ use super::codegen_ctx::diagnostics::CellCounter;
 use super::codegen_rules::CodegenRules;
 use super::dispatch_helpers::is_pthread_noop_foreign_call;
 use super::{ChcCtx, RelationApp, Rule, RuleBody};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
+#[allow(unused_imports)]
+use rustc_public::CrateDef as _;
+use rustc_public::mir::Operand;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
-use tracing::warn;
+use tracing::{debug, warn};
 use trust_mc_core::violation::PropertyKind;
 
 /// A diverging (`-> !`) callee that is a KNOWN guaranteed panic: reaching it is
@@ -75,12 +81,26 @@ use trust_mc_core::violation::PropertyKind;
 /// case of the assert_* intrinsics returns normally (target=Some) and never
 /// reaches the diverging-call handler, so matching here is exact.
 pub(in crate::codegen_ay::chc::call) fn is_known_diverging_panic_intrinsic(path: &str) -> bool {
-    path.ends_with("::abort")
-        || path.contains("intrinsics::abort")
-        || path.contains("assert_zero_valid")
-        || path.contains("assert_mem_uninitialized_valid")
-        || path.contains("assert_uninit_valid")
-        || path.contains("assert_inhabited")
+    // Match the real core/std items exactly (generic arguments stripped). A
+    // name-suffix match certified a user function such as `user::intrinsics::abort`
+    // as a Genuine panic, dropping its diverging_call_drop taint.
+    let path = path.split_once("::<").map_or(path, |(item, _)| item);
+    if path == "std::process::abort" {
+        return true;
+    }
+    let Some(name) =
+        path.strip_prefix("core::intrinsics::").or_else(|| path.strip_prefix("std::intrinsics::"))
+    else {
+        return false;
+    };
+    matches!(
+        name,
+        "abort"
+            | "assert_zero_valid"
+            | "assert_mem_uninitialized_valid"
+            | "assert_uninit_valid"
+            | "assert_inhabited"
+    )
 }
 
 /// Extension trait for the call terminator dispatch spine on `ChcCtx`.
@@ -95,10 +115,74 @@ pub(in crate::codegen_ay::chc) trait CallTerminator {
 
 impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
     fn codegen_call_terminator(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
+        // FC-06: stubs, models and intrinsics write through pointer arguments
+        // without a checked store path; check those writes against the frame.
+        self.modifies_frame_call_check(dcx);
+        self.subslice_consumer_fail_closed(dcx);
+        self.pointer_move_fail_closed(dcx);
         if self.try_dispatch_call_kani(dcx) {
             return true;
         }
+        // The unwinding check below reads the call's ARGUMENTS, as they were
+        // before the call. A handler that moves a flattened argument (the
+        // iterators `Iterator::eq` consumes) sets that local's slots to the
+        // moved-out placeholder in `flattened_field_env`
+        // (`invalidate_moved_fn_inline_args`), and the check read them after
+        // it: the receiver's remaining length was the placeholder's 0, which
+        // discharged Kani's unwinding assertion
+        // (`model_call_unwind_iter_eq_dual.rs::z5_eq_slice_other_u3_bug`,
+        // `model_call_unwind_dual.rs::u5_iter_eq_u2_bug`: clean proofs once
+        // main's placeholder bound every slot, where Kani fails).
+        let pre_call_env = self.encode.flattened_field_env.clone();
+        // Saved and restored: a dispatcher may dispatch a nested call through
+        // this spine, and its outcome must not answer for the outer call.
+        let outer = std::mem::replace(&mut self.call_replays_body, false);
+        let handled = self.codegen_call_terminator_after_kani(dcx);
+        let replayed = std::mem::replace(&mut self.call_replays_body, outer);
+        if !replayed {
+            let post_call_env =
+                std::mem::replace(&mut self.encode.flattened_field_env, pre_call_env);
+            self.model_call_unwinding_check(dcx);
+            self.encode.flattened_field_env = post_call_env;
+        }
+        handled
+    }
+}
 
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// The dispatch spine after the Kani-function dispatcher
+    /// ([`CallTerminator::codegen_call_terminator`]).
+    fn codegen_call_terminator_after_kani(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if self.try_native_box_into_raw(dcx) {
+            return true;
+        }
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if self.try_native_maybe_unsafe_access(dcx) {
+            return true;
+        }
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if self.try_native_maybe_uninit_write(dcx) || self.try_native_initialized_handoff(dcx) {
+            return true;
+        }
+        if self.try_native_box_new_uninit(dcx) {
+            return true;
+        }
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        self.book_native_maybe_user_callee(dcx);
+        if super::inline_str_chars::try_codegen_str_chars(self, dcx)
+            || super::inline_str_chars::try_codegen_chars_next(self, dcx)
+            || self.try_codegen_native_iterator_size_hint(dcx)
+        {
+            return true;
+        }
+        // A comparison whose `==` or order is not its encodings' comparison
+        // (a float, a reference or a hand-written `PartialEq` in it) is
+        // decided before any handler that compares encodings can claim it
+        // (`codegen_call_cmp_semantic.rs`).
+        if self.try_dispatch_call_unfaithful_comparison(dcx) {
+            return true;
+        }
         // Coroutine-owned allocation elisions must run before collection/alloc
         // dispatch so BoxNew does not materialize assertion-irrelevant
         // Pin<Box<Coroutine>> heap arrays.
@@ -139,6 +223,7 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         }
 
         if self.try_dispatch_call_closure(dcx) {
+            self.call_replays_body = true;
             return true;
         }
 
@@ -146,6 +231,7 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         // Detects InstanceKind::Virtual and devirtualizes to the concrete
         // implementation when there is exactly one reachable impl.
         if self.try_dispatch_call_virtual(dcx) {
+            self.call_replays_body = true;
             return true;
         }
 
@@ -350,9 +436,12 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         // Part of #3187/#4073: General-purpose fn inlining + catch_unwind wrapper.
         // Resolves callee to concrete Instance, inlines small function bodies.
         if self.try_dispatch_call_catch_unwind(dcx) {
+            self.call_replays_body = true;
             return true;
         }
 
+        // fn-inline sets `call_replays_body` itself: a known-call fast path is
+        // a model.
         if self.try_dispatch_call_fn_inline(dcx) {
             return true;
         }
@@ -411,6 +500,32 @@ impl<'tcx, 'body> CallTerminator for ChcCtx<'tcx, 'body> {
         }
 
         if self.try_dispatch_call_fn_ptr(dcx) {
+            self.call_replays_body = true;
+            return true;
+        }
+
+        // An indirect call through a fn pointer that reifies a FOREIGN item no
+        // `--c-lib` file defines. Kani fails it with "call to foreign "C"
+        // function `f` is not currently supported by Kani". `is_foreign_call`
+        // below only sees `FnDef` operands, so this call used to reach the
+        // tail's anonymous havoc (`call_dispatch_fallback_prebuilt`, "fell
+        // through all dispatch stages"), which havocked the result and let a
+        // dead-path call fail the harness on a downstream assertion. Mirror the
+        // BMC lane (statement/terminator.rs): Kani's check, gated on reaching
+        // the call, with no successor edge, never certified Genuine.
+        if self.undefined_function_checks
+            && let Some(symbol) = self.fn_ptr_foreign_link_symbol(dcx)
+            && !crate::codegen_ay::foreign_defs::c_lib_defines(&symbol)
+        {
+            super::codegen_call_coerce::emit_kani_unsupported_check(
+                self,
+                dcx.from_app,
+                dcx.stmt_constraints,
+                dcx.bb_idx,
+                super::codegen_call_coerce::kani_unsupported_message(&format!(
+                    "call to foreign \"C\" function `{symbol}`"
+                )),
+            );
             return true;
         }
 
@@ -619,5 +734,244 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             ));
         }
         None
+    }
+
+    /// A sub-slice with a NONZERO start handed to a call that does not honour
+    /// the start: fail closed.
+    ///
+    /// `&source[a..b]` is materialized with the start recorded in
+    /// `subslice_offset`, and the element-access route applies it
+    /// (`source.select(idx + offset)`), which is why `s[i]` is exact. Every
+    /// OTHER consumer reads the backing array from index zero, so
+    /// `s.first() == Some(&1)` and `a[1..3] == [1u8, 2]` verified SUCCESSFUL and
+    /// `contains`, `split_first`, `split_last`, `rchunks`, `as_ptr` and
+    /// `extend_from_slice` certified Genuine counterexamples for their safe twins
+    /// (negative/subslice_offsets.rs, negative/subslice_producers.rs, main
+    /// 31793ccc3).
+    ///
+    /// The allowlist is the routes that DO apply the offset. Everything else —
+    /// a modelled slice method, a user function, an unmodelled callee — is
+    /// tainted, so those harnesses report an uncertified counterexample or
+    /// Unknown instead of a proof or a certificate.
+    fn subslice_consumer_fail_closed(&mut self, dcx: &DispatchCallContext<'_>) {
+        /// Callee paths whose element access goes through the offset-applying
+        /// route, or which read no element at all.
+        const HONOURS_SUBSLICE_OFFSET: &[&str] = &[
+            "core::slice::index::<impl std::ops::Index<I> for [T]>::index",
+            "core::slice::index::<impl std::ops::IndexMut<I> for [T]>::index_mut",
+            "std::ops::Index::index",
+            "std::ops::IndexMut::index_mut",
+            "core::slice::<impl [T]>::len",
+            "core::slice::<impl [T]>::is_empty",
+            "core::str::<impl str>::len",
+            "core::str::<impl str>::is_empty",
+            "std::slice::<impl [T]>::len",
+            "std::slice::<impl [T]>::is_empty",
+        ];
+        // The exempt paths are named in full. A `path.ends_with("::len")`
+        // suffix test used to stand here, and it skipped the WHOLE taint — the
+        // producer clause and every other argument of the call included — for
+        // any callee whose path ends in `len`, which a user function or a trait
+        // method called `len` satisfies (adversarial review of
+        // m3/soundness-fixes-2, 2026-09-14, minor 1).
+        if let Some(path) = dcx.callee_path.as_deref()
+            && HONOURS_SUBSLICE_OFFSET.contains(&path)
+        {
+            return;
+        }
+        let shifted = dcx.args.iter().any(|arg| {
+            let (Operand::Copy(p) | Operand::Move(p)) = arg else { return false };
+            // Only a SLICE view. `subslice_offset` also accumulates raw-pointer
+            // arithmetic (`p.add(k)`) and custom-DST tail reborrows, and those
+            // routes read through the offset-applying address lane, so tainting
+            // them would demote proofs for no soundness gain.
+            let is_slice_ref = p.ty(self.body.locals()).ok().is_some_and(|ty| {
+                matches!(
+                    ty.kind(),
+                    TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
+                        if matches!(
+                            pointee.kind(),
+                            TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str)
+                        )
+                )
+            });
+            is_slice_ref
+                && self
+                    .ref_resolution
+                    .subslice_offset
+                    .get(&p.local)
+                    .is_some_and(|off| Self::try_eval_const_bv(off) != Some(0))
+        });
+        if shifted {
+            debug!(
+                fn_name = %self.fn_name,
+                callee = ?dcx.callee_path,
+                "CHC: sub-slice with a nonzero start reaches a consumer that ignores it — fail closed"
+            );
+            self.record_sound_fallback_reason("subslice_start_ignored_by_consumer");
+        }
+
+        // The same defect from the PRODUCER side. These methods hand back a view
+        // that does not begin at the source's index 0 — `split_first().1` is
+        // `&a[1..]`, `rchunks(3).next()` is `&a[1..4]` — and the model gives the
+        // view neither the shifted backing nor a recorded start, so a read at its
+        // own index 0 returns the source's element 0:
+        // `let (_f, rest) = a.split_first().unwrap(); assert!(rest[0] == 2)` and
+        // the `split_last` and `rchunks` twins were certified FAILED
+        // (negative/subslice_producers.rs, main 31793ccc3). No argument of theirs
+        // carries a `subslice_offset`, so the consumer test above cannot see them.
+        // Every slice producer whose returned view does NOT begin at the
+        // source's index 0, or whose element route the model does not shift.
+        // The list used to name six; `split_at`, `chunks`, `windows`,
+        // `strip_prefix` and the rest hand back exactly the same kind of view
+        // and were undefended (adversarial review, 2026-09-14, minor 1).
+        const VIEW_OFFSET_UNMODELLED: &[&str] = &[
+            "split_first",
+            "split_last",
+            "split_first_mut",
+            "split_last_mut",
+            "rchunks",
+            "rchunks_mut",
+            "rchunks_exact",
+            "rchunks_exact_mut",
+            "split_at",
+            "split_at_mut",
+            "split_at_unchecked",
+            "split_at_mut_unchecked",
+            "chunks",
+            "chunks_mut",
+            "chunks_exact",
+            "chunks_exact_mut",
+            "array_chunks",
+            "array_windows",
+            "windows",
+            "strip_prefix",
+            "strip_suffix",
+            "rsplit",
+            "rsplit_mut",
+            "rsplitn",
+            "rsplitn_mut",
+            "splitn",
+            "splitn_mut",
+        ];
+        if let Some(path) = dcx.callee_path.as_deref()
+            && VIEW_OFFSET_UNMODELLED.contains(&Self::callee_leaf(path))
+            && path.contains("slice")
+        {
+            debug!(
+                fn_name = %self.fn_name,
+                callee = path,
+                "CHC: slice producer whose view offset is not modelled — fail closed"
+            );
+            self.record_sound_fallback_reason("slice_producer_view_offset_unmodelled");
+        }
+    }
+
+    /// A call that MOVES a value out of one storage and another in, whose value
+    /// type is a POINTER.
+    ///
+    /// `mem::swap` has an exact handler that exchanges the pointee bindings
+    /// (`swap_pointee_bindings`). Its siblings have none: `mem::replace`,
+    /// `mem::take`, `ptr::replace`, `Option::replace`, `Option::take`,
+    /// `Option::insert` and `Option::get_or_insert*` are INLINED, and the
+    /// inline walker knows nothing about pointer identity, so the bindings stay
+    /// where they were and a later store through either name writes the wrong
+    /// object: `let mut a = &mut x; let old = mem::replace(&mut a, &mut y);
+    /// *old = 7; *a = 9; assert!(y == 2)` verified SUCCESSFUL and its safe twin
+    /// `assert!(x == 7 && y == 9)` was FAILED [AY:CTREX_CAT:Genuine]
+    /// (adversarial review of m3/soundness-fixes-2, 2026-09-14; pre-existing on
+    /// main). The bindings of every storage the call can rebind are dropped and
+    /// the harness fails closed.
+    ///
+    /// Only a value type that is ITSELF a pointer, or a shallow carrier of one
+    /// (`Option<&mut T>`, `(&T, u8)`), arms the guard: `mem::replace(&mut v,
+    /// Vec::new())` moves an owning container, whose buffer identity the model
+    /// does not key on a points-at edge, and demoting it would cost proofs for
+    /// no soundness gain.
+    fn pointer_move_fail_closed(&mut self, dcx: &DispatchCallContext<'_>) {
+        const POINTER_MOVING_LEAVES: &[&str] =
+            &["replace", "take", "insert", "get_or_insert", "get_or_insert_with", "replace_with"];
+        let Some(path) = dcx.callee_path.as_deref() else { return };
+        // A resolved callee path carries its generic arguments
+        // (`std::mem::replace::<&mut u8>`), so the leaf is what comes before
+        // `::<` — taking the last `::` segment outright gives `<&mut u8>` and
+        // matches nothing.
+        let leaf = Self::callee_leaf(path);
+        if !POINTER_MOVING_LEAVES.contains(&leaf) {
+            return;
+        }
+        if !(path.contains("mem::")
+            || path.contains("ptr::")
+            || path.contains("Option")
+            || path.contains("option::"))
+        {
+            return;
+        }
+        // The moved value's type: the destination for `replace` / `take`, and
+        // the by-value argument for `insert` / `get_or_insert`.
+        let mut moved = Vec::new();
+        if let Ok(ty) = dcx.destination.ty(self.body.locals()) {
+            moved.push(ty);
+        }
+        for arg in dcx.args {
+            if let Ok(ty) = arg.ty(self.body.locals()) {
+                moved.push(Self::strip_one_pointer(ty));
+            }
+        }
+        if !moved.iter().any(|ty| Self::ty_is_pointer_move_sensitive(*ty, 0)) {
+            return;
+        }
+        debug!(
+            fn_name = %self.fn_name,
+            callee = path,
+            "CHC: a pointer value moved by a call with no binding transfer — fail closed"
+        );
+        self.record_sound_fallback_reason("pointer_move_bindings_not_transferred");
+        let mut rebound: Vec<usize> = vec![dcx.destination.local];
+        for arg in dcx.args {
+            let (Operand::Copy(p) | Operand::Move(p)) = arg else { continue };
+            rebound.push(p.local);
+            if let Some(target) = self.ref_resolution.ref_targets.get(&p.local) {
+                rebound.push(target.local);
+            }
+        }
+        for local in rebound {
+            self.ref_resolution.clear_path_insensitive_ref_metadata(local);
+        }
+    }
+
+    /// The callee's own name, without its generic arguments, wherever they sit.
+    fn callee_leaf(path: &str) -> &str {
+        crate::codegen_ay::chc::modifies_frame::callee_path_leaf(path)
+    }
+
+    /// `&mut T` / `*mut T` -> `T`; anything else unchanged.
+    fn strip_one_pointer(ty: rustc_public::ty::Ty) -> rustc_public::ty::Ty {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, pointee, _) | RigidTy::RawPtr(pointee, _)) => pointee,
+            _ => ty,
+        }
+    }
+
+    /// Is `ty` a pointer, or a SHALLOW carrier of one? Bounded at depth 2 so
+    /// owning containers (`Vec`, `String`, `Box`), whose raw pointer sits
+    /// deeper, do not arm the guard.
+    fn ty_is_pointer_move_sensitive(ty: rustc_public::ty::Ty, depth: u32) -> bool {
+        if depth > 2 {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(..) | RigidTy::RawPtr(..)) => true,
+            TyKind::RigidTy(RigidTy::Tuple(tys)) => {
+                tys.iter().any(|t| Self::ty_is_pointer_move_sensitive(*t, depth + 1))
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => def.variants().into_iter().any(|v| {
+                v.fields().into_iter().any(|f| {
+                    mono_ty::field_ty(&f, &args)
+                        .is_none_or(|t| Self::ty_is_pointer_move_sensitive(t, depth + 1))
+                })
+            }),
+            _ => false,
+        }
     }
 }

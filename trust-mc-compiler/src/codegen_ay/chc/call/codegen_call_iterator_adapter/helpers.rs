@@ -7,6 +7,7 @@
 //! Extracted from `codegen_call_iterator_adapter.rs` per #2884 (500 LOC threshold).
 //! Moved into directory module per #4129.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort, SortInner};
@@ -16,7 +17,7 @@ use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::{CtorFieldExt, SignExtension, bool_sort};
 
 use super::super::stubs_option_helpers::{OptionHelpers, option_value_sort};
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Build Option-shaped result for adapter `next()` calls.
@@ -97,13 +98,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Build a symbolic value used by iterator adapter modeling.
     #[must_use]
     pub(in crate::codegen_ay::chc) fn fresh_adapter_symbol(
-        &self,
+        &mut self,
         prefix: &str,
         sort: Sort,
     ) -> Expr {
         // Part of #3447: adapter symbol is unconstrained (over-approximation).
         self.record_aggregate_gap("iter_adapter_symbol_unconstrained");
-        declare_pending_var(chc_fresh_name(prefix), sort)
+        // An accounted sound havoc with the symbol as its freed variable: a
+        // counterexample that reads it is never certified Genuine (Rule E's
+        // `Havoc::mint`, under the reason its audit line names).
+        Havoc::mint(self, sound_havoc::ITER_ADAPTER_SYMBOL_OVERAPPROX, chc_fresh_name(prefix), sort)
     }
 
     /// Compute a best-effort "has remaining items" condition and updated iterator.
@@ -201,7 +205,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     /// Construct a map/filter adapter value with the provided inner iterator.
     pub(in crate::codegen_ay::chc) fn construct_adapter_with_inner_iter(
-        &self,
+        &mut self,
         adapter_sort: &Sort,
         inner_iter: Expr,
     ) -> Option<Expr> {
@@ -235,7 +239,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Returns `ite(pos == 0, vec, symbolic_vec)`. Does not traverse adapter chains.
     /// Part of #3348.
     pub(in crate::codegen_ay::chc) fn try_collect_vec_from_iterator(
-        &self,
+        &mut self,
         iter_expr: &Expr,
     ) -> Option<Expr> {
         let (vec_expr, pos) = self.find_vec_in_iterator_chain(iter_expr)?;
@@ -245,11 +249,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         Some(Expr::ite(pos_zero, vec_expr, sym))
     }
 
-    /// Extract the remaining element count from an iterator chain.
+    /// Extract the remaining count from one model carrier.
     ///
-    /// Traverses through adapter wrappers to find the base iterator's
-    /// `(fld_pos, fld_len)` or `(fld_vec.fld_len, fld_pos)` and returns
-    /// `len - pos` (the number of elements remaining to be consumed).
+    /// Callers authenticate the receiver type. Never search through wrappers:
+    /// Chars counts bytes, while Take and Filter alter item cardinality.
+    /// Use typed_iterator_remaining_len for authenticated adapter chains.
     ///
     /// Part of #3348: length propagation for IterCollect.
     pub(in crate::codegen_ay::chc) fn try_extract_iterator_remaining_len(
@@ -277,16 +281,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             let len_field = vec_ctor.field("fld_len")?;
             let len = vec_val.field_select(&*vec_dt.name, "fld_len", len_field.sort.clone());
             return Self::bv_saturating_sub(len, pos);
-        }
-
-        // Wrapped adapter: recurse through fld_iter/fld_inner.
-        if let Some(inner_field) = ctor.field("fld_iter").or_else(|| ctor.field("fld_inner")) {
-            let inner = iter_expr.clone().field_select(
-                &*dt.name,
-                &*inner_field.name,
-                inner_field.sort.clone(),
-            );
-            return self.try_extract_iterator_remaining_len(&inner);
         }
 
         None

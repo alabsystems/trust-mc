@@ -18,6 +18,33 @@ use super::codegen_ctx::diagnostics::CellCounter;
 use super::dispatch_helpers::DispatchHelpers;
 use tracing::warn;
 
+/// The fail-closed record of a write through `ManuallyDrop::deref_mut` into
+/// a collection whose side state the identity does not carry (a `FailClose`
+/// reason: `codegen_ctx::fallback_soundness` does not bless it).
+const MANUALLY_DROP_COLLECTION_WRITE: &str = "manually_drop_collection_write_unmodelled";
+
+/// Does `rvalue` read `local` (as a whole or through a projection)?
+fn rvalue_mentions_local(rvalue: &rustc_public::mir::Rvalue, local: usize) -> bool {
+    use rustc_public::mir::Rvalue;
+    let operand =
+        |op: &Operand| matches!(op, Operand::Copy(p) | Operand::Move(p) if p.local == local);
+    match rvalue {
+        Rvalue::Use(op, ..)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Repeat(op, _) => operand(op),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => operand(a) || operand(b),
+        Rvalue::Aggregate(_, ops) => ops.iter().any(operand),
+        Rvalue::Ref(_, _, place)
+        | Rvalue::AddressOf(_, place)
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place)
+        | Rvalue::CopyForDeref(place) => place.local == local,
+        #[allow(unreachable_patterns)]
+        _ => true,
+    }
+}
+
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Dispatch array IntoIter identity calls: `unsize_mut`/`unsize` and
     /// `ManuallyDrop::deref_mut`/`deref`.
@@ -38,11 +65,126 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let label =
             if is_unsize { "array_iter::unsize_mut" } else { "array_iter::manually_drop_deref" };
 
-        self.emit_identity_call(dcx, label, |ctx, d| {
-            d.args
-                .first()
-                .and_then(|arg| ctx.translate_operand_with_modified(arg, d.modified_locals))
-        })
+        // A write through `ManuallyDrop::deref_mut` into a collection whose
+        // length and capacity live in per-local side state (`Vec`, `String`,
+        // the maps and sets) reaches the wrapper's memory but not that state:
+        // `ManuallyDrop<Vec<T>>` has none of its own. The identity then read
+        // the capacity `with_capacity` set after `push` grew it, and a
+        // `capacity() == 1` assertion after two pushes verified clean where
+        // Kani fails (walker fail-closed review 6 round 2, finding 4); on main
+        // the same writes were lost to a havocked reference and `len()` after
+        // `ManuallyDrop::into_inner` was certified Genuine on a program Kani
+        // proves. Such a write fails closed; a `deref_mut` whose result only
+        // feeds calls that read or expose the buffer (`as_mut_ptr`, `len`,
+        // `capacity`) keeps the exact identity.
+        if is_deref && self.manually_drop_deref_mut_may_write_side_state(dcx) {
+            self.record_sound_fallback_reason(MANUALLY_DROP_COLLECTION_WRITE);
+        }
+
+        // `ManuallyDrop::deref` returns `&self.value`, the reference it was
+        // handed: the result points where the argument does, so it takes the
+        // argument's reference target, and a collection op through it
+        // (`Vec::capacity`) finds the wrapped collection's side state
+        // (walker fail-closed review 6, finding 8).
+        self.emit_identity_call_with_success(
+            dcx,
+            label,
+            |ctx, d| {
+                d.args
+                    .first()
+                    .and_then(|arg| ctx.translate_operand_with_modified(arg, d.modified_locals))
+            },
+            |ctx, d| {
+                if !is_deref || !d.destination.projection.is_empty() {
+                    return;
+                }
+                let Some(Operand::Copy(src) | Operand::Move(src)) = d.args.first() else {
+                    return;
+                };
+                if !src.projection.is_empty() {
+                    return;
+                }
+                match ctx.ref_resolution.ref_targets.get(&src.local).cloned() {
+                    Some(target) => {
+                        ctx.ref_resolution.ref_targets.insert(d.destination.local, target);
+                    }
+                    None => {
+                        ctx.ref_resolution.ref_targets.remove(&d.destination.local);
+                    }
+                }
+            },
+        )
+    }
+
+    /// Is this a `<ManuallyDrop<T> as DerefMut>::deref_mut` of a collection
+    /// `T` with side state ([`Self::detect_collection_type`]) whose result
+    /// reaches anything but a side-state-pure call on the collection
+    /// (`as_mut_ptr`, `as_ptr`, `as_slice`, `as_mut_slice`, `len`,
+    /// `capacity`, `is_empty`)? `true` when the destination is projected or
+    /// its type does not resolve.
+    fn manually_drop_deref_mut_may_write_side_state(&self, dcx: &DispatchCallContext<'_>) -> bool {
+        use rustc_public::mir::{StatementKind, TerminatorKind};
+        use rustc_public::ty::{RigidTy, TyKind};
+        if !self.resolve_callee_path(dcx.func).is_some_and(|path| path.ends_with("::deref_mut")) {
+            return false;
+        }
+        if !dcx.destination.projection.is_empty() {
+            return true;
+        }
+        let dest = dcx.destination.local;
+        let Some(decl) = self.body.locals().get(dest) else { return true };
+        let inner = match self.resolve_body_ty(decl.ty).kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => self.resolve_body_ty(inner),
+            _ => return true,
+        };
+        if Self::detect_collection_type(inner).is_none() {
+            return false;
+        }
+        let mentions = |place: &rustc_public::mir::Place| place.local == dest;
+        for block in &self.body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {}
+                    StatementKind::Assign(lhs, rvalue) => {
+                        if mentions(lhs) {
+                            continue;
+                        }
+                        // A reborrow, a copy, a deref: a use this does not
+                        // classify.
+                        if rvalue_mentions_local(rvalue, dest) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let TerminatorKind::Call { func, args, .. } = &block.terminator.kind {
+                let passes = args.iter().any(
+                    |arg| matches!(arg, Operand::Copy(p) | Operand::Move(p) if p.local == dest),
+                );
+                if !passes {
+                    continue;
+                }
+                let pure = self.resolve_callee_path(func).is_some_and(|path| {
+                    matches!(
+                        path.rsplit("::").next(),
+                        Some(
+                            "as_mut_ptr"
+                                | "as_ptr"
+                                | "as_slice"
+                                | "as_mut_slice"
+                                | "len"
+                                | "capacity"
+                                | "is_empty"
+                        )
+                    )
+                });
+                if !pure {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Dispatch `Pin::new_unchecked` / `Pin::as_mut` as transparent identity calls.

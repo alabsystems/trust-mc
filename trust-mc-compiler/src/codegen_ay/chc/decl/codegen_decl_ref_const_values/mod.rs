@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 
-//! Constant-reference scalar-value collection and provenance resolution.
+//! Constant-reference scalar-value collection.
 //!
-//! This directory module hosts the collect/worklist engine and provenance
-//! helpers for constant-reference encoding. The central decode match lives
+//! This directory module hosts the collect/worklist engine for
+//! constant-reference encoding. Where a constant pointer points is
+//! `shared::const_pointer`; its object is `decl::global_objects`. The central decode match lives
 //! in sibling modules (`codegen_decl_ref_const_extract` and friends).
 //!
 //! Originally a single file; split per #3694 (collect/provenance-first
@@ -15,4 +16,3 @@
 use super::ChcCtx;
 
 mod collect;
-mod provenance;

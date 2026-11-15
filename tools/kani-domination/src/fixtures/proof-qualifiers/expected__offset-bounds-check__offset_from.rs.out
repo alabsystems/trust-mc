@@ -1,0 +1,64 @@
+# Reconstructed transcript: the chc-m1 unit log (trust-mc 04d4e4e67, --ay-chc) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_offset_from_same_dangling...
+[AY:PROOF] CHC verification: property proven
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_offset_from_same_dangling.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: offset == 0"
+	 - Location: /corpus/expected/offset-bounds-check/offset_from.rs:16:5 in function check_offset_from_same_dangling
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_offset_from_unit_panic...
+[AY:CTREX_CAT:Genuine]
+[AY:EFFECTIVE_SUCCESS:should_panic_panics_only]
+Check 1: check_offset_from_unit_panic.assertion.1
+	 - Status: FAILURE
+	 - Description: "assertion failed: 0 < pointee_size && pointee_size <= isize::MAX as usize"
+	 - Location: /corpus/expected/offset-bounds-check/offset_from.rs:24:14 in function check_offset_from_unit_panic
+
+SUMMARY:
+ ** 1 of 1 failed
+Failed Checks: assertion failed: 0 < pointee_size && pointee_size <= isize::MAX as usize
+ File: /corpus/expected/offset-bounds-check/offset_from.rs, line 24, in check_offset_from_unit_panic
+
+VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)
+Verification Time: 0.4s
+
+Checking harness check_offset_from_diff_alloc...
+[AY:CTREX_CAT:Genuine]
+Check 1: check_offset_from_diff_alloc.offset_from.1
+	 - Status: FAILURE
+	 - Description: "Offset result and original pointer should point to the same allocation"
+	 - Location: /corpus/expected/offset-bounds-check/offset_from.rs:33:14 in function check_offset_from_diff_alloc
+
+SUMMARY:
+ ** 1 of 1 failed
+Failed Checks: Offset result and original pointer should point to the same allocation
+ File: /corpus/expected/offset-bounds-check/offset_from.rs, line 33, in check_offset_from_diff_alloc
+
+VERIFICATION:- FAILED
+Verification Time: 0.4s
+
+Checking harness check_offset_from_oob_ptr...
+[AY:PROOF] CHC verification: property proven (trivially safe)
+[AY:PROOF_QUALIFIERS:trivial_safe=no_error_rule]
+Check 1: check_offset_from_oob_ptr.offset_from.1
+	 - Status: SUCCESS
+	 - Description: "Offset result and original pointer should point to the same allocation"
+	 - Location: /corpus/expected/offset-bounds-check/offset_from.rs:42:14 in function check_offset_from_oob_ptr
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_offset_from_diff_alloc
+Complete - 3 successfully verified harnesses, 1 failures, 4 total.
+CTREX breakdown: 0 EncodingGap, 0 OverApproximation, 1 Genuine, 0 Unknown

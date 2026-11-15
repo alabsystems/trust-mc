@@ -83,6 +83,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let one = Expr::bitvec_const(1u128, POINTER_WIDTH);
         self.assert_guarded(dest_expr.clone().bvuge(one));
         self.env_update(base_name, dest_expr);
+        // The BMC lane has no vtable model: a `dyn` pointee's alignment is a
+        // stand-in, and a counterexample reading it must not certify
+        // (expected/intrinsics/align_of_dst.rs).
+        self.ctx.bmc_sound_havoc("align_of_val_dst");
         debug!("codegen_align_of_val: using symbolic alignment (DST or unknown type)");
         target
     }
@@ -227,6 +231,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let name = self.ssa_name_from_base(&base_name, true);
         let symbolic = self.ctx.declare_var(&name, option_sort);
         self.env_update(base_name, symbolic);
+        // A raw slice pointer's length is not carried to this point
+        // (expected/MemPredicates/ptr_size_validity.rs): the result is a
+        // stand-in.
+        self.ctx.bmc_sound_havoc("checked_size_or_align_symbolic");
         let kind = if is_size { "size" } else { "align" };
         debug!("codegen_checked_{}: symbolic fallback (unsized type)", kind);
     }
@@ -288,6 +296,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Note: For unsigned bitvectors, size >= 0 is implicit.
         // The symbolic value represents any valid size for the DST.
         self.env_update(base_name, dest_expr);
+        // No vtable or unsize metadata reaches here: a stand-in size
+        // (kani/SizeAndAlignOfDst/unsized_tail.rs).
+        self.ctx.bmc_sound_havoc("size_of_val_dst");
         debug!("codegen_size_of_val: using symbolic size (DST or unknown type)");
         target
     }

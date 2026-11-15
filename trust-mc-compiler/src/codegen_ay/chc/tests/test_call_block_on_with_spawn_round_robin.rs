@@ -231,9 +231,19 @@ fn assert_pick_task_result_is_exact(result_value: &Expr) {
     }
 }
 
+/// The probe's `RoundRobin` is a LOCAL look-alike of the library's
+/// (`library/trust-mc/src/futures.rs`): a callee of the crate under
+/// verification is never answered by a path-text model (walker fail-closed
+/// repair round 5, `user_type_named_like_std_dual.rs`; `nested_call.rs`
+/// `callee_is_local`), so its `pick_task` is walked as its code and the
+/// scheduler packet is not consumed. The library's own `pick_task` is not
+/// local and takes the scheduler model.
 fn assert_spawn_model_advanced(chc_ctx: &ChcCtx<'_, '_>) {
     let model = chc_ctx.spawn_scheduler_vtable_model.as_ref().expect("spawn model");
-    assert_eq!(model.next_task_idx, 2, "pick_task should advance the scheduler packet once");
+    assert_eq!(
+        model.next_task_idx, 1,
+        "a local look-alike pick_task is walked as its code, not answered by the scheduler model"
+    );
     assert_eq!(
         model.poll_task_indices,
         vec![0, 1, 0],

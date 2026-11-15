@@ -12,14 +12,15 @@
 //!
 //! Part of #3807, #4181: coroutine yield/resume state machine encoding.
 
-use ay_bindings::Expr;
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+use ay_bindings::{Expr, Sort};
 use tracing::debug;
 
 use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_call_coerce::{CallCoerce, emit_sound_fallback_goto};
 use super::codegen_call_fn_inline::CallDispatchFnInline;
-use super::codegen_ctx::globals::{chc_fresh_name, declare_pending_var};
+use super::codegen_ctx::globals::chc_fresh_name;
 use super::codegen_rules::CodegenRules;
 
 #[path = "codegen_call_coroutine_elision.rs"]
@@ -162,6 +163,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return true;
         }
 
+        // The resume is not walked: its outcome and payloads are booked havocs.
+        let mut mint = |prefix: &'static str, sort: Sort| {
+            Havoc::mint(self, sound_havoc::UNTRACKED_COROUTINE_STATE, chc_fresh_name(prefix), sort)
+        };
         let result_expr = match sequenced_transition.as_ref() {
             Some(transition) => match (
                 try_construct_coroutine_state_variant_expr(
@@ -169,18 +174,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     CoroutineStateBranch::Yielded,
                     yield_is_zst,
                     complete_is_zst,
+                    &mut mint,
                 ),
                 try_construct_coroutine_state_variant_expr(
                     &dest_sort,
                     CoroutineStateBranch::Complete,
                     yield_is_zst,
                     complete_is_zst,
+                    &mut mint,
                 ),
                 try_construct_coroutine_state_expr(
                     &dest_sort,
                     yield_is_zst,
                     complete_is_zst,
                     allow_complete_branch,
+                    &mut mint,
                 ),
             ) {
                 (Some(yielded_expr), Some(complete_expr), Some(fallback_expr)) => Some(Expr::ite(
@@ -195,6 +203,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 yield_is_zst,
                 complete_is_zst,
                 allow_complete_branch,
+                &mut mint,
             ),
         };
         if let Some(result_expr) = result_expr
@@ -449,7 +458,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let payload = if yield_is_zst && out_sort.is_bool() {
                         Expr::bool_const(true)
                     } else {
-                        declare_pending_var(
+                        Havoc::mint(
+                            self,
+                            sound_havoc::UNTRACKED_COROUTINE_STATE,
                             chc_fresh_name("__coro_yield_payload"),
                             out_sort.clone(),
                         )

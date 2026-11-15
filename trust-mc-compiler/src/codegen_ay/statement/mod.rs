@@ -20,14 +20,11 @@ pub(super) use crate::codegen_ay::context::AYCtx;
 pub(super) use crate::kani_middle::abi::LayoutOf;
 pub(super) use ay_bindings::{Expr, Sort};
 pub(super) use rustc_public::CrateDef;
-pub(super) use rustc_public::mir::alloc::GlobalAlloc;
 pub(super) use rustc_public::mir::{
     AssertMessage, BinOp, CastKind, ConstOperand, Operand, Place, PointerCoercion, ProjectionElem,
     Rvalue, SwitchTargets, Terminator, TerminatorKind,
 };
-pub(super) use rustc_public::ty::{
-    Allocation, ConstantKind, MirConst, RigidTy, TyConstKind, TyKind,
-};
+pub(super) use rustc_public::ty::{ConstantKind, MirConst, RigidTy, TyConstKind, TyKind};
 pub(super) use rustc_public_bridge::IndexedVal;
 
 mod aggregate;
@@ -39,16 +36,22 @@ mod alloc_posix_memalign;
 mod alloc_ptr;
 mod alloc_ptr_ext;
 mod alloc_sysconf;
+mod alloc_view;
 mod arithmetic;
 mod arithmetic_atomic;
 mod arithmetic_checks;
 mod arithmetic_overflow;
+mod box_deref;
 mod cast;
 mod cast_dt_to_bv;
 mod cast_dt_to_dt;
+mod cast_float;
 mod cast_transmute;
 mod cast_unsize;
+mod global_alloc;
+mod memory_on_path;
 mod memory_swap;
+mod typed_memory_store;
 // Codegen modules (converted from include!() per #2595).
 mod codegen_assign;
 mod codegen_assign_flatten;
@@ -67,6 +70,7 @@ mod codegen_statement;
 mod codegen_write_bytes;
 mod comparison;
 mod comparison_eq;
+mod copy_shadow;
 mod datatype;
 mod datatype_deref_write;
 mod dispatch;
@@ -81,6 +85,7 @@ mod kani;
 mod kani_float;
 mod kani_shadow_mem;
 mod modifies_frame;
+mod modifies_frame_calls;
 mod operand;
 mod operand_ref;
 mod operand_scalar;
@@ -96,6 +101,7 @@ mod place_deref_first;
 mod place_pointee;
 mod place_post_deref;
 mod place_projection;
+mod ref_pointee_table;
 mod result;
 mod result_combinators;
 mod result_helpers;
@@ -107,14 +113,16 @@ mod slice;
 mod sort_inference;
 mod sort_inference_adt;
 mod ssa;
+mod stack_lifetime;
 mod terminator;
-mod unwind_sentinel;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 mod tests;
+mod unwind_sentinel;
 
 // Re-export StatementCodegen from codegen_prelude for crate-level access.
 pub(in crate::codegen_ay) use codegen_prelude::StatementCodegen;
 pub(in crate::codegen_ay) use codegen_prelude::{AdapterStage, AdapterStageKind, BmcModifiesFrame};
+pub(in crate::codegen_ay) use ref_pointee_table::{MergedAlternative, PointeeLookup, RefPointees};
 
 // Re-export iterator unsoundness counter accessor (#1929)
 pub(in crate::codegen_ay) use collections::get_bmc_iterator_unsound_skip_count;
@@ -235,6 +243,9 @@ pub(super) struct IncomingEdge {
     /// edge — snapshotted from `current_variant_facts` plus the switch's per-branch
     /// fact. Merged by INTERSECTION at the target block's entry.
     pub(super) variant_facts: Vec<VariantFact>,
+    /// The reference-pointee table on this edge (a copy-on-write snapshot),
+    /// merged at the target block's entry (`ref_pointee_table`).
+    pub(super) ref_pointees: RefPointees,
 }
 
 /// SwitchInt→variant bridge (Effort 2, #3017): a path-scoped fact that the storage

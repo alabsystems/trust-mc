@@ -19,14 +19,16 @@ fn test_codegen_simd_and_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result =
             codegen.codegen_simd_and(&[local_operand(1), local_operand(2)], &dest, Some(1));
         assert_eq!(result, Some(1));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_and should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvand"), "simd_and should emit bvand, got {emitted}");
     });
 }
@@ -42,14 +44,16 @@ fn test_codegen_simd_shr_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result =
             codegen.codegen_simd_shr(&[local_operand(1), local_operand(2)], &dest, Some(2));
         assert_eq!(result, Some(2));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_shr should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("I32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("I32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvashr"), "signed simd_shr should emit bvashr, got {emitted}");
     });
 }
@@ -80,14 +84,16 @@ fn test_codegen_simd_or_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result =
             codegen.codegen_simd_or(&[local_operand(1), local_operand(2)], &dest, Some(13));
         assert_eq!(result, Some(13));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_or should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvor"), "simd_or should emit bvor, got {emitted}");
     });
 }
@@ -103,14 +109,16 @@ fn test_codegen_simd_xor_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result =
             codegen.codegen_simd_xor(&[local_operand(1), local_operand(2)], &dest, Some(14));
         assert_eq!(result, Some(14));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_xor should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("U32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("U32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvxor"), "simd_xor should emit bvxor, got {emitted}");
     });
 }
@@ -126,14 +134,16 @@ fn test_codegen_simd_shl_returns_target() {
         seed_arg_locals(&mut codegen, &body);
         let dest = return_dest_place();
 
+        let before = constraint_count(&codegen);
+
         let result =
             codegen.codegen_simd_shl(&[local_operand(1), local_operand(2)], &dest, Some(15));
         assert_eq!(result, Some(15));
 
         let dest_expr = assigned_expr_for_place(&mut codegen, &dest)
             .expect("simd_shl should assign destination");
-        assert_eq!(dest_expr.sort().datatype_name(), Some("I32x4"));
-        let emitted = latest_constraint_text(&codegen);
+        assert_eq!(dest_expr.sort().datatype_name().map(local_sort_name), Some("I32x4"));
+        let emitted = constraints_text_since(&codegen, before);
         assert!(emitted.contains("bvshl"), "simd_shl should emit bvshl, got {emitted}");
     });
 }

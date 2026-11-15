@@ -68,8 +68,18 @@ pub(crate) fn candidates() -> Vec<Candidate> {
         |dir| format!("{}/bin/{DRIVER}", dir.display()),
     );
 
+    // A package manager may install the complete bundle at any prefix. Resolve
+    // it from the executable, so a PATH symlink works without a global
+    // TRUST_MC_SYSROOT override or a checkout in the working directory.
+    let colocated = env::current_exe().ok().and_then(|exe| colocated_sysroot(&exe));
+    let colocated_display = colocated.as_ref().map_or_else(
+        || format!("<executable bundle>/bin/{DRIVER}"),
+        |dir| format!("{}/bin/{DRIVER}", dir.display()),
+    );
+
     vec![
         Candidate { source: "TRUST_MC_SYSROOT", sysroot: env_sysroot, display: env_display },
+        Candidate { source: "executable bundle", sysroot: colocated, display: colocated_display },
         Candidate {
             source: "local build",
             sysroot: dev,
@@ -80,6 +90,14 @@ pub(crate) fn candidates() -> Vec<Candidate> {
         },
         Candidate { source: "release bundle", sysroot: bundle, display: bundle_display },
     ]
+}
+
+fn colocated_sysroot(executable: &Path) -> Option<PathBuf> {
+    let bin = executable.parent()?;
+    if bin.file_name()? != "bin" || !bin.join(DRIVER).is_file() {
+        return None;
+    }
+    Some(bin.parent()?.to_path_buf())
 }
 
 /// A sysroot produced by `build-trust-mc build-dev`, at `<repo>/target/trust-mc`.
@@ -144,12 +162,127 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// The `ay` solver binary the engine will pick: first in the sysroot's `bin`,
-/// then on `PATH` — the same order the engine's `PATH` sees after
+/// Names the `ay` binary the engine runs, in preference to `PATH`.
+pub(crate) const AY_BIN_ENV: &str = "TRUST_MC_AY_BIN";
+/// `1` lets the engine run an off-pin `ay`, with every success UNVALIDATED.
+pub(crate) const ALLOW_UNPINNED_ENV: &str = "TRUST_MC_ALLOW_UNPINNED_AY";
+
+/// `$TRUST_MC_AY_BIN`, when set to something non-empty. The engine runs that
+/// binary and does not fall back to `PATH` while it is set.
+pub(crate) fn solver_override() -> Option<PathBuf> {
+    env::var_os(AY_BIN_ENV).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// The `ay` solver binary the engine will pick: `$TRUST_MC_AY_BIN` when set
+/// (and nothing else, even when it is unusable), otherwise first in the
+/// sysroot's `bin`, then on `PATH` — the same order the engine sees after
 /// [`exec_engine`] prepends `<sysroot>/bin`.
 pub(crate) fn solver_path(engine: Option<&Engine>) -> Option<PathBuf> {
+    if let Some(path) = solver_override() {
+        return is_executable(&path).then_some(path);
+    }
     let extra = engine.map(|e| vec![e.sysroot.join("bin")]).unwrap_or_default();
     find_on_path("ay", &extra)
+}
+
+/// The root manifest of the workspace this front door was built in.
+const ROOT_MANIFEST: &str = include_str!("../../Cargo.toml");
+
+/// The AY commit this front door's workspace pins: the `rev` of `ay` in the
+/// root `Cargo.toml`'s `[workspace.dependencies]`, the same declaration the
+/// engine checks its `ay` against. Doctor falls back to it when the engine is
+/// missing or will not attest its own pin, so it can still call a binary
+/// off-pin.
+pub(crate) fn declared_ay_pin() -> Option<String> {
+    parse_declared_ay_pin(ROOT_MANIFEST)
+}
+
+pub(crate) fn parse_declared_ay_pin(manifest: &str) -> Option<String> {
+    let mut in_workspace_dependencies = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_workspace_dependencies = line == "[workspace.dependencies]";
+            continue;
+        }
+        if !in_workspace_dependencies {
+            continue;
+        }
+        // `ay = {...}`, not `ay-dpll = {...}` or `ay_bindings = {...}`.
+        let Some(table) =
+            line.strip_prefix("ay").and_then(|rest| rest.trim_start().strip_prefix('='))
+        else {
+            continue;
+        };
+        let (_, after_rev) = table.split_once("rev")?;
+        let value = after_rev.trim_start().strip_prefix('=')?.trim_start().strip_prefix('"')?;
+        let sha = value.split('"').next()?;
+        return is_full_commit(sha).then(|| sha.to_string());
+    }
+    None
+}
+
+fn is_full_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// How an `ay` binary relates to the pinned AY commit. Mirrors the engine's
+/// `PinStatus` (`trust-mc-driver/src/ay_binary.rs`); the engine is what
+/// refuses, doctor only reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SolverPin {
+    Matched,
+    OtherCommit(String),
+    DirtyBuild(String),
+    Unstamped,
+    NoVersion,
+}
+
+pub(crate) fn solver_pin(version: Option<&str>, pin: &str) -> SolverPin {
+    let Some(version) = version else {
+        return SolverPin::NoVersion;
+    };
+    match solver_build_stamp(version) {
+        None => SolverPin::Unstamped,
+        Some((commit, true)) => SolverPin::DirtyBuild(commit),
+        Some((commit, false)) if commit == pin => SolverPin::Matched,
+        Some((commit, false)) => SolverPin::OtherCommit(commit),
+    }
+}
+
+impl SolverPin {
+    /// The same wording the engine's refusal uses.
+    pub(crate) fn problem(&self) -> String {
+        match self {
+            SolverPin::Matched => "none: it is the pinned commit".to_string(),
+            SolverPin::OtherCommit(commit) => {
+                format!("it was built from AY commit {commit}, not the pinned commit")
+            }
+            SolverPin::DirtyBuild(commit) => format!(
+                "it was built from a dirty AY tree at {commit}, so it is not the pinned commit"
+            ),
+            SolverPin::Unstamped => "its version line carries no `+build.<n>.<commit>` stamp, \
+                                     so its commit cannot be checked"
+                .to_string(),
+            SolverPin::NoVersion => {
+                "it did not answer `ay --version`, so its commit cannot be checked".to_string()
+            }
+        }
+    }
+}
+
+/// The fix for an off-pin `ay`, word for word what the engine prints when it
+/// refuses one (`trust-mc-driver/src/ay_binary.rs`, `unpinned_ay_fix`);
+/// `tests/cli.rs` compares the two binaries' output.
+pub(crate) fn unpinned_ay_fix(pin: &str) -> String {
+    format!(
+        "build `ay` at the pinned AY commit and point trust-mc at it:\n    \
+         git -C <ay checkout> checkout {pin}\n    \
+         targo --unverified build --release --manifest-path <ay checkout>/Cargo.toml -p ay --features cli\n    \
+         export {AY_BIN_ENV}=<ay checkout>/target/release/ay\n  \
+         ...or run anyway, with every success reported as SUCCESSFUL (UNVALIDATED):\n    \
+         pass --allow-unpinned-ay, or set {ALLOW_UNPINNED_ENV}=1"
+    )
 }
 
 /// A sibling `ay` checkout whose solver binary is already built, if there is one.
@@ -173,7 +306,7 @@ pub(crate) fn solver_hint() -> String {
             format!("export PATH=\"{}:$PATH\"", dir.display())
         }
         None => "build the AY solver in a sibling checkout of alabsystems/ay\n    \
-                 (cd ../ay && cargo build --release -p ay --features cli),\n    \
+                 (cd ../ay && targo --unverified build --release -p ay --features cli),\n    \
                  then put its target/release directory on PATH"
             .to_string(),
     }
@@ -214,6 +347,19 @@ pub(crate) fn drive_as(
              {BUILD_CMD}\n",
             engine.driver.display(),
             missing.join(", ")
+        )));
+    }
+
+    if needs_solver
+        && solver_path(Some(&engine)).is_none()
+        && let Some(path) = solver_override()
+    {
+        return Err(Fail::not_ready(format!(
+            "error: {AY_BIN_ENV}={} is not an executable file\n\n\
+             trust-mc runs the `ay` solver {AY_BIN_ENV} names in preference to PATH, and\n\
+             does not fall back to PATH while it is set.\n\n\
+             To fix, point it at a built `ay` binary, or unset it:\n\n    unset {AY_BIN_ENV}\n",
+            path.display()
         )));
     }
 
@@ -441,13 +587,31 @@ pub(crate) fn solver_version(ay: &Path) -> Option<String> {
     capture(ay, &["--version"]).and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
 }
 
-/// The 40-hex commit embedded in an `ay --version` line (`+build.<n>.<sha>`),
-/// when the solver stamps one.
-pub(crate) fn solver_build_sha(version_line: &str) -> Option<String> {
+/// The build stamp of an `ay --version` line, `+build.<n>.<commit>[-dirty]`:
+/// the 40-hex commit and whether the build was dirty. Strict in the same way
+/// the engine is — a decimal increment, exactly 40 lowercase hex digits, then
+/// `-dirty`, `@`, whitespace or the end.
+pub(crate) fn solver_build_stamp(version_line: &str) -> Option<(String, bool)> {
     let (_, after) = version_line.split_once("+build.")?;
-    let (_, rest) = after.split_once('.')?;
-    let sha: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-    if sha.len() == 40 { Some(sha) } else { None }
+    let (increment, rest) = after.split_once('.')?;
+    if increment.is_empty() || !increment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if rest.bytes().take_while(u8::is_ascii_hexdigit).count() != 40 {
+        return None;
+    }
+    let (commit, tail) = rest.split_at(40);
+    if !is_full_commit(commit) {
+        return None;
+    }
+    let (dirty, tail) = match tail.strip_prefix("-dirty") {
+        Some(tail) => (true, tail),
+        None => (false, tail),
+    };
+    if !(tail.is_empty() || tail.starts_with('@') || tail.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    Some((commit.to_string(), dirty))
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +652,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn installed_front_door_finds_its_own_bundle_without_a_checkout() {
+        let unique =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = env::temp_dir().join(format!("trust-mc-bundle-{}-{unique}", std::process::id()));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("trust-mc");
+        // A front door on its own must not claim an installed engine.
+        assert_eq!(colocated_sysroot(&executable), None);
+        fs::write(bin.join(DRIVER), b"fixture").unwrap();
+        assert_eq!(colocated_sysroot(&executable), Some(root.clone()));
+        // A conventional cargo output remains the existing local-build lane.
+        let release = root.join("target/release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join(DRIVER), b"fixture").unwrap();
+        assert_eq!(colocated_sysroot(&release.join("trust-mc")), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn the_authority_line_parses() {
         let line = "trust_mc-version-authority version=0.2.0 invocation=standalone \
                     trust_mc_sha=fcdc0472e27fd131167fd7508d428af9a9c6c69f trust_mc_dirty=1 \
@@ -504,15 +688,81 @@ mod tests {
     }
 
     #[test]
-    fn the_solver_build_sha_is_extracted_from_the_version_stamp() {
-        let line =
-            "ay 0.13.0+build.8212.5bd74669349190eae57027c91c0430b4980046ac@2026-08-20T15:54:57Z";
+    fn the_solver_build_stamp_is_extracted_strictly() {
+        let pin = "94bf24d0f07fbcbfceea7ca3c509f8f35e9a8322";
         assert_eq!(
-            solver_build_sha(line).as_deref(),
-            Some("5bd74669349190eae57027c91c0430b4980046ac")
+            solver_build_stamp(&format!("ay 0.26.0+build.9281.{pin}@2026-09-11T02:47:31Z")),
+            Some((pin.to_string(), false))
         );
-        assert_eq!(solver_build_sha("ay 0.5.0"), None);
-        assert_eq!(solver_build_sha("ay 0.5.0+build.1.abcdef@now"), None);
+        assert_eq!(
+            solver_build_stamp(&format!("ay 0.26.0+build.1.{pin}-dirty@now")),
+            Some((pin.to_string(), true))
+        );
+        assert_eq!(solver_build_stamp("ay 0.5.0"), None);
+        assert_eq!(solver_build_stamp("ay 0.5.0+build.1.abcdef@now"), None);
+        assert_eq!(solver_build_stamp(&format!("ay 0.26.0+build.1.{pin}0@now")), None);
+        assert_eq!(solver_build_stamp(&format!("ay 0.26.0+build.x.{pin}@now")), None);
+        assert_eq!(
+            solver_build_stamp(&format!("ay 0.26.0+build.1.{}@now", pin.to_ascii_uppercase())),
+            None
+        );
+    }
+
+    #[test]
+    fn solver_pin_names_every_off_pin_shape() {
+        let pin = "94bf24d0f07fbcbfceea7ca3c509f8f35e9a8322";
+        let old = "dd4de9e94e0bb94a458641c7e5aa814c8aeadf59";
+        let line = |commit: &str| format!("ay 0.26.0+build.9281.{commit}@2026-09-11T02:47:31Z");
+        assert_eq!(solver_pin(Some(&line(pin)), pin), SolverPin::Matched);
+        assert_eq!(solver_pin(Some(&line(old)), pin), SolverPin::OtherCommit(old.to_string()));
+        assert_eq!(
+            solver_pin(Some(&format!("ay 0.26.0+build.1.{pin}-dirty")), pin),
+            SolverPin::DirtyBuild(pin.to_string())
+        );
+        assert_eq!(solver_pin(Some("ay 0.26.0"), pin), SolverPin::Unstamped);
+        assert_eq!(solver_pin(None, pin), SolverPin::NoVersion);
+        assert!(SolverPin::OtherCommit(old.to_string()).problem().contains(old));
+    }
+
+    #[test]
+    fn the_declared_ay_pin_comes_from_workspace_dependencies_only() {
+        let pin = "94bf24d0f07fbcbfceea7ca3c509f8f35e9a8322";
+        let manifest = format!(
+            "[workspace.dependencies]\n\
+             ay-dpll = {{ git = \"https://github.com/alabsystems/ay.git\", rev = \"{}\" }}\n\
+             ay_bindings = {{ rev = \"{}\", package = \"ay-bindings\" }}\n\
+             ay = {{ version = \"0.26.0\", git = \"https://github.com/alabsystems/ay.git\", rev = \"{pin}\", default-features = false }}\n\
+             \n[patch.\"https://github.com/alabsystems/ay.git\"]\nay = {{ path = \"../ay/crates/ay\" }}\n",
+            "a".repeat(40),
+            "b".repeat(40),
+        );
+        assert_eq!(parse_declared_ay_pin(&manifest).as_deref(), Some(pin));
+        assert_eq!(
+            parse_declared_ay_pin(&format!("[patch.x]\nay = {{ rev = \"{pin}\" }}\n")),
+            None
+        );
+        assert_eq!(
+            parse_declared_ay_pin("[workspace.dependencies]\nay = { path = \"../ay\" }\n"),
+            None
+        );
+        assert_eq!(
+            parse_declared_ay_pin("[workspace.dependencies]\nay = { rev = \"abc\" }\n"),
+            None
+        );
+
+        let real = declared_ay_pin().expect("this workspace pins ay by rev");
+        assert!(is_full_commit(&real), "{real}");
+    }
+
+    #[test]
+    fn the_unpinned_fix_names_the_pin_the_override_and_the_escape_hatch() {
+        let fix = unpinned_ay_fix("94bf24d0f07fbcbfceea7ca3c509f8f35e9a8322");
+        assert!(
+            fix.contains("git -C <ay checkout> checkout 94bf24d0f07fbcbfceea7ca3c509f8f35e9a8322")
+        );
+        assert!(fix.contains("export TRUST_MC_AY_BIN=<ay checkout>/target/release/ay"));
+        assert!(fix.contains("--allow-unpinned-ay"));
+        assert!(fix.contains("TRUST_MC_ALLOW_UNPINNED_AY=1"));
     }
 
     #[test]

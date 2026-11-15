@@ -9,37 +9,118 @@ use std::collections::HashMap;
 
 use crate::property_model::{RawSourceLocation, TraceArrayValue, TraceData, TraceItem, TraceValue};
 
-/// Parse kani::any_raw values from solver output into trace items.
+/// Decode a complete, guarded playback input stream from one SAT model.
 ///
-/// Extracts (ay_any_N value) pairs from get-value output and converts them
-/// to TraceItem format for concrete playback.
-///
-/// REQUIRES: output is solver output containing (ay_any_* value) entries (may be empty)
-/// REQUIRES: value formats are bitvector (#b, #x, (_ bvN W)), bool, or array models
-/// ENSURES: each ay_any entry with parseable value produces exactly one TraceItem
-/// ENSURES: returned TraceItems have step_type == "assignment"
-/// ENSURES: returned TraceItems have function == "kani::any_raw_internal::<ay>"
-pub(crate) fn parse_kani_any_trace(output: &str) -> Vec<TraceItem> {
-    let pairs = extract_named_pairs(output, "ay_any_");
-    let mut items = Vec::new();
-
-    for (idx, (_name, value)) in pairs.into_iter().enumerate() {
-        if let Some(trace_value) = trace_value_from_model_value(&value) {
-            items.push(TraceItem {
-                step_type: Cow::Borrowed("assignment"),
-                lhs: Some(format!("goto_symex$$return_value{idx}")),
-                source_location: Some(RawSourceLocation {
-                    column: None,
-                    file: None,
-                    function: Some("kani::any_raw_internal::<ay>".to_string()),
-                    line: None,
-                }),
-                value: Some(trace_value),
-            });
+/// Missing or malformed markers refuse playback (`None`), rather than silently
+/// dropping inputs. The count includes inactive sites; only active, replayable
+/// byte values enter the returned trace. Ordinals preserve creation order even
+/// when the solver prints get-value results in a different order.
+pub(crate) fn parse_kani_any_trace(output: &str) -> Option<Vec<TraceItem>> {
+    let pairs = extract_named_pairs(output, "ay_playback_");
+    // extract_named_pairs stops at a truncated S-expression. Do not accept an
+    // otherwise complete prefix followed by a truncated duplicate or extra slot.
+    if pairs.len() != output.matches("(ay_playback_").count() || !balanced_model_output(output) {
+        return None;
+    }
+    let mut fields = HashMap::new();
+    for (name, value) in pairs {
+        if fields.insert(name, value).is_some() {
+            return None;
         }
     }
+    let count = trace_value_from_model_value(&fields.remove("ay_playback_count")?)?;
+    if count.width != Some(64) || count.elements.is_some() {
+        return None;
+    }
+    let count = usize::try_from(u64::from_str_radix(count.binary.as_deref()?, 2).ok()?).ok()?;
+    if count.checked_mul(3)? != fields.len() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for ordinal in 0..count {
+        let active = parse_bool(&fields.remove(&format!("ay_playback_guard_{ordinal}"))?)?;
+        let replayable = parse_bool(&fields.remove(&format!("ay_playback_replayable_{ordinal}"))?)?;
+        let value = fields.remove(&format!("ay_playback_value_{ordinal}"))?;
+        // A field is exactly one SMT term. Even inactive sites must not hide
+        // malformed literal encodings or a truncated/multiple-term value.
+        let (_, rest) = split_first_sexpr(&value)?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        let decoded = trace_value_from_model_value(&value);
+        if value.starts_with("#x") || value.starts_with("#b") || value.starts_with("(_ bv") {
+            let bits = decoded.as_ref()?.binary.as_deref()?;
+            if bits.is_empty() || !bits.bytes().all(|bit| matches!(bit, b'0' | b'1')) {
+                return None;
+            }
+        }
+        if !active {
+            continue;
+        }
+        if !replayable {
+            return None;
+        }
+        let value = decoded?;
+        let bits = value.binary.as_deref()?;
+        let width = value.width? as usize;
+        // Raw SMT arrays do not identify their finite length or default-filled
+        // holes. Compiler-generated arrays query each scalar element instead.
+        if value.elements.is_some()
+            || width == 0
+            || width > 128
+            || width % 8 != 0
+            || bits.len() != width
+            || !bits.bytes().all(|bit| matches!(bit, b'0' | b'1'))
+        {
+            return None;
+        }
+        items.push(TraceItem {
+            step_type: Cow::Borrowed("assignment"),
+            lhs: Some(format!("goto_symex$$return_value{ordinal}")),
+            source_location: Some(RawSourceLocation {
+                column: None,
+                file: None,
+                function: Some("kani::any_raw_internal::<ay>".to_string()),
+                line: None,
+            }),
+            value: Some(value),
+        });
+    }
+    fields.is_empty().then_some(items)
+}
 
-    items
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn balanced_model_output(output: &str) -> bool {
+    let (mut depth, mut quoted, mut symbol, mut comment) = (0usize, false, false, false);
+    for ch in output.chars() {
+        if comment {
+            comment = ch != '\n';
+        } else if quoted {
+            quoted = ch != '"';
+        } else if symbol {
+            symbol = ch != '|';
+        } else {
+            match ch {
+                ';' => comment = true,
+                '"' => quoted = true,
+                '|' => symbol = true,
+                '(' => depth += 1,
+                ')' => {
+                    let Some(next) = depth.checked_sub(1) else { return false };
+                    depth = next;
+                }
+                _ => {}
+            }
+        }
+    }
+    depth == 0 && !quoted && !symbol
 }
 
 /// Extract `(name value)` pairs for a given prefix from SMT solver output.
@@ -151,6 +232,11 @@ pub(super) fn trace_value_from_model_value(value: &str) -> Option<TraceValue> {
     }
 
     if let Some((dec, width)) = parse_bv_sexpr(trimmed) {
+        // Native primitive inputs are at most 128 bits. Refuse wider model
+        // terms before allocating width-sized padding from untrusted output.
+        if width > 128 {
+            return None;
+        }
         let bits = decimal_to_bits(&dec, width);
         return Some(TraceValue {
             binary: Some(bits),
@@ -177,12 +263,15 @@ fn parse_bv_sexpr(value: &str) -> Option<(&str, u32)> {
     let bv = parts.next()?;
     let width = parts.next()?;
 
-    if head != "_" || !bv.starts_with("bv") {
+    if head != "_" || !bv.starts_with("bv") || parts.next().is_some() {
         return None;
     }
 
     let dec = bv.trim_start_matches("bv");
     let width = width.parse::<u32>().ok()?;
+    if dec.is_empty() || !dec.bytes().all(|digit| digit.is_ascii_digit()) || width == 0 {
+        return None;
+    }
     Some((dec, width))
 }
 
@@ -397,3 +486,7 @@ fn parse_index_value(s: &str) -> Option<u64> {
     // Try plain decimal
     trimmed.parse().ok()
 }
+
+#[cfg(test)]
+#[path = "trace_tests.rs"]
+mod tests;

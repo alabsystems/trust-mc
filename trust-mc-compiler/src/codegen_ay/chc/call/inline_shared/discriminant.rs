@@ -8,6 +8,8 @@
 //! just coroutine discriminants, so destructor assertions like
 //! `self.0.is_some()` remain reachable on cleanup paths.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue, SortInner};
 use rustc_abi::VariantIdx as InternalVariantIdx;
 use rustc_public::rustc_internal;
@@ -31,6 +33,32 @@ pub(in crate::codegen_ay) fn inline_discriminant_expr(
         }
         _ => Some(Expr::bitvec_const(0u64, POINTER_WIDTH)),
     }
+}
+
+/// The condition that `value`, the term of a FIELDLESS enum (two or more
+/// variants, none with a field; a raw bitvector in the encoding), holds one
+/// of the enum's discriminants: the disjunction over its variants, compared
+/// as the walker compares discriminants (sign-extended to pointer width for a
+/// signed repr). `None` for any other type, or a term that is no bitvector.
+pub(in crate::codegen_ay) fn inline_fieldless_enum_validity(
+    ctx: &ChcCtx<'_, '_>,
+    ty: rustc_public::ty::Ty,
+    value: Expr,
+) -> Option<Expr> {
+    let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+        return None;
+    };
+    if def.kind() != AdtKind::Enum {
+        return None;
+    }
+    let variants = def.variants();
+    if variants.len() < 2 || !variants.iter().all(|variant| variant.fields().is_empty()) {
+        return None;
+    }
+    let discr = normalize_enum_scalar(def, value)?;
+    (0..variants.len())
+        .map(|idx| discr.clone().eq(enum_discriminant_const(ctx, def, idx)))
+        .reduce(|acc, eq| acc.or(eq))
 }
 
 fn translate_enum_discriminant(

@@ -12,13 +12,83 @@ denominator.
 
 | Artifact | Rows | `row_sha256` |
 | --- | ---: | --- |
-| `tests/trust-mc/replacement-harness-inventory.json` | 818 | `393e71e1f522142a880a86a03f8dfdd1362dd09855c09582f0a1e507fa365a30` |
-| `tests/trust-mc/replacement-harness-inventory.proof.json` | 504 | `62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf` |
-| `tests/trust-mc/non-proof-closure.json` | 314 | `4e47d2dac3feb0c6835b2566a98f47d1388970ec6b58098a91c3b33138f39bbf` |
+| `tests/trust-mc/replacement-harness-inventory.json` | 818 | `91e3425e3e1cb4339ced9bc99f5bb24caad671f147697d02c1b95293f5dfdd98` |
+| `tests/trust-mc/replacement-harness-inventory.proof.json` | 485 | `ffdde89eb28c7e8c1a4c73897e1b2c3c47078bd718046294ece8babcebe4c40f` |
+| `tests/trust-mc/non-proof-closure.json` | 333 | `cd0d81801df6f0ceb4aad67818bd628991112966b455ab4772ace8629bbccaf6` |
 | `tests/trust-mc/replacement-upstream-inactive.json` | 32 | `7e2eef01baaa59e5f4ee92daa7f025e3dc841071ae784dd68247dc0f464c9fe5` |
 
-The mixed inventory is the whole replacement denominator. Its 504 `PROOF`
-rows are the proof-quality subset; its 314 non-`PROOF` rows are deliberate
+### Corrected failure oracles, 2026-11-14
+
+The original survey labelled 27 single-harness files `PROOF` despite their
+explicit `kani-verify-fail` annotations in the initial fork. Their program bodies
+are unchanged; examples include the assertion `2 + 3 == 6`, which the actual
+current driver correctly refutes. The survey had applied the missing expected-
+output-file default to suites whose test mode uses failure annotations.
+
+[The correction record](tools/replacement-inventory/oracle-corrections-2026-11-14.json)
+names every changed row and the immutable fork/blob/source identities. Only those
+27 expectations move from `PROOF` to `CTREX`: all 818 file/harness/lane identities
+remain unchanged, no source program is weakened, and no row is excluded. The
+current partition is 485 proof expectations and 333 negative expectations;
+with the same 32 upstream-inactive proof rows, the active bar is 453 + 333 = 786.
+Historical reports retain their original authority hashes and counts and do not
+become measurements of this corrected authority. Counterexamples still need the
+required checked evidence; this correction grants no proof or execution credit.
+
+A subsequent [per-harness semantic audit](tools/replacement-inventory/oracle-semantic-corrections-2026-11-14.json)
+corrects six more labels: two coroutine harnesses and the valid mutable-reference
+division contract require PROOF; the uninitialized atomic read and two invalid
+postcondition checks require CTREX. Three labels move each way, leaving the same
+partition and every historical identity. The selected contract harness controls
+its oracle; a different ordinary harness's file-level output is not its result.
+Expected-panic test success likewise retains its raw checked CTREX outcome.
+
+The two [safe enum examples](tools/replacement-inventory/niche-oracle-corrections-2026-11-14.json)
+also require PROOF. Their unchanged sources construct the exact variants they
+match, and their original outputs require only SUCCESS or UNREACHABLE checks.
+The words `assertion failed` describe the checked assertion, not a failing
+status. These corrections preserve every source and historical identity.
+Separate reachability examples retain their existing requirements pending
+qualification of their explicit unreachable-check reporting.
+
+The two [independent-prior contract checks](tools/replacement-inventory/contract-prior-oracle-corrections-2026-11-14.json)
+also require CTREX: their preconditions do not equate `prior` with the initial
+target. Inputs target=0 and prior=1 violate each postcondition after increment.
+The original successful output names only their separate `main` harnesses,
+which pass the correct prior value and retain PROOF requirements.
+
+The [dead-pointer negation correction](tools/replacement-inventory/memory-predicate-oracle-correction-2026-11-14.json)
+requires PROOF for `thin_ptr_validity::check_invalid_ptr`: it asserts that expired
+nonzero stack storage cannot be dereferenced. The original Kani failure names
+an unsupported-memory limitation, not a false program assertion. Reproducing
+that limitation is not a genuine refutation. The sibling `check_invalid_array`
+still asserts the opposite and requires a Genuine counterexample. Both source
+programs remain unchanged.
+
+The [remaining source-oracle audit](tools/replacement-inventory/remaining-oracle-corrections-2026-11-14.json)
+corrects sixteen labels: eleven safe programs need PROOF, while five union
+programs with uninitialized reads or an invalid transmute-copy need Genuine
+counterexamples. The safe cases include untyped byte writes/copies without
+invalid typed reads, initialized swap, valid char conversion, double reversal,
+address-only enum use, a nop, fixed slice destructuring and C string literals.
+The renamed union and C string sources are bound to their original fork blobs;
+the five initialized union controls retain PROOF. The original unsupported or
+file-level failure output is not a semantic bug oracle. Every historical
+identity remains, and historical measurements keep their original labels.
+
+The cover examples also require their original property outcomes. A safety
+PROOF with undetermined cover properties does not establish coverage parity.
+The five original cover rows now require exact named property outcomes through
+[the source-bound cover authority](tools/replacement-inventory/cover-property-oracles.json).
+The runner, progress accounting and proof extraction refuse missing, duplicate,
+extra, malformed or mismatched cover evidence. Generic ordinal descriptions and
+aggregate counts do not establish original property identity. Only
+`cover-unreachable` changes its safety oracle to PROOF; all ten cover requirements
+remain. Runtime coverage parity remains open: implementing accounting and
+correcting a safety label supplies no successful cover measurement.
+
+The mixed inventory is the whole replacement denominator. Its 485 `PROOF`
+rows are the proof-quality subset; its 333 non-`PROOF` rows are deliberate
 negative expectations with checked closure records. The generator reads the
 surveyed `tools/replacement-inventory/public-corpus.json`; it does not infer a
 smaller authority set from whichever harnesses happen to compile today.
@@ -27,16 +97,17 @@ smaller authority set from whichever harnesses happen to compile today.
 back to current source and to an executable driver identity. The binding is
 fail-closed:
 
-- 740 rows have an exact current harness name;
-- 45 bare historical names resolve to one unique module-qualified harness;
+- 739 rows have an exact current harness name;
+- 46 bare historical names resolve to one unique qualified harness, including
+  the associated method `Dummy::new`;
 - one function-level gate is active through its package's default `full`
   feature;
 - 32 `PROOF` rows are source-bound to an exact `#[cfg(disabled)]` harness.
 
 Therefore the current source-bound plan is 818 historical rows, 786 active
-executions, and 32 inactive-accounted rows. The proof subset is 472 active plus
+executions, and 32 inactive-accounted rows. The proof subset is 453 active plus
 32 inactive rows. Inactive rows receive neither execution nor proof credit.
-The 314 non-`PROOF` rows are all active. An unknown mapping, an ambiguous alias,
+The 333 non-`PROOF` rows are all active. An unknown mapping, an ambiguous alias,
 or a changed gate is an error rather than an implicit skip.
 
 The 66 active Cargo rows are also bound through the conventional Rust module
@@ -59,10 +130,10 @@ A REPLACEMENT claim is bounded by what the INCUMBENT DOES. Upstream Kani ships 3
 them — 12 need more than 10 GB, 5 exceed 15 minutes, 11 need
 `pthread_key_create`, 2 need `memchr`, one `syscall`, one `write`. Those are not
 things Kani does. Requiring them made the strict bar *harder* than replacement
-and mathematically unreachable: 32 of 504 `PROOF` rows earned zero credit by
+and mathematically unreachable: the 32 upstream-inactive `PROOF` rows earned zero credit by
 construction, so the gate could never go green however good AY became.
 
-The bar is therefore the **786 active rows** (472 `PROOF` + 314 non-`PROOF`).
+The bar is therefore the **786 active rows** (453 `PROOF` + 333 non-`PROOF`).
 
 **This narrows the BAR. It does not narrow the DENOMINATOR.** All 818 historical
 rows remain the authority, every one still appears in the schema-v2 report, and
@@ -153,7 +224,8 @@ library models, then thread-local/syscall and spawn/select semantics. For every
 row, remove `#[cfg(disabled)]`, run the exact cargo harness through AY, retain
 the row in the 818 authority, regenerate/check the disposition artifact, and
 require a clean `PROOF` record. The strict gate becomes eligible only when
-`.summary.proof.inactive_zero_credit == 0`.
+`.summary.proof.local_inactive == 0`; each activated row raises
+`.summary.proof.bar` and must then carry a clean `PROOF` record.
 
 ## What constitutes replacement evidence
 
@@ -169,7 +241,15 @@ A replacement claim must bind all evidence to one tuple:
   `--version-authority` evidence for the current clean TrustMC commit and the
   clean linked AY authority;
 - one schema-v2 report containing all 818 historical rows;
-- a proof-only report containing exactly the 504 `PROOF` rows;
+- a proof-only report containing exactly the **453 active** `PROOF` rows, plus
+  a `replacement_bar` block naming all 32 upstream-inactive rows it excludes
+  (`historical` 485, `bar` 453, `upstream_inactive_zero_credit` 32,
+  `local_inactive` 0, and the active-subset digest). The 32 must each be
+  present in the full 818-row report as a zero-credit `SKIP` carrying its bound
+  reason before extraction may exclude it — a row that is simply absent fails
+  the gate. Keeping all 485 rows with 32 `SKIP`s is not available: the Rust
+  auditor treats `status SKIP` as not-`PASS`, requires report keys to equal the
+  inventory denominator, and the zero-fallback gate requires `summary.skip == 0`;
 - logs and exit codes from the self-test, public runner, proof extraction,
   zero-fallback gate, and strict audit.
 
@@ -217,9 +297,12 @@ checked plan before producing the schema-v2 report. The measurement tree must
 be clean before and after execution and its fingerprint must not change during
 the run; Cargo lock creation or mutation therefore fails rather than becoming
 evidence.
-At the current source state it is expected to finish the active work but return
-nonzero because 32 proof rows are inactive with zero credit. Do not convert
-that expected red result into green evidence.
+At the current source state it is expected to finish the 786 active rows and
+return zero when they all pass; the 32 upstream-inactive rows are reported as
+`SKIP` / `inactive_accounted` with no credit. It returns nonzero on any
+active-row failure, or on any row a LOCAL `#[cfg(disabled)]` removed from the
+run — those stay inside the bar and are named individually. Do not convert a
+red result into green evidence by disabling the row that produced it.
 
 Once every proof row is active and the full report is clean, derive the
 proof-only report:
@@ -231,8 +314,10 @@ proof-only report:
   reports/compiletest-per-harness-proof-latest-trust-mc.json
 ```
 
-Extraction is intentionally red today because a `SKIP` cannot become proof
-evidence. When it succeeds, compute the explicit authority tuple and run:
+Extraction demands the 453 active `PROOF` rows, and separately requires each of
+the 32 upstream-inactive rows to be present in the full report as a zero-credit
+`SKIP`. A `SKIP` never becomes proof evidence; it only has to be accounted for.
+Compute the explicit authority tuple and run:
 
 ```bash
 HEAD_SHA=$(git rev-parse HEAD)
@@ -258,8 +343,8 @@ NON_PROOF_FILE_SHA=$(shasum -a 256 tests/trust-mc/non-proof-closure.json | awk '
   --expected-commit "$HEAD_SHA" \
   --expected-ay-pin "$AY_PIN" \
   --expected-tree-fingerprint "$TREE_FINGERPRINT" \
-  --expected-harnesses 504 \
-  --expected-inventory-sha 62ddf770d23c96f5d45875e381ba310f9e0374658b50885df0a07b7c48d3c9cf \
+  --expected-harnesses 485 \
+  --expected-inventory-sha ffdde89eb28c7e8c1a4c73897e1b2c3c47078bd718046294ece8babcebe4c40f \
   --non-proof-closure tests/trust-mc/non-proof-closure.json \
   --expected-non-proof-closure-sha "$NON_PROOF_FILE_SHA"
 ```
@@ -283,8 +368,10 @@ source-disposition, current-head, solver-attestation, and strict proof gates.
 ## Must fail closed
 
 Reject a replacement claim when any authority digest or identity differs; a
-row is missing, duplicated, ambiguous, inactive, skipped, xfailed, unknown, or
-errored; an expectation changes unexpectedly; a proof uses fallback or loses
+row is missing, duplicated, ambiguous, xfailed, unknown, or errored; a row is
+inactive or skipped anywhere but the 32-row upstream-inactive set, or one of
+those 32 is missing from the full report or carries any credit; an
+expectation changes unexpectedly; a proof uses fallback or loses
 classification metadata; the report is stale or dirty; AY identity cannot be
 attested; the TrustMC driver is stale, dirty, changed, or unattested; or any
 required command exits nonzero. "Upstream blocked", timeout, resource cost, or

@@ -1,0 +1,17 @@
+# Reconstructed transcript: the Trust-lane driver log (smack/structures/point.rs, CHC, external ay, 2026-09-14) this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness main...
+[AY:PROOF] CHC verification: property proven (external ay)
+[AY:PROOF_QUALIFIERS:unattributed_check=chc.0]
+Check 1: chc.0
+	 - Status: SUCCESS
+	 - Description: "chc.0"
+	 - Location: Unknown file
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Complete - 1 successfully verified harnesses, 0 failures, 1 total.

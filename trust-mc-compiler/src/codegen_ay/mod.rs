@@ -17,6 +17,7 @@ mod context;
 mod coroutine_layout;
 pub(crate) mod diagnostics;
 mod emitter;
+mod unstubbed_accounting;
 // The per-datatype field-role table (`docs/addr-vs-value-conversion-queue.md`
 // §4 item 7): the declaration records which fields hold ADDRESSES, from the MIR
 // type it was built out of, so consumers read the fact instead of guessing it
@@ -27,12 +28,16 @@ mod float_arithmetic_pure;
 mod float_compare;
 #[allow(dead_code)] // BMC-path functions not yet wired into dispatch
 mod float_math_ops;
+mod float_minmax;
 mod float_range_check;
+mod fn_ptr_identity;
 mod foreign_defs;
+mod iter_closure_obligation;
+mod iter_sum_summand;
 mod loop_invariant;
-mod obligation_free_walk;
 mod loop_unroll;
 mod names;
+mod obligation_free_walk;
 mod option_like_eq;
 // Wave 1 of the address-vs-value conversion converted its first entry points;
 // the remaining accessors stay allowed until the later waves consume them.
@@ -43,14 +48,33 @@ mod provenance;
 // bit-identical to a widened thin one — `Val`/`Loc` alone cannot express that,
 // so `PtrRepr` decodes it structurally, once.
 mod ptr_repr;
+pub(crate) mod reduce_loop_rule;
 mod shadow_mem;
 mod shared;
+pub(crate) use shared::native_box_call::{NativeBoxCallKind, native_global_dyn_box_call};
+pub(crate) use shared::native_box_drop::{
+    native_global_box_pointee, native_global_dyn_box_drop_value,
+};
+pub(crate) use shared::native_box_raw::{
+    native_bmc_box_drop_is_modeled, native_bmc_box_drop_value, native_bmc_box_from_raw,
+    native_bmc_box_into_raw, native_bmc_has_custom_global_allocator, native_box_into_raw_identity,
+};
 mod statement;
+#[cfg(all(trust_toolchain, version("1.101")))]
+pub(crate) use shared::native_box_init::native_init_boundary;
+#[cfg(all(trust_toolchain, version("1.101")))]
+pub(crate) use shared::native_box_init::native_maybe_uninit_write;
+#[cfg(all(trust_toolchain, version("1.101")))]
+pub(crate) use shared::native_box_init::native_maybe_unsafe_accessor;
+#[cfg(all(trust_toolchain, version("1.101")))]
+pub(crate) use shared::native_box_init::native_maybe_write_box_receiver;
+pub(crate) use shared::native_box_uninit::native_box_new_uninit;
 mod store_coercion;
 // stubs extracted to trust_mc-codegen-stubs crate (Part of #2997).
 // Re-export as module alias to preserve all existing import paths.
 pub(crate) use trust_mc_codegen_stubs as stubs;
 mod target_config;
+pub(crate) mod translation_deadline;
 mod type_depth_guard;
 mod types;
 mod unsoundness_fields;
@@ -65,6 +89,8 @@ pub(crate) use compiler_interface::AYCodegenBackend;
 pub(crate) use unsoundness_fields::collect_unsoundness_fields;
 
 // Internal APIs used within the crate for MIR codegen
+// The production BMC IR path calls `emitter::emit_bmc_with_logic_override`.
+#[cfg(test)]
 pub(in crate::codegen_ay) use emitter::emit_bmc;
 pub(in crate::codegen_ay) use emitter::emit_chc;
 
@@ -142,6 +168,7 @@ pub(in crate::codegen_ay) use chc::take_known_stdlib_unconstrained_count;
 
 // kani::mem over-approximation counter accessor (#3165)
 // Used by metadata/reporting to surface memory safety predicates approximated as true.
+pub(in crate::codegen_ay) use chc::take_assert_untranslatable_by_fn;
 pub(in crate::codegen_ay) use chc::take_kani_mem_overapprox_by_fn;
 pub(in crate::codegen_ay) use chc::take_kani_mem_overapprox_count;
 pub(in crate::codegen_ay) use chc::take_offset_provenance_unresolved_by_fn;
@@ -252,8 +279,25 @@ pub(in crate::codegen_ay) use statement::set_vec_field_fallback_count_for_test;
 pub(in crate::codegen_ay) use store_coercion::set_bmc_store_coercion_fallback_count_for_test;
 
 #[cfg(test)]
+mod test_const_pointer_single_rule;
+#[cfg(test)]
 mod test_fixtures;
+#[cfg(test)]
+mod test_fresh_var_single_rule;
+#[cfg(test)]
+mod test_mono_ty_single_rule;
+#[cfg(test)]
+mod test_no_tool_by_name;
+#[cfg(test)]
+mod test_sort_name_single_rule;
+#[cfg(test)]
+mod test_source_scan;
+#[cfg(test)]
+pub(in crate::codegen_ay) mod test_support;
 #[cfg(test)]
 mod test_types;
 #[cfg(test)]
 mod test_types_enum;
+
+#[cfg(all(test, feature = "compiler-corpus-tests"))]
+mod trait_resolution_defaults;

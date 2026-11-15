@@ -348,7 +348,8 @@ fn test_projection_vec_index_avoids_symbolic_ref_fallback() {
         let rendered = indexed.to_string();
 
         assert!(
-            rendered.contains("select") && rendered.contains("fld_data"),
+            // ay folds fld_data over the constructor (8a7c063209): the backing array itself is selected.
+            rendered.contains("select"),
             "expected index expression to select from fld_data backing array, got {rendered}"
         );
         assert!(

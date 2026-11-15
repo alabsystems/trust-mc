@@ -25,7 +25,8 @@ pub use diagnostics::{
     SortHarmonizeFreshVarInfo, StaticInitIncompleteInfo, StoreDroppedTransitionInfo,
     StubApproximationInfo, TypeSortFallbackInfo, UNSOUNDNESS_CATEGORY_COUNT,
     UnconstrainedAssignmentInfo, UnhandledCallInfo, UnsoundnessCategory, UnsoundnessClass,
-    UnsoundnessRecord, UnsupportedConstructFallbackInfo, VecFieldFallbackInfo,
+    UnsoundnessRecord, UnstubbedAbstractionInfo, UnsupportedConstructFallbackInfo,
+    VecFieldFallbackInfo,
 };
 pub use harness::{
     AssignsContract, HarnessAttributes, HarnessKind, HarnessMetadata, Stub, find_proof_harnesses,
@@ -40,6 +41,7 @@ pub mod artifact;
 mod autoharness;
 mod chc;
 mod diagnostics;
+pub mod engine_args;
 mod harness;
 mod solver_option;
 pub mod unstable;
@@ -164,6 +166,13 @@ pub struct KaniMetadata {
     /// for pre-inlined UTF8/Cow/String internals not intercepted at reachability level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abstracted_fallbacks: Option<AbstractedFallbackInfo>,
+    /// Unstubbed-abstraction count (D1, 2026-09-14).
+    /// When present and non-zero, reachability abstracted a stdlib function away
+    /// with no stub and no handler, leaving its result unconstrained. Sound for
+    /// the verdict, but a counterexample raised over one is an
+    /// over-approximation, never a certified `Genuine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstubbed_abstractions: Option<UnstubbedAbstractionInfo>,
     /// Vec field fallback information (#2733).
     /// When present and non-zero, indicates `vec_field_select` encountered a Vec with
     /// non-datatype sort and returned a symbolic fallback instead of a real field access.
@@ -296,6 +305,7 @@ impl KaniMetadata {
             StoreDroppedTransition => ph!(self.store_dropped_transitions),
             IntoOptionDrop => ph!(self.into_option_drops),
             AbstractedFallback => ph!(self.abstracted_fallbacks),
+            UnstubbedAbstraction => ph!(self.unstubbed_abstractions),
             VecFieldFallback => ph!(self.vec_field_fallbacks),
             PointeeSynthesisFallback => ph!(self.pointee_synthesis_fallbacks),
             UnhandledCalls => ph!(self.unhandled_calls),

@@ -19,11 +19,15 @@ use stable::stable_tool_unstable_attrs;
 
 use std::collections::{BTreeMap, HashSet};
 
+use crate::rustc_compat::Attribute;
+#[cfg(all(trust_toolchain, version("1.101")))]
+use crate::rustc_compat::ToolAttributeSpan;
 use quote::ToTokens;
+#[cfg(all(trust_toolchain, version("1.101")))]
+use rustc_ast::attr::AttributeExt;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::{
-    Attribute,
     def::DefKind,
     def_id::{DefId, LocalDefId},
 };
@@ -258,6 +262,12 @@ impl<'tcx> KaniAttributes<'tcx> {
 
     pub(crate) fn has_recursion(&self) -> bool {
         self.map.contains_key(&KaniAttributeKind::Recursion)
+    }
+
+    /// Whether the item carries `#[kani::should_panic]`. Read-only: unlike
+    /// [`Self::harness_attributes`], it validates nothing and emits nothing.
+    pub(crate) fn has_should_panic(&self) -> bool {
+        self.map.contains_key(&KaniAttributeKind::ShouldPanic)
     }
 
     /// Whether this item is the contract machinery's recursion reentry
@@ -548,24 +558,28 @@ impl<'tcx> KaniAttributes<'tcx> {
     /// Report misusage of an unstable feature that was not enabled.
     fn report_unstable_forbidden(&self, unstable_attr: &UnstableAttribute) -> ErrorGuaranteed {
         let item_name = self.tcx.def_path_str(self.item);
-        self.tcx
-            .dcx()
-            .struct_err(format!(
-                "Use of unstable feature `{}`: {}",
-                unstable_attr.feature, unstable_attr.reason
-            ))
-            .with_span_note(
-                self.tcx.def_span(self.item),
-                format!("the item `{item_name}` is unstable:"),
-            )
-            .with_note(format!("see issue {} for more information", unstable_attr.issue))
-            .with_help(format!("use `-Z {}` to enable using this item.", unstable_attr.feature))
-            .emit()
+        emit_error!(
+            self.tcx
+                .dcx()
+                .struct_err(format!(
+                    "Use of unstable feature `{}`: {}",
+                    unstable_attr.feature, unstable_attr.reason
+                ))
+                .with_span_note(
+                    self.tcx.def_span(self.item),
+                    format!("the item `{item_name}` is unstable:"),
+                )
+                .with_note(format!("see issue {} for more information", unstable_attr.issue))
+                .with_help(format!(
+                    "use `-Z {}` to enable using this item.",
+                    unstable_attr.feature
+                ))
+        )
     }
 
     /// Is this item a harness? (either `proof` or `proof_for_contract`
     /// attribute are present)
-    fn is_proof_harness(&self) -> bool {
+    pub(crate) fn is_proof_harness(&self) -> bool {
         self.map.contains_key(&KaniAttributeKind::Proof)
             || self.map.contains_key(&KaniAttributeKind::ProofForContract)
     }
@@ -792,7 +806,7 @@ impl<'tcx> KaniAttributes<'tcx> {
                     ));
                 }
                 ResolveError::MissingTraitImpl { tcx: _, trait_fn_id, ty: _ } => {
-                    let generics = self.tcx.generics_of(trait_fn_id);
+                    let generics = self.tcx.generics_of(*trait_fn_id);
                     let parent_generics =
                         generics.parent.map(|parent| self.tcx.generics_of(parent));
                     if !generics.own_params.is_empty()

@@ -15,6 +15,7 @@
 mod constructor_wrap;
 mod raw_memory_reconstruct;
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ use self::constructor_wrap::wrap_value_into_matching_constructor;
 use self::raw_memory_reconstruct::reconstruct_datatype_from_raw_memory_bits;
 use super::ChcCtx;
 use super::codegen_ctx::diagnostics::{CellCounter, GLOBAL_COUNTERS};
-use super::codegen_ctx::globals::declare_pending_var;
+use crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::pack_declared_slice_roles;
 
 // All counter storage consolidated into GLOBAL_COUNTERS (Part of #2906).
 // Functions below delegate to GLOBAL_COUNTERS fields/methods.
@@ -116,6 +117,13 @@ pub(in crate::codegen_ay::chc) fn coerce_eq_constraint(
         let dt = result_sort.datatype_sort()?;
         let cons = dt.constructors.first()?;
         let target_width = out_sort.bitvec_width()?;
+        // Design 4 D: a slice view into a wide slot packs its declared roles,
+        // `[fld_len : upper | fld_ptr : lower]`. The MSB-first flatten below
+        // would transpose them, and the `fld_ptr`-only arm writes a widened
+        // thin pointer whose zero high half reads as length 0.
+        if let Some(packed) = pack_declared_slice_roles(&result_expr, target_width) {
+            return Some(dest_var.clone().eq(packed));
+        }
         if cons.fields.iter().any(|field| field.name == "fld_ptr") {
             // Part of #4050: full flatten when DT width matches target (e.g., Dyn_Trait→BV128).
             if let Some(dt_width) = flattenable_datatype_sort_width(&result_sort)
@@ -229,29 +237,19 @@ pub(in crate::codegen_ay::chc) fn coerce_eq_constraint(
         // Part of #3675: fixes check_ge SIMD PartialOrd via transmute.
         Some(dest_var.clone().eq(coerced))
     } else if out_sort.is_array()
-        && let Some(arr) = out_sort.array_sort()
-        && arr.element_sort == result_sort
+        && out_sort.array_sort().is_some_and(|arr| arr.element_sort == result_sort)
     {
-        // Part of #3783: Element→Array wrapping for compound Vec element types.
-        // When the destination is Array<K, V> and the value is V (the element sort),
-        // the value is a single element being assigned to an array-sorted slot.
-        // This arises for Vec<[T; N]> where the data field is Array<BV64, Array<BV64, T>>
-        // but the value is a single [T; N] element with sort Array<BV64, T>.
-        //
-        // Sound over-approximation: wrap the value in a fresh array with store(0, value).
-        // Index 0 is constrained to the value; all other indices are nondeterministic.
-        // This is strictly more precise than dropping the constraint entirely (which
-        // leaves the entire array nondeterministic via sound_fallback).
-        let fresh =
-            declare_pending_var(format!("coerce_elem_to_arr_{}", dest_var), out_sort.clone());
-        let idx = Expr::bitvec_const(0u64, arr.index_sort.bitvec_width().unwrap_or(POINTER_WIDTH));
-        let wrapped = fresh.store(idx, result_expr);
+        // Part of #3783: an element-sorted value for an array-sorted slot
+        // (`Vec<[T; N]>`'s data from one `[T; N]`) is wrapped by
+        // `wrap_element_into_array_slot`, which mints the array's other cells
+        // as a booked havoc (Rule E). A function with no translation context
+        // cannot book one, so it refuses the shape.
         debug!(
             val_sort = ?result_sort,
             out_sort = ?out_sort,
-            "coerce_eq_constraint: element→array wrapping (#3783)"
+            "coerce_eq_constraint: element into array slot needs a translation context; refusing"
         );
-        Some(dest_var.clone().eq(wrapped))
+        None
     } else if result_sort.is_array()
         && out_sort.is_array()
         && let Some(src_arr) = result_sort.array_sort()
@@ -450,7 +448,21 @@ impl<'tcx, 'body> CallCoerce for ChcCtx<'tcx, 'body> {
         dest_local: usize,
         site: &'static str,
     ) -> Option<Expr> {
+        // Design 4 D: the write boundary of a slice slot at a call destination.
+        // A slice view packs its declared roles, a thin result is widened, and
+        // any leaf whose high half is extension padding gets a counted fresh
+        // length instead of reading as length 0.
+        let result_expr = match self.body.locals().get(dest_local) {
+            Some(decl) if PtrSlot::of_sort(out_sort) == Some(PtrSlot::Fat) => {
+                let dest_ty = decl.ty;
+                self.guard_slice_len_slot_write(dest_ty, result_expr, site)
+            }
+            _ => result_expr,
+        };
         let result_sort = result_expr.sort().clone();
+        if let Some(wrapped) = self.wrap_element_into_array_slot(dest_var, &result_expr, out_sort) {
+            return Some(wrapped);
+        }
         // fc-interior-mut: refuse to coerce a bitvec that is not pointer-shaped
         // into a raw-pointer-typed destination. Such a result reaching a `*T`
         // dest is a dematerialized referent VALUE (e.g. the flattened u32
@@ -545,6 +557,37 @@ impl<'tcx, 'body> CallCoerce for ChcCtx<'tcx, 'body> {
 // Sound-fallback transition helpers extracted to codegen_call_fallback_emit.rs.
 // Re-exported here for backward compatibility with existing imports.
 pub(in crate::codegen_ay::chc) use super::codegen_call_fallback_emit::{
-    emit_sound_fallback_goto, emit_sound_fallback_goto_extra, emit_sound_fallback_goto_prebuilt,
-    try_emit_precise_call_result,
+    emit_kani_unsupported_check, emit_sound_fallback_goto, emit_sound_fallback_goto_extra,
+    emit_sound_fallback_goto_prebuilt, kani_unsupported_message, try_emit_precise_call_result,
 };
+
+impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Part of #3783: an element-sorted value for an array-sorted slot
+    /// (`Vec<[T; N]>`'s data field is `Array<BV64, Array<BV64, T>>`, the value
+    /// a single `[T; N]`): the slot becomes a fresh array holding the value at
+    /// index 0. The other cells are values the coercion does not know, so the
+    /// fresh array is a booked havoc (`sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE`,
+    /// Rule E): a proof over it stands, and a counterexample that reads it is
+    /// not certified Genuine. Dropping the constraint instead would leave the
+    /// whole array free.
+    pub(in crate::codegen_ay::chc) fn wrap_element_into_array_slot(
+        &mut self,
+        dest_var: &Expr,
+        result_expr: &Expr,
+        out_sort: &Sort,
+    ) -> Option<Expr> {
+        let arr = out_sort.array_sort()?;
+        if arr.element_sort != *result_expr.sort() {
+            return None;
+        }
+        let idx = Expr::bitvec_const(0u64, arr.index_sort.bitvec_width().unwrap_or(POINTER_WIDTH));
+        let fresh = Havoc::mint(
+            self,
+            sound_havoc::UNTRACKED_SORT_MISMATCH_VALUE,
+            format!("coerce_elem_to_arr_{dest_var}"),
+            out_sort.clone(),
+        );
+        debug!(out_sort = ?out_sort, "coerce: element into array slot (#3783)");
+        Some(dest_var.clone().eq(fresh.store(idx, result_expr.clone())))
+    }
+}

@@ -103,7 +103,7 @@ fn test_realloc_stale_ptr_error_rules_check_obj_valid() {
         let has_obj_valid_error = vc
             .rules
             .iter()
-            .filter(|r| r.head.name == "error")
+            .filter(|r| is_error_check_rule(r))
             .any(|rule| rule_contains_var(rule, "obj_valid"));
         assert!(
             has_obj_valid_error,

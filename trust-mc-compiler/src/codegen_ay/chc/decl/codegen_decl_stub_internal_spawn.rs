@@ -12,6 +12,7 @@
 //! widen relation signatures mid-block for noop waker/context carriers
 //! and boxed-future task slots.
 
+use crate::callee_body::CalleeBody;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ay_bindings::Sort;
@@ -53,13 +54,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             if let Some(spawn_fn) = self.resolve_body_call_instance_by_suffix(body, "spawn")
-                && let Some(spawn_body) = spawn_fn.body()
+                && let Some(spawn_body) = spawn_fn.callee_body()
             {
                 self.collect_spawn_scheduler_type_arrays_from_body(&spawn_body, &mut type_arrays);
                 self.predeclare_spawn_scheduler_heap_regions_from_body(&spawn_body);
                 if let Some(scheduler_spawn) =
                     self.resolve_body_call_instance_by_suffix(&spawn_body, "Scheduler::spawn")
-                    && let Some(scheduler_spawn_body) = scheduler_spawn.body()
+                    && let Some(scheduler_spawn_body) = scheduler_spawn.callee_body()
                 {
                     self.collect_spawn_scheduler_type_arrays_from_body(
                         &scheduler_spawn_body,
@@ -70,7 +71,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             if let Some(join_handle_poll) =
                 self.resolve_body_call_instance_by_suffix(body, "JoinHandle::poll")
-                && let Some(join_handle_poll_body) = join_handle_poll.body()
+                && let Some(join_handle_poll_body) = join_handle_poll.callee_body()
             {
                 self.collect_spawn_scheduler_type_arrays_from_body(
                     &join_handle_poll_body,
@@ -96,7 +97,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.predeclare_spawn_scheduler_heap_regions_from_body(&scheduler_block_on_body);
             if let Some(scheduler_run) = self
                 .resolve_body_call_instance_by_suffix(&scheduler_block_on_body, "Scheduler::run")
-                && let Some(scheduler_run_body) = scheduler_run.body()
+                && let Some(scheduler_run_body) = scheduler_run.callee_body()
             {
                 self.collect_spawn_scheduler_type_arrays_from_body(
                     &scheduler_run_body,
@@ -140,18 +141,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Some(scheduler_block_on) =
             self.resolve_body_call_instance_by_suffix(self.body, "Scheduler::block_on")
         {
-            return scheduler_block_on.body();
+            return scheduler_block_on.callee_body();
         }
 
         let block_on_with_spawn =
             self.resolve_body_call_instance_by_suffix(self.body, "block_on_with_spawn")?;
-        let block_on_with_spawn_body = block_on_with_spawn.body()?;
+        let block_on_with_spawn_body = block_on_with_spawn.callee_body()?;
         self.resolve_body_call_instance_by_suffix(&block_on_with_spawn_body, "Scheduler::block_on")?
-            .body()
+            .callee_body()
     }
 
     fn spawn_block_on_with_spawn_body(&self) -> Option<rustc_public::mir::Body> {
-        self.resolve_body_call_instance_by_suffix(self.body, "block_on_with_spawn")?.body()
+        self.resolve_body_call_instance_by_suffix(self.body, "block_on_with_spawn")?.callee_body()
     }
 
     fn predeclare_spawn_scheduler_core_type_arrays(
@@ -331,6 +332,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             };
 
             match rvalue {
+                #[cfg(not(trust_toolchain))]
                 Rvalue::ShallowInitBox(operand, boxed_ty)
                     if Self::spawn_operand_is_unprojected_local(operand, alloc_local) =>
                 {

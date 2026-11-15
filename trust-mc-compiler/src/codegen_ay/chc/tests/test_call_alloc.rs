@@ -120,12 +120,27 @@ fn test_box_new_array_payload_mirrors_flat_heap_elements() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_box_new_array_read");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(
+        // `translate()` records the fallback and translation-drop counters asserted below.
+        let _translated_vc = mir_to_chc(
             ctx.tcx,
             &body,
             "probe_box_new_array_read",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the constant-offset element
+        // stores are scalarized into per-lane scalars (7faa74cf9, 948cc5d4e) in the translated
+        // VC, which then has no `mem_u32` store or `mem_u32__out`.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_box_new_array_read",
+            ChcConfig {
+                track_level: crate::args::ChcTrackLevel::Mem,
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_box_new_array_read", body.blocks.len());
         assert_has_nontrivial_transition_constraints(&vc, "probe_box_new_array_read");
@@ -259,8 +274,7 @@ fn test_ptr_comparison_real_file_mem_level_after_inline_localizer() {
                 if !callee_instance.has_body() {
                     return None;
                 }
-                let callee_name = callee_instance.name();
-                if crate::kani_middle::reachability::is_prefix_abstracted(&callee_name) {
+                if ctx.std_abstraction.abstracts_public_instance(ctx.tcx, callee_instance) {
                     return None;
                 }
                 callee_instance.body()
@@ -316,12 +330,16 @@ fn test_ptr_comparison_real_file_mem_level_after_inline_localizer() {
                     Some((place.local, place.projection.clone()))
                 }
                 Operand::Constant(_) => None,
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => None,
             };
             let idx_local = idx_arg.and_then(|arg| match arg {
                 Operand::Copy(place) | Operand::Move(place) => {
                     Some((place.local, place.projection.clone()))
                 }
                 Operand::Constant(_) => None,
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => None,
             });
             let slice_def = slice_local.as_ref().and_then(|(local, _)| {
                 inlined_body.blocks.iter().flat_map(|block| block.statements.iter()).find_map(
@@ -432,6 +450,8 @@ fn test_check_box_comparison_range_backing_recovers_without_ref_targets() {
             let slice_local = match slice_arg {
                 Operand::Copy(place) | Operand::Move(place) => place.local,
                 Operand::Constant(_) => panic!("slice receiver should be a local operand"),
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => panic!("slice receiver should be a local operand"),
             };
 
             assert!(

@@ -142,11 +142,29 @@ struct TestCx<'test> {
     testpaths: &'test TestPaths,
 }
 
+/// The verifier named by `TRUST_MC_TEST_BIN`, else `KANI_TEST_BIN` (compatibility).
+fn configured_test_bin() -> Option<OsString> {
+    env::var_os("TRUST_MC_TEST_BIN").or_else(|| env::var_os("KANI_TEST_BIN"))
+}
+
 fn kani_test_bin() -> OsString {
-    // Check TRUST_MC_TEST_BIN first, fall back to KANI_TEST_BIN for compatibility
-    env::var_os("TRUST_MC_TEST_BIN")
-        .or_else(|| env::var_os("KANI_TEST_BIN"))
-        .unwrap_or_else(|| OsString::from("trust-mc"))
+    configured_test_bin().unwrap_or_else(|| OsString::from("trust-mc"))
+}
+
+/// The verifier in its cargo-plugin identity: `<verifier> kani …` is exactly the
+/// argv `cargo kani …` hands a `cargo-kani` plugin (argv[1] = `kani`; see
+/// `determine_invocation_type` in trust-mc-driver). Spawning the verifier
+/// directly needs no `cargo` on PATH -- there is no `cargo-kani` plugin to find
+/// any more, and on an ALab host a bare `cargo` is not the Trust toolchain.
+///
+/// Without `TRUST_MC_TEST_BIN` this is the installed cargo plugin
+/// `cargo-trust-mc`, not `kani_test_bin`'s `trust-mc` default: that front door
+/// has its own command line and refuses `kani` ("unknown command"), while
+/// `cargo-trust-mc kani …` forwards to the driver (measured 2026-09-28).
+fn cargo_kani_command() -> Command {
+    let mut cmd = Command::new(configured_test_bin().unwrap_or_else(|| "cargo-trust-mc".into()));
+    cmd.arg("kani");
+    cmd
 }
 
 impl TestCx<'_> {
@@ -410,19 +428,18 @@ impl TestCx<'_> {
         }
     }
 
-    /// Runs cargo-kani on the function specified by the stem of `self.testpaths.file`.
-    /// The `test` parameter controls whether to specify `--tests` to `cargo kani`.
-    /// An error message is printed to stdout if verification output does not
-    /// contain the expected output in `self.testpaths.file`.
+    /// Runs the verifier in its cargo-plugin identity on the function specified by
+    /// the stem of `self.testpaths.file`. The `test` parameter controls whether to
+    /// specify `--tests`. An error message is printed to stdout if verification
+    /// output does not contain the expected output in `self.testpaths.file`.
     fn run_cargo_kani_test(&self, test: bool) {
         // We create our own command for the same reasons listed in `run_kani_test` method.
-        let mut cargo = Command::new("cargo");
-        // We run `cargo` on the directory where we found the `*.expected` file
+        let mut cargo = cargo_kani_command();
+        // We run the verifier on the directory where we found the `*.expected` file
         let parent_dir = self.testpaths.file.parent().unwrap();
         // The name of the function to test is the same as the stem of `*.expected` file
         let function_name = self.testpaths.file.file_stem().unwrap().to_str().unwrap();
         cargo
-            .arg("kani")
             .arg("--target-dir")
             .arg(self.output_base_dir().join("target"))
             .current_dir(parent_dir);
@@ -493,13 +510,12 @@ impl TestCx<'_> {
     /// Run Kani with coverage enabled on a cargo package
     fn run_cargo_coverage_test(&self) {
         // We create our own command for the same reasons listed in `run_kani_test` method.
-        let mut cargo = Command::new("cargo");
-        // We run `cargo` on the directory where we found the `*.expected` file
+        let mut cargo = cargo_kani_command();
+        // We run the verifier on the directory where we found the `*.expected` file
         let parent_dir = self.testpaths.file.parent().unwrap();
         // The name of the function to test is the same as the stem of `*.expected` file
         let function_name = self.testpaths.file.file_stem().unwrap().to_str().unwrap();
         cargo
-            .arg("kani")
             .arg("--coverage")
             .arg("-Zsource-coverage")
             .arg("--target-dir")

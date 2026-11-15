@@ -33,6 +33,7 @@ fn test_render_nia_success_shows_unvalidated() {
         ValidationStatus::Unvalidated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("SUCCESSFUL (UNVALIDATED)"),
@@ -55,6 +56,7 @@ fn test_render_validated_success_shows_successful() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(output.contains("SUCCESSFUL"), "Validated PROOF should show SUCCESSFUL, got: {output}");
     assert!(!output.contains("UNVALIDATED"), "Validated PROOF must not show UNVALIDATED");
@@ -71,6 +73,7 @@ fn test_render_nia_failure_shows_failed_not_unvalidated() {
         ValidationStatus::Unvalidated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("UNVALIDATED (DT+BV)"),
@@ -89,6 +92,7 @@ fn test_render_validated_failure_shows_failed() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(output.contains("FAILED"), "Validated failure should show FAILED, got: {output}");
     assert!(!output.contains("UNVALIDATED"), "Validated failure must not show UNVALIDATED");
@@ -105,6 +109,7 @@ fn test_render_should_panic_panics_only_shows_successful() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)"),
@@ -157,6 +162,7 @@ fn test_render_zero_checks_shows_inconclusive() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("INCONCLUSIVE (no checks)"),
@@ -178,6 +184,7 @@ fn test_render_zero_checks_success_still_shows_successful() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("SUCCESSFUL"),
@@ -272,6 +279,7 @@ fn v4_renders_vacuous_not_failed() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(output.contains("VACUOUS"), "all-unreachable Failure should render VACUOUS: {output}");
     assert!(!output.contains("FAILED"), "vacuous should not render as a plain FAILED: {output}");
@@ -289,6 +297,7 @@ fn v4_should_panic_is_exempt_from_vacuous_label() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(!output.contains("VACUOUS"), "should_panic is exempt from the V4 label: {output}");
 }
@@ -356,6 +365,7 @@ fn a_rejected_query_and_a_memout_name_their_own_cause() {
             ValidationStatus::Validated,
             Some(SolverUnknownReason::SmtParseError),
             HarnessFeasibility::Undetermined,
+            false,
         );
         assert!(
             rejected.contains("INCONCLUSIVE (solver rejected the emitted query as ill-formed"),
@@ -375,6 +385,7 @@ fn a_rejected_query_and_a_memout_name_their_own_cause() {
             ValidationStatus::Validated,
             Some(SolverUnknownReason::Memout),
             HarnessFeasibility::Undetermined,
+            false,
         );
         assert!(
             memout.contains("INCONCLUSIVE (solver ran out of memory"),
@@ -411,6 +422,7 @@ fn only_undecidable_reasons_change_the_no_checks_verdict() {
             ValidationStatus::Validated,
             Some(reason),
             HarnessFeasibility::Undetermined,
+            false,
         );
         assert!(
             output.contains("solver undecided"),
@@ -435,6 +447,7 @@ fn only_undecidable_reasons_change_the_no_checks_verdict() {
             ValidationStatus::Validated,
             Some(reason),
             HarnessFeasibility::Undetermined,
+            false,
         );
         assert!(
             output.contains("INCONCLUSIVE (no checks)"),
@@ -456,6 +469,7 @@ fn only_undecidable_reasons_change_the_no_checks_verdict() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(output.contains("INCONCLUSIVE (no checks)"), "{output}");
 }
@@ -479,6 +493,7 @@ fn a_populated_undetermined_table_still_reports_the_solver_undecided() {
         ValidationStatus::Validated,
         Some(SolverUnknownReason::UndecidedModel),
         HarnessFeasibility::Undetermined,
+        false,
     );
     let populated = [
         make_property(CheckStatus::Undetermined),
@@ -494,6 +509,7 @@ fn a_populated_undetermined_table_still_reports_the_solver_undecided() {
         ValidationStatus::Validated,
         Some(SolverUnknownReason::UndecidedModel),
         HarnessFeasibility::Undetermined,
+        false,
     );
 
     assert!(empty_table.contains("solver undecided"), "{empty_table}");
@@ -549,6 +565,7 @@ fn one_decided_check_takes_the_harness_out_of_the_undecided_arm() {
         ValidationStatus::Validated,
         Some(SolverUnknownReason::UndecidedModel),
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(
         output.contains("VERIFICATION:- FAILED"),
@@ -575,6 +592,7 @@ fn a_solver_error_with_no_checks_keeps_the_no_checks_verdict() {
         ValidationStatus::Validated,
         Some(SolverUnknownReason::SolverError),
         HarnessFeasibility::Undetermined,
+        false,
     );
     assert!(output.contains("INCONCLUSIVE (no checks)"), "{output}");
     assert!(!output.contains("solver undecided"), "{output}");
@@ -653,6 +671,7 @@ fn v4_split_renders_dead_checks_without_claiming_contradictory_assumptions() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Reachable,
+        false,
     );
     assert!(dead.contains("INCONCLUSIVE (every check is unreachable"), "{dead}");
     assert!(!dead.contains("VACUOUS"), "a harness that runs is not vacuous: {dead}");
@@ -667,6 +686,38 @@ fn v4_split_renders_dead_checks_without_claiming_contradictory_assumptions() {
         ValidationStatus::Validated,
         None,
         HarnessFeasibility::Infeasible,
+        false,
     );
     assert!(contra.contains("VACUOUS"), "the unsat-assumption verdict is unchanged: {contra}");
+}
+
+/// Registered checks that never reached a solver print their own INCONCLUSIVE
+/// arm: not SUCCESSFUL, not FAILED, and not the undecided arm's remedy.
+#[test]
+fn lost_error_rules_is_inconclusive_not_undecided() {
+    let check = Property {
+        description: Cow::Borrowed("assertion failed: offset == 0"),
+        property_id: PropertyId { fn_name: None, class: Cow::Borrowed("assertion"), id: 0 },
+        source_location: RawSourceLocation { column: None, file: None, function: None, line: None },
+        status: CheckStatus::Undetermined,
+        trace: None,
+    };
+    let output = format_result(
+        &[check],
+        VerificationStatus::Failure,
+        false,
+        FailedProperties::Other,
+        true,
+        ValidationStatus::Validated,
+        Some(SolverUnknownReason::LostErrorRules),
+        HarnessFeasibility::Undetermined,
+        false,
+    );
+    assert!(
+        output.contains("VERIFICATION:- INCONCLUSIVE (checks lost from the CHC encoding"),
+        "got: {output}"
+    );
+    assert!(!output.contains("SUCCESSFUL"), "got: {output}");
+    assert!(!output.contains("solver undecided"), "got: {output}");
+    assert!(!output.contains("FAILED"), "got: {output}");
 }

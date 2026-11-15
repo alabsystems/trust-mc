@@ -53,21 +53,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let dt_name = sort.datatype_name()?;
             // Part of #2631: Use scoped constructor name.
             let ok_ctor = Self::find_result_constructor(sort, "Ok", dt_name)?;
-            let field_name = if sort.datatype_has_field("value") {
-                "value"
-            } else if sort.datatype_has_field("ok") {
-                "ok"
-            } else {
-                warn!("Result::unwrap_or_else: datatype '{}' missing value/ok field", dt_name);
+            // Resolve the Ok payload by its ACTUAL field name (canonical
+            // `value`/`ok` first, then the Ok constructor's first field), the
+            // same way `unwrap`/`unwrap_or`/`unwrap_err` already do — the
+            // general enum-sort path names the payload positionally
+            // (`Ok_field_0`), which the hardcoded lookup missed.
+            let Some(field_name) = Self::result_payload_field_name(sort, "Ok") else {
+                warn!("Result::unwrap_or_else: datatype '{}' has no Ok payload field", dt_name);
                 // Part of #3211: Track constraint drop in demotion pipeline.
                 self.ctx.unsupported_with_fallback(
                     "result_unwrap_or_else_missing_field",
-                    "datatype missing value/ok field",
+                    "datatype missing Ok payload field",
                 );
                 return None;
             };
             let is_ok = result_expr.clone().is_constructor(dt_name, ok_ctor);
-            let inner = result_expr.clone().field_select(dt_name, field_name, dest_sort.clone());
+            let inner = result_expr.clone().field_select(dt_name, &field_name, dest_sort.clone());
             (is_ok, inner)
         } else {
             warn!("Result::unwrap_or_else: could not find Result value for {}", result_base);
@@ -82,6 +83,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Over-approximate closure result with symbolic value
         let closure_name = self.ctx.fresh_name("res_unwrap_or_else");
         let closure_result = self.ctx.declare_var(&closure_name, dest_sort);
+        self.ctx.bmc_sound_havoc("result_unwrap_or_else_closure");
 
         // ITE(is_ok, ok_value, symbolic_closure_result)
         let result = ay_bindings::Expr::ite(is_ok, ok_value, closure_result);

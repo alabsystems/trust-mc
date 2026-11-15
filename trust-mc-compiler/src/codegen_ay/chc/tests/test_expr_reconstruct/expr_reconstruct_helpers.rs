@@ -10,6 +10,8 @@ fn places_from_operand(op: &Operand) -> Vec<&Place> {
     match op {
         Operand::Copy(place) | Operand::Move(place) => vec![place],
         Operand::Constant(_) => vec![],
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => vec![],
     }
 }
 
@@ -41,7 +43,7 @@ pub(super) fn find_field_index_place(body: &Body, local_idx: usize) -> Option<Pl
                 }
 
                 let source_places: Vec<&Place> = match rvalue {
-                    Rvalue::Use(op) => places_from_operand(op),
+                    Rvalue::Use(op, ..) => places_from_operand(op),
                     Rvalue::Ref(_, _, place)
                     | Rvalue::AddressOf(_, place)
                     | Rvalue::CopyForDeref(place)

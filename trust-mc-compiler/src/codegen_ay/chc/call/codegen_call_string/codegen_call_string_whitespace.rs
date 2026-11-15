@@ -4,6 +4,7 @@
 
 //! `SplitWhitespace::next` string-core summary helpers.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
@@ -16,7 +17,7 @@ use crate::codegen_ay::types::POINTER_WIDTH;
 use super::super::codegen_call_coerce::CallCoerce;
 use super::super::codegen_types::CodegenTypes;
 use super::super::stubs_option_helpers::OptionHelpers;
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 use super::codegen_call_string_utf8::ConcreteByteSlice;
 
 pub(in crate::codegen_ay::chc) trait CallStringWhitespace {
@@ -113,8 +114,8 @@ impl<'tcx, 'body> CallStringWhitespace for ChcCtx<'tcx, 'body> {
         });
 
         let result_expr = precise_result.unwrap_or_else(|| {
-            self.record_sound_fallback_reason("split_whitespace_next_symbolic");
-            declare_pending_var(chc_fresh_name("__split_whitespace_next"), result_sort.clone())
+            let booked = self.record_sound_fallback_reason("split_whitespace_next_symbolic");
+            Havoc::booked(booked, chc_fresh_name("__split_whitespace_next"), result_sort.clone())
         });
 
         if let Some(flat_constraints) =
@@ -182,7 +183,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                        Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                         | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _)
                             if place.projection.is_empty() =>
                         {

@@ -15,6 +15,7 @@ mod closure_body;
 mod closure_captures;
 mod helpers;
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::{Expr, ExprValue, SortInner};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{LocalDecl, Operand, StatementKind};
@@ -154,7 +155,7 @@ impl<'tcx, 'body> QuantifierEncoding for ChcCtx<'tcx, 'body> {
                 for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
                     if let Ok(instance) =
                         Instance::resolve_closure(def, &closure_args, kind.clone())
-                        && let Some(body) = instance.body()
+                        && let Some(body) = instance.callee_body()
                     {
                         debug!(
                             "quantifier closure found (kind={kind:?}), blocks={} locals={}",
@@ -354,7 +355,7 @@ pub(in crate::codegen_ay) fn resolve_quantifier_closure_body(
         if let TyKind::RigidTy(RigidTy::Closure(def, closure_args)) = arg_ty.kind() {
             for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
                 if let Ok(instance) = Instance::resolve_closure(def, &closure_args, kind)
-                    && let Some(body) = instance.body()
+                    && let Some(body) = instance.callee_body()
                 {
                     return Some(body);
                 }

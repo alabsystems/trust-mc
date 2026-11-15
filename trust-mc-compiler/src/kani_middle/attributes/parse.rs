@@ -14,15 +14,18 @@
 //! - Public API helpers (`is_proof_harness`, `has_kani_attribute`)
 
 use super::KaniAttributeKind;
+#[cfg(all(trust_toolchain, version("1.101")))]
+use crate::rustc_compat::ToolAttributeSpan;
+use crate::rustc_compat::{AttrArgs, Attribute};
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use quote::ToTokens;
+#[cfg(all(trust_toolchain, version("1.101")))]
+use rustc_ast::attr::AttributeExt;
 use rustc_ast::{LitKind, MetaItem, MetaItemKind};
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::AttrArgs;
-use rustc_hir::Attribute;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
@@ -63,7 +66,15 @@ pub(super) fn expect_key_string_value(
     attr: &Attribute,
 ) -> Result<rustc_span::Symbol, ErrorGuaranteed> {
     let span = attr.span();
-    let AttrArgs::Eq { expr, .. } = &attr.get_normal_item().args else {
+    #[cfg(not(all(trust_toolchain, version("1.101"))))]
+    let normal = attr.get_normal_item();
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    let Attribute::Unparsed(normal) = attr else {
+        return Err(sess
+            .dcx()
+            .span_err(span, "Expected attribute of the form #[attr = \"value\"]"));
+    };
+    let AttrArgs::Eq { expr, .. } = &normal.args else {
         return Err(sess
             .dcx()
             .span_err(span, "Expected attribute of the form #[attr = \"value\"]"));
@@ -116,16 +127,17 @@ pub(super) struct UnstableAttrParseError<'a> {
 impl UnstableAttrParseError<'_> {
     /// Report the error in a friendly format.
     pub(super) fn report(&self, tcx: TyCtxt) -> ErrorGuaranteed {
-        tcx.dcx()
-            .struct_span_err(
-                self.attr.span(),
-                format!("failed to parse `#[kani::unstable_feature]`: {}", self.reason),
-            )
-            .with_note(format!(
-                "expected format: #[kani::unstable_feature({}, {}, {})]",
-                r#"feature="<IDENTIFIER>""#, r#"issue="<ISSUE>""#, r#"reason="<DESCRIPTION>""#
-            ))
-            .emit()
+        emit_error!(
+            tcx.dcx()
+                .struct_span_err(
+                    self.attr.span(),
+                    format!("failed to parse `#[kani::unstable_feature]`: {}", self.reason),
+                )
+                .with_note(format!(
+                    "expected format: #[kani::unstable_feature({}, {}, {})]",
+                    r#"feature="<IDENTIFIER>""#, r#"issue="<ISSUE>""#, r#"reason="<DESCRIPTION>""#
+                ))
+        )
     }
 }
 
@@ -303,11 +315,11 @@ fn parse_key_values(attr: &Attribute) -> Result<BTreeMap<String, String>, String
 pub(super) fn attr_kind(tcx: TyCtxt, attr: &Attribute) -> Option<KaniAttributeKind> {
     if let Attribute::Unparsed(normal) = attr {
         let segments = &normal.path.segments;
-        let tool_name = segments.first().map(rustc_span::Ident::as_str);
+        let tool_name = segments.first().map(|segment| segment.as_str());
         if matches!(tool_name, Some("kanitool") | Some("trust_mctool")) {
             let ident_str = segments[1..]
                 .iter()
-                .map(rustc_span::Ident::as_str)
+                .map(|segment| segment.as_str())
                 .intersperse("::")
                 .collect::<String>();
             KaniAttributeKind::try_from(ident_str.as_str())
@@ -328,7 +340,13 @@ pub(super) fn attr_kind(tcx: TyCtxt, attr: &Attribute) -> Option<KaniAttributeKi
 ///
 /// This provides a user-friendly interface to manipulate than the internal compiler AST.
 pub(super) fn syn_attr(tcx: TyCtxt, attr: &Attribute) -> syn::Attribute {
+    #[cfg(not(all(trust_toolchain, version("1.101"))))]
     let attr_str = rustc_hir_pretty::attribute_to_string(&tcx, attr);
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    let attr_str = {
+        let hir: &dyn rustc_hir::intravisit::HirTyCtxt<'_> = &tcx;
+        rustc_hir_pretty::attribute_to_string(&hir, attr)
+    };
     let parser = syn::Attribute::parse_outer;
     parser
         .parse_str(&attr_str)

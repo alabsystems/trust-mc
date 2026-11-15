@@ -183,32 +183,86 @@ pub fn region_key(obj_id: u32) -> Cow<'static, str> {
     }
 }
 
-/// Type-indexed memory array name: `_{fn_name}_mem_{type_key}`.
+/// Longest type key spelled verbatim into a variable name; longer ones go
+/// through [`bounded_type_key_segment`].
+pub const MAX_TYPE_KEY_NAME_BYTES: usize = 96;
+/// Verbatim prefix kept when a type key is shortened for a variable name.
+pub const TYPE_KEY_NAME_KEEP_BYTES: usize = 64;
+
+/// The type-key segment of a variable name: the key itself up to
+/// [`MAX_TYPE_KEY_NAME_BYTES`], otherwise its first
+/// [`TYPE_KEY_NAME_KEEP_BYTES`] bytes plus `_h` and a 64-bit FNV-1a hash of
+/// the WHOLE key.
+///
+/// The type key is the encoder's identity for a type-indexed memory array:
+/// `heap_state.type_arrays` is keyed by it, the value-sort tables strip
+/// structural prefixes (`Vec_`, `Option_`, `tuple_`, ...) off it, and the
+/// pointer-wrapper aliasing rebuilds `std_ptr_Unique_<inner>` from
+/// `ptr_<inner>` by concatenation. None of that may see a shortened key, so
+/// the key stays full-length everywhere inside the encoder and is shortened
+/// only where it is spelled into an emitted variable name. AY's executor
+/// admission charges the name of every variable OCCURRENCE against
+/// `MAX_EXECUTOR_SURFACE_NAME_BYTES` (1 MiB) for the whole problem
+/// (`ay-chc/src/smt/executor_adapter/logic_detection.rs`);
+/// kani/Coroutines/rustc-coroutine-tests/iterator-count.rs mints closure keys
+/// of up to 8 686 bytes (nested iterator-adaptor closures spell every generic
+/// argument recursively), and 2 829 occurrences of eight such names were
+/// 24.56 MB of a 24.7 MB charge — rejected before any solver ran.
+///
+/// Deterministic, so every site that spells the same key mints the same
+/// name; injective up to a 64-bit hash collision between two keys that share
+/// their first 64 bytes, and the hash covers the full key because two types
+/// sharing one array would alias memory. Cuts fall on a `char` boundary.
+pub fn bounded_type_key_segment(type_key: &str) -> Cow<'_, str> {
+    if type_key.len() <= MAX_TYPE_KEY_NAME_BYTES {
+        return Cow::Borrowed(type_key);
+    }
+    let mut cut = TYPE_KEY_NAME_KEEP_BYTES;
+    while !type_key.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in type_key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut s = String::with_capacity(cut + 18);
+    s.push_str(&type_key[..cut]);
+    s.push_str("_h");
+    let _ = write!(&mut s, "{hash:016x}");
+    Cow::Owned(s)
+}
+
+/// Type-indexed memory array name: `_{fn_name}_mem_{type_key}`, the type key
+/// spelled through [`bounded_type_key_segment`].
 ///
 /// Used for per-type heap memory arrays in the CHC encoding.
 /// Returns `Arc<str>` — all callers store the result in `Arc<str>`-keyed maps (Part of #2267).
 pub fn mem_array_name(fn_name: &str, type_key: &str) -> Arc<str> {
-    let mut s = String::with_capacity(fn_name.len() + type_key.len() + 6);
+    let key = bounded_type_key_segment(type_key);
+    let mut s = String::with_capacity(fn_name.len() + key.len() + 6);
     s.push('_');
     s.push_str(fn_name);
     s.push_str("_mem_");
-    s.push_str(type_key);
+    s.push_str(&key);
     Arc::from(s)
 }
 
-/// Combined memory array name pair: `(_{fn}_mem_{key}, _{fn}_mem_{key}__out)`.
+/// Combined memory array name pair: `(_{fn}_mem_{key}, _{fn}_mem_{key}__out)`,
+/// the type key spelled through [`bounded_type_key_segment`].
 ///
 /// Generates both the input and output CHC memory array names from a single
 /// buffer. The `Arc<str>` is created from the base name, then the same buffer
 /// is extended with `__out` for the output name — saves one allocation vs
 /// calling `mem_array_name` + `out_name` separately. Part of #2267.
 pub fn mem_array_name_pair(fn_name: &str, type_key: &str) -> (Arc<str>, String) {
-    let base_len = fn_name.len() + type_key.len() + 6;
+    let key = bounded_type_key_segment(type_key);
+    let base_len = fn_name.len() + key.len() + 6;
     let mut s = String::with_capacity(base_len + 5);
     s.push('_');
     s.push_str(fn_name);
     s.push_str("_mem_");
-    s.push_str(type_key);
+    s.push_str(&key);
     let in_name: Arc<str> = Arc::from(s.as_str());
     s.push_str("__out");
     (in_name, s)
@@ -246,13 +300,15 @@ pub fn region_array_name_pair(fn_name: &str, obj_id: u32, type_suffix: &str) -> 
     (in_name, s)
 }
 
-/// Store coercion symbolic variable: `__store_coerce_{type_key}_{id}`.
+/// Store coercion symbolic variable: `__store_coerce_{type_key}_{id}`, the
+/// type key spelled through [`bounded_type_key_segment`].
 ///
 /// Used for type-coercion symbolics in memory store operations.
 pub fn store_coerce_name(type_key: &str, id: u64) -> String {
-    let mut s = String::with_capacity(type_key.len() + 24);
+    let key = bounded_type_key_segment(type_key);
+    let mut s = String::with_capacity(key.len() + 24);
     s.push_str("__store_coerce_");
-    s.push_str(type_key);
+    s.push_str(&key);
     s.push('_');
     let _ = write!(&mut s, "{id}");
     s

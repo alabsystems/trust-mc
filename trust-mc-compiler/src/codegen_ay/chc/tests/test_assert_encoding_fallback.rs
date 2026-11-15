@@ -64,7 +64,7 @@ fn test_kani_assert_empty_args_emits_conservative_error_rule() {
         // Seed reachability so an unconditional error rule is solver-visible.
         chc_ctx.vc.add_rule(Rule::init(Expr::bool_const(true), from_app.clone()));
 
-        let before = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
 
         // Pass empty args with non-empty stmt_constraints — exercises the
         // production-realistic path where block constraints are propagated
@@ -72,7 +72,7 @@ fn test_kani_assert_empty_args_emits_conservative_error_rule() {
         let stmt_constraints = [Expr::bool_const(true)];
         chc_ctx.emit_kani_assert_error_rule(&from_app, &[], &stmt_constraints, &modified, 0);
 
-        let after = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let after = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(
             after,
             before + 1,
@@ -84,7 +84,7 @@ fn test_kani_assert_empty_args_emits_conservative_error_rule() {
             .vc
             .rules
             .iter()
-            .rfind(|r| r.head.name == "error")
+            .rfind(|r| is_error_check_rule(r))
             .expect("expected fallback error rule");
         assert_eq!(
             fallback_rule.body.constraints.len(),
@@ -150,7 +150,8 @@ fn test_kani_assume_empty_args_emits_conservative_error_rule() {
         // Should emit exactly one fallback rule.
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before + 2,
             "empty-args fallback must emit a conservative error rule, not silently drop the assume"
         );
 
@@ -159,7 +160,7 @@ fn test_kani_assume_empty_args_emits_conservative_error_rule() {
             .vc
             .rules
             .iter()
-            .find(|r| r.head.name == "error")
+            .find(|r| is_error_check_rule(r))
             .expect("expected fallback error rule for assume");
         assert_eq!(
             assume_rule.body.constraints.len(),
@@ -206,7 +207,7 @@ fn test_kani_assert_nonempty_args_emits_negated_violation_guard() {
         let cond_operand = Operand::Copy(Place { local: 1usize, projection: vec![] });
 
         let stmt_constraints = [Expr::bool_const(true)];
-        let before = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
 
         // Call with real args — exercises the successful translation path.
         chc_ctx.emit_kani_assert_error_rule(
@@ -217,7 +218,7 @@ fn test_kani_assert_nonempty_args_emits_negated_violation_guard() {
             0,
         );
 
-        let after = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let after = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(after, before + 1, "real-condition assert must emit exactly one error rule");
 
         // The real-condition error rule should have MORE constraints than just
@@ -226,7 +227,7 @@ fn test_kani_assert_nonempty_args_emits_negated_violation_guard() {
             .vc
             .rules
             .iter()
-            .rfind(|r| r.head.name == "error")
+            .rfind(|r| is_error_check_rule(r))
             .expect("expected error rule from real-condition assert");
         assert!(
             error_rule.body.constraints.len() > stmt_constraints.len(),
@@ -285,7 +286,7 @@ fn test_kani_assert_bitvec_condition_coerced_to_bool() {
         let bv_operand = Operand::Copy(Place { local: 1usize, projection: vec![] });
 
         let stmt_constraints = [Expr::bool_const(true)];
-        let before = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
 
         chc_ctx.emit_kani_assert_error_rule(
             &from_app,
@@ -295,7 +296,7 @@ fn test_kani_assert_bitvec_condition_coerced_to_bool() {
             0,
         );
 
-        let after = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let after = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(after, before + 1, "bitvec-condition assert must emit exactly one error rule");
 
         // The violation guard should be a negation of the BV-to-Bool conversion:
@@ -304,7 +305,7 @@ fn test_kani_assert_bitvec_condition_coerced_to_bool() {
             .vc
             .rules
             .iter()
-            .rfind(|r| r.head.name == "error")
+            .rfind(|r| is_error_check_rule(r))
             .expect("expected error rule from bitvec-condition assert");
         assert!(
             error_rule.body.constraints.len() > stmt_constraints.len(),
@@ -314,12 +315,15 @@ fn test_kani_assert_bitvec_condition_coerced_to_bool() {
             stmt_constraints.len()
         );
 
-        // Verify the violation guard is a Not() wrapping the BV-to-Bool conversion,
-        // mirroring the structure check in the bool-condition test.
+        // The violation guard negates the BV-to-Bool conversion: Not(Not(Eq(x, 0))).
+        // `simplify_bool_expr` folds the double negation, so the emitted guard is the
+        // equivalent Eq(x, 0) (violated exactly when x == 0); accept either form.
         let violation = error_rule.body.constraints.last().expect("expected violation constraint");
+        let is_double_negated_eq = matches!(violation.value(), ExprValue::Not(inner)
+            if matches!(inner.value(), ExprValue::Not(eq) if matches!(eq.value(), ExprValue::Eq(..))));
         assert!(
-            matches!(violation.value(), ExprValue::Not(_)),
-            "bitvec violation guard should be Not(Not(Eq(x, 0))), got: {:?}",
+            is_double_negated_eq || matches!(violation.value(), ExprValue::Eq(..)),
+            "bitvec violation guard should be Eq(x, 0) or its unfolded Not(Not(Eq(x, 0))), got: {:?}",
             violation.value()
         );
 
@@ -439,7 +443,7 @@ fn test_kani_assert_untranslatable_operand_emits_conservative_error() {
         let bogus_operand = Operand::Copy(Place { local: 999usize, projection: vec![] });
 
         let stmt_constraints = [Expr::bool_const(true)];
-        let before = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let before = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         let before_count = GLOBAL_COUNTERS.assert_untranslatable.load(Ordering::Relaxed);
 
         chc_ctx.emit_kani_assert_error_rule(
@@ -450,7 +454,7 @@ fn test_kani_assert_untranslatable_operand_emits_conservative_error() {
             0,
         );
 
-        let after = chc_ctx.vc.rules.iter().filter(|r| r.head.name == "error").count();
+        let after = chc_ctx.vc.rules.iter().filter(|r| is_error_check_rule(r)).count();
         assert_eq!(
             after,
             before + 1,
@@ -528,7 +532,8 @@ fn test_kani_assume_untranslatable_operand_emits_conservative_error() {
         // Should emit one rule: the conservative error fallback.
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before + 2,
             "untranslatable operand must emit conservative error rule, not silently drop the assume"
         );
 
@@ -537,7 +542,7 @@ fn test_kani_assume_untranslatable_operand_emits_conservative_error() {
             .vc
             .rules
             .iter()
-            .find(|r| r.head.name == "error")
+            .find(|r| is_error_check_rule(r))
             .expect("expected fallback error rule");
         assert_eq!(
             assume_rule.body.constraints.len(),
@@ -606,12 +611,17 @@ fn test_kani_assume_empty_args_falls_back_and_counts_drop() {
 
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before_rules + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before_rules + 2,
             "empty-args assume must emit conservative error fallback rule"
         );
 
         let last_rule = chc_ctx.vc.rules.last().expect("expected fallback rule");
-        assert_eq!(last_rule.head.name, "error", "fallback rule must target error relation");
+        assert!(
+            is_error_check_rule(last_rule),
+            "fallback rule must target the error family, got {}",
+            last_rule.head.name
+        );
 
         let after_count = GLOBAL_COUNTERS.assume_dropped_transition.load(Ordering::Relaxed);
         assert!(
@@ -688,7 +698,8 @@ fn test_kani_assume_missing_target_block_drops_transition() {
         // the solver reports FAILURE, preventing unsound vacuous truth.
         assert_eq!(
             chc_ctx.vc.rules.len(),
-            before_rules + 1,
+            // BSEM-18: the error_p check rule plus the bridge `register_error_head` adds.
+            before_rules + 2,
             "missing target block must emit conservative error rule"
         );
 

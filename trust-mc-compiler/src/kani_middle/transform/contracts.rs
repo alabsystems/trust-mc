@@ -11,14 +11,14 @@ use crate::kani_middle::codegen_units::CodegenUnit;
 use crate::kani_middle::kani_functions::{KaniHook, KaniIntrinsic, KaniModel};
 use crate::kani_middle::transform::body::{InsertPosition, MutableBody, SourceInstruction};
 use crate::kani_middle::transform::contracts_frame;
+use crate::kani_middle::transform::contracts_mutual_recursion;
 use crate::kani_middle::transform::{TransformPass, TransformationType};
 use crate::kani_queries::QueryDb;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    Body, ConstOperand, Operand, Rvalue, StatementKind, Terminator, TerminatorKind,
-    VarDebugInfoContents,
+    Body, ConstOperand, Operand, Rvalue, StatementKind, TerminatorKind, VarDebugInfoContents,
 };
 use rustc_public::rustc_internal;
 use rustc_public::ty::{ClosureDef, FnDef, MirConst, RigidTy, TyKind, TypeAndMut, UintTy};
@@ -145,7 +145,7 @@ impl AnyModifiesPass {
                         .expect("resolve kani_any instance");
                 let literal = MirConst::try_new_zero_sized(instance.ty())
                     .expect("zero-sized const for kani_any");
-                let span = bb.terminator.span;
+                let span = mir_span!(bb.terminator);
                 let new_func = ConstOperand { span, user_ty: None, const_: literal };
                 *func = Operand::Constant(new_func);
                 changed = true;
@@ -171,7 +171,7 @@ impl AnyModifiesPass {
                     .expect("resolve write_any_slice");
                     let literal = MirConst::try_new_zero_sized(instance.ty())
                         .expect("zero-sized const for write_any_slice");
-                    let span = bb.terminator.span;
+                    let span = mir_span!(bb.terminator);
                     let new_func = ConstOperand { span, user_ty: None, const_: literal };
                     *func = Operand::Constant(new_func);
                 } else if let TyKind::RigidTy(RigidTy::Str) = internal_type.kind() {
@@ -183,7 +183,7 @@ impl AnyModifiesPass {
                     .expect("resolve write_any_str");
                     let literal = MirConst::try_new_zero_sized(instance.ty())
                         .expect("zero-sized const for write_any_str");
-                    let span = bb.terminator.span;
+                    let span = mir_span!(bb.terminator);
                     let new_func = ConstOperand { span, user_ty: None, const_: literal };
                     *func = Operand::Constant(new_func);
                 } else {
@@ -195,7 +195,7 @@ impl AnyModifiesPass {
                     .expect("resolve write_any_slim");
                     let literal = MirConst::try_new_zero_sized(instance.ty())
                         .expect("zero-sized const for write_any_slim");
-                    let span = bb.terminator.span;
+                    let span = mir_span!(bb.terminator);
                     let new_func = ConstOperand { span, user_ty: None, const_: literal };
                     *func = Operand::Constant(new_func);
                 }
@@ -234,7 +234,10 @@ impl AnyModifiesPass {
                             format!("`{receiver_ty}` doesn't implement `kani::Arbitrary`.")
                         };
                         tcx.dcx()
-                            .struct_span_err(rustc_internal::internal(tcx, bb.terminator.span), msg)
+                            .struct_span_err(
+                                rustc_internal::internal(tcx, mir_span!(bb.terminator)),
+                                msg,
+                            )
                             .with_help(
                                 "All objects in the modifies clause must implement the Arbitrary. \
                                  The return type must also implement the Arbitrary trait if you \
@@ -351,6 +354,12 @@ impl TransformPass for FunctionWithContractPass {
         match instance.ty().kind().rigid().expect("rigid type for contract transform") {
             RigidTy::FnDef(def, args) => {
                 if let Some(mode) = self.contract_mode(tcx, *def) {
+                    // Kani parity: a `#[kani::recursion]` check through a
+                    // mutually recursive contract is a compile error, not a
+                    // codegen that never finishes.
+                    if mode == ContractMode::RecursiveCheck {
+                        contracts_mutual_recursion::check_mutual_recursion(tcx, *def, &body);
+                    }
                     self.mark_unused(tcx, *def, &body, mode);
                     let new_body = self.set_mode(tcx, body, mode);
                     (true, new_body)
@@ -515,10 +524,15 @@ impl FunctionWithContractPass {
         let ret_local = ret.local;
         let ret_proj_empty = ret.projection.is_empty();
         let mode_const = new_body.new_uint_operand(mode as _, UintTy::U8, span);
-        new_body.assign_to(ret, Rvalue::Use(mode_const), &mut mode_call, InsertPosition::Before);
+        new_body.assign_to(
+            ret,
+            rvalue_use!(Rvalue::Use(mode_const)),
+            &mut mode_call,
+            InsertPosition::Before,
+        );
         new_body.replace_terminator(
             &mode_call,
-            Terminator { kind: TerminatorKind::Goto { target }, span },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target }, span),
         );
 
         // G3 fix: `ret` (the contract mode) is now a compile-time constant, but
@@ -542,7 +556,7 @@ impl FunctionWithContractPass {
                 changed = false;
                 for bb in new_body.blocks() {
                     for stmt in &bb.statements {
-                        if let StatementKind::Assign(dest, Rvalue::Use(op)) = &stmt.kind
+                        if let StatementKind::Assign(dest, Rvalue::Use(op, ..)) = &stmt.kind
                             && let Operand::Copy(src) | Operand::Move(src) = op
                             && src.projection.is_empty()
                             && dest.projection.is_empty()
@@ -567,14 +581,17 @@ impl FunctionWithContractPass {
                         .find(|(v, _)| *v == mode_val)
                         .map(|(_, t)| t)
                         .unwrap_or_else(|| targets.otherwise());
-                    return Some((bb_idx, selected, bb.terminator.span));
+                    return Some((bb_idx, selected, mir_span!(bb.terminator)));
                 }
                 None
             });
             if let Some((bb_idx, selected, sw_span)) = fold {
                 new_body.replace_terminator(
                     &SourceInstruction::Terminator { bb: bb_idx },
-                    Terminator { kind: TerminatorKind::Goto { target: selected }, span: sw_span },
+                    crate::rustc_compat::mir_terminator(
+                        TerminatorKind::Goto { target: selected },
+                        sw_span,
+                    ),
                 );
             }
         }

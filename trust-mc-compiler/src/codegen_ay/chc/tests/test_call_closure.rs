@@ -447,56 +447,67 @@ fn test_closure_captured_vec_len_assume_emits_strict_unsigned_bound() {
     let _ = take_translation_drop_by_fn();
     let _ = crate::codegen_ay::take_inferable_predicate_count();
 
-    with_test_ay_ctx_for_source(CLOSURE_CAPTURED_VEC_LEN_ASSUME_SOURCE, |ctx| {
-        let fn_name = "probe_closure_captured_vec_len_assume";
-        let instance = find_instance_by_suffix(ctx.tcx, fn_name);
-        let body = instance.body().expect("function body");
-        let vc = mir_to_chc(
-            ctx.tcx,
-            &body,
-            fn_name,
-            ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
-        );
+    // The production driver sets panic=abort for verifier harnesses.
+    crate::codegen_ay::context::with_test_ay_ctx_for_source_with_rustc_flags(
+        CLOSURE_CAPTURED_VEC_LEN_ASSUME_SOURCE,
+        &["-Cpanic=abort"],
+        |ctx| {
+            let fn_name = "probe_closure_captured_vec_len_assume";
+            let instance = find_instance_by_suffix(ctx.tcx, fn_name);
+            let body = instance.body().expect("function body");
+            let vc = mir_to_chc(
+                ctx.tcx,
+                &body,
+                fn_name,
+                ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
+            );
 
-        assert_vc_structure(&vc, fn_name, body.blocks.len());
-        assert!(has_any_constraints(&vc), "{fn_name} should constrain the VC");
+            assert_vc_structure(&vc, fn_name, body.blocks.len());
+            assert!(has_any_constraints(&vc), "{fn_name} should constrain the VC");
 
-        let inferable_decls: Vec<_> = vc
-            .vars()
-            .iter()
-            .filter(|decl| decl.name.contains("P_inf"))
-            .map(|decl| decl.name.clone())
-            .collect();
-        assert!(
-            inferable_decls.is_empty(),
-            "{fn_name} should inline captured closure refs without inferable summaries: {inferable_decls:?}"
-        );
+            let inferable_decls: Vec<_> = vc
+                .vars()
+                .iter()
+                .filter(|decl| decl.name.contains("P_inf"))
+                .map(|decl| decl.name.clone())
+                .collect();
+            assert!(
+                inferable_decls.is_empty(),
+                "{fn_name} should inline captured closure refs without inferable summaries: {inferable_decls:?}"
+            );
 
-        let fallback_count = get_chc_fallback_counts().get(fn_name).copied().unwrap_or(0);
-        assert_eq!(
-            fallback_count, 0,
-            "{fn_name} should avoid CHC fallback while lowering captured closure refs"
-        );
+            let fallback_count = get_chc_fallback_counts().get(fn_name).copied().unwrap_or(0);
+            let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn()
+                .remove(fn_name)
+                .unwrap_or_default();
+            assert_eq!(
+                fallback_count, 0,
+                "{fn_name} should avoid CHC fallback while lowering captured closure refs: {reasons:?}"
+            );
 
-        let has_strict_unsigned_bound = vc.rules.iter().any(|rule| {
-            rule.body.constraints.iter().any(|constraint| {
-                constraint_tree_contains(constraint, &|expr| {
-                    matches!(expr.value(), ExprValue::BvULt(_, _))
+            let has_strict_unsigned_bound = vc.rules.iter().any(|rule| {
+                rule.body.constraints.iter().any(|constraint| {
+                    constraint_tree_contains(constraint, &|expr| {
+                        matches!(expr.value(), ExprValue::BvULt(_, _))
+                    })
+                }) || rule.head.args.iter().any(|arg| {
+                    constraint_tree_contains(arg, &|expr| {
+                        matches!(expr.value(), ExprValue::BvULt(_, _))
+                    })
                 })
-            }) || rule.head.args.iter().any(|arg| {
-                constraint_tree_contains(arg, &|expr| {
-                    matches!(expr.value(), ExprValue::BvULt(_, _))
-                })
-            })
-        });
-        assert!(
-            has_strict_unsigned_bound,
-            "{fn_name} should emit a strict unsigned bound for the closure predicate"
-        );
+            });
+            assert!(
+                has_strict_unsigned_bound,
+                "{fn_name} should emit a strict unsigned bound for the closure predicate"
+            );
 
-        let smt = emit_chc(&vc).to_string();
-        assert!(smt.contains("bvult"), "{fn_name} SMT should contain strict unsigned comparison");
-    });
+            let smt = emit_chc(&vc).to_string();
+            assert!(
+                smt.contains("bvult"),
+                "{fn_name} SMT should contain strict unsigned comparison"
+            );
+        },
+    );
 
     clear_chc_fallback_counts();
     let _ = take_translation_drop_by_fn();
@@ -654,6 +665,10 @@ fn test_multi_signature_dyn_callable_generates_vc_without_fail_closed_constraint
     with_test_ay_ctx_for_source(MULTI_SIGNATURE_DYN_CALLABLE_SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_multi_signature_dyn_callable");
         let body = instance.body().expect("function body");
+        // The closure lane walks a callable unconditionally only when the
+        // harness's dyn-coercion universe says it is the receiver's only
+        // runtime type (design 3: `dyn_dispatch_scope.rs`).
+        let _universe = install_harness_dyn_universe(ctx.tcx, instance);
 
         let vc =
             mir_to_chc(ctx.tcx, &body, "probe_multi_signature_dyn_callable", ChcConfig::default());

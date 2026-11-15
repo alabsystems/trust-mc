@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# Front door for the Kani spec generator. Examples:
+#   tools/kani-spec/kani-spec fetch --seed /path/to/kani-clone
+#   tools/kani-spec/kani-spec generate
+#   tools/kani-spec/kani-spec --check
+set -euo pipefail
+TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$TOOL_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/ay_python.sh
+source "$REPO_ROOT/scripts/ay_python.sh"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$TOOL_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec "$AY_PYTHON_BIN" -m kani_spec.cli "$@"

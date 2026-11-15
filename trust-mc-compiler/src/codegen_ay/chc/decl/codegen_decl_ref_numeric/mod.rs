@@ -24,6 +24,126 @@ use crate::codegen_ay::chc::stmt::codegen_stmt_slice_metadata::projected_subslic
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// Whether every whole-local definition of `local` is a borrow
+    /// (`&`, `&mut`, `&raw`) of exactly `place`, and `place` names one fixed
+    /// location on every path.
+    ///
+    /// A place qualifies only when its projections are all statically
+    /// resolved: a `Deref` depends on the value of the pointer being
+    /// dereferenced and an `Index(i)` on the value of `i`, both of which may
+    /// differ between producers. `Field`, `Downcast`, `ConstantIndex` and
+    /// `Subslice` are fixed offsets. A `Call` terminator writing `local` is a
+    /// producer that is not a borrow, so it disqualifies.
+    /// Whether every whole-local definition of `local` is the same copy of
+    /// `src` — `local = copy src`, `move src`, or the same `copy src as T` cast —
+    /// with no `Call` producer and no partial write.
+    ///
+    /// Loop unwinding duplicates `_21 = copy _15` into every copy of a body just
+    /// as it duplicates the borrow `_15 = &mut _13`. When `src`'s own points-at
+    /// edge holds on every path (it is in `ref_targets`, whose every admission
+    /// rule is path-insensitive), such a copy names that same place on every
+    /// path. Producers are compared by their MIR rendering, so two DIFFERENT
+    /// casts of the same `src` do not qualify.
+    pub(in crate::codegen_ay::chc) fn whole_definitions_all_same_copy_of(
+        &self,
+        local: usize,
+        src: usize,
+    ) -> bool {
+        use rustc_public::mir::{Operand, TerminatorKind};
+        if local == src {
+            return false;
+        }
+        let call_defines = self.body.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator.kind,
+                TerminatorKind::Call { destination, .. } if destination.local == local
+            )
+        });
+        if call_defines {
+            return false;
+        }
+        let mut first: Option<String> = None;
+        for stmt in self.body.blocks.iter().flat_map(|block| &block.statements) {
+            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                continue;
+            };
+            if lhs.local != local {
+                continue;
+            }
+            if !lhs.projection.is_empty() {
+                return false;
+            }
+            let operand = match rhs {
+                Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) => op,
+                _ => return false,
+            };
+            match operand {
+                Operand::Copy(p) | Operand::Move(p)
+                    if p.local == src && p.projection.is_empty() => {}
+                _ => return false,
+            }
+            let rendered = format!("{rhs:?}");
+            match &first {
+                None => first = Some(rendered),
+                Some(f) if *f == rendered => {}
+                Some(_) => return false,
+            }
+        }
+        first.is_some()
+    }
+
+    pub(in crate::codegen_ay::chc) fn whole_definitions_all_borrow_place(
+        &self,
+        local: usize,
+        place: &rustc_public::mir::Place,
+    ) -> bool {
+        use rustc_public::mir::TerminatorKind;
+        let fixed_location = place.projection.iter().all(|p| {
+            matches!(
+                p,
+                ProjectionElem::Field(..)
+                    | ProjectionElem::Downcast(_)
+                    | ProjectionElem::ConstantIndex { .. }
+                    | ProjectionElem::Subslice { .. }
+            )
+        });
+        if !fixed_location {
+            return false;
+        }
+        let call_defines = self.body.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator.kind,
+                TerminatorKind::Call { destination, .. } if destination.local == local
+            )
+        });
+        if call_defines {
+            return false;
+        }
+        let mut producers = 0usize;
+        for stmt in self.body.blocks.iter().flat_map(|block| &block.statements) {
+            let StatementKind::Assign(lhs, rhs) = &stmt.kind else {
+                continue;
+            };
+            if lhs.local != local {
+                continue;
+            }
+            if !lhs.projection.is_empty() {
+                // A partial write into the reference local itself: not a
+                // whole-local borrow producer.
+                return false;
+            }
+            match rhs {
+                Rvalue::Ref(_, _, p) | Rvalue::AddressOf(_, p)
+                    if p.local == place.local && p.projection == place.projection =>
+                {
+                    producers += 1;
+                }
+                _ => return false,
+            }
+        }
+        producers > 0
+    }
+
     /// Collects BigInt/BigRational reference targets from MIR statements.
     ///
     /// When we see `_ref = &_bigint` where `_bigint` is a BigInt local, we record
@@ -63,6 +183,28 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     // Track non-Deref projections so we can resolve patterns like `&arr[idx]`.
                     // Defer Deref-based patterns (e.g., &(*ref).field) to pass 2.
                     if place.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)) {
+                        continue;
+                    }
+                    // A points-at edge is a fact about EVERY path only when this
+                    // statement is the reference's sole producer. Keyed by local,
+                    // the map would keep whichever producer came last: for
+                    // `let r = if b { &m } else { &n };` every read through `r`
+                    // (and through its copies, below) resolved to one referent on
+                    // both paths. Such a reference keeps its path-sensitive value.
+                    //
+                    // Exception: every producer is the SAME borrow of the SAME
+                    // deref-free, index-free place. That is what loop unwinding
+                    // leaves behind when it duplicates a `for` body: each copy
+                    // re-borrows the iterator (`_14 = &mut _12`). The address
+                    // is then one fixed place on every path, so the edge is a
+                    // fact about every path after all.
+                    if self.local_has_multiple_whole_definitions(ref_local)
+                        && !self.whole_definitions_all_borrow_place(ref_local, place)
+                    {
+                        debug!(
+                            ref_local,
+                            "Pass1: no points-at edge for a reference with several producers"
+                        );
                         continue;
                     }
                     self.ref_resolution.ref_targets.insert(
@@ -122,8 +264,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // resolved to the closure environment's own storage instead of the
         // captured referent, so the post-state read landed on a memory cell
         // nothing ever writes (free BV -> refutable postcondition on a correct
-        // program). Correct the base BEFORE composing on top of it.
+        // program). Correct the base BEFORE composing on top of it, and drop
+        // the value-of edges the repair could not turn into points-at edges,
+        // so Pass 2 does not compose on them either.
         self.resolve_adt_field_ref_targets(&field_sources);
+        self.drop_pointer_field_value_of_edges();
 
         // Part of #1712: Pass 2 - Resolve deref-through-ref patterns like _ref = &((*other_ref).field)
         for bb_data in &self.body.blocks {
@@ -176,7 +321,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 }
                             }
                         }
-                        if all_supported {
+                        if all_supported && !self.local_has_multiple_whole_definitions(ref_local) {
                             debug!(
                                 ref_local,
                                 target_local = target.local,
@@ -224,6 +369,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `_ref_local`'s ref_target. This makes `*_tmp` resolve directly to the referent
         // without going through memory.
         self.resolve_adt_field_ref_targets(&field_sources);
+        self.drop_pointer_field_value_of_edges();
 
         debug!(
             count = self.ref_resolution.bigint_ref_targets.len(),
@@ -525,7 +671,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     let src_local: usize = match rvalue {
-                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), ..)
                             if p.projection.is_empty() =>
                         {
                             p.local
@@ -534,7 +680,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     };
                     let dest_local = place.local;
                     if !self.path_insensitive_metadata_copy_is_unique(src_local, dest_local) {
+                        // Keep ONLY the exact points-at edge when every producer of
+                        // `dest` is this same copy of `src` (loop unwinding
+                        // duplicates the copy): Pass 1.5 admitted that edge, and
+                        // this sweep erased it again. Value facts stay dropped.
+                        let kept_edge = self
+                            .whole_definitions_all_same_copy_of(dest_local, src_local)
+                            .then(|| self.ref_resolution.ref_targets.get(&src_local).cloned())
+                            .flatten();
                         self.ref_resolution.clear_path_insensitive_ref_metadata(dest_local);
+                        if let Some(edge) = kept_edge {
+                            self.ref_resolution.ref_targets.insert(dest_local, edge);
+                        }
                         continue;
                     }
                     let crv = self.ref_resolution.const_ref_values.get(&src_local).cloned();

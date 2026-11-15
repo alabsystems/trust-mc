@@ -1,0 +1,16 @@
+# `sess.opts.cg.llvm_args` of a standalone trustc compile on trust-mc-driver's
+# Trustc route, one element per line, for the driver's argv test session
+# (project_compiler_route_tests.rs `argv_test_args`). Both sides test against
+# this file: the driver must produce it, the engine must parse it.
+# `@CARGO_PKG_VERSION@` stands for the version of the crate reading the file.
+--trust-mc-engine-args=pct1:10
+--check-version=@CARGO_PKG_VERSION@
+--log-level=warn
+--assertion-reach-checks
+--harness
+check_add
+--c-lib
+/opt/Application%20Support/stub.o
+--default-unwind
+3
+--reachability=harnesses

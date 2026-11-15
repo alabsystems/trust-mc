@@ -13,6 +13,8 @@
 //!
 //! Part of #3348: IterCollect closure body analysis for transform chains.
 
+use crate::callee_body::CalleeBody;
+use crate::codegen_ay::chc::codegen_ctx::{ExactVar, Havoc, sound_havoc};
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::Operand;
 use rustc_public::mir::mono::Instance;
@@ -25,7 +27,7 @@ use crate::codegen_ay::types::ptr_sort;
 use super::super::codegen_ctx::types::ClosureTemplate;
 use super::super::inline_body::translate_closure_inline_body;
 use super::super::stubs_option_helpers::OptionHelpers;
-use super::super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::super::{ChcCtx, chc_fresh_name};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Try to translate an IterMap closure body into a AY expression template.
@@ -63,7 +65,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut closure_body = None;
         for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
             if let Ok(instance) = Instance::resolve_closure(def, &closure_args, kind)
-                && let Some(body) = instance.body()
+                && let Some(body) = instance.callee_body()
             {
                 closure_body = Some(body);
                 break;
@@ -180,7 +182,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let idx_sort = arr_sort.index_sort.clone();
                     let base = Expr::const_array(
                         idx_sort,
-                        declare_pending_var(
+                        ExactVar::nondet(
                             format!("iter_collect_default_{dest_local}"),
                             elem_sort.clone(),
                         ),
@@ -215,7 +217,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     dest_local,
                     "IterCollect: transform chain — symbolic data (forall blocks PDR) (#3348)"
                 );
-                return declare_pending_var(
+                return Havoc::mint(
+                    self,
+                    sound_havoc::UNTRACKED_COLLECTION_STATE,
                     format!("iter_collect_data_{dest_local}"),
                     data_sort.clone(),
                 );
@@ -223,8 +227,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         // Case 3: Fallback — unconstrained symbolic data.
-        self.record_sound_fallback_reason("iter_collect_symbolic_fallback");
-        declare_pending_var(format!("iter_collect_data_{dest_local}"), data_sort.clone())
+        let booked = self.record_sound_fallback_reason("iter_collect_symbolic_fallback");
+        Havoc::booked(booked, format!("iter_collect_data_{dest_local}"), data_sort.clone())
     }
 
     /// Try to extract concrete element values from a AY store-chain array.
@@ -372,86 +376,200 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         String::from_utf8(bytes).ok()
     }
 
-    /// Try to concretely evaluate a filter_map closure over concrete source
-    /// elements. Currently handles the `|s| s.parse::<T>().ok()` pattern
-    /// where T is an integer type.
-    ///
-    /// Returns a Vec of concrete output values (Some results only, None filtered).
-    /// Returns `None` if the closure cannot be concretely evaluated.
-    ///
-    /// Part of #3692: concrete filter_map replay for parse.rs PROOF.
-    /// Check if the filter_map closure contains an IntParse (FromStr) call.
-    ///
-    /// Part of #3189: extracted from try_concrete_filter_map_int_parse for reuse.
-    pub(in crate::codegen_ay::chc) fn has_int_parse_closure(&self, args: &[Operand]) -> bool {
-        let Some(closure_arg) = args.get(1) else { return false };
-        let Ok(closure_ty) = closure_arg.ty(self.body.locals()) else { return false };
+    /// The body of the closure argument `args[1]`, resolved.
+    fn closure_arg_body(&self, args: &[Operand]) -> Option<rustc_public::mir::Body> {
+        let closure_ty = args.get(1)?.ty(self.body.locals()).ok()?;
         let TyKind::RigidTy(RigidTy::Closure(def, closure_args)) = closure_ty.kind() else {
+            return None;
+        };
+        [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce]
+            .into_iter()
+            .find_map(|kind| Instance::resolve_closure(def, &closure_args, kind).ok())?
+            .callee_body()
+    }
+
+    /// The calls of a closure body in block order, each with its callee
+    /// path, its arguments and its destination local, when every call's
+    /// destination is a whole local; `None` otherwise.
+    fn closure_body_calls(
+        &self,
+        body: &rustc_public::mir::Body,
+    ) -> Option<Vec<(String, Vec<Operand>, usize)>> {
+        let mut calls = Vec::new();
+        for block in &body.blocks {
+            if let rustc_public::mir::TerminatorKind::Call { func, args, destination, .. } =
+                &block.terminator.kind
+            {
+                if !destination.projection.is_empty() {
+                    return None;
+                }
+                calls.push((self.resolve_callee_path(func)?, args.clone(), destination.local));
+            }
+        }
+        Some(calls)
+    }
+
+    /// Does the operand of a closure body derive, through copies and
+    /// dereferences only, from the closure's item argument (local 2), never
+    /// from its environment?
+    fn closure_operand_is_item(body: &rustc_public::mir::Body, operand: &Operand) -> bool {
+        use rustc_public::mir::{ProjectionElem, Rvalue, StatementKind};
+        let (Operand::Copy(place) | Operand::Move(place)) = operand else {
             return false;
         };
-        for kind in [ClosureKind::Fn, ClosureKind::FnMut, ClosureKind::FnOnce] {
-            if let Ok(instance) = Instance::resolve_closure(def, &closure_args, kind)
-                && let Some(body) = instance.body()
-            {
-                for bb in &body.blocks {
-                    if let rustc_public::mir::TerminatorKind::Call { func, .. } =
-                        &bb.terminator.kind
-                    {
-                        if let Some(callee_path) = self.resolve_callee_path(func) {
-                            // Part of #3189: match both `FromStr::from_str` (direct trait call)
-                            // and `<str>::parse` (convenience method that delegates to from_str).
-                            // The closure `|s| s.parse::<i32>().ok()` produces MIR calling
-                            // `core::str::<impl str>::parse`, not `from_str` directly.
-                            if callee_path.contains("from_str")
-                                || callee_path.contains("FromStr")
-                                || callee_path.contains("::parse")
-                            {
-                                return true;
-                            }
-                        }
+        if !place.projection.iter().all(|p| matches!(p, ProjectionElem::Deref)) {
+            return false;
+        }
+        let mut local = place.local;
+        for _ in 0..6 {
+            if local == 2 {
+                return true;
+            }
+            let defs: Vec<&Rvalue> = body
+                .blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .filter_map(|stmt| match &stmt.kind {
+                    StatementKind::Assign(lhs, rhs) if lhs.local == local && lhs.projection.is_empty() => {
+                        Some(rhs)
                     }
-                }
+                    _ => None,
+                })
+                .collect();
+            let [def] = defs.as_slice() else {
+                return false;
+            };
+            let src = match def {
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => src,
+                Rvalue::CopyForDeref(src) => src,
+                Rvalue::Ref(_, _, src) => src,
+                _ => return false,
+            };
+            if !src.projection.iter().all(|p| matches!(p, ProjectionElem::Deref)) {
                 return false;
             }
+            local = src.local;
         }
         false
     }
 
+    /// Is the closure argument `args[1]` exactly `|s| s.chars()`: one call,
+    /// `str::chars` of its item argument, returned? The concrete `flat_map`
+    /// model yields the chars of each string; any other closure (`|s|
+    /// s.chars().rev()`, a captured string's chars) yields others, and
+    /// `flat_map(|s| s.chars().rev()).next() == Some('H')` over `["Hx", ..]`
+    /// verified clean where Kani fails (walker fail-closed repair round 5,
+    /// `iter_concrete_source_dual.rs`).
+    pub(in crate::codegen_ay::chc) fn closure_is_str_chars(&self, args: &[Operand]) -> bool {
+        let Some(body) = self.closure_arg_body(args) else { return false };
+        let Some(calls) = self.closure_body_calls(&body) else { return false };
+        let [(path, call_args, dest)] = calls.as_slice() else { return false };
+        path.ends_with("<impl str>::chars")
+            && *dest == 0
+            && call_args.first().is_some_and(|arg| Self::closure_operand_is_item(&body, arg))
+    }
+
+    /// The integer type `T` (bit width, signedness) when the closure argument
+    /// `args[1]` is exactly `|s| s.parse::<T>().ok()`: a `str::parse` of its
+    /// item argument whose result `Result::ok` returns. The concrete
+    /// `filter_map` replay parses each string as `T`; it took any closure
+    /// that CALLED a parse as `parse::<i32>().ok()` (walker fail-closed
+    /// repair round 5, `iter_concrete_source_dual.rs`). `None` for any other
+    /// shape, and for 128-bit `T` (parsed exactly only up to `i128`).
+    pub(in crate::codegen_ay::chc) fn int_parse_ok_closure_target(&self, args: &[Operand]) -> Option<(u32, bool)> {
+        use rustc_public::ty::{IntTy, UintTy};
+        let body = self.closure_arg_body(args)?;
+        let calls = self.closure_body_calls(&body)?;
+        let [(parse_path, parse_args, parse_dest), (ok_path, ok_args, ok_dest)] = calls.as_slice() else {
+            return None;
+        };
+        if !(parse_path.contains("<impl str>::parse")
+            && parse_args.first().is_some_and(|arg| Self::closure_operand_is_item(&body, arg))
+            && ok_path.contains("Result") && ok_path.ends_with("::ok")
+            && *ok_dest == 0
+            && matches!(ok_args.first(), Some(Operand::Copy(p) | Operand::Move(p))
+                if p.local == *parse_dest && p.projection.is_empty()))
+        {
+            return None;
+        }
+        // `T` is the payload of the closure's `Option<T>` return.
+        let ret_ty = body.locals().first()?.ty;
+        let TyKind::RigidTy(RigidTy::Adt(_, ret_args)) = ret_ty.kind() else { return None };
+        let rustc_public::ty::GenericArgKind::Type(t) = ret_args.0.first()? else { return None };
+        let pointer = crate::codegen_ay::types::POINTER_WIDTH;
+        Some(match t.kind() {
+            TyKind::RigidTy(RigidTy::Int(int)) => (
+                match int {
+                    IntTy::I8 => 8,
+                    IntTy::I16 => 16,
+                    IntTy::I32 => 32,
+                    IntTy::I64 => 64,
+                    IntTy::Isize => pointer,
+                    IntTy::I128 => return None,
+                },
+                true,
+            ),
+            TyKind::RigidTy(RigidTy::Uint(uint)) => (
+                match uint {
+                    UintTy::U8 => 8,
+                    UintTy::U16 => 16,
+                    UintTy::U32 => 32,
+                    UintTy::U64 => 64,
+                    UintTy::Usize => pointer,
+                    UintTy::U128 => return None,
+                },
+                false,
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Concretely evaluate a filter_map closure `|s| s.parse::<T>().ok()`
+    /// over concrete source strings: the values that parse as `T` (Rust's
+    /// integer `FromStr` accepts exactly what `i128` parsing accepts within
+    /// `T`'s range). `None` when the closure is not that shape
+    /// ([`Self::int_parse_ok_closure_target`]).
+    ///
+    /// Part of #3692: concrete filter_map replay for parse.rs PROOF.
     pub(in crate::codegen_ay::chc) fn try_concrete_filter_map_int_parse(
         &self,
         args: &[Operand],
         concrete_source_elems: &[Expr],
-        target_bv_width: u32,
     ) -> Option<Vec<Expr>> {
-        if !self.has_int_parse_closure(args) {
-            return None;
-        }
-
-        // Evaluate each source element concretely.
-        let mut output = Vec::new();
-        for elem in concrete_source_elems {
-            let text = Self::try_extract_str_from_expr(elem)?;
-            // Parse as integer at codegen time.
-            // Use i128 to handle all integer widths, then truncate to BV.
-            if let Ok(parsed) = text.parse::<i128>() {
-                // Check if value fits in target width (signed).
-                let max = (1i128 << (target_bv_width - 1)) - 1;
-                let min = -(1i128 << (target_bv_width - 1));
-                if parsed >= min && parsed <= max {
-                    output.push(Expr::bitvec_const(parsed, target_bv_width));
-                }
-                // Value overflows target width → Err → filtered out by .ok()
-            }
-            // Parse failure → Err → None → filtered out by .ok()
-        }
-
+        let (width, signed) = self.int_parse_ok_closure_target(args)?;
+        let texts: Vec<String> = concrete_source_elems
+            .iter()
+            .map(|elem| Self::try_extract_str_from_expr(elem))
+            .collect::<Option<_>>()?;
+        let output = Self::parse_ints_like_from_str(&texts, width, signed);
         debug!(
             source_count = concrete_source_elems.len(),
             output_count = output.len(),
-            target_bv_width,
+            width,
+            signed,
             "try_concrete_filter_map_int_parse: concrete replay (#3692)"
         );
         Some(output)
+    }
+
+    /// The integers of width `width` and signedness `signed` that
+    /// `str::parse` accepts among `texts`, in order.
+    pub(in crate::codegen_ay::chc) fn parse_ints_like_from_str(
+        texts: &[String],
+        width: u32,
+        signed: bool,
+    ) -> Vec<Expr> {
+        let (min, max) = if signed {
+            (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
+        } else {
+            (0i128, (1i128 << width) - 1)
+        };
+        texts
+            .iter()
+            .filter_map(|text| text.parse::<i128>().ok())
+            .filter(|value| *value >= min && *value <= max)
+            .map(|value| Expr::bitvec_const(value, width))
+            .collect()
     }
 }
 

@@ -63,7 +63,8 @@ pub(super) fn format_manifest_lines(
 
 pub(super) fn format_command_line(config: &ProgressConfig) -> String {
     let mut args = vec![
-        "cargo".to_string(),
+        "targo".to_string(),
+        "--unverified".to_string(),
         "run".to_string(),
         "--manifest-path".to_string(),
         "tools/replacement-audit/Cargo.toml".to_string(),

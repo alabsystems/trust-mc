@@ -5,59 +5,35 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! This module defines all compiler extensions that form the Kani compiler.
+//! The rustc driver callbacks of the embedded `trust-mc-compiler` binary.
 //!
-//! The [KaniCompiler] can be used across multiple rustc driver runs ([`rustc_driver::run_compiler`]),
-//! which is used to implement stubs.
+//! [KaniCompiler] runs one [`rustc_driver::run_compiler`] session. Stubbing is a
+//! MIR transform inside the backend (`kani_middle::transform`), so there are no
+//! driver restarts.
 //!
-//! In the first run, [KaniCompiler::config] will implement the compiler configuration and it will
-//! also collect any stubs that may need to be applied. This method will be a no-op for any
-//! subsequent runs. The [KaniCompiler] will parse options that are passed via `-C llvm-args`.
-//!
-//! If no stubs need to be applied, the compiler will proceed to generate AY verification conditions, and it won't
-//! need any extra runs. However, if stubs are required, we will have to restart the rustc driver
-//! in order to apply the stubs. For the subsequent runs, we add the stub configuration to
-//! `-C llvm-args`.
+//! The backend it installs is the one canonical trustc loads from
+//! `librustc_codegen_trust_mc.dylib` ([`crate::make_backend`]): the engine
+//! arguments are parsed once from `-C llvm-args` in `CodegenBackend::init`, and
+//! `check_crate_items` runs at the top of `codegen_crate`. What stays here is
+//! what only an embedded driver needs: rustc's own logger, and the crate-items
+//! check for sessions that never reach codegen.
 
-use crate::args::Arguments;
-#[cfg(feature = "ay")]
-use crate::codegen_ay::AYCodegenBackend;
 use crate::kani_middle::check_crate_items;
-use crate::kani_queries::QUERY_DB;
-use crate::session::init_session;
-use clap::Parser;
-use rustc_codegen_ssa::traits::CodegenBackend;
+use crate::kani_queries::{QUERY_DB, claim_crate_items_check};
+use crate::session::init_embedded_rustc_logger;
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_interface::Config;
 use rustc_middle::ty::TyCtxt;
 use rustc_public::rustc_internal;
-use rustc_session::config::ErrorOutputType;
 use tracing::debug;
 
 /// Run the Kani flavour of the compiler.
-/// This may require multiple runs of the rustc driver ([`rustc_driver::run_compiler`]).
 pub(crate) fn run(args: Vec<String>) {
     let mut kani_compiler = KaniCompiler::new();
     kani_compiler.run(args);
 }
 
-/// Configure and return the AY backend that generates SMT-LIB2 verification conditions.
-#[cfg(feature = "ay")]
-fn backend(args: Arguments) -> Box<dyn CodegenBackend> {
-    QUERY_DB.with(|db| db.borrow_mut().set_args(args));
-    Box::new(AYCodegenBackend::new())
-}
-
-/// Fallback backend. It will trigger an error if no backend has been enabled.
-#[cfg(not(feature = "ay"))]
-fn backend(_args: Arguments) -> Box<dyn CodegenBackend> {
-    compile_error!("No backend is available. Enable the `ay` feature.");
-}
-
 /// This object controls the compiler behavior.
-///
-/// It is responsible for initializing the query database, as well as controlling the compiler
-/// state machine.
 struct KaniCompiler {}
 
 impl KaniCompiler {
@@ -67,9 +43,6 @@ impl KaniCompiler {
     }
 
     /// Compile the current crate with the given arguments.
-    ///
-    /// Since harnesses may have different attributes that affect compilation, Kani compiler can
-    /// actually invoke the rust compiler multiple times.
     fn run(&mut self, args: Vec<String>) {
         debug!(?args, "run_compilation_session");
         run_compiler(&args, self);
@@ -78,35 +51,40 @@ impl KaniCompiler {
 
 /// Use default function implementations.
 impl Callbacks for KaniCompiler {
-    /// Configure the [KaniCompiler] `self` object during initialization.
+    /// Install rustc's logger and the trust-mc backend factory.
     fn config(&mut self, config: &mut Config) {
-        // `trust_mc-driver` passes the `trust_mc-compiler` specific arguments through llvm-args,
-        // so parse directly from borrowed strings and avoid cloning the full argument vector.
-        let args = Arguments::parse_from(
-            std::iter::once("trust_mc-compiler")
-                .chain(config.opts.cg.llvm_args.iter().map(String::as_str)),
-        );
-        init_session(&args, matches!(config.opts.error_format, ErrorOutputType::Json { .. }));
+        init_embedded_rustc_logger();
 
-        // Capture args in the closure so they're available when the backend is created
-        // (potentially on a different thread).
-        config.make_codegen_backend = Some(Box::new({
-            let args = args;
-            move |_cfg, _| backend(args)
-        }));
+        #[cfg(not(trust_toolchain))]
+        {
+            config.make_codegen_backend = Some(Box::new(|_cfg, _| crate::make_backend()));
+        }
+        // Trust: the factory receives the constructed `&Session` instead of
+        // `(&Options, &Target)`. Neither closure reads its parameters.
+        #[cfg(trust_toolchain)]
+        {
+            config.make_codegen_backend = Some(Box::new(|_sess| crate::make_backend()));
+        }
     }
 
-    /// After analysis, we check the crate items for Kani API misuse or configuration issues.
+    /// Check the crate items here only when this session will not reach
+    /// `codegen_crate`, which otherwise runs the check (see
+    /// [`claim_crate_items_check`]). rustc skips codegen under exactly this
+    /// condition (`rustc_interface::passes::start_codegen`).
     fn after_analysis(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'_>,
     ) -> Compilation {
-        rustc_internal::run(tcx, || {
-            let ignore_global_asm = QUERY_DB.with(|db| db.borrow().args().ignore_global_asm);
-            check_crate_items(tcx, ignore_global_asm);
-        })
-        .expect("failed to run crate item check");
+        let skips_codegen = tcx.sess.opts.unstable_opts.no_codegen
+            || !tcx.sess.opts.output_types.should_codegen();
+        if skips_codegen && claim_crate_items_check() {
+            rustc_internal::run(tcx, || {
+                let ignore_global_asm = QUERY_DB.with(|db| db.borrow().args().ignore_global_asm);
+                check_crate_items(tcx, ignore_global_asm);
+            })
+            .expect("failed to run crate item check");
+        }
         Compilation::Continue
     }
 }

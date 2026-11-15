@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "fork_commit": "c4d858036efec56e02caa743f8732582da973d5a",
+  "corrections": [
+    {
+      "file": "tests/expected/MemPredicates/thin_ptr_validity.rs",
+      "harness": "check_invalid_ptr",
+      "before": "CTREX",
+      "after": "PROOF",
+      "reason": "The unchanged harness asserts that a pointer to expired nonzero stack storage cannot be dereferenced. This is a valid semantic assertion. The original expected failure is explicitly a Kani unsupported-memory limitation, not a violated program assertion. Require a complete positive proof; retain the sibling invalid-array assertion as a genuine negative control.",
+      "fork_blob": "519a072971926b10c8cdc39aac6dd2f48873c2de",
+      "source_sha256": "2c4b14296f230e5edd4ec2673a4d353d32efa35f5c0e7b6c15f15ed208c1158f",
+      "expectation_file": "tests/expected/MemPredicates/thin_ptr_validity.expected",
+      "expectation_blob": "54245a84a491ddcfa413b84f4d6e674c74f2cd80",
+      "expectation_sha256": "f14360347e9baacd2ff9b2e854d46d96993708da9148e78f835ebea573179eaf"
+    }
+  ],
+  "historical_total": 818,
+  "partition": {
+    "proof": 479,
+    "negative": 339,
+    "active_proof": 447,
+    "active_negative": 339
+  },
+  "scope": "Source-oracle correction for an incumbent implementation limitation. No new inactive row, weaker positive proof requirement, source change or budget change."
+}

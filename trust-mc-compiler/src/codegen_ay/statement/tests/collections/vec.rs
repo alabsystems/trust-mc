@@ -383,7 +383,9 @@ fn test_codegen_vec_reserve_real_operand_updates_capacity() {
         );
         let len_smt = len.to_string();
         assert!(
-            len_smt.contains("(fld_len"),
+            // make_test_vec builds a constructor, so ay folds fld_len to the stored
+            // length (8a7c063209).
+            len_smt.contains("(fld_len") || len_smt == "#x0000000000000001",
             "VecReserve should preserve length field, got {len_smt}"
         );
     });
@@ -455,7 +457,9 @@ fn test_codegen_vec_shrink_to_fit_sets_cap_to_len() {
         let cap_smt = cap.to_string();
         let len_smt = len.to_string();
         assert!(
-            cap_smt.contains("(fld_len"),
+            // The capacity is the length expression; over a constructor ay folds both
+            // selectors to the stored length (8a7c063209), so they are the same term.
+            cap_smt.contains("(fld_len") || cap == len,
             "VecShrinkToFit should set cap to len expression, got {cap_smt}"
         );
         assert!(

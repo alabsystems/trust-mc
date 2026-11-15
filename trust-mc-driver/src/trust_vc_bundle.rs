@@ -32,7 +32,16 @@ pub(crate) fn verify_trust_vc_bundle(session: KaniSession, bundle_path: &Path) -
 
     let harness = synthetic_bundle_harness(&unit.source_id, bundle_path);
     let deadline = crate::deadline::Deadline::for_harness(session.args.harness_timeout);
-    let result = session.run_ay(temp_smt.path(), &harness, 0, deadline)?;
+    let mut result = session.run_ay(temp_smt.path(), &harness, 0, deadline)?;
+    // Same rule as `check_harness`: once an off-pin `ay` was accepted under
+    // --allow-unpinned-ay, the verdict carries the marker and a success is
+    // SUCCESSFUL (UNVALIDATED), never a clean SUCCESSFUL (`crate::ay_binary`).
+    if let Some(marker) =
+        crate::ay_binary::demote_for_unpinned_solver(&mut result, harness.attributes.should_panic)
+        && !session.args.common_args.quiet
+    {
+        println!("{marker}");
+    }
     session.process_output(&result, &harness, 0)?;
 
     let results = [HarnessResult { harness: &harness, result }];

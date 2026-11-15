@@ -275,6 +275,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for key in &modified_keys {
             self.mark_type_array_modified(key);
         }
+        // One store that writes zeros under every key it filled, and the
+        // zeroed region (`heap_view_ledger.rs`).
+        if let Some(obj) = Self::try_extract_obj_id(&ptr) {
+            let mut keys: Vec<&str> = modified_keys.iter().map(String::as_str).collect();
+            keys.push(crate::codegen_ay::chc::heap::heap_view_ledger::REGION_VIEW_KEY);
+            let span = crate::codegen_ay::chc::heap::heap_view_ledger::ViewSpan::new(
+                0,
+                Some(concrete_size.unwrap_or(effective_window) as u64),
+            );
+            self.note_view_fill(obj, span, &keys);
+        }
     }
 
     /// #3728: Always-moved realloc copy constraints.
@@ -364,6 +375,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 self.heap_state.mark_heap_obj_type_overlay(new_obj_id, key);
             }
         }
+        // The copy is one store into the new object under every key it
+        // copied, and its region (`heap_view_ledger.rs`); a key it did not
+        // copy (an array key, a struct's) is unwritten there.
+        if let Some(new_obj_id) = new_obj_id {
+            let mut keys: Vec<&str> = modified_keys.iter().map(String::as_str).collect();
+            keys.push(crate::codegen_ay::chc::heap::heap_view_ledger::REGION_VIEW_KEY);
+            let span = crate::codegen_ay::chc::heap::heap_view_ledger::ViewSpan::new(
+                0,
+                Some(concrete_old_size.unwrap_or(effective_window) as u64),
+            );
+            self.note_view_fill(new_obj_id, span, &keys);
+        }
 
         // Fix #3677: Region array copy constraints (see stubs_alloc_overlay_helpers.rs).
         self.add_realloc_region_copy_constraints(
@@ -403,6 +426,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     fn translate_box_new_alloc(&mut self, ctx: &StubTranslateArgs<'_>) -> Option<AllocCallResult> {
+        if self.native_box_uses_custom_allocator()
+            && ctx
+                .args
+                .first()
+                .and_then(|arg| arg.ty(self.body.locals()).ok())
+                .and_then(|ty| self.get_type_size(ty))
+                != Some(0)
+        {
+            self.record_sound_fallback_reason("box_new_custom_global_allocator_unmodeled");
+        }
         // BoxNew: opaque Box::new call when MIR doesn't desugar to exchange_malloc.
         // Args are the value to box (not size/align). translate_rust_alloc has a
         // BoxNew-specific path that resolves concrete size/align from the argument's

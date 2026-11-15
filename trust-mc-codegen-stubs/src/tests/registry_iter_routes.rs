@@ -223,13 +223,11 @@ fn lookup_slice_into_iter_routes_to_vec_iter() {
 #[test]
 fn lookup_manuallydrop_identity_helpers() {
     assert_eq!(lookup("std::mem::ManuallyDrop::<u32>::new"), Some(StubKind::GlobalAllocImpl));
-    assert_eq!(
-        lookup("<std::mem::ManuallyDrop<u32> as std::ops::Deref>::deref"),
-        Some(StubKind::GlobalAllocImpl)
-    );
+    // Deref::deref / DerefMut::deref_mut are no stub: the CHC call spine
+    // models them as the address identity they are
+    // (`try_dispatch_array_iter_identity_call`); the unconstrained
+    // `GlobalAllocImpl` havoc certified false counterexamples through them.
+    assert_eq!(lookup("<std::mem::ManuallyDrop<u32> as std::ops::Deref>::deref"), None);
     // DerefMut::deref_mut — appears in Vec::IntoIter paths (Part of #2967)
-    assert_eq!(
-        lookup("<std::mem::ManuallyDrop<T> as std::ops::DerefMut>::deref_mut"),
-        Some(StubKind::GlobalAllocImpl)
-    );
+    assert_eq!(lookup("<std::mem::ManuallyDrop<T> as std::ops::DerefMut>::deref_mut"), None);
 }

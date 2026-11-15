@@ -5,6 +5,9 @@
 //!
 //! Contains functions for codegen of iterator types (IntoIter, PolymorphicIter, IndexRange).
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use std::sync::Arc;
 
 use ay_bindings::SortInner;
@@ -62,8 +65,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = range_ty.kind() else {
             return None;
         };
-        let adt_name = Self::adt_sort_name(def, &args);
+        let path_name = Self::adt_sort_name(def, &args);
         let sort = Self::infer_adt_sort(def, args)?;
+        let adt_name = names::constructor_datatype_name(&sort, &path_name);
         let (start_expr, end_expr) = if let Some(width) = end_expr.sort().bitvec_width() {
             (Self::coerce_to_width(start_expr, width), Self::coerce_to_width(end_expr, width))
         } else {
@@ -83,9 +87,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = iter_ty.kind() else {
             return None;
         };
-        // Get adt_name before moving args into infer_adt_sort
-        let adt_name = Self::adt_sort_name(def, &args);
+        // Get the path name before moving args into infer_adt_sort
+        let path_name = Self::adt_sort_name(def, &args);
         let sort = Self::infer_adt_sort(def, args)?;
+        let adt_name = names::constructor_datatype_name(&sort, &path_name);
         let cons_name = names::resolve_ctor_name(&sort, &adt_name);
         Some(Expr::datatype_constructor(adt_name, cons_name, vec![alive_expr, data_expr], sort))
     }
@@ -229,7 +234,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = iter_ty.kind() else {
             return None;
         };
-        let adt_name = Self::adt_sort_name(def, &args);
+        // Fields are read from `iter_expr` under the name of the sort it has.
+        let adt_name =
+            names::constructor_datatype_name(iter_expr.sort(), &Self::adt_sort_name(def, &args));
         // Guard: iter_expr must be a Datatype to use field_select (#967)
         if !iter_expr.sort().is_datatype() {
             return None;
@@ -242,7 +249,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
         let alive_field = &fields[0];
-        let alive_ty = Self::resolve_generic_ty(alive_field.ty(), &args)?;
+        let alive_ty = mono_ty::field_ty(alive_field, &args)?;
         let alive_sort = Self::infer_sort_from_ty(alive_ty)?;
         let alive_expr = iter_expr.clone().field_select(adt_name, "fld_alive", alive_sort.clone());
         self.index_range_len_expr(&alive_expr, &alive_sort, false) // array indices: unsigned
@@ -258,7 +265,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = iter_ty.kind() else {
             return None;
         };
-        let adt_name = Self::adt_sort_name(def, &args);
+        // Fields are read from `iter_expr` under the name of the sort it has.
+        let adt_name =
+            names::constructor_datatype_name(iter_expr.sort(), &Self::adt_sort_name(def, &args));
         // Guard: iter_expr must be a Datatype to use field_select (#967)
         if !iter_expr.sort().is_datatype() {
             return None;
@@ -272,8 +281,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         let alive_field = &fields[0];
         let data_field = &fields[1];
-        let alive_ty = Self::resolve_generic_ty(alive_field.ty(), &args)?;
-        let data_ty = Self::resolve_generic_ty(data_field.ty(), &args)?;
+        let alive_ty = mono_ty::field_ty(alive_field, &args)?;
+        let data_ty = mono_ty::field_ty(data_field, &args)?;
         let alive_sort = Self::infer_sort_from_ty(alive_ty)?;
         let data_sort = Self::infer_sort_from_ty(data_ty)?;
         let alive_expr =
@@ -298,6 +307,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let option_expr = self.build_option_expr(destination, has_next, elem_expr)?;
         let iter_sort = Self::infer_adt_sort(def, args)?;
+        let adt_name = names::constructor_datatype_name(&iter_sort, &adt_name);
         let cons_name = names::resolve_ctor_name(&iter_sort, &adt_name);
         // Last use of `data_expr` — move instead of clone
         let updated_iter = Expr::datatype_constructor(
@@ -533,9 +543,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if !((v0_fields == 0 && v1_fields == 1) || (v0_fields == 1 && v1_fields == 0)) {
             return None;
         }
-        // Get adt_name before moving args into infer_adt_sort
-        let adt_name = Self::adt_sort_name(def, &args);
+        // Get the path name before moving args into infer_adt_sort
+        let path_name = Self::adt_sort_name(def, &args);
         let sort = Self::infer_adt_sort(def, args)?;
+        let adt_name = names::constructor_datatype_name(&sort, &path_name);
         // Part of #2549: Use scoped constructor names to avoid Z3
         // "ambiguous function declaration" with multiple Option instantiations.
         let some_name = names::option_some_constructor_name(&adt_name);

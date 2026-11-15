@@ -115,7 +115,7 @@ fn assert_option_as_mut_dispatch_uses_guarded_reference_payload(
             let modified_locals = HashSet::new();
             let target_opt = Some(target_bb);
             let before_rules = chc_ctx.vc.rules.len();
-            let before_fallbacks = chc_ctx.sound_fallback_count();
+            let before_bookings = bookings(&chc_ctx);
             let before_gaps = chc_ctx.diagnostics.aggregate_encoding_gap.get();
 
             let dcx = DispatchCallContext {
@@ -138,10 +138,12 @@ fn assert_option_as_mut_dispatch_uses_guarded_reference_payload(
                 chc_ctx.vc.rules.len() > before_rules,
                 "{label} fast path should emit a transition rule"
             );
-            assert_eq!(
-                chc_ctx.sound_fallback_count(),
-                before_fallbacks,
-                "{label} fast path should not record a sound fallback"
+            // The payload is a reference the model does not pin: a booked,
+            // identified havoc (Rule E), not a fallback.
+            assert_precise_up_to_attributed_havocs(
+                &chc_ctx,
+                &before_bookings,
+                &format!("{label} fast path should not fall back"),
             );
             assert_eq!(
                 chc_ctx.diagnostics.aggregate_encoding_gap.get(),
@@ -224,7 +226,7 @@ fn test_dispatch_option_as_mut_fast_path_claims_call() {
             let modified_locals = HashSet::new();
             let target_opt = Some(target_bb);
             let before_rules = chc_ctx.vc.rules.len();
-            let before_fallbacks = chc_ctx.sound_fallback_count();
+            let before_bookings = bookings(&chc_ctx);
 
             let dcx = DispatchCallContext {
                 bb_idx,
@@ -246,10 +248,12 @@ fn test_dispatch_option_as_mut_fast_path_claims_call() {
                 chc_ctx.vc.rules.len() > before_rules,
                 "Option::as_mut fast path should emit a transition rule"
             );
-            assert_eq!(
-                chc_ctx.sound_fallback_count(),
-                before_fallbacks,
-                "Option::as_mut fast path should not record a sound fallback"
+            // The payload is a reference the model does not pin: a booked,
+            // identified havoc (Rule E), not a fallback.
+            assert_precise_up_to_attributed_havocs(
+                &chc_ctx,
+                &before_bookings,
+                "Option::as_mut fast path should not fall back",
             );
             found += 1;
         }

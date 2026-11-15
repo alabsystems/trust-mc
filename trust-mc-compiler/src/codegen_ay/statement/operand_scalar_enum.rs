@@ -6,23 +6,15 @@
 //!
 //! Extracted from `operand_scalar.rs` — Part of #4206.
 
-use super::{Allocation, Expr, GlobalAlloc, IntoOption, LayoutOf, SortInner, StatementCodegen};
-use crate::codegen_ay::chc::codegen_stmt_aggregate_adt::sign_extend_discr_val;
-use crate::codegen_ay::types::POINTER_WIDTH;
-use rustc_abi::VariantIdx as InternalVariantIdx;
-use rustc_public::rustc_internal;
+use super::{Expr, LayoutOf, StatementCodegen};
+use crate::codegen_ay::chc::expr::codegen_expr_constant_payload::{
+    decode_non_unit_enum_variant_index, fieldless_enum_const_bits, ty_is_fieldless_enum,
+};
+use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use tracing::debug;
-
-fn read_alloc_uint_le(alloc: &Allocation, offset: usize, byte_count: usize) -> Option<u128> {
-    let bytes = alloc.bytes.get(offset..offset.checked_add(byte_count)?)?;
-    let mut value = 0u128;
-    for (i, byte) in bytes.iter().enumerate() {
-        if let Some(b) = byte {
-            value |= (*b as u128) << (i * 8);
-        }
-    }
-    Some(value)
-}
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Extract a unit enum constant from an allocation.
@@ -31,7 +23,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Uses `sign_extend_discr_val` instead of the previous Ordering-only special case.
     pub(super) fn codegen_unit_enum_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         adt_def: rustc_public::ty::AdtDef,
         variants: &[rustc_public::ty::VariantDef],
     ) -> Option<Expr> {
@@ -39,17 +31,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let num_variants = variants.len();
         let bits: u32 = if num_variants <= 65536 { 32 } else { 64 };
 
-        // Read raw unsigned bytes from the allocation.
-        let value = alloc.read_uint().into_option()?;
-        let value_u128 = if bits >= 128 { value } else { value & ((1u128 << bits) - 1) };
-
-        // Get the discriminant type from variant 0 (type is the same for all variants).
-        let internal_def = rustc_internal::internal(self.ctx.tcx, adt_def);
-        let discr =
-            internal_def.discriminant_for_variant(self.ctx.tcx, InternalVariantIdx::from_usize(0));
-
-        // Sign-extend if the discriminant type is signed (e.g., Ordering repr(i8)).
-        let discriminant_val = sign_extend_discr_val(value_u128, discr.ty, self.ctx.tcx, bits);
+        // The discriminant, sign-extended as the aggregate path does, decoded
+        // from the tag's own width: sign-extending the raw tag from the
+        // DISCRIMINANT type's width left a default-repr `enum G { N = -1 }`
+        // (discriminant type `isize`, one-byte tag) at `0xFF`.
+        let discriminant_val = fieldless_enum_const_bits(adt_def.ty(), alloc, 0, bits)?;
         Some(Expr::bitvec_const(discriminant_val, bits))
     }
 
@@ -57,7 +43,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Option-like: 2 variants, one empty + one with 1 field.
     pub(super) fn codegen_option_like_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         option_ty: rustc_public::ty::Ty,
         adt_def: rustc_public::ty::AdtDef,
         args: rustc_public::ty::GenericArgs,
@@ -65,72 +51,65 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<Expr> {
         let (some_idx, some_variant) =
             variants.iter().enumerate().find(|(_, v)| v.fields().len() == 1)?;
-        let field_ty = some_variant.fields()[0].ty();
-        let concrete_ty = Self::resolve_generic_ty(field_ty, &args)?;
+        let concrete_ty = mono_ty::field_ty(&some_variant.fields()[0], &args)?;
         let dt_name = Self::adt_sort_name(adt_def, &args);
         let dt_sort = Self::infer_adt_sort(adt_def, args)?;
 
-        // Check discriminant to determine Some vs None
-        let option_layout = LayoutOf::new(option_ty);
-        let payload_layout = LayoutOf::new(concrete_ty);
-        let payload_size = payload_layout.size_of().unwrap_or(0);
-        let option_size = option_layout.size_of().unwrap_or(alloc.bytes.len());
-        let explicit_tag_bytes = option_size.saturating_sub(payload_size);
-        let payload_offset =
-            if explicit_tag_bytes > 0 { explicit_tag_bytes.min(alloc.bytes.len()) } else { 0 };
-        let discrim_val = if explicit_tag_bytes > 0 {
-            read_alloc_uint_le(alloc, 0, explicit_tag_bytes).unwrap_or(0)
-        } else {
-            alloc.read_uint().into_option().unwrap_or(0)
-        };
-        let is_some = discrim_val == some_idx as u128;
-
-        if is_some {
-            // Try to extract the inner value
-            if let Some(inner_sort) = Self::infer_sort_from_ty(concrete_ty) {
-                // Check for Option<&T> promotion to Option<T>
-                if let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(
-                    _,
-                    pointee_ty,
-                    _,
-                )) = concrete_ty.kind()
-                {
-                    if let Some(result) =
-                        self.codegen_option_ref_promotion(alloc, pointee_ty, &dt_name)
-                    {
-                        return Some(result);
-                    }
-                }
-
-                // Extract value from allocation bytes
-                if let Some(bv_width) = inner_sort.bitvec_width() {
-                    let byte_count = (bv_width / 8) as usize;
-                    let value = read_alloc_uint_le(alloc, payload_offset, byte_count)?;
-                    let some_ctor =
-                        crate::codegen_ay::names::scope_option_ctor(&some_variant.name(), &dt_name);
-                    return Some(Expr::datatype_constructor(
-                        &dt_name,
-                        &some_ctor,
-                        vec![Expr::bitvec_const(value, bv_width)],
-                        dt_sort,
-                    ));
-                }
-            }
-        } else {
-            // None variant
+        // The active variant, from the layout's own tag: its tag field's
+        // offset and width, direct or niche (`Option<char>` keeps `None` at
+        // 0x110000, `Option<Ordering>` at 2, `Option<&T>` at null). A guessed
+        // tag (`size_of(Option<T>) - size_of(T)` bytes at 0, uninitialized
+        // padding read as 0) read `Some('a')` as `None`, and the BMC lane
+        // proved `assert!(!(o == Some('a')))` for a joined `o`
+        // (tools/soundness-duals/negative/review_r11a_other_payloads.rs).
+        let is_some =
+            decode_non_unit_enum_variant_index(alloc, option_ty, variants.len())? == some_idx;
+        if !is_some {
             let none_variant = variants.iter().find(|v| v.fields().is_empty())?;
             let none_ctor =
                 crate::codegen_ay::names::scope_option_ctor(&none_variant.name(), &dt_name);
             return Some(Expr::datatype_constructor(&dt_name, &none_ctor, vec![], dt_sort));
         }
 
+        // The payload at its own offset in the Some variant's layout.
+        let payload_offset = LayoutOf::new(option_ty).variant_field_offset(some_idx, 0)?;
+        let inner_sort = Self::infer_sort_from_ty(concrete_ty)?;
+        // Check for Option<&T> promotion to Option<T>
+        if let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, pointee_ty, _)) =
+            concrete_ty.kind()
+        {
+            if let Some(result) =
+                self.codegen_option_ref_promotion(alloc, payload_offset, pointee_ty, &dt_name)
+            {
+                return Some(result);
+            }
+        }
+        // A bitvector payload (a fieldless enum's discriminant, an integer,
+        // or a pointer slot's value) read under the slot clause.
+        if inner_sort.bitvec_width().is_some() {
+            let payload_size = LayoutOf::new(concrete_ty).size_of()?;
+            if !ty_is_fieldless_enum(concrete_ty)
+                && inner_sort.bitvec_width() != u32::try_from(payload_size * 8).ok()
+            {
+                return None;
+            }
+            let value =
+                self.read_field_from_alloc(alloc, concrete_ty, &inner_sort, payload_offset)?;
+            let some_ctor =
+                crate::codegen_ay::names::scope_option_ctor(&some_variant.name(), &dt_name);
+            return Some(Expr::datatype_constructor(&dt_name, &some_ctor, vec![value], dt_sort));
+        }
         None
     }
 
-    /// Promote Option<&T> to Option<T> by following provenance (#3133).
+    /// Promote Option<&T> to Option<T> by reading the pointee (#3133): the
+    /// window the payload's pointer names in a FIXED target, at the offset
+    /// the pointer carries (`const_pointer::fixed_pointee`), never the
+    /// target from byte 0.
     pub(super) fn codegen_option_ref_promotion(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
+        payload_offset: usize,
         pointee_ty: rustc_public::ty::Ty,
         dt_name: &str,
     ) -> Option<Expr> {
@@ -141,28 +120,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let val_dt_name = val_option_sort.datatype_name().unwrap_or(dt_name);
         let val_some = crate::codegen_ay::names::option_some_constructor_name(val_dt_name);
 
-        // Follow provenance to extract pointee value
-        if !alloc.provenance.ptrs.is_empty() {
-            let (_, prov) = &alloc.provenance.ptrs[0];
-            let alloc_id = prov.0;
-            if let GlobalAlloc::Memory(target_alloc) = GlobalAlloc::from(alloc_id) {
-                if let Some(pointee_expr) =
-                    self.codegen_scalar_from_alloc(&target_alloc, pointee_ty)
-                {
-                    debug!(
-                        "#3133: promoted Option<&T> → Option<T> with value sort {:?}",
-                        pointee_sort
-                    );
-                    return Some(Expr::datatype_constructor(
-                        val_dt_name,
-                        &val_some,
-                        vec![pointee_expr],
-                        val_option_sort.clone(),
-                    ));
-                }
-            }
-        }
-        None
+        let (_, window) =
+            const_pointer::fixed_pointee(self.ctx.tcx, alloc, payload_offset, pointee_ty)?;
+        let pointee_expr = self.codegen_scalar_from_bytes(&window, pointee_ty)?;
+        debug!("#3133: promoted Option<&T> → Option<T> with value sort {:?}", pointee_sort);
+        Some(Expr::datatype_constructor(
+            val_dt_name,
+            &val_some,
+            vec![pointee_expr],
+            val_option_sort.clone(),
+        ))
     }
 
     /// Extract a single-variant enum/struct with data fields from an allocation (#3094).
@@ -173,7 +140,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// field sorts.
     pub(super) fn codegen_single_variant_enum_from_alloc(
         &self,
-        alloc: &Allocation,
+        alloc: &dyn ConstRead,
         ty: rustc_public::ty::Ty,
         adt_def: rustc_public::ty::AdtDef,
         args: rustc_public::ty::GenericArgs,
@@ -185,8 +152,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let mut all_fields_ok = true;
 
         for (idx, field) in variant.fields().iter().enumerate() {
-            let field_ty = field.ty();
-            let Some(concrete_ty) = Self::resolve_generic_ty(field_ty, &args) else {
+            let Some(concrete_ty) = mono_ty::field_ty(field, &args) else {
                 all_fields_ok = false;
                 break;
             };
@@ -203,31 +169,27 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 all_fields_ok = false;
                 break;
             };
-            let offset = layout.field_offset(idx).unwrap_or(0);
+            let Some(offset) = layout.field_offset(idx) else {
+                all_fields_ok = false;
+                break;
+            };
 
-            // Try to extract the field value based on its sort type.
-            let field_expr = if let Some(field_width) = field_sort.bitvec_width() {
-                // BV fields: read bytes at offset (original path).
-                let field_byte_count = (field_width as usize) / 8;
-                let mut value: u128 = 0;
-                if let Some(bytes) = alloc.bytes.get(offset..offset + field_byte_count) {
-                    for (i, byte) in bytes.iter().enumerate() {
-                        if let Some(b) = byte {
-                            value |= (*b as u128) << (i * 8);
-                        }
-                    }
+            // A bitvector field whose type is not exactly the sort's width
+            // (other than a fieldless enum, decoded from its own tag bytes)
+            // drops the constant instead of inventing bytes. Reading the
+            // sort's four bytes from `S { a: Ordering::Greater, b: 2 }` (a
+            // one-byte field) found none and produced `a == 0`, and a joined
+            // `o` was proved unequal to the constant it equals
+            // (tools/soundness-duals/negative/joined_enum_constant_payloads.rs).
+            let width_ok = match field_sort.bitvec_width() {
+                Some(width) => {
+                    ty_is_fieldless_enum(concrete_ty)
+                        || u32::try_from(field_size_bytes * 8).ok() == Some(width)
                 }
-                Some(Expr::bitvec_const(value, field_width))
-            } else if field_sort.is_bool() {
-                // Bool fields: read 1 byte.
-                let byte_val = alloc.bytes.get(offset).and_then(|b| *b).unwrap_or(0);
-                Some(Expr::bool_const(byte_val != 0))
-            } else if let SortInner::Datatype(_) = field_sort.inner() {
-                // Nested Datatype fields: recursively extract from allocation bytes.
-                Self::extract_datatype_field_from_alloc(alloc, offset, concrete_ty, &field_sort)
-            } else if field_sort.is_array() {
-                // Array fields: extract element-wise from allocation bytes.
-                self.extract_array_field_from_alloc(alloc, offset, concrete_ty)
+                None => true,
+            };
+            let field_expr = if width_ok {
+                self.read_field_from_alloc(alloc, concrete_ty, &field_sort, offset)
             } else {
                 None
             };
@@ -275,142 +237,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         None
     }
 
-    /// Extract a nested Datatype field value from allocation bytes at a given offset.
-    ///
-    /// Used by `codegen_single_variant_enum_from_alloc` for struct fields that are
-    /// themselves structs/tuples (Datatype sort). Reads sub-field values from the
-    /// allocation bytes using the field layout offsets relative to `base_offset`.
-    fn extract_datatype_field_from_alloc(
-        alloc: &Allocation,
-        base_offset: usize,
-        field_ty: rustc_public::ty::Ty,
-        field_sort: &ay_bindings::Sort,
-    ) -> Option<Expr> {
-        let SortInner::Datatype(dt) = field_sort.inner() else {
-            return None;
-        };
-        let ctor = dt.constructors.first()?;
-
-        // Try to get the field layout for offset computation.
-        let field_layout = field_ty.layout().ok()?;
-        let field_shape = field_layout.shape();
-
-        let mut sub_field_exprs = Vec::with_capacity(ctor.fields.len());
-        for (sub_idx, sub_field_info) in ctor.fields.iter().enumerate() {
-            // Compute sub-field offset within the nested struct.
-            let sub_offset = if let rustc_public::abi::FieldsShape::Arbitrary { ref offsets } =
-                field_shape.fields
-            {
-                offsets.get(sub_idx).map(|off| off.bytes()).unwrap_or(0)
-            } else {
-                0
-            };
-            let abs_offset = base_offset + sub_offset;
-
-            let sub_expr = if sub_field_info.sort.is_bool() {
-                let byte_val = alloc.bytes.get(abs_offset).and_then(|b| *b).unwrap_or(0);
-                Expr::bool_const(byte_val != 0)
-            } else if let Some(bits) = sub_field_info.sort.bitvec_width() {
-                let bw = (bits as usize / 8).max(1);
-                let mut value: u128 = 0;
-                if let Some(bytes) = alloc.bytes.get(abs_offset..abs_offset + bw) {
-                    for (i, byte) in bytes.iter().enumerate() {
-                        if let Some(b) = byte {
-                            value |= (*b as u128) << (i * 8);
-                        }
-                    }
-                }
-                Expr::bitvec_const(value, bits)
-            } else {
-                // Unsupported sub-field sort (deeply nested DT, array, etc.).
-                // Bail on the entire nested field.
-                return None;
-            };
-            sub_field_exprs.push(sub_expr);
-        }
-
-        Some(Expr::datatype_constructor(&dt.name, &ctor.name, sub_field_exprs, field_sort.clone()))
-    }
-
-    /// Extract an Array-sorted field value from allocation bytes at a given offset.
-    ///
-    /// Used by `codegen_single_variant_enum_from_alloc` for struct fields that are
-    /// arrays (e.g., `[u32; 4]`). Reads element values from the allocation bytes
-    /// starting at `base_offset`.
-    fn extract_array_field_from_alloc(
-        &self,
-        alloc: &Allocation,
-        base_offset: usize,
-        field_ty: rustc_public::ty::Ty,
-    ) -> Option<Expr> {
-        // Match the field type to get element type and length.
-        let (elem_ty, len) = match field_ty.kind() {
-            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Array(
-                elem_ty,
-                len_const,
-            )) => {
-                let len = len_const.eval_target_usize().into_option()? as usize;
-                (elem_ty, len)
-            }
-            _ => return None,
-        };
-
-        let elem_sort = Self::infer_sort_from_ty(elem_ty)?;
-        let elem_width = elem_sort.bitvec_width()?;
-        let elem_bytes = (elem_width as usize) / 8;
-
-        // Verify allocation has enough bytes.
-        if alloc.bytes.len() < base_offset + len * elem_bytes {
-            return None;
-        }
-
-        // Build const_array base and store each element.
-        let zero_elem = Expr::bitvec_const(0u128, elem_width);
-        let mut result = Expr::const_array(crate::codegen_ay::types::ptr_sort(), zero_elem);
-
-        for i in 0..len {
-            let abs_offset = base_offset + i * elem_bytes;
-            let mut value: u128 = 0;
-            if let Some(bytes) = alloc.bytes.get(abs_offset..abs_offset + elem_bytes) {
-                for (j, byte) in bytes.iter().enumerate() {
-                    if let Some(b) = byte {
-                        value |= (*b as u128) << (j * 8);
-                    }
-                }
-            }
-            let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
-            let elem = Expr::bitvec_const(value, elem_width);
-            result = result.store(idx, elem);
-        }
-
-        debug!(
-            "extract_array_field_from_alloc: {} elements of width {} at offset {}",
-            len, elem_width, base_offset
-        );
-        Some(result)
-    }
-
     /// Read a float constant from an allocation as an IEEE 754 bitvector.
     ///
     /// Part of #3094: F32 → BV32, F64 → BV64, matching sort_inference.rs.
     #[must_use]
     pub(super) fn float_scalar_to_expr(
-        alloc: &Allocation,
+        bytes: &dyn ConstRead,
         float_ty: rustc_public::ty::FloatTy,
     ) -> Option<Expr> {
         let width = crate::codegen_ay::types::float_ty_to_bitvec_width(float_ty);
-        let byte_count = (width / 8) as usize;
-        if alloc.bytes.len() >= byte_count {
-            let mut value: u128 = 0;
-            for (i, byte) in alloc.bytes.iter().take(byte_count).enumerate() {
-                if let Some(b) = byte {
-                    value |= (*b as u128) << (i * 8);
-                }
-            }
-            debug!("float_scalar_to_expr: width={} value={:#x}", width, value);
-            Some(Expr::bitvec_const(value, width))
-        } else {
-            None
-        }
+        let value = bytes.read_uint_at(0, (width / 8) as usize)?;
+        debug!("float_scalar_to_expr: width={} value={:#x}", width, value);
+        Some(Expr::bitvec_const(value, width))
     }
 }

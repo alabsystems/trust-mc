@@ -183,7 +183,6 @@ where
 fn check_portable_bitmask<T, E, const LANES: usize, M>(mask: Mask<T, LANES>)
 where
     T: core::simd::MaskElement,
-    LaneCount<LANES>: SupportedLaneCount,
     E: MaskElement,
     [u8; mask_len(LANES)]: Sized,
     u64: From<M>,
@@ -253,14 +252,14 @@ fn test_bitmask_i128_all() {
 
 /// Model correctly rejects invalid mask values (not 0 or -1).
 ///
-/// Uses `from_int_unchecked` with value 10 — undefined behavior. In release
+/// Uses `from_simd_unchecked` with value 10 — undefined behavior. In release
 /// mode LLVM can optimize the UB away before the assertion runs, so we only
 /// test this in debug mode.
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "Masks values should either be 0 or -1")]
 fn test_invalid_bitmask() {
-    let invalid_mask = unsafe { mask32x16::from_int_unchecked(i32x16::splat(10)) };
+    let invalid_mask = unsafe { mask32x16::from_simd_unchecked(i32x16::splat(10)) };
     assert_eq!(unsafe { simd_bitmask::<_, u16, i32, 16>(invalid_mask) }, u16::MAX);
 }
 

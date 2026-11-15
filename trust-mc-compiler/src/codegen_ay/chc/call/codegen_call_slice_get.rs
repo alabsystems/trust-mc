@@ -165,10 +165,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             args.first().and_then(|receiver| match receiver {
                 Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
                     // For promoted const arrays, compute base + idx * elem_size.
-                    if let Some(promoted_obj_id) =
-                        self.ref_resolution.const_ref_promoted_obj_ids.get(&place.local).copied()
+                    if let Some(object) =
+                        self.ref_resolution.const_ref_objects.get(&place.local).copied()
                     {
-                        let base = self.heap_state.promoted_const_address_for(promoted_obj_id);
+                        let base = object.address();
                         // For index 0, just return the base address.
                         if let ExprValue::BitVecConst { value, .. } = idx_expr.value() {
                             if *value == 0u8.into() {
@@ -372,6 +372,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             .map(|len| Expr::bitvec_const(len as u128, POINTER_WIDTH));
         let slice_backing = self.resolve_slice_backing(slice_arg, modified_locals);
         let slice_value = self.resolve_ref_or_const_referent(slice_arg, modified_locals);
+        // The whole-slice length this call returns, when a route knows it: the
+        // resolved backing's length, else the conflict-sticky MIR walk.
+        let whole_len = slice_backing
+            .as_ref()
+            .map(|backing| backing.len.as_expr().clone())
+            .or_else(|| exact_source_len.clone());
         if let Some(backing) = slice_backing.as_ref() {
             self.ref_resolution.const_ref_values.insert(dest_local, backing.data.as_expr().clone());
             if *backing.offset.as_expr() != Expr::bitvec_const(0u64, POINTER_WIDTH) {
@@ -387,7 +393,31 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         // Compute pointer-level value BEFORE the Mem-level bridge so it can be
         // stored into typed memory (which expects BV64 pointer sort, not Array sort).
-        let source_expr = self.translate_operand_with_modified(slice_arg, modified_locals);
+        // Design 4: into a wide `&[T]` slot, `&x[..]` of an array reference is
+        // the array's address with the array's length; the bare thin address was
+        // zero-extended into the slot and read as length 0.
+        let dest_is_slice =
+            crate::codegen_ay::chc::stmt::codegen_stmt_slice_len_write::is_slice_len_pointer_ty(
+                self.body.locals()[dest_local].ty,
+            );
+        let source_expr = if dest_is_slice {
+            self.whole_slice_value_of(slice_arg, modified_locals)
+                .or_else(|| {
+                    // A thin receiver (`&Vec<T>`, `&String`): its address stays
+                    // the data lane as before, and the slot carries the whole
+                    // slice's known length instead of zero padding.
+                    let thin = self.translate_operand_with_modified(slice_arg, modified_locals)?;
+                    let crate::codegen_ay::ptr_repr::PtrRepr::Thin(addr) =
+                        crate::codegen_ay::ptr_repr::PtrRepr::classify(&thin)?
+                    else {
+                        return None;
+                    };
+                    Some(self.pack_slice_slot(addr.into_expr(), whole_len.clone()?))
+                })
+                .or_else(|| self.translate_operand_with_modified(slice_arg, modified_locals))
+        } else {
+            self.translate_operand_with_modified(slice_arg, modified_locals)
+        };
 
         // Part of #3528/#3495: Mem-level bridge — mirror result into typed memory
         // so subsequent SubSlice references through load_from_memory read correct data.
@@ -418,7 +448,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3528: Filter superseded store chain constraints.
         let filtered_stmts = super::heap_store_chains::filter_superseded_store_chains(
             cx.stmt_constraints,
-            &mem_constraints,
+            &mut mem_constraints,
         );
         let effective_stmts: &[Expr] = filtered_stmts.as_deref().unwrap_or(cx.stmt_constraints);
 

@@ -31,7 +31,8 @@ fn test_codegen_operand_i32_const_42_preserves_value() {
             let mut found_i32_const = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                         && matches!(
                             c.const_.ty().kind(),
                             TyKind::RigidTy(RigidTy::Int(rustc_public::ty::IntTy::I32))
@@ -107,7 +108,7 @@ fn test_codegen_operand_dispatches_constant() {
             let mut found_constant = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(op)) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(op, ..)) = &stmt.kind
                         && let Operand::Constant(_) = op
                     {
                         let result = codegen.codegen_operand(op);
@@ -138,7 +139,8 @@ fn test_codegen_operand_bool_constant() {
             // Find constant bool operand
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Bool)) {
@@ -171,7 +173,8 @@ fn test_try_extract_str_constant_u32_ref_constant_returns_none() {
             let mut found_non_str_ref_constant = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                         && let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) =
                             c.const_.ty().kind()
                         && !matches!(pointee_ty.kind(), TyKind::RigidTy(RigidTy::Str))
@@ -236,7 +239,7 @@ fn test_codegen_operand_copy_move_resolves_place() {
             let mut found_copy_or_move = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(op)) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(op, ..)) = &stmt.kind
                         && matches!(op, Operand::Copy(_) | Operand::Move(_))
                     {
                         let result = codegen.codegen_operand(op);
@@ -313,7 +316,8 @@ fn test_codegen_operand_char_constant() {
             let mut found_char = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                         && matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Char))
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
@@ -351,7 +355,8 @@ fn test_codegen_operand_negative_int_constant() {
             let mut found_int = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Int(_))) {
@@ -392,7 +397,7 @@ fn test_try_extract_str_constant_on_string_literal() {
             let mut found_str = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_))) =
+                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_), ..)) =
                         &stmt.kind
                         && let Some(text) = codegen.try_extract_str_constant(op)
                     {
@@ -431,7 +436,7 @@ fn test_try_extract_str_constant_non_str_returns_none() {
 
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_))) =
+                    if let StatementKind::Assign(_, Rvalue::Use(op @ Operand::Constant(_), ..)) =
                         &stmt.kind
                     {
                         let result = codegen.try_extract_str_constant(op);
@@ -461,7 +466,8 @@ fn test_codegen_operand_u64_constant() {
             let mut found_u64 = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Uint(_))) {
@@ -499,7 +505,8 @@ fn test_codegen_operand_i8_constant() {
             let mut found_i8 = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Int(_))) {
@@ -544,7 +551,8 @@ fn test_try_codegen_const_ref_pointee_static_ref() {
             let mut found_ref = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) = ty.kind() {
@@ -597,7 +605,8 @@ fn test_try_codegen_const_ref_pointee_promoted_constant() {
             let mut ref_count = 0u32;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let ty = c.const_.ty();
                         if let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) = ty.kind() {
@@ -622,6 +631,43 @@ fn test_try_codegen_const_ref_pointee_promoted_constant() {
 }
 
 #[test]
+fn test_try_codegen_const_ref_pointee_reads_at_the_pointer_offset() {
+    // `E` points 4 bytes INTO the constant array `[1, 2, 3]`, so its pointee
+    // is `2`. The target allocation used to be decoded from byte 0, which read
+    // `1`: `*E == 1` PROVED in the BMC lane
+    // (tools/soundness-duals/bmc_global_alloc_object_dual.rs).
+    with_test_ay_ctx_for_source(
+        r#"
+        const E: &u32 = &[1u32, 2, 3][1];
+        pub fn offset_ref_probe() -> &'static u32 { E }
+        "#,
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "offset_ref_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+
+            let mut pointees = Vec::new();
+            for bb in &body.blocks {
+                for stmt in &bb.statements {
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
+                        && let TyKind::RigidTy(RigidTy::Ref(_, pointee_ty, _)) =
+                            c.const_.ty().kind()
+                    {
+                        pointees.push(codegen.try_codegen_const_ref_pointee(&c.const_, pointee_ty));
+                    }
+                }
+            }
+            assert_eq!(pointees.len(), 1, "expected the one reference constant `E`");
+            let pointee = pointees[0].clone().expect("the pointee of `E` decodes");
+            assert_eq!(pointee, Expr::bitvec_const(2u128, 32), "`*E` is the array's element 1");
+        },
+    );
+}
+
+#[test]
 fn test_codegen_operand_const_array_ref() {
     // Array constant references exercise the codegen path for compound types.
     // The function uses a const array to ensure MIR contains an array constant.
@@ -641,7 +687,7 @@ fn test_codegen_operand_const_array_ref() {
             for bb in &body.blocks {
                 for stmt in &bb.statements {
                     match &stmt.kind {
-                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) => {
+                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) => {
                             let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                             if result.is_some() {
                                 found_array = true;
@@ -689,7 +735,7 @@ fn test_codegen_operand_ordering_less_constant() {
             for bb in &body.blocks {
                 for stmt in &bb.statements {
                     match &stmt.kind {
-                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) => {
+                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) => {
                             if let Some(expr) =
                                 codegen.codegen_operand(&Operand::Constant(c.clone()))
                             {
@@ -744,7 +790,7 @@ fn test_codegen_operand_c_like_enum_constant() {
             for bb in &body.blocks {
                 for stmt in &bb.statements {
                     match &stmt.kind {
-                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) => {
+                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) => {
                             if let Some(expr) =
                                 codegen.codegen_operand(&Operand::Constant(c.clone()))
                             {
@@ -800,7 +846,8 @@ fn test_codegen_operand_option_none_constant() {
             let mut produced_exprs = Vec::new();
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                         && let Some(expr) = codegen.codegen_operand(&Operand::Constant(c.clone()))
                     {
                         produced_exprs.push(expr);
@@ -840,7 +887,7 @@ fn test_codegen_operand_option_some_constant() {
             for bb in &body.blocks {
                 for stmt in &bb.statements {
                     match &stmt.kind {
-                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) => {
+                        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) => {
                             if let Some(expr) =
                                 codegen.codegen_operand(&Operand::Constant(c.clone()))
                             {
@@ -893,7 +940,8 @@ fn test_codegen_operand_u8_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -928,7 +976,8 @@ fn test_codegen_operand_u16_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -963,7 +1012,8 @@ fn test_codegen_operand_i16_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -998,7 +1048,8 @@ fn test_codegen_operand_i64_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -1033,7 +1084,8 @@ fn test_codegen_operand_usize_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -1072,7 +1124,8 @@ fn test_codegen_operand_u128_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -1107,7 +1160,8 @@ fn test_codegen_operand_i128_constant() {
             let mut found = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) =
+                        &stmt.kind
                     {
                         let result = codegen.codegen_operand(&Operand::Constant(c.clone()));
                         if let Some(expr) = result {
@@ -1150,7 +1204,7 @@ fn test_codegen_operand_use_constant() {
             let mut found_use = false;
             for bb in &body.blocks {
                 for stmt in &bb.statements {
-                    if let StatementKind::Assign(_, Rvalue::Use(operand)) = &stmt.kind
+                    if let StatementKind::Assign(_, Rvalue::Use(operand, ..)) = &stmt.kind
                         && let Some(expr) = codegen.codegen_operand(operand)
                     {
                         assert!(
@@ -1222,6 +1276,251 @@ fn test_codegen_operand_move_bool() {
             let result = codegen.codegen_operand(&operand);
             assert!(result.is_some(), "Move operand should produce an expression");
             assert!(result.unwrap().sort().is_bool(), "bool Move should produce Bool sort");
+        },
+    );
+}
+
+// ─── The constant-pointer rule, BMC half (design unit test 8) ──────────
+
+/// Every constant operand a body assigns straight to a local.
+fn body_const_operands(body: &rustc_public::mir::Body) -> Vec<rustc_public::mir::ConstOperand> {
+    let mut out = Vec::new();
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c), ..)) = &stmt.kind {
+                out.push(c.clone());
+            }
+        }
+    }
+    out
+}
+
+/// `T = "hello".split_at(2).1` is the window "llo" of its target, and its
+/// `fld_ptr` is the target's ONE address plus 2. On main the bytes were read
+/// from the target's byte 0 ("hel": `T.as_bytes()[0] == b'h'` PROVED) and
+/// `fld_ptr` was a fresh counter per use.
+#[test]
+fn test_const_str_slice_is_its_window_at_its_address() {
+    with_test_ay_ctx_for_source(
+        r#"
+        const T: &str = "hello".split_at(2).1;
+        pub fn str_window_probe() -> usize { T.len() }
+        "#,
+        |mut ctx| {
+            use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
+            let instance = find_instance_by_suffix(&ctx, "str_window_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            let consts: Vec<_> = body_const_operands(&body)
+                .into_iter()
+                .filter(|c| matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..))))
+                .collect();
+            assert_eq!(consts.len(), 1, "expected the one `&str` constant `T`");
+            let c = &consts[0];
+            codegen.premint_const_ref_targets(&c.const_);
+            let slice = codegen.try_codegen_const_str_slice(&c.const_).expect("T decodes");
+            let key = const_pointer::const_bytes(&c.const_)
+                .unwrap()
+                .stored_pointer(0)
+                .unwrap()
+                .key()
+                .unwrap();
+            let base =
+                codegen.ctx.global_alloc_addrs.get(&key).expect("T's target has its address");
+            let fld_ptr = base.clone().bvadd(Expr::bitvec_const(2u128, POINTER_WIDTH));
+            let text = slice.to_string();
+            assert!(text.contains(&fld_ptr.to_string()), "{text} lacks fld_ptr = base + 2");
+            assert!(text.contains(&Expr::bitvec_const(3u128, POINTER_WIDTH).to_string()));
+            for byte in b"lo" {
+                assert!(text.contains(&Expr::bitvec_const(u128::from(*byte), 8).to_string()));
+            }
+            for byte in b"he" {
+                assert!(
+                    !text.contains(&Expr::bitvec_const(u128::from(*byte), 8).to_string()),
+                    "{text} holds {byte:#x}, outside the window"
+                );
+            }
+        },
+    );
+}
+
+/// `SL = [0, 1, 2, 3][1..]` is the window `[1, 2, 3]` (length from the
+/// metadata word). On main its elements were read from byte 0: `SL[0] == 0`.
+#[test]
+fn test_const_typed_slice_is_its_window() {
+    with_test_ay_ctx_for_source(
+        r#"
+        const SL: &[u32] = {
+            let a: &[u32] = &[0, 1, 2, 3];
+            a.split_at(1).1
+        };
+        pub fn slice_window_probe() -> usize { SL.len() }
+        "#,
+        |mut ctx| {
+            let instance = find_instance_by_suffix(&ctx, "slice_window_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            let c = body_const_operands(&body)
+                .into_iter()
+                .find(|c| matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..))))
+                .expect("the `&[u32]` constant `SL`");
+            codegen.premint_const_ref_targets(&c.const_);
+            let TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) = c.const_.ty().kind() else {
+                unreachable!()
+            };
+            let TyKind::RigidTy(RigidTy::Slice(elem)) = pointee.kind() else { panic!("a slice") };
+            let slice = codegen.try_codegen_const_typed_slice(&c.const_, elem).expect("SL decodes");
+            let text = slice.to_string();
+            for v in [1u128, 2, 3] {
+                assert!(text.contains(&Expr::bitvec_const(v, 32).to_string()), "{text} lacks {v}");
+            }
+            assert!(text.contains(&Expr::bitvec_const(3u128, POINTER_WIDTH).to_string()));
+        },
+    );
+}
+
+/// A pointer INSIDE a constant value is its relocation's target address plus
+/// the offset its bytes carry: `PTRS` is `[addr(PAIR) + 0, addr(PAIR) + 4]`.
+/// On main the elements were the raw offsets `0` and `4`, so
+/// `PTRS[0].is_null()` PROVED (const_pointer_value_slots_dual.rs).
+#[test]
+fn test_pointer_slots_in_const_value_are_addresses() {
+    with_test_ay_ctx_for_source(
+        r#"
+        static PAIR: (u32, u32) = (1, 2);
+        const PTRS: [*const u32; 2] = [&raw const PAIR.0, &raw const PAIR.1];
+        pub fn ptrs_probe() -> bool { let p = PTRS; p[0].is_null() }
+        "#,
+        |mut ctx| {
+            use crate::codegen_ay::shared::const_pointer;
+            let instance = find_instance_by_suffix(&ctx, "ptrs_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            super::super::global_alloc::materialize_body_global_allocs(&mut ctx, &body);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            let c = body_const_operands(&body)
+                .into_iter()
+                .find(|c| matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Array(..))))
+                .expect("the PTRS constant");
+            let bytes = const_pointer::const_bytes(&c.const_).unwrap();
+            let key = {
+                use crate::codegen_ay::shared::const_pointer::ConstRead;
+                bytes.stored_pointer(0).unwrap().key().unwrap()
+            };
+            let base =
+                codegen.ctx.global_alloc_addrs.get(&key).expect("PAIR is materialized").clone();
+            let value =
+                codegen.codegen_scalar_from_bytes(&bytes, c.const_.ty()).expect("PTRS decodes");
+            let text = value.to_string();
+            let second = base.clone().bvadd(Expr::bitvec_const(4u128, POINTER_WIDTH));
+            assert!(text.contains(&second.to_string()), "{text} lacks addr(PAIR) + 4");
+            assert!(text.contains(&base.to_string()), "{text} lacks addr(PAIR)");
+        },
+    );
+}
+
+/// The reference lane names a FIXED target when it forms an address into it
+/// (`E as *const u32`): the target's bytes go on the initial memory array
+/// then, so a raw pointer derived from that address (`wrapping_add`,
+/// `byte_add`, a cast) reads `[1, 2, 3]`, not free memory. Before, only the
+/// body walk's raw-pointer constants were materialized, and
+/// `*(E as *const u32).wrapping_add(1) == 3` was certified FALSE
+/// (const_pointer_raw_from_ref_dual.rs). A LIVE target named the same way
+/// (an `UnsafeCell` static) keeps free bytes: its state is what the program
+/// wrote, which the initial image does not describe.
+#[test]
+fn test_fixed_target_named_by_the_reference_lane_is_materialized() {
+    with_test_ay_ctx_for_source(
+        r#"
+        use std::cell::UnsafeCell;
+        const E: &u32 = &[1u32, 2, 3][1];
+        pub struct S(UnsafeCell<u32>);
+        unsafe impl Sync for S {}
+        pub static C: S = S(UnsafeCell::new(3));
+        pub fn raw_from_ref_probe() -> u32 {
+            let c = &C;
+            unsafe { *(E as *const u32).wrapping_add(1) + *c.0.get() }
+        }
+        "#,
+        |mut ctx| {
+            use super::super::global_alloc::{Naming, global_alloc_address};
+            use crate::codegen_ay::shared::const_pointer::{self, ConstRead, TargetKey};
+            let instance = find_instance_by_suffix(&ctx, "raw_from_ref_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let keys: Vec<TargetKey> = body_const_operands(&body)
+                .into_iter()
+                .filter(|c| matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..))))
+                .filter_map(|c| const_pointer::const_bytes(&c.const_)?.stored_pointer(0)?.key())
+                .collect();
+            let fixed = keys
+                .iter()
+                .find(|k| matches!(k, TargetKey::Memory(_)))
+                .expect("E's constant-memory target");
+            let live =
+                keys.iter().find(|k| matches!(k, TargetKey::Static(_))).expect("C, a live static");
+            assert!(!ctx.global_alloc_bytes.contains(fixed));
+            global_alloc_address(&mut ctx, fixed, Naming::MayContinue).expect("E's address");
+            assert!(
+                ctx.global_alloc_bytes.contains(fixed),
+                "a fixed target named by the reference lane must be materialized"
+            );
+            global_alloc_address(&mut ctx, live, Naming::MayContinue).expect("C's address");
+            assert!(
+                !ctx.global_alloc_bytes.contains(live),
+                "a live target's initial image must not be taken as its state"
+            );
+        },
+    );
+}
+
+/// A fixed target named from a PANIC-ONLY block gets its address and NOT its
+/// bytes (`global_alloc::Naming::PanicOnly`): a run that enters the block
+/// fails whatever it reads, and an assertion message's bytes on memory beside
+/// floating point made ay answer `unknown` (`unsupported`), costing
+/// `bmc_f64_rem_true` its proof. Named again from a block that can continue,
+/// the same target is materialized then, at the same address. Removing the
+/// deferral fails the first assertion; materializing only on first naming
+/// fails the second.
+#[test]
+fn test_fixed_target_named_from_a_panic_only_block_is_materialized_on_a_continuing_naming() {
+    with_test_ay_ctx_for_source(
+        r#"
+        const E: &u32 = &[1u32, 2, 3][1];
+        pub fn raw_from_ref_probe() -> u32 {
+            unsafe { *(E as *const u32).wrapping_add(1) }
+        }
+        "#,
+        |mut ctx| {
+            use super::super::global_alloc::{Naming, global_alloc_address};
+            use crate::codegen_ay::shared::const_pointer::{self, ConstRead, TargetKey};
+            let instance = find_instance_by_suffix(&ctx, "raw_from_ref_probe");
+            let body = instance.body().expect("body");
+            ctx.set_current_fn(instance);
+            let fixed = body_const_operands(&body)
+                .into_iter()
+                .filter(|c| matches!(c.const_.ty().kind(), TyKind::RigidTy(RigidTy::Ref(..))))
+                .filter_map(|c| const_pointer::const_bytes(&c.const_)?.stored_pointer(0)?.key())
+                .find(|k| matches!(k, TargetKey::Memory(_)))
+                .expect("E's constant-memory target");
+            let panic_only =
+                global_alloc_address(&mut ctx, &fixed, Naming::PanicOnly).expect("E's address");
+            assert!(
+                !ctx.global_alloc_bytes.contains(&fixed),
+                "a panic-only naming must not put the target's bytes on memory"
+            );
+            let continuing =
+                global_alloc_address(&mut ctx, &fixed, Naming::MayContinue).expect("E's address");
+            assert!(
+                ctx.global_alloc_bytes.contains(&fixed),
+                "a continuing naming must materialize a target a panic-only naming left out"
+            );
+            assert_eq!(panic_only.to_string(), continuing.to_string(), "one address per target");
         },
     );
 }

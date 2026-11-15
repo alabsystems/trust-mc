@@ -12,7 +12,9 @@
 
 use ay_bindings::{Expr, Sort};
 use rustc_public::CrateDef;
-use rustc_public::mir::{BinOp, NullOp, Operand, RuntimeChecks, Rvalue, UnOp};
+use rustc_public::mir::{BinOp, Operand, Rvalue, UnOp};
+#[cfg(not(trust_toolchain))]
+use rustc_public::mir::{NullOp, RuntimeChecks};
 use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
@@ -74,9 +76,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             Operand::Copy(place) | Operand::Move(place) => {
                 let name = self.ssa_name(place, false);
                 let meta_name = crate::codegen_ay::names::meta_name(&name);
+                // No fat-pointer metadata in scope: a fresh stand-in length.
+                self.ctx.bmc_sound_havoc("ptr_metadata_fresh");
                 Some(self.ctx.declare_var(&meta_name, ptr_sort()))
             }
             Operand::Constant(_) => Some(Expr::bitvec_const(0, POINTER_WIDTH)),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => Some(Expr::bitvec_const(0, POINTER_WIDTH)),
         }
     }
 
@@ -100,7 +106,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: on Some, result sort matches inferred MIR type when available.
     pub(super) fn codegen_rvalue(&mut self, rvalue: &Rvalue) -> Option<Expr> {
         match rvalue {
-            Rvalue::Use(operand) => self.codegen_operand(operand),
+            Rvalue::Use(operand, ..) => self.codegen_operand(operand),
+
+            // Trust: `Reborrow(ty, Mut, place)` (a user ADT implementing
+            // `Reborrow`) is a bitwise copy of `place` with the SAME type —
+            // rustc_codegen_ssa lowers it to `Operand::Copy(place)` — so it is
+            // exactly `Use(Copy(place))`. `codegen_statement` already rewrites it
+            // to that shape before `codegen_assign`, so every assignment tracker
+            // sees a copy; this arm keeps any other caller exact too.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(_, rustc_public::mir::Mutability::Mut, place) => {
+                self.codegen_operand(&Operand::Copy(place.clone()))
+            }
+
+            // Trust: `Reborrow(target, Not, place)` (`CoerceShared`) retypes the
+            // copy to a DIFFERENT ADT whose layout is only "currently" equal to the
+            // source's. That retyping is not modelled: fail closed through the
+            // demotion counter (upstream Kani reports it as unsupported, too). The
+            // counter is recorded HERE, not left to the caller, because some
+            // callers (e.g. `codegen_raw_ptr_simple_store`) drop a `None` silently.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(target_ty, rustc_public::mir::Mutability::Not, place) => {
+                self.ctx.unsupported_with_fallback(
+                    "Rvalue::Reborrow (CoerceShared)",
+                    format!("{place:?} as {target_ty:?}"),
+                );
+                None
+            }
 
             Rvalue::BinaryOp(bin_op, lhs, rhs) => {
                 // Comparison of DYN fat pointers (vtable metadata) — Kani's
@@ -165,6 +197,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     (self.codegen_operand(lhs)?, self.codegen_operand(rhs)?)
                 };
+                self.guard_box_pointer_comparison(*bin_op, lhs, &lhs_expr, &rhs_expr);
                 let is_float = lhs
                     .ty(self.body.locals())
                     .into_option()
@@ -181,23 +214,46 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     self.is_signed_integer_op(lhs, rhs)
                 };
 
-                // Emit division-by-zero check for all division/remainder operations.
-                // Integer division by zero is UB in Rust. Float div/rem fail
-                // closed below instead of reusing integer UB checks.
+                // Operator-level zero-divisor and signed `MIN / -1` checks on
+                // every integer `BinOp::Div`/`Rem`. These are NOT the MIR
+                // `Assert` labels (`div_by_zero_check`, `mod_by_zero_check`,
+                // `overflow_check_div`/`_rem`; codegen_sort.rs), whose driver
+                // classes are Rust panics:
+                //
+                // * After a source `/` or `%`, rustc has already asserted the
+                //   divisor non-zero and, signed, not `MIN / -1`
+                //   (rustc_mir_build as_rvalue.rs). The Assert arm
+                //   (terminator.rs) makes that this block's edge condition, so
+                //   these checks are unsatisfiable: Kani's redundant
+                //   `check_div_overflow` (`arithmetic_overflow`), which
+                //   tests/ui/duplicates pins SUCCESS.
+                // * `intrinsics::unchecked_div`/`unchecked_rem` lower to the
+                //   same plain `Div`/`Rem` with NO Assert (LowerIntrinsics).
+                //   There these are the only checks, and they are UB of an
+                //   unsafe intrinsic, never a panic. Under the panic labels a
+                //   `#[kani::should_panic]` harness that divided by zero through
+                //   `unchecked_div` reported SUCCESSFUL; Kani fails it.
+                //
+                // LowerIntrinsics erases the origin, so one non-panic class
+                // serves both shapes (docs/DECISION_QUEUE.md). Keep every label
+                // a literal argument: the driver's drift guard
+                // (taxonomy_tests.rs RECORDER_LABEL_PATTERN) reads them.
                 if !is_float && matches!(bin_op, BinOp::Div | BinOp::Rem) {
-                    let label = if matches!(bin_op, BinOp::Rem) {
-                        "mod_by_zero_check"
+                    if matches!(bin_op, BinOp::Rem) {
+                        self.emit_division_by_zero_check(&rhs_expr, "binop_rem_by_zero");
                     } else {
-                        "div_by_zero_check"
-                    };
-                    self.emit_division_by_zero_check(&rhs_expr, label);
-                }
-
-                // Emit overflow check for signed division/remainder
-                // (INT_MIN / -1 overflows because |INT_MIN| > INT_MAX)
-                if !is_float && matches!(bin_op, BinOp::Div | BinOp::Rem) && is_signed == Some(true)
-                {
-                    self.emit_overflow_check(*bin_op, &lhs_expr, &rhs_expr, true);
+                        self.emit_division_by_zero_check(&rhs_expr, "binop_div_by_zero");
+                    }
+                    if is_signed == Some(true)
+                        && let Some((no_overflow, _)) =
+                            self.overflow_check(*bin_op, &lhs_expr, &rhs_expr, true)
+                    {
+                        if matches!(bin_op, BinOp::Rem) {
+                            self.record_violation_guarded(no_overflow.not(), "binop_rem_overflow");
+                        } else {
+                            self.record_violation_guarded(no_overflow.not(), "binop_div_overflow");
+                        }
+                    }
                 }
 
                 // Emit overflow check for unchecked arithmetic operations.
@@ -282,6 +338,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     let base = Loc::of_address(lhs_expr.clone());
                     let count = Val::of_value(rhs_expr.clone());
                     self.emit_offset_overflow_check(&base, &count, pointee_size);
+                    self.emit_offset_same_allocation_check(
+                        &lhs_expr,
+                        &lhs_expr,
+                        &rhs_expr,
+                        pointee_size,
+                    );
 
                     // Compute byte offset: count * size_of::<T>()
                     let byte_offset = match pointee_size {
@@ -368,6 +430,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                             .sort()
                             .bitvec_width()
                             .expect("invariant: sort is bitvec (guarded by is_bitvec check)");
+                        // Kani `--nan-check`: the NaN-generation obligation.
+                        // Before this, the BMC lane never read `nan_checks`
+                        // (only CHC did), so `0.0 / 0.0`, `0.0 * inf` and
+                        // `inf + -inf` on symbolic operands proved clean
+                        // under the flag.
+                        if self.ctx.config.nan_checks {
+                            self.emit_float_nan_check(*bin_op, &lhs_expr, &rhs_expr, width);
+                        }
                         return bv_float_binop(*bin_op, lhs_expr, rhs_expr, width);
                     }
                 }
@@ -414,6 +484,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+                self.guard_box_pointer_storage(place);
                 self.codegen_address_of(place, rvalue)
             }
 
@@ -495,6 +566,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
             Rvalue::Discriminant(place) => self.codegen_discriminant(place, rvalue),
 
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(operand, _ty) => {
                 // Box initialization: treat as address
                 self.codegen_operand(operand)
@@ -517,11 +589,38 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 debug!("codegen Repeat: elem_sort={:?}, len={}", elem_expr.sort(), len);
                 // Native AY can return `unknown` on datatype-valued const arrays and
                 // store chains. The assignment path tracks the repeated element for
-                // direct indexed projections; keep the array value symbolic here.
+                // direct indexed projections; the array value itself is a fresh
+                // symbol here, CONSTRAINED element by element with the
+                // select-only idiom (`(= (select a i) v)`) the array-aggregate
+                // path already uses for ay#5148.
+                //
+                // Without those equalities the value was UNCONSTRAINED, and the
+                // `repeat_array_values` side table only answers reads keyed by
+                // the array's own local: the moment the array was MOVED into an
+                // aggregate (`Holder { a: [P { .. }; 2], tag: 0 }`) every read
+                // through the container saw an arbitrary array, so
+                // `{ let p = &mut h.a[0]; p.x = 9; p.z = 8; }
+                //  assert!(h.a[0].x == 9 && h.a[0].z == 8 && h.a[1].x == 0)`
+                // was FAILED [AY:CTREX_CAT:Genuine] on a program with no bug —
+                // the UNTOUCHED element `h.a[1]` was the counterexample (fifth
+                // adversarial review of m3/soundness-fixes-2, 2026-09-14, defect
+                // R2). The repair that placed the two stores exactly removed the
+                // fallback that used to demote this shape, which is what made a
+                // latent hole a certificate.
                 let result = if elem_expr.sort().is_datatype() && len <= 64 {
                     let array_sort = Sort::array(ptr_sort(), elem_expr.sort().clone());
                     let backing_name = self.ctx.fresh_name("repeat_array_symbolic");
-                    self.ctx.declare_var(&backing_name, array_sort)
+                    let array_expr = self.ctx.declare_var(&backing_name, array_sort);
+                    for i in 0..len {
+                        let idx = Expr::bitvec_const(i as u128, POINTER_WIDTH);
+                        self.ctx.assert(array_expr.clone().select(idx).eq(elem_expr.clone()));
+                    }
+                    debug!(
+                        len,
+                        "codegen Repeat: constrained every element of the symbolic \
+                         repeat array (select-only, ay#5148)"
+                    );
+                    array_expr
                 } else {
                     Expr::const_array(ptr_sort(), elem_expr)
                 };
@@ -541,18 +640,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     "ThreadLocalRef: symbolic variable (single-thread model)"
                 );
                 let var_name = self.ctx.fresh_name(&format!("__tls_{item_name}"));
+                self.ctx.bmc_sound_havoc("thread_local_ref");
                 Some(self.ctx.declare_var(&var_name, sort))
             }
 
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(null_op) => {
                 match null_op {
                     NullOp::RuntimeChecks(RuntimeChecks::UbChecks) => {
-                        // Return true so MIR-generated UB assertions are reachable.
-                        // Part of #3186: Parity with CHC path (Fixes #3299). Returning
-                        // false makes Assert terminators for AddUnchecked/SubUnchecked/
-                        // MulUnchecked dead code, producing false PROOF verdicts.
-                        debug!("codegen_rvalue: UbChecks -> true (#3186 parity with CHC #3299)");
-                        Some(Expr::bool_const(true))
+                        // false, as Kani (see `rustc_compat::runtime_checks_value`).
+                        debug!("codegen_rvalue: UbChecks -> false (Kani parity)");
+                        Some(Expr::bool_const(crate::rustc_compat::runtime_checks_value(
+                            &RuntimeChecks::UbChecks,
+                        )))
                     }
                     NullOp::RuntimeChecks(RuntimeChecks::ContractChecks) => {
                         // Contract checks are enabled in verification mode

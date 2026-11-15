@@ -16,6 +16,8 @@ use super::place_post_deref::DerefProjectionResult;
 use super::{Expr, IntoOption, Place, ProjectionElem, Sort, StatementCodegen};
 use crate::codegen_ay::names::struct_sort;
 use crate::codegen_ay::provenance::is_transparent_pointer_wrapper_repr;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use rustc_public::ty::{RigidTy, TyKind};
 use std::fmt::Write as _;
 use std::sync::Arc;

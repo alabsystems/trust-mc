@@ -73,6 +73,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => None,
         }) else {
             self.clear_ptr_offset_metadata(dest_local);
+            self.ref_resolution.const_memory_provenance.remove(&dest_local);
             return;
         };
 
@@ -98,23 +99,37 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         delta: Option<i128>,
     ) {
         // PROVENANCE (allocation id) is invariant under pointer offset
-        // arithmetic — for ANY delta, const or symbolic — so carry
-        // known_alloc_ids from the base to the result. This keeps the offset
-        // alloc-bound check's metadata side-channel alive on derived pointers
-        // (ptr.add(k).sub(1), offset(other_ptr, i)). SCOPED to promoted-const
-        // allocations: for heap/stack ids the provenance demotion is the
-        // load-bearing fail-closed net over still-missing models (uninit
-        // shadow memory) — carrying those ids resolved alloc-to-slice's UB
-        // harness into a false Safe.
-        if let Some(obj_id) = self
+        // arithmetic — for ANY delta, const or symbolic — which keeps the
+        // offset alloc-bound check's metadata side-channel alive on derived
+        // pointers (ptr.add(k).sub(1), offset(other_ptr, i)). SCOPED to
+        // constant-memory allocations: for heap/stack ids the provenance
+        // demotion is the load-bearing fail-closed net over still-missing
+        // models (uninit shadow memory) — carrying those ids resolved
+        // alloc-to-slice's UB harness into a false Safe.
+        //
+        // But a `known_alloc_ids` entry carries an implicit offset of ZERO: it
+        // is read back as the deref base `concat(obj, 0)`. So the id rides in
+        // `known_alloc_ids` only through a KNOWN ZERO delta; any other delta
+        // records it as provenance only (`const_memory_provenance`), which
+        // names no address.
+        let src_known = self
             .known_alloc_ids
             .get(&src_local)
             .copied()
-            .filter(|&id| self.is_promoted_const_obj_id(id))
-        {
-            self.known_alloc_ids.insert(dest_local, obj_id);
-        } else {
-            self.known_alloc_ids.remove(&dest_local);
+            .filter(|&id| self.is_const_memory_obj_id(id));
+        let src_provenance = src_known
+            .or_else(|| self.ref_resolution.const_memory_provenance.get(&src_local).copied())
+            .or_else(|| self.ref_resolution.const_ref_objects.get(&src_local).map(|o| o.obj_id));
+        self.known_alloc_ids.remove(&dest_local);
+        self.ref_resolution.const_memory_provenance.remove(&dest_local);
+        match (src_known, src_provenance) {
+            (Some(obj_id), _) if delta == Some(0) => {
+                self.known_alloc_ids.insert(dest_local, obj_id);
+            }
+            (_, Some(obj_id)) => {
+                self.ref_resolution.const_memory_provenance.insert(dest_local, obj_id);
+            }
+            _ => {}
         }
 
         // Symbolic step (delta unknown at compile time): the destination's
@@ -135,12 +150,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let mut shifted_ref_projection = false;
         let mut shifted_const_value = None;
 
+        let src_elem_bytes = self.body.locals().get(src_local).and_then(|decl| {
+            match self.resolve_body_ty(decl.ty).kind() {
+                rustc_public::ty::TyKind::RigidTy(
+                    rustc_public::ty::RigidTy::RawPtr(inner, _)
+                    | rustc_public::ty::RigidTy::Ref(_, inner, _),
+                ) => self.get_type_size(inner).and_then(|s| u64::try_from(s).ok()),
+                _ => None,
+            }
+        });
         if let Some(mut ref_target) = self.ref_resolution.ref_targets.get(&src_local).cloned() {
             shifted_ref_projection = delta.is_some_and(|delta| {
                 self.shift_ref_target_constant_index(
                     ref_target.local,
                     &mut ref_target.projections,
                     delta,
+                    src_elem_bytes,
                 )
             });
             if shifted_ref_projection {
@@ -153,12 +178,24 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             self.ref_resolution.call_forwarded_raw_ptrs.remove(&dest_local);
         }
 
-        if let Some(value) = self.ref_resolution.const_ref_values.get(&src_local).cloned() {
+        // D10: a value fact describes exactly one window. It is copied only
+        // through a known zero delta (or re-indexed, for an array fact), and
+        // re-decoded at the moved window otherwise (`moved_const_value_fact`).
+        let known_delta = delta.unwrap_or(0);
+        if let Some(value) = self.moved_const_value_fact(src_local, dest_local, known_delta) {
             self.ref_resolution.const_ref_values.insert(dest_local, value);
         } else if let Some(value) = shifted_const_value {
             self.ref_resolution.const_ref_values.insert(dest_local, value);
         } else {
             self.ref_resolution.const_ref_values.remove(&dest_local);
+        }
+        match self.moved_const_ref_object(src_local, known_delta) {
+            Some(object) => {
+                self.ref_resolution.const_ref_objects.insert(dest_local, object);
+            }
+            None => {
+                self.ref_resolution.const_ref_objects.remove(&dest_local);
+            }
         }
 
         if let Some(len) = self.ref_resolution.subslice_len.get(&src_local).cloned() {

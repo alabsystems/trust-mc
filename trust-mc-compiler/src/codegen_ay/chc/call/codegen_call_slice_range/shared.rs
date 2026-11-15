@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ay_bindings::{Expr, Sort, SortInner};
 use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
-use rustc_public::ty::{ConstantKind, IntTy, RigidTy, Ty, TyConstKind, TyKind, UintTy};
+use rustc_public::ty::{IntTy, RigidTy, Ty, TyKind, UintTy};
 use tracing::debug;
 
 use crate::codegen_ay::provenance::{Loc, Val};
@@ -51,6 +51,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             )?,
             self.resolve_range_field_from_local(local, 1, &["end", "fld_end"], modified_locals)?,
         ))
+    }
+
+    /// Whether the `RangeInclusive` held by `local` is exhausted: false for
+    /// a literal that is current wherever it is read (a fresh range), the
+    /// range's own `exhausted` field otherwise, and `None` when neither
+    /// answers.
+    pub(in crate::codegen_ay::chc) fn range_inclusive_exhausted(
+        &mut self,
+        local: usize,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<Expr> {
+        if self.extract_range_const_field_from_mir(local, 0).is_some()
+            && self.extract_range_const_field_from_mir(local, 1).is_some()
+        {
+            return Some(Expr::bool_const(false));
+        }
+        let flag = self.resolve_range_field_from_local(
+            local,
+            2,
+            &["exhausted", "fld_exhausted"],
+            modified_locals,
+        )?;
+        if flag.sort().is_bool() {
+            Some(flag)
+        } else {
+            let width = flag.sort().bitvec_width()?;
+            Some(flag.eq(Expr::bitvec_const(0u64, width)).not())
+        }
     }
 
     pub(in crate::codegen_ay::chc) fn resolve_range_field_from_local(
@@ -258,17 +286,83 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
-    fn extract_range_const_field_from_mir(
+    /// The constant a range literal stored in field `field_idx` of the range
+    /// `start_local` holds (through `Use` copies of the local), when that
+    /// literal is the value the local holds wherever it is read.
+    ///
+    /// The scan is syntactic: it finds the `Range { .. }` aggregate or the
+    /// `RangeInclusive::new(..)` call that defines a local of the copy chain.
+    /// It used to answer whatever happened to the range afterwards: a range
+    /// advanced by `next` / `next_back` / `nth`, written through `&mut` or by
+    /// a field store, advanced in a helper, or assigned on two paths still
+    /// read as its literal, so `v.extend(r)` after `r.next()` grew `v` by the
+    /// literal's length and `&a[r]` sliced by it (walker fail-closed repair
+    /// round 5, `range_literal_stale_dual.rs`). The literal now answers only
+    /// when every local of the chain, and every local a field constant is
+    /// read through, has one definition, no partial write and no mutable or
+    /// raw borrow ([`Self::local_written_once_unborrowed`]); otherwise the
+    /// callers read the range's state.
+    pub(in crate::codegen_ay::chc) fn extract_range_const_field_from_mir(
         &self,
         start_local: usize,
         field_idx: usize,
     ) -> Option<Expr> {
         let locals_to_check = self.trace_move_copy_chain(start_local);
+        if !locals_to_check.iter().all(|&local| self.local_written_once_unborrowed(local)) {
+            debug!(
+                start_local,
+                field_idx, "range literal: a chain local is rewritten — read the state"
+            );
+            return None;
+        }
 
         if let Some(expr) = self.scan_aggregate_range_field_consts(&locals_to_check, field_idx) {
             return Some(expr);
         }
         self.scan_call_range_field_consts(&locals_to_check, field_idx)
+    }
+
+    /// Does `local` hold the value of its one definition wherever it is read?
+    /// True when the body defines it exactly once as a whole (an assignment
+    /// or a call's destination), never writes part of it, and never takes a
+    /// mutable or raw borrow of it or of any of its fields. A shared
+    /// reference cannot change a range (no interior mutability), so it is
+    /// allowed: `r.contains(&x)`, `r.clone()`.
+    pub(in crate::codegen_ay::chc) fn local_written_once_unborrowed(&self, local: usize) -> bool {
+        use rustc_public::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
+        let mut defs = 0usize;
+        for block in &self.body.blocks {
+            for stmt in &block.statements {
+                let StatementKind::Assign(lhs, rhs) = &stmt.kind else { continue };
+                if let Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) = rhs
+                    && place.local == local
+                {
+                    let shared_ref = matches!(rhs, Rvalue::Ref(..))
+                        && matches!(
+                            rhs.ty(self.body.locals()).map(|ty| ty.kind()),
+                            Ok(TyKind::RigidTy(RigidTy::Ref(_, _, Mutability::Not)))
+                        );
+                    if !shared_ref {
+                        return false;
+                    }
+                }
+                if lhs.local == local {
+                    if !lhs.projection.is_empty() {
+                        return false;
+                    }
+                    defs += 1;
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &block.terminator.kind
+                && destination.local == local
+            {
+                if !destination.projection.is_empty() {
+                    return false;
+                }
+                defs += 1;
+            }
+        }
+        defs == 1
     }
 
     /// Trace Move/Copy assignment chains from `start_local` to collect all
@@ -288,7 +382,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if !locals_to_check.contains(&place.local) {
                         continue;
                     }
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) = rvalue {
                         if src.projection.is_empty()
                             && !locals_to_check.contains(&src.local)
                             && !new_locals.contains(&src.local)
@@ -390,13 +484,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
             _ => return None,
         };
+        // A local assigned on two paths (`let mut s = 0; if c { s = 5 }`) or
+        // rewritten through a borrow does not hold its first constant.
+        if !self.local_written_once_unborrowed(local) {
+            return None;
+        }
         for bb_data in &self.body.blocks {
             for stmt in &bb_data.statements {
                 let StatementKind::Assign(place, rvalue) = &stmt.kind else { continue };
                 if place.local != local || !place.projection.is_empty() {
                     continue;
                 }
-                if let Rvalue::Use(inner_op) = rvalue
+                if let Rvalue::Use(inner_op, ..) = rvalue
                     && let Some(expr) = Self::try_extract_const_bitvec(inner_op)
                 {
                     return Some(expr);
@@ -432,19 +531,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             _ => return None,
         };
 
-        let extract_from_alloc = |alloc: &rustc_public::ty::Allocation| -> Option<Expr> {
-            let value = alloc.read_uint().ok()?;
-            Some(Expr::bitvec_const(value, width))
-        };
-
-        match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => extract_from_alloc(alloc),
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_, alloc) => extract_from_alloc(alloc),
-                _ => None,
-            },
-            _ => None,
-        }
+        let value = crate::codegen_ay::shared::const_pointer::const_uint(mir_const)?;
+        Some(Expr::bitvec_const(value, width))
     }
 
     /// Resolve a source-derived data address for a subslice.
@@ -525,7 +613,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     }
 
     /// Evaluate a BV expression to constant u64, folding `BvAdd(const, const)`.
-    fn try_eval_const_bv(expr: &Expr) -> Option<u64> {
+    pub(in crate::codegen_ay::chc) fn try_eval_const_bv(expr: &Expr) -> Option<u64> {
         use ay_bindings::ExprValue;
         match expr.value() {
             ExprValue::BitVecConst { value, .. } => value.clone().try_into().ok(),

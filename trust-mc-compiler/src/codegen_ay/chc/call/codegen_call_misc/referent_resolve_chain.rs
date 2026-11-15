@@ -44,6 +44,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return None,
         };
         if !place.projection.is_empty() {
             return None;
@@ -138,7 +140,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     {
                         return Some(src.local);
                     }
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return Some(src.local);

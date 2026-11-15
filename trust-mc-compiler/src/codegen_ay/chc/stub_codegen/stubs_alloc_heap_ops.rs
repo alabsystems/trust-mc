@@ -5,14 +5,27 @@
 // Extracted from stubs_alloc.rs per #2408 (500 LOC decomposition target).
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, bv8_sort};
-use super::{AllocCallResult, ChcCtx, chc_fresh_name, codegen_expr_heap, declare_pending_var};
+use super::{AllocCallResult, ChcCtx, chc_fresh_name, codegen_expr_heap};
 use crate::args::ChcTrackLevel;
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::{Expr, ExprValue, Sort};
 use rustc_public::mir::Operand;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
+    /// A static allocation ID cannot certify a fresh lifetime at a repeated
+    /// call site. Inline frames need their own generation proof as well.
+    fn heap_alignment_site_is_single_execution(&self) -> bool {
+        if !self.inline_walk_frames.is_empty() {
+            return false;
+        }
+        crate::codegen_ay::shared::native_box_uninit::native_allocation_site_is_single_execution(
+            self.body,
+            self.current_encode_bb,
+        )
+    }
+
     /// Alignment a C `malloc` result is guaranteed to carry.
     ///
     /// C requires the returned block to be suitably aligned for any object with
@@ -48,6 +61,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             args,
             modified_locals,
             Some(Self::LIBC_MALLOC_ALIGN),
+            None,
         )
     }
 
@@ -64,7 +78,33 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<AllocCallResult> {
-        self.translate_alloc_object(stub, args, modified_locals, None)
+        self.translate_alloc_object(stub, args, modified_locals, None, None)
+    }
+
+    /// A native zero-argument allocation's layout is authenticated by its
+    /// instantiated return type. This entry grants no initialized bytes.
+    pub(in crate::codegen_ay::chc) fn translate_native_uninit_allocation(
+        &mut self,
+        size: u64,
+        align: u64,
+        modified_locals: &HashSet<usize>,
+    ) -> Option<AllocCallResult> {
+        if size == 0
+            || size > u64::from(u32::MAX)
+            || !align.is_power_of_two()
+            || !self.heap_alignment_site_is_single_execution()
+        {
+            return None;
+        }
+        let allocation =
+            self.heap_state.native_uninit_reservations.remove(&self.current_encode_bb)?;
+        self.translate_alloc_object(
+            StubKind::RustAlloc,
+            &[],
+            modified_locals,
+            None,
+            Some((size, align, allocation)),
+        )
     }
 
     /// Shared allocation-object model behind `translate_rust_alloc` and
@@ -80,15 +120,34 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         args: &[Operand],
         modified_locals: &HashSet<usize>,
         callee_align: Option<u64>,
+        native_layout: Option<(u64, u64, u32)>,
     ) -> Option<AllocCallResult> {
         // Support both alloc ABIs:
         // - __rust_alloc(size, align)
         // - std::alloc::alloc(layout) / alloc_zeroed(layout)
-        let arg0_expr =
-            args.first().and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
-        let arg1_expr =
-            args.get(1).and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
-        let (size_expr, align_expr, args_resolved) = if let Some(align) = callee_align {
+        //
+        // `Box::new`'s operand is the boxed VALUE, so neither ABI applies to it
+        // and its layout comes from the value's type below. Decoding the operand
+        // as a Layout read any 128-bit value as `size ++ align`: `Box::new(0u128)`
+        // allocated size 0 with alignment 0, both allocator preconditions failed
+        // on every path, and `drop(Box::new(0u128))` FAILED with a Genuine
+        // counterexample.
+        let layout_abi = stub != StubKind::BoxNew;
+        let arg0_expr = args
+            .first()
+            .filter(|_| layout_abi)
+            .and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
+        let arg1_expr = args
+            .get(1)
+            .filter(|_| layout_abi)
+            .and_then(|arg| self.resolve_layout_operand_expr(arg, modified_locals));
+        let (size_expr, align_expr, args_resolved) = if let Some((size, align, _)) = native_layout {
+            (
+                Expr::bitvec_const(size, POINTER_WIDTH),
+                Expr::bitvec_const(align, POINTER_WIDTH),
+                true,
+            )
+        } else if let Some(align) = callee_align {
             // C `malloc(size)`: one argument, alignment fixed by the callee.
             let size = args
                 .first()
@@ -181,11 +240,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                          allocating with symbolic size"
                     );
                     // Part of #3447: Record that allocation size/align are unconstrained.
-                    self.record_sound_fallback_reason("box_new_layout_unknown");
+                    let booked = self.record_sound_fallback_reason("box_new_layout_unknown");
                     let symbolic_size =
-                        declare_pending_var(chc_fresh_name("__alloc_size"), Sort::bitvec(64));
+                        Havoc::booked(booked, chc_fresh_name("__alloc_size"), Sort::bitvec(64));
                     let symbolic_align =
-                        declare_pending_var(chc_fresh_name("__alloc_align"), Sort::bitvec(64));
+                        Havoc::booked(booked, chc_fresh_name("__alloc_align"), Sort::bitvec(64));
                     (symbolic_size, symbolic_align, false)
                 }
             } else {
@@ -194,11 +253,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     "BoxNew: failed to resolve argument type; \
                      allocating with symbolic size"
                 );
-                self.record_sound_fallback_reason("box_new_layout_unknown");
+                let booked = self.record_sound_fallback_reason("box_new_layout_unknown");
                 let symbolic_size =
-                    declare_pending_var(chc_fresh_name("__alloc_size"), Sort::bitvec(64));
+                    Havoc::booked(booked, chc_fresh_name("__alloc_size"), Sort::bitvec(64));
                 let symbolic_align =
-                    declare_pending_var(chc_fresh_name("__alloc_align"), Sort::bitvec(64));
+                    Havoc::booked(booked, chc_fresh_name("__alloc_align"), Sort::bitvec(64));
                 (symbolic_size, symbolic_align, false)
             }
         } else {
@@ -212,16 +271,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                  allocating with symbolic size to preserve pointer constraints"
             );
             // Part of #3447: Record that alloc size/align are unconstrained.
-            self.record_sound_fallback_reason("alloc_args_unresolved");
+            let booked = self.record_sound_fallback_reason("alloc_args_unresolved");
             let symbolic_size =
-                declare_pending_var(chc_fresh_name("__alloc_size"), Sort::bitvec(64));
+                Havoc::booked(booked, chc_fresh_name("__alloc_size"), Sort::bitvec(64));
             let symbolic_align =
-                declare_pending_var(chc_fresh_name("__alloc_align"), Sort::bitvec(64));
+                Havoc::booked(booked, chc_fresh_name("__alloc_align"), Sort::bitvec(64));
             (symbolic_size, symbolic_align, false)
         };
 
         // Allocate fresh object ID
-        let obj_id = self.heap_state.next_heap_alloc_id().or_else(|| {
+        let allocation = if let Some((_, _, id)) = native_layout {
+            Some(self.heap_state.activate_reserved_heap_alloc_id(id))
+        } else {
+            self.heap_state.next_heap_alloc_id()
+        };
+        let obj_id = allocation.or_else(|| {
             warn!("RustAlloc: allocation ID overflow; falling back to unconstrained call");
             self.record_sound_fallback_reason("alloc_id_overflow");
             None
@@ -230,7 +294,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Create pointer expression: (obj_id << 32) | 0
         let obj_id_expr = Expr::bitvec_const(obj_id as i128, 32);
         let ptr = Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32));
-        let explicit_ptr_align = Self::try_extract_concrete_usize(&align_expr)
+        let requested_ptr_align = Self::try_extract_concrete_usize(&align_expr)
             .and_then(|align| u64::try_from(align).ok())
             .or_else(|| {
                 args.first()
@@ -244,8 +308,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                             .and_then(|arg_ty| self.get_type_align(arg_ty))
                     })
                     .flatten()
-            })
-            .filter(|align| *align > 1);
+            });
+        // New Box-validity authority must not come from the legacy Layout
+        // reconstruction above: its first-producer trace is a precision
+        // heuristic, not a proof of the actual argument on every path.
+        let guaranteed_align = if let Some((_, align, _)) = native_layout {
+            Some(align)
+        } else if let Some(align) = callee_align {
+            Some(align)
+        } else if stub == StubKind::BoxNew && self.inline_walk_frames.is_empty() {
+            args.first()
+                .and_then(|arg| arg.ty(self.body.locals()).ok())
+                .and_then(|ty| self.get_type_align(ty))
+        } else if let [_, Operand::Constant(align)] = args {
+            align.const_.eval_target_usize().ok()
+        } else {
+            None
+        };
+        let guaranteed_align =
+            guaranteed_align.filter(|_| self.heap_alignment_site_is_single_execution());
+        self.heap_state.record_heap_alloc_alignment(obj_id, guaranteed_align);
+        let explicit_ptr_align = requested_ptr_align.filter(|align| *align > 1);
 
         // Build heap constraints using store() pattern (SSA-style update)
         let obj_valid_in = codegen_expr_heap::obj_valid_in();
@@ -261,8 +344,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let size_32_for_heap = self.coerce_to_heap_bv32(size_expr.clone()).unwrap_or_else(|| {
             // Part of #3447: Record that heap object size BV32 coercion failed
             // — size is unconstrained (weakens dealloc size-mismatch checks).
-            self.record_sound_fallback_reason("alloc_size_bv32_coercion_failed");
-            declare_pending_var(
+            let booked = self.record_sound_fallback_reason("alloc_size_bv32_coercion_failed");
+            Havoc::booked(
+                booked,
                 crate::codegen_ay::names::alloc_obj_size_name(obj_id),
                 Sort::bitvec(32),
             )

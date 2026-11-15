@@ -95,7 +95,8 @@ fn collect_translated_constants<'tcx, 'body>(
     let mut results = Vec::new();
     for block in &body.blocks {
         for stmt in &block.statements {
-            if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(const_op))) = &stmt.kind
+            if let StatementKind::Assign(_, Rvalue::Use(Operand::Constant(const_op), ..)) =
+                &stmt.kind
                 && let Some(expr) = chc_ctx.translate_constant(const_op)
             {
                 results.push(expr);
@@ -257,10 +258,10 @@ fn test_translate_operand_constant_passthrough() {
             for stmt in &block.statements {
                 if let rustc_public::mir::StatementKind::Assign(
                     _,
-                    rvalue @ Rvalue::Use(Operand::Constant(_)),
+                    rvalue @ Rvalue::Use(Operand::Constant(_), ..),
                 ) = &stmt.kind
                 {
-                    let Rvalue::Use(op) = rvalue else { unreachable!() };
+                    let Rvalue::Use(op, ..) = rvalue else { unreachable!() };
                     let result = chc_ctx.translate_operand_with_modified(op, &modified);
                     assert!(result.is_some(), "constant operand should translate successfully");
                     found_constant = true;
@@ -462,7 +463,7 @@ fn test_translate_rvalue_use_from_env() {
 
         // Rvalue::Use(Copy(local_1)) should find it in env
         let place = Place { local: 1usize, projection: vec![] };
-        let rvalue = Rvalue::Use(Operand::Copy(place));
+        let rvalue = rvalue_use!(Rvalue::Use(Operand::Copy(place)));
 
         let result = chc_ctx.translate_rvalue_with_env(&rvalue, &env, &[], None, None);
         assert!(result.is_some(), "Rvalue::Use of env local should succeed");
@@ -484,7 +485,7 @@ fn test_translate_rvalue_use_constant() {
             for stmt in &block.statements {
                 if let rustc_public::mir::StatementKind::Assign(
                     _,
-                    rvalue @ Rvalue::Use(Operand::Constant(_)),
+                    rvalue @ Rvalue::Use(Operand::Constant(_), ..),
                 ) = &stmt.kind
                 {
                     let result =
@@ -774,7 +775,7 @@ fn collect_all_constants<'tcx, 'body>(
         results: &mut Vec<Expr>,
     ) {
         match rvalue {
-            Rvalue::Use(op)
+            Rvalue::Use(op, ..)
             | Rvalue::Repeat(op, _)
             | Rvalue::Cast(_, op, _)
             | Rvalue::UnaryOp(_, op) => {

@@ -7,8 +7,45 @@
 //! Part of #3840: concrete fast path for `kani::float::float_to_int_in_range`.
 //! Split from `float_arithmetic.rs` per 500-line file limit.
 
+use ay_bindings::Expr;
 use rustc_public::mir::Operand;
 use rustc_public::ty::{RigidTy, TyKind};
+
+use crate::codegen_ay::chc::call::codegen_call_cmp_string::float_to_int_saturating::build_float_to_int_saturating_expr;
+use crate::codegen_ay::float_arithmetic::{float_width_to_eb_sb, int_max_bits, int_min_bits};
+
+/// `float_to_int_in_range::<Float, Int>(value)` on a bitvector-encoded float:
+/// `value` is finite and its truncation toward zero lies in
+/// `[Int::MIN, Int::MAX]`.
+///
+/// Built from the exact saturating float-to-int conversion at `int_width + 2`
+/// signed bits. That range strictly contains `Int`'s, so a truncation outside
+/// `Int` either stays outside it or saturates to a bound that is outside it.
+/// NaN and ±Inf are excluded explicitly, because the conversion maps NaN to 0.
+/// Shared by the BMC lane (`statement::kani_float`) and the CHC lane
+/// (`chc::call::codegen_call_kani`): the predicate is pure bitvector logic.
+/// For a 128-bit `Int` the saturation width is 130 bits, whose bounds
+/// `build_float_to_int_saturating_expr` builds from `BigInt`.
+///
+/// Deliberately NOT `build_float_to_int_ub_components`: that predicate treats
+/// every signed value in `(Int::MIN - 1, Int::MIN)` as out of range (e.g.
+/// -128.5 for `i8`, whose truncation -128 fits), which would make this
+/// intrinsic return a definite wrong `false`.
+pub(in crate::codegen_ay) fn float_to_int_in_range_expr(
+    value: &Expr,
+    int_width: u32,
+    int_signed: bool,
+) -> Option<Expr> {
+    let float_width = value.sort().bitvec_width()?;
+    let (eb, sb) = float_width_to_eb_sb(float_width)?;
+    let exponent = value.clone().extract(float_width - 2, sb - 1);
+    let finite = exponent.eq(Expr::bitvec_const((1u64 << eb) - 1, eb)).not();
+    let truncated = build_float_to_int_saturating_expr(value, int_width + 2, true)?;
+    let widen = |bound: Expr| if int_signed { bound.sign_extend(2) } else { bound.zero_extend(2) };
+    let min = widen(Expr::bitvec_const(int_min_bits(int_width, int_signed), int_width));
+    let max = widen(Expr::bitvec_const(int_max_bits(int_width, int_signed), int_width));
+    Some(finite.and(truncated.clone().bvsge(min)).and(truncated.bvsle(max)))
+}
 
 /// Evaluate whether a concrete float value (after truncation) fits in a target
 /// integer range. Returns `Some(true/false)` when the float mantissa can exactly
@@ -53,45 +90,18 @@ pub(in crate::codegen_ay) fn extract_const_float(
     operand: &Operand,
     float_ty: &rustc_public::ty::Ty,
 ) -> Option<(f64, u32)> {
-    use rustc_public::ty::TyConstKind;
-
     let const_op = match operand {
         Operand::Constant(c) => c,
         _ => return None, // Copy/Move — not a literal constant in MIR
     };
 
-    let mir_const = &const_op.const_;
-    let alloc = match mir_const.kind() {
-        rustc_public::ty::ConstantKind::Allocated(alloc) => alloc.clone(),
-        rustc_public::ty::ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_ty, alloc) => alloc.clone(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-
+    let bits = crate::codegen_ay::shared::const_pointer::const_uint(&const_op.const_)?;
     match float_ty.kind() {
         TyKind::RigidTy(RigidTy::Float(rustc_public::ty::FloatTy::F32)) => {
-            if alloc.bytes.len() < 4 {
-                return None;
-            }
-            let mut arr = [0u8; 4];
-            for (i, b) in alloc.bytes.iter().take(4).enumerate() {
-                arr[i] = (*b)?;
-            }
-            let bits = u32::from_le_bytes(arr);
-            Some((f32::from_bits(bits) as f64, 24))
+            Some((f32::from_bits(u32::try_from(bits).ok()?) as f64, 24))
         }
         TyKind::RigidTy(RigidTy::Float(rustc_public::ty::FloatTy::F64)) => {
-            if alloc.bytes.len() < 8 {
-                return None;
-            }
-            let mut arr = [0u8; 8];
-            for (i, b) in alloc.bytes.iter().take(8).enumerate() {
-                arr[i] = (*b)?;
-            }
-            let bits = u64::from_le_bytes(arr);
-            Some((f64::from_bits(bits), 53))
+            Some((f64::from_bits(u64::try_from(bits).ok()?), 53))
         }
         _ => None,
     }
@@ -119,7 +129,7 @@ pub(in crate::codegen_ay) fn trace_local_const_float(
         for stmt in &bb.statements {
             if let StatementKind::Assign(place, rvalue) = &stmt.kind {
                 if place.local == local_idx && place.projection.is_empty() {
-                    if let Rvalue::Use(rhs_operand) = rvalue {
+                    if let Rvalue::Use(rhs_operand, ..) = rvalue {
                         return extract_const_float(rhs_operand, float_ty);
                     }
                 }

@@ -45,7 +45,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
     AssertMessage, BasicBlock, BasicBlockIdx, BinOp, Body, CastKind, Local, LocalDecl, Mutability,
-    Operand, Place, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    Operand, Place, Rvalue, Statement, StatementKind, SwitchTargets, TerminatorKind,
 };
 use rustc_public::ty::{FloatTy, IntTy, RigidTy, Span, Ty, TyKind, UintTy};
 use std::collections::HashSet;
@@ -160,8 +160,8 @@ pub(super) fn rewrite_fetch_terminators(
         // actual argument list is UB, so this is asserted, never assumed.
         let len_operand = caller.new_uint_operand(n_actuals as u128, UintTy::Usize, span);
         let in_range = caller.new_local(bool_ty, span, Mutability::Not);
-        block.statements.push(Statement {
-            kind: StatementKind::Assign(
+        block.statements.push(crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 Place::from(in_range),
                 Rvalue::BinaryOp(
                     BinOp::Lt,
@@ -170,13 +170,13 @@ pub(super) fn rewrite_fetch_terminators(
                 ),
             ),
             span,
-        });
+        ));
 
         // With zero actuals every fetch is UB; the assert alone carries it and
         // there is no arm to branch to.
         let assert_target = if n_actuals == 0 { orig_target } else { first_extra_bb + extra.len() };
-        block.terminator = Terminator {
-            kind: TerminatorKind::Assert {
+        block.terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Assert {
                 cond: Operand::Move(Place::from(in_range)),
                 expected: true,
                 msg: AssertMessage::BoundsCheck {
@@ -187,7 +187,7 @@ pub(super) fn rewrite_fetch_terminators(
                 unwind: unwind.clone(),
             },
             span,
-        };
+        );
         if n_actuals == 0 {
             continue;
         }
@@ -197,7 +197,7 @@ pub(super) fn rewrite_fetch_terminators(
         let switch_bb_idx = first_extra_bb + extra.len();
         extra.push(BasicBlock {
             statements: Vec::new(),
-            terminator: Terminator { kind: TerminatorKind::Unreachable, span },
+            terminator: crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, span),
         });
 
         let mut branches: Vec<(u128, BasicBlockIdx)> = Vec::with_capacity(n_actuals);
@@ -211,9 +211,12 @@ pub(super) fn rewrite_fetch_terminators(
             let one = caller.new_uint_operand(1, UintTy::Usize, span);
             extra.push(BasicBlock {
                 statements: vec![
-                    Statement { kind: StatementKind::Assign(dest.clone(), value), span },
-                    Statement {
-                        kind: StatementKind::Assign(
+                    crate::rustc_compat::mir_statement(
+                        StatementKind::Assign(dest.clone(), value),
+                        span,
+                    ),
+                    crate::rustc_compat::mir_statement(
+                        StatementKind::Assign(
                             Place::from(cursor_local),
                             Rvalue::BinaryOp(
                                 BinOp::Add,
@@ -222,21 +225,24 @@ pub(super) fn rewrite_fetch_terminators(
                             ),
                         ),
                         span,
-                    },
+                    ),
                 ],
-                terminator: Terminator { kind: TerminatorKind::Goto { target: orig_target }, span },
+                terminator: crate::rustc_compat::mir_terminator(
+                    TerminatorKind::Goto { target: orig_target },
+                    span,
+                ),
             });
             branches.push((k as u128, arm_idx));
         }
 
         let otherwise = branches.pop().expect("at least one actual").1;
-        extra[switch_bb_idx - first_extra_bb].terminator = Terminator {
-            kind: TerminatorKind::SwitchInt {
+        extra[switch_bb_idx - first_extra_bb].terminator = crate::rustc_compat::mir_terminator(
+            TerminatorKind::SwitchInt {
                 discr: Operand::Copy(Place::from(cursor_local)),
                 targets: SwitchTargets::new(branches, otherwise),
             },
             span,
-        };
+        );
     }
 
     extra
@@ -248,20 +254,31 @@ fn callee_sig_is_c_variadic(callee_instance: Instance) -> bool {
     callee_instance.ty().kind().fn_sig().is_some_and(|sig| sig.value.c_variadic)
 }
 
+/// Is this the type the `...` parameter lowers to? The frozen nightly spells it
+/// `VaListImpl`. Trust's library has no `VaListImpl`: `...` is `core::ffi::VaList`
+/// itself, so matching the nightly name there declined every variadic call.
 fn is_va_list_ty(ty: Ty) -> bool {
     match ty.kind() {
+        #[cfg(not(trust_toolchain))]
         TyKind::RigidTy(RigidTy::Adt(def, _)) => def.0.name().contains("VaListImpl"),
+        #[cfg(trust_toolchain)]
+        TyKind::RigidTy(RigidTy::Adt(def, _)) => def.0.name().ends_with("::VaList"),
         _ => false,
     }
 }
 
-/// Is this callee the `VaListImpl` argument fetch (`arg::<T>` or the intrinsic
-/// it lowers to)?
+/// Is this callee the variadic argument fetch (`VaListImpl::arg::<T>` on the
+/// frozen nightly, `VaList::next_arg::<T>` on Trust, or the intrinsic both lower
+/// to)?
 fn is_va_arg_callee(func: &Operand, locals: &[LocalDecl]) -> bool {
+    #[cfg(not(trust_toolchain))]
+    const FETCH_METHOD: &str = "::arg";
+    #[cfg(trust_toolchain)]
+    const FETCH_METHOD: &str = "::next_arg";
     let Ok(ty) = func.ty(locals) else { return false };
     let TyKind::RigidTy(RigidTy::FnDef(fn_def, _)) = ty.kind() else { return false };
     let name = fn_def.0.name();
-    name.ends_with("::va_arg") || (name.contains("VaList") && name.ends_with("::arg"))
+    name.ends_with("::va_arg") || (name.contains("VaList") && name.ends_with(FETCH_METHOD))
 }
 
 /// Monomorphized type fetched by the `va_arg` call terminating `bb`.
@@ -296,7 +313,7 @@ impl Promotion {
     fn rvalue(&self, actual_local: Local, fetch_ty: Ty) -> Rvalue {
         let operand = Operand::Copy(Place::from(actual_local));
         match self {
-            Promotion::Identity => Rvalue::Use(operand),
+            Promotion::Identity => rvalue_use!(Rvalue::Use(operand)),
             Promotion::IntWiden => Rvalue::Cast(CastKind::IntToInt, operand, fetch_ty),
             Promotion::FloatWiden => Rvalue::Cast(CastKind::FloatToFloat, operand, fetch_ty),
         }
@@ -440,7 +457,7 @@ fn alias_closure(callee: &Body, valist_local: Local) -> HashSet<Local> {
                     Rvalue::Ref(_, _, place)
                     | Rvalue::AddressOf(_, place)
                     | Rvalue::CopyForDeref(place) => Some(place),
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                     | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                         Some(place)
                     }
@@ -479,7 +496,7 @@ fn statement_use_is_recognized(stmt: &Statement, alias: &HashSet<Local>) -> bool
                     // already in the alias set.
                     !alias.contains(&place.local) || alias.contains(&dest.local)
                 }
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..)
                 | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                     if !alias.contains(&place.local) {
                         return true;
@@ -497,9 +514,10 @@ fn statement_use_is_recognized(stmt: &Statement, alias: &HashSet<Local>) -> bool
         | StatementKind::PlaceMention(_)
         | StatementKind::FakeRead(..)
         | StatementKind::AscribeUserType { .. }
-        | StatementKind::Retag(..)
         | StatementKind::Coverage(_)
         | StatementKind::ConstEvalCounter => true,
+        #[cfg(not(trust_toolchain))]
+        StatementKind::Retag(..) => true,
         StatementKind::SetDiscriminant { place, .. } => !alias.contains(&place.local),
         StatementKind::Intrinsic(_) => false,
     }
@@ -509,6 +527,8 @@ fn operand_mentions(operand: &Operand, alias: &HashSet<Local>) -> bool {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => alias.contains(&place.local),
         Operand::Constant(_) => false,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => false,
     }
 }
 
@@ -519,15 +539,21 @@ fn rvalue_mentions(rvalue: &Rvalue, alias: &HashSet<Local>) -> bool {
         | Rvalue::Discriminant(place)
         | Rvalue::Len(place)
         | Rvalue::Ref(_, _, place) => alias.contains(&place.local),
+        // A reborrow copies the value stored at `place`.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(_, _, place) => alias.contains(&place.local),
         Rvalue::Aggregate(_, operands) => operands.iter().any(|o| operand_mentions(o, alias)),
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
             operand_mentions(lhs, alias) || operand_mentions(rhs, alias)
         }
         Rvalue::Cast(_, operand, _)
         | Rvalue::Repeat(operand, _)
-        | Rvalue::ShallowInitBox(operand, _)
         | Rvalue::UnaryOp(_, operand)
-        | Rvalue::Use(operand) => operand_mentions(operand, alias),
-        Rvalue::NullaryOp(..) | Rvalue::ThreadLocalRef(_) => false,
+        | Rvalue::Use(operand, ..) => operand_mentions(operand, alias),
+        #[cfg(not(trust_toolchain))]
+        Rvalue::ShallowInitBox(operand, _) => operand_mentions(operand, alias),
+        Rvalue::ThreadLocalRef(_) => false,
+        #[cfg(not(trust_toolchain))]
+        Rvalue::NullaryOp(..) => false,
     }
 }

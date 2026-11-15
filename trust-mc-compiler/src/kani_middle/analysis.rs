@@ -137,9 +137,10 @@ impl From<&Statement> for Key {
             | StatementKind::FakeRead(..)
             | StatementKind::Nop
             | StatementKind::PlaceMention(_)
-            | StatementKind::Retag(_, _)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_) => Key("Ignored"),
+            #[cfg(not(trust_toolchain))]
+            StatementKind::Retag(_, _) => Key("Ignored"),
         }
     }
 }
@@ -164,7 +165,7 @@ impl From<&Terminator> for Key {
 impl From<&Rvalue> for Key {
     fn from(value: &Rvalue) -> Self {
         match value {
-            Rvalue::Use(_) => Key("Use"),
+            Rvalue::Use(_, ..) => Key("Use"),
             Rvalue::Repeat(_, _) => Key("Repeat"),
             Rvalue::Ref(_, _, _) => Key("Ref"),
             Rvalue::ThreadLocalRef(_) => Key("ThreadLocalRef"),
@@ -173,12 +174,16 @@ impl From<&Rvalue> for Key {
             Rvalue::Cast(_, _, _) => Key("Cast"),
             Rvalue::BinaryOp(..) => Key("BinaryOp"),
             Rvalue::CheckedBinaryOp(..) => Key("CheckedBinaryOp"),
+            #[cfg(not(trust_toolchain))]
             Rvalue::NullaryOp(_) => Key("NullaryOp"),
             Rvalue::UnaryOp(_, _) => Key("UnaryOp"),
             Rvalue::Discriminant(_) => Key("Discriminant"),
             Rvalue::Aggregate(_, _) => Key("Aggregate"),
+            #[cfg(not(trust_toolchain))]
             Rvalue::ShallowInitBox(_, _) => Key("ShallowInitBox"),
             Rvalue::CopyForDeref(_) => Key("CopyForDeref"),
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(..) => Key("Reborrow"),
         }
     }
 }
@@ -187,9 +192,7 @@ impl From<&Rvalue> for Key {
 mod tests {
     use super::*;
     use crate::rustc_public_bridge::IndexedVal;
-    use rustc_public::mir::{
-        Operand, Place, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnwindAction,
-    };
+    use rustc_public::mir::{Operand, Place, Rvalue, StatementKind, TerminatorKind, UnwindAction};
     use rustc_public::ty::Span;
 
     fn dummy_span() -> Span {
@@ -257,90 +260,92 @@ mod tests {
 
     #[test]
     fn test_key_from_statement_assign() {
-        let stmt = Statement {
-            kind: StatementKind::Assign(
+        let stmt = crate::rustc_compat::mir_statement(
+            StatementKind::Assign(
                 Place { local: 0, projection: vec![] },
-                Rvalue::Use(Operand::Copy(Place { local: 1, projection: vec![] })),
+                rvalue_use!(Rvalue::Use(Operand::Copy(Place { local: 1, projection: vec![] }))),
             ),
-            span: dummy_span(),
-        };
+            dummy_span(),
+        );
         let key: Key = (&stmt).into();
         assert_eq!(key, Key("Assign"));
     }
 
     #[test]
     fn test_key_from_statement_storage_live() {
-        let stmt = Statement { kind: StatementKind::StorageLive(5), span: dummy_span() };
+        let stmt = crate::rustc_compat::mir_statement(StatementKind::StorageLive(5), dummy_span());
         let key: Key = (&stmt).into();
         assert_eq!(key, Key("Ignored"));
     }
 
     #[test]
     fn test_key_from_statement_storage_dead() {
-        let stmt = Statement { kind: StatementKind::StorageDead(3), span: dummy_span() };
+        let stmt = crate::rustc_compat::mir_statement(StatementKind::StorageDead(3), dummy_span());
         let key: Key = (&stmt).into();
         assert_eq!(key, Key("Ignored"));
     }
 
     #[test]
     fn test_key_from_statement_nop() {
-        let stmt = Statement { kind: StatementKind::Nop, span: dummy_span() };
+        let stmt = crate::rustc_compat::mir_statement(StatementKind::Nop, dummy_span());
         let key: Key = (&stmt).into();
         assert_eq!(key, Key("Ignored"));
     }
 
     #[test]
     fn test_key_from_terminator_goto() {
-        let term = Terminator { kind: TerminatorKind::Goto { target: 1 }, span: dummy_span() };
+        let term =
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: 1 }, dummy_span());
         let key: Key = (&term).into();
         assert_eq!(key, Key("Goto"));
     }
 
     #[test]
     fn test_key_from_terminator_return() {
-        let term = Terminator { kind: TerminatorKind::Return, span: dummy_span() };
+        let term = crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span());
         let key: Key = (&term).into();
         assert_eq!(key, Key("Return"));
     }
 
     #[test]
     fn test_key_from_terminator_unreachable() {
-        let term = Terminator { kind: TerminatorKind::Unreachable, span: dummy_span() };
+        let term = crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, dummy_span());
         let key: Key = (&term).into();
         assert_eq!(key, Key("Unreachable"));
     }
 
     #[test]
     fn test_key_from_terminator_resume() {
-        let term = Terminator { kind: TerminatorKind::Resume, span: dummy_span() };
+        let term = crate::rustc_compat::mir_terminator(TerminatorKind::Resume, dummy_span());
         let key: Key = (&term).into();
         assert_eq!(key, Key("Resume"));
     }
 
     #[test]
     fn test_key_from_terminator_abort() {
-        let term = Terminator { kind: TerminatorKind::Abort, span: dummy_span() };
+        let term = crate::rustc_compat::mir_terminator(TerminatorKind::Abort, dummy_span());
         let key: Key = (&term).into();
         assert_eq!(key, Key("Abort"));
     }
 
     #[test]
     fn test_key_from_terminator_drop() {
-        let term = Terminator {
-            kind: TerminatorKind::Drop {
+        let term = crate::rustc_compat::mir_terminator(
+            TerminatorKind::Drop {
                 place: Place { local: 0, projection: vec![] },
                 target: 1,
                 unwind: UnwindAction::Continue,
             },
-            span: dummy_span(),
-        };
+            dummy_span(),
+        );
         let key: Key = (&term).into();
         assert_eq!(key, Key("Drop"));
     }
 
     #[test]
     fn test_key_from_rvalue_use() {
-        let rvalue = Rvalue::Use(Operand::Copy(Place { local: 0, projection: vec![] }));
+        let rvalue =
+            rvalue_use!(Rvalue::Use(Operand::Copy(Place { local: 0, projection: vec![] })));
         let key: Key = (&rvalue).into();
         assert_eq!(key, Key("Use"));
     }
@@ -371,23 +376,23 @@ mod tests {
     #[test]
     fn test_counter_mixed_statement_types() {
         let stmts = [
-            Statement {
-                kind: StatementKind::Assign(
+            crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
                     Place { local: 0, projection: vec![] },
-                    Rvalue::Use(Operand::Copy(Place { local: 1, projection: vec![] })),
+                    rvalue_use!(Rvalue::Use(Operand::Copy(Place { local: 1, projection: vec![] }))),
                 ),
-                span: dummy_span(),
-            },
-            Statement { kind: StatementKind::StorageLive(1), span: dummy_span() },
-            Statement { kind: StatementKind::StorageDead(1), span: dummy_span() },
-            Statement {
-                kind: StatementKind::Assign(
+                dummy_span(),
+            ),
+            crate::rustc_compat::mir_statement(StatementKind::StorageLive(1), dummy_span()),
+            crate::rustc_compat::mir_statement(StatementKind::StorageDead(1), dummy_span()),
+            crate::rustc_compat::mir_statement(
+                StatementKind::Assign(
                     Place { local: 2, projection: vec![] },
-                    Rvalue::Use(Operand::Copy(Place { local: 3, projection: vec![] })),
+                    rvalue_use!(Rvalue::Use(Operand::Copy(Place { local: 3, projection: vec![] }))),
                 ),
-                span: dummy_span(),
-            },
-            Statement { kind: StatementKind::Nop, span: dummy_span() },
+                dummy_span(),
+            ),
+            crate::rustc_compat::mir_statement(StatementKind::Nop, dummy_span()),
         ];
         let counter: Counter = stmts.iter().collect();
         assert_eq!(counter.total(), 5);
@@ -398,10 +403,10 @@ mod tests {
     #[test]
     fn test_counter_multiple_terminator_types() {
         let terminators = [
-            Terminator { kind: TerminatorKind::Return, span: dummy_span() },
-            Terminator { kind: TerminatorKind::Goto { target: 0 }, span: dummy_span() },
-            Terminator { kind: TerminatorKind::Goto { target: 1 }, span: dummy_span() },
-            Terminator { kind: TerminatorKind::Unreachable, span: dummy_span() },
+            crate::rustc_compat::mir_terminator(TerminatorKind::Return, dummy_span()),
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: 0 }, dummy_span()),
+            crate::rustc_compat::mir_terminator(TerminatorKind::Goto { target: 1 }, dummy_span()),
+            crate::rustc_compat::mir_terminator(TerminatorKind::Unreachable, dummy_span()),
         ];
         let counter: Counter = terminators.iter().collect();
         assert_eq!(counter.total(), 4);

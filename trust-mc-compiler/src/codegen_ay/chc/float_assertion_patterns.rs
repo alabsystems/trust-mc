@@ -26,7 +26,7 @@ use crate::codegen_ay::chc::call::codegen_call_cmp_string::math_const::{
 };
 use ay_bindings::Expr;
 use rustc_public::mir::{BinOp, Body, Operand, Rvalue, StatementKind, TerminatorKind};
-use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+use rustc_public::ty::{RigidTy, TyKind};
 use std::collections::HashSet;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FloatConstKind {
@@ -346,7 +346,7 @@ pub(super) fn trace_passthrough_local(body: &Body, operand: &Operand) -> Option<
     let mut local = operand_local(operand)?;
     let mut seen = HashSet::new();
     while seen.insert(local) {
-        let Some(LocalDef::Assign(Rvalue::Use(next))) = find_local_def(body, local) else {
+        let Some(LocalDef::Assign(Rvalue::Use(next, ..))) = find_local_def(body, local) else {
             return Some(local);
         };
         let Some(next_local) = operand_local(next) else {
@@ -367,7 +367,7 @@ pub(super) fn follow_passthrough_uses<'body>(
         if !seen.insert(local) {
             break;
         }
-        let Some(LocalDef::Assign(Rvalue::Use(next))) = find_local_def(body, local) else {
+        let Some(LocalDef::Assign(Rvalue::Use(next, ..))) = find_local_def(body, local) else {
             break;
         };
         current = next;
@@ -384,6 +384,8 @@ fn try_extract_const_u128(body: &Body, operand: &Operand) -> Option<u128> {
             }
             find_const_u128_assignment(body, place.local)
         }
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -395,8 +397,8 @@ fn find_const_u128_assignment(body: &Body, local_idx: usize) -> Option<u128> {
                 && lhs.projection.is_empty()
             {
                 match rhs {
-                    Rvalue::Use(Operand::Constant(c)) => return extract_u128_from_const_op(c),
-                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    Rvalue::Use(Operand::Constant(c), ..) => return extract_u128_from_const_op(c),
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         if src.projection.is_empty() =>
                     {
                         return find_const_u128_direct(body, src.local);
@@ -415,7 +417,7 @@ fn find_const_u128_direct(body: &Body, local_idx: usize) -> Option<u128> {
             if let StatementKind::Assign(lhs, rhs) = &stmt.kind
                 && lhs.local == local_idx
                 && lhs.projection.is_empty()
-                && let Rvalue::Use(Operand::Constant(c)) = rhs
+                && let Rvalue::Use(Operand::Constant(c), ..) = rhs
             {
                 return extract_u128_from_const_op(c);
             }
@@ -427,25 +429,12 @@ fn find_const_u128_direct(body: &Body, local_idx: usize) -> Option<u128> {
 fn extract_u128_from_const_op(const_op: &rustc_public::mir::ConstOperand) -> Option<u128> {
     let mir_const = &const_op.const_;
 
-    let extract_from_alloc =
-        |alloc: &rustc_public::ty::Allocation, ty: rustc_public::ty::Ty| -> Option<u128> {
-            match ty.kind() {
-                TyKind::RigidTy(RigidTy::Uint(_)) => alloc.read_uint().ok(),
-                TyKind::RigidTy(RigidTy::Int(_)) => {
-                    let value = alloc.read_int().ok()?;
-                    u128::try_from(value).ok()
-                }
-                _ => None,
-            }
-        };
-
-    let ty = mir_const.ty();
-    match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => extract_from_alloc(alloc, ty),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(value_ty, alloc) => extract_from_alloc(alloc, *value_ty),
-            _ => None,
-        },
+    use crate::codegen_ay::shared::const_pointer;
+    match mir_const.ty().kind() {
+        TyKind::RigidTy(RigidTy::Uint(_)) => const_pointer::const_uint(mir_const),
+        TyKind::RigidTy(RigidTy::Int(_)) => {
+            u128::try_from(const_pointer::const_int(mir_const)?).ok()
+        }
         _ => None,
     }
 }

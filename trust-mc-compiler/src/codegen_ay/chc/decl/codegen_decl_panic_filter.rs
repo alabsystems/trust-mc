@@ -108,6 +108,50 @@ pub(in crate::codegen_ay::chc) fn compute_return_reachable_blocks(body: &Body) -
     )
 }
 
+/// Compute which basic blocks can CONTINUE: reach a `Return`, or reach a
+/// cycle (a loop can run forever without ever panicking). The complement is
+/// PANIC-ONLY: every path from such a block ends, after finitely many steps,
+/// at a diverging terminator (a call with no return target, `Unreachable`,
+/// `Abort`, `Resume`).
+///
+/// A value read only inside panic-only blocks cannot change a verdict: a safe
+/// run never enters them, and a run that enters one fails there whatever it
+/// reads. The constant-pointer rule uses this to leave assertion-message and
+/// panic-location constants out of the whole-object seeding (D2,
+/// `decl::global_objects`), which they only cost; the BMC lane reads it for
+/// the same purpose (`statement::global_alloc::global_alloc_address`). (A `-> !` call that is not a
+/// failure, `std::process::exit`, is also a diverging terminator: a read before
+/// it may be left unseeded, so a counterexample there can only over-approximate
+/// — a free value admits every real one — never prove a false program.)
+pub(in crate::codegen_ay) fn compute_may_continue_blocks(body: &Body) -> Vec<bool> {
+    let n = body.blocks.len();
+    let successors: Vec<Vec<usize>> =
+        body.blocks.iter().map(|bb| all_successors(&bb.terminator.kind)).collect();
+    let predecessors = predecessor_map(body);
+    // A block is on a cycle iff it is forward-reachable from one of its own
+    // successors.
+    let on_cycle = |start: usize| -> bool {
+        let mut seen = vec![false; n];
+        let mut work: Vec<usize> = successors[start].clone();
+        while let Some(bb) = work.pop() {
+            if bb == start {
+                return true;
+            }
+            if bb < n && !seen[bb] {
+                seen[bb] = true;
+                work.extend(successors[bb].iter().copied());
+            }
+        }
+        false
+    };
+    let seeds: Vec<usize> = (0..n)
+        .filter(|&bb| {
+            matches!(body.blocks[bb].terminator.kind, TerminatorKind::Return) || on_cycle(bb)
+        })
+        .collect();
+    reverse_reachable_from_seeds(&predecessors, seeds)
+}
+
 /// Compute blocks on panic-unwind cleanup chains.
 ///
 /// Seeds from direct `Cleanup(bb)` targets on Call/Drop/Assert terminators, then
@@ -273,11 +317,14 @@ fn collect_locals_from_operand(op: &Operand, used: &mut HashSet<usize>) {
 
 fn collect_locals_from_rvalue(rvalue: &Rvalue, used: &mut HashSet<usize>) {
     match rvalue {
-        Rvalue::Use(op)
+        Rvalue::Use(op, ..)
         | Rvalue::Repeat(op, _)
         | Rvalue::Cast(_, op, _)
-        | Rvalue::UnaryOp(_, op)
-        | Rvalue::ShallowInitBox(op, _) => {
+        | Rvalue::UnaryOp(_, op) => {
+            collect_locals_from_operand(op, used);
+        }
+        #[cfg(not(trust_toolchain))]
+        Rvalue::ShallowInitBox(op, _) => {
             collect_locals_from_operand(op, used);
         }
         Rvalue::Ref(_, _, place)
@@ -285,6 +332,11 @@ fn collect_locals_from_rvalue(rvalue: &Rvalue, used: &mut HashSet<usize>) {
         | Rvalue::Discriminant(place)
         | Rvalue::Len(place)
         | Rvalue::CopyForDeref(place) => {
+            used.insert(place.local);
+        }
+        // Trust: `Reborrow` uses `place.local`, like `Use(Copy(place))`.
+        #[cfg(trust_toolchain)]
+        Rvalue::Reborrow(_, _, place) => {
             used.insert(place.local);
         }
         Rvalue::BinaryOp(_, lhs, rhs) | Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
@@ -296,6 +348,8 @@ fn collect_locals_from_rvalue(rvalue: &Rvalue, used: &mut HashSet<usize>) {
                 collect_locals_from_operand(op, used);
             }
         }
-        Rvalue::NullaryOp(_) | Rvalue::ThreadLocalRef(_) => {}
+        Rvalue::ThreadLocalRef(_) => {}
+        #[cfg(not(trust_toolchain))]
+        Rvalue::NullaryOp(_) => {}
     }
 }

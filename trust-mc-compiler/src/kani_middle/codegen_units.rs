@@ -113,7 +113,7 @@ impl CodegenUnits {
                     .set(AutoHarnessMetadata {
                         chosen: chosen
                             .iter()
-                            .map(rustc_public::mir::mono::Instance::name)
+                            .map(|instance| crate::rustc_compat::instance_name(tcx, *instance))
                             .collect::<BTreeSet<_>>(),
                         skipped,
                     })
@@ -127,7 +127,12 @@ impl CodegenUnits {
                 );
                 // We generate one contract harness per function under contract, so each harness is in its own unit,
                 // and these harnesses have no stubs.
-                units.extend(automatic_harnesses.keys().map(|harness| CodegenUnit {
+                // In name order, like `group_by_stubs`: the codegen loop visits
+                // the units in this order.
+                let mut automatic: Vec<(&Harness, &HarnessMetadata)> =
+                    automatic_harnesses.iter().collect();
+                automatic.sort_by(|(_, a), (_, b)| a.mangled_name.cmp(&b.mangled_name));
+                units.extend(automatic.into_iter().map(|(harness, _)| CodegenUnit {
                     harnesses: vec![*harness],
                     stubs: HashMap::default(),
                 }));
@@ -202,6 +207,7 @@ impl CodegenUnits {
             into_option_drops: uf.into_option_drops,
             internal_workarounds: uf.internal_workarounds,
             abstracted_fallbacks: uf.abstracted_fallbacks,
+            unstubbed_abstractions: uf.unstubbed_abstractions,
             vec_field_fallbacks: uf.vec_field_fallbacks,
             pointee_synthesis_fallbacks: uf.pointee_synthesis_fallbacks,
             unsupported_construct_fallbacks: uf.unsupported_construct_fallbacks,
@@ -251,7 +257,8 @@ impl CodegenUnits {
 }
 
 fn stub_def(tcx: TyCtxt, def_id: DefId) -> FnDef {
-    let ty_internal = tcx.type_of(def_id).instantiate_identity();
+    let ty_internal =
+        crate::rustc_compat::skip_normalization(tcx.type_of(def_id).instantiate_identity());
     let ty = rustc_internal::stable(ty_internal);
     if let TyKind::RigidTy(RigidTy::FnDef(def, _)) = ty.kind() {
         def
@@ -265,8 +272,17 @@ fn group_by_stubs(
     tcx: TyCtxt,
     all_harnesses: &HashMap<Harness, HarnessMetadata>,
 ) -> Vec<CodegenUnit> {
-    let mut per_stubs: HashMap<_, CodegenUnit> = HashMap::default();
-    for (harness, metadata) in all_harnesses {
+    // Harnesses in name order, units in the order their first harness appears:
+    // the codegen loop visits units and harnesses in exactly this order, and
+    // process-global state (the interned type table, the string-constant and
+    // fresh-name counters) accumulates across harnesses, so a std `HashMap`
+    // order here gave the SAME harness different SMT text from run to run
+    // (measured 2026-10-01 over the soundness duals: string-literal addresses
+    // `#x3000` vs `#x3001`, and the type ids inside CHC memory-array names).
+    let mut ordered: Vec<(&Harness, &HarnessMetadata)> = all_harnesses.iter().collect();
+    ordered.sort_by(|(_, a), (_, b)| a.mangled_name.cmp(&b.mangled_name));
+    let mut per_stubs: rustc_data_structures::fx::FxIndexMap<_, CodegenUnit> = Default::default();
+    for (harness, metadata) in ordered {
         let stub_ids = harness_stub_map(tcx, *harness, metadata);
         let contracts = extract_contracts(tcx, *harness);
         let stub_map = stub_ids
@@ -367,7 +383,7 @@ fn apply_transitivity(tcx: TyCtxt, harness: Harness, stubs: Stubs) -> Stubs {
                     format!(
                         "Cannot stub `{}`. Stub configuration for harness `{}` has a cycle",
                         orig.name(),
-                        harness.def.name(),
+                        crate::rustc_compat::def_name(tcx, &harness.def),
                     ),
                 );
                 break;
@@ -527,7 +543,7 @@ fn automatic_harness_partition(
         // filter flags.
         let mut name = String::from(crate_name);
         name.push_str("::");
-        name.push_str(&instance.name());
+        name.push_str(&crate::rustc_compat::instance_name(tcx, instance));
         let body = instance.body().expect("instance should have body after has_body check");
 
         if is_proof_harness(tcx, instance)
@@ -582,7 +598,7 @@ fn automatic_harness_partition(
 
     for func in crate_fns {
         if let Some(reason) = skip_reason(func) {
-            skipped.insert(func.name(), reason);
+            skipped.insert(crate::rustc_compat::def_name(tcx, &func), reason);
         } else {
             chosen.push(
                 Instance::try_from(func)

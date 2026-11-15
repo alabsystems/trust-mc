@@ -10,10 +10,14 @@
 //! - `build_enum_bv_bitvec_destination_values`: BV result → per-slot values via extract
 //! - `build_canonical_enum_bv_bridge_value`: either path → single concat'd BV
 
+use crate::codegen_ay::chc::codegen_ctx::ExactVar;
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, ExprValue};
 
 use super::codegen_ctx::clusters::EnumBvLayout;
-use super::{ChcCtx, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, chc_fresh_name};
 use crate::codegen_ay::chc::decl::codegen_decl_flatten::byte_size_to_bv_width;
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
@@ -99,7 +103,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             // Part of #3994: zero-default base for ITE chain.
             let mut slot_expr = Self::sort_default_expr(out_sort).unwrap_or_else(|| {
-                declare_pending_var(chc_fresh_name("__flat_enum_payload"), out_sort.clone())
+                ExactVar::unobserved(chc_fresh_name("__flat_enum_payload"), out_sort.clone())
             });
             for ctor_idx in (0..layout.num_constructors).rev() {
                 let Some(value) = ctor_slot_values[ctor_idx][slot_idx].clone() else {
@@ -286,7 +290,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else { return None };
         for variant in def.variants() {
             for field in variant.fields() {
-                let fty = field.ty_with_args(&args);
+                let fty = mono_ty::field_ty(&field, &args)?;
                 if matches!(fty.kind(), TyKind::RigidTy(RigidTy::Array(..))) {
                     let byte_size = fty.layout().ok()?.shape().size.bytes();
                     return Some(byte_size_to_bv_width(byte_size));

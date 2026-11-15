@@ -265,6 +265,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        if self.ctx.has_native_box_allocations() {
+            self.ctx.unsupported_with_fallback("BoxPointerWithAddr",
+                "with_addr needs a physical-address/provenance model distinct from synthetic allocation IDs");
+        }
         if args.len() < 2 {
             warn!("codegen_ptr_with_addr: insufficient args (need ptr, addr), skipping");
             self.ctx

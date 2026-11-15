@@ -7,6 +7,7 @@
 //!
 //! Extracted from stubs_util.rs per #2220 decomposition.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use std::collections::HashSet;
 
 use ay_bindings::{Expr, Sort};
@@ -19,7 +20,7 @@ use super::codegen_ctx::diagnostics::CellCounter;
 use super::names::{self, struct_sort};
 use super::stubs::StubKind;
 use super::types::{POINTER_WIDTH, bool_sort, ptr_sort};
-use super::{ChcCtx, CollectionCallResult, chc_fresh_name, declare_pending_var};
+use super::{ChcCtx, CollectionCallResult, chc_fresh_name};
 
 /// Parts returned by the collection-specific element extraction closure
 /// in [`ChcCtx::translate_iter_next_skeleton`].
@@ -115,7 +116,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3447: no content model — result is fully unconstrained Bool.
         self.record_aggregate_gap("collection_predicate_no_content_model");
         let sym_name = chc_fresh_name(prefix);
-        Some(declare_pending_var(sym_name, bool_sort()))
+        Some(Havoc::mint(self, sound_havoc::UNTRACKED_COLLECTION_STATE, sym_name, bool_sort()))
     }
 
     /// Translate VecEq to element-wise forall comparison.
@@ -318,6 +319,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
             }
             Operand::Constant(_) => None,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -339,7 +342,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // (no tracked length from collection ghost state).
             self.record_aggregate_gap("collection_iter_len_unconstrained");
             let len_name = chc_fresh_name(fresh_len_prefix);
-            declare_pending_var(len_name, ptr_sort())
+            Havoc::mint_deferred(
+                self,
+                sound_havoc::UNTRACKED_COLLECTION_STATE,
+                len_name,
+                ptr_sort(),
+            )
         })
     }
 
@@ -354,7 +362,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.record_aggregate_gap("collection_iter_keys_unconstrained");
         let keys_name = chc_fresh_name(fresh_keys_prefix);
         let keys_sort = Sort::array(ptr_sort(), key_sort);
-        let keys = declare_pending_var(keys_name, keys_sort.clone());
+        let keys = Havoc::mint_deferred(
+            self,
+            sound_havoc::UNTRACKED_COLLECTION_STATE,
+            keys_name,
+            keys_sort.clone(),
+        );
         (keys, keys_sort)
     }
 

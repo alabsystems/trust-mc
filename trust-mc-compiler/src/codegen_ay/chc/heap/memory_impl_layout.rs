@@ -5,12 +5,13 @@
 //! Converted from include!() to proper module per #2595.
 //! Extracted from memory_impl.rs per #2246 (500 LOC threshold).
 use super::ChcCtx;
+use crate::codegen_ay::shared::mono_ty;
 use crate::kani_middle::abi::LayoutOf;
 use rustc_middle::ty::TypingEnv;
 use rustc_public::CrateDef;
 use rustc_public::abi::VariantsShape;
 use rustc_public::rustc_internal;
-use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
+use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
 use tracing::{debug, warn};
 
 pub(in crate::codegen_ay::chc) fn unwrap_heap_transparent_ty(
@@ -41,32 +42,6 @@ pub(in crate::codegen_ay::chc) fn unwrap_heap_transparent_ty(
             return ty;
         }
         ty = *inner_ty;
-    }
-}
-
-pub(super) fn ty_has_unresolved_non_region_params(ty: rustc_public::ty::Ty) -> bool {
-    match ty.kind() {
-        TyKind::Param(_) => true,
-        TyKind::RigidTy(RigidTy::Array(elem_ty, len)) => {
-            ty_has_unresolved_non_region_params(elem_ty)
-                || matches!(len.kind(), TyConstKind::Param(_))
-        }
-        TyKind::RigidTy(RigidTy::Slice(elem_ty)) => ty_has_unresolved_non_region_params(elem_ty),
-        TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) => {
-            ty_has_unresolved_non_region_params(pointee)
-        }
-        TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => {
-            ty_has_unresolved_non_region_params(pointee)
-        }
-        TyKind::RigidTy(RigidTy::Tuple(fields)) => {
-            fields.iter().any(|field_ty| ty_has_unresolved_non_region_params(*field_ty))
-        }
-        TyKind::RigidTy(RigidTy::Adt(_, ref args)) => args.0.iter().any(|arg| match arg {
-            GenericArgKind::Type(arg_ty) => ty_has_unresolved_non_region_params(*arg_ty),
-            GenericArgKind::Const(c) => matches!(c.kind(), TyConstKind::Param(_)),
-            _ => false,
-        }),
-        _ => false,
     }
 }
 
@@ -150,7 +125,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #3942: Bail out only for unresolved type/const params.
         // Lifetime-only params do not affect repr-simd layout and should still
         // be allowed through rustc layout queries.
-        if ty_has_unresolved_non_region_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return None;
         }
 
@@ -176,7 +151,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<u64> {
         // Part of #3942: Bail out only for unresolved type/const params.
         // Lifetime-only params are layout-transparent.
-        if ty_has_unresolved_non_region_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return None;
         }
         // Use proper layout from rustc when available (#901 done)
@@ -339,7 +314,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         field_idx: usize,
     ) -> Option<u64> {
         // Part of #3942: Bail out only for unresolved type/const params.
-        if ty_has_unresolved_non_region_params(ty) {
+        if mono_ty::has_unresolved_params(ty) {
             return None;
         }
         let Ok(layout) = ty.layout() else {

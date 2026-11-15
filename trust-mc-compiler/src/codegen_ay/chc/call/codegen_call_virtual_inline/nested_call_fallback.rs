@@ -6,6 +6,7 @@
 //!
 //! Extracted from terminator_exec.rs — Part of #134 D2, #4099.
 
+use crate::codegen_ay::chc::codegen_ctx::Havoc;
 use ay_bindings::Expr;
 use rustc_public::CrateDef;
 use rustc_public::ty::{GenericArgKind, RigidTy, Ty, TyKind};
@@ -87,40 +88,22 @@ pub(super) fn is_pointer_destination(
 /// needs `Prov::Unknown` propagated into the havoc and consumed fail-closed,
 /// which is a coverage change and has to be measured against the burndown, not
 /// smuggled into a retyping wave. Deliberately left as-is.
+///
+/// `name` is the fresh value's name, already booked by the caller
+/// (`booked`, Rule E): the walker's nested-call fallback records it as the
+/// approximation's identity before minting it.
 pub(super) fn build_nested_call_fallback_expr(
+    booked: crate::codegen_ay::chc::codegen_ctx::Booked,
+    name: String,
     effective_sort: ay_bindings::Sort,
     is_pointer_like: bool,
 ) -> Expr {
     if PtrSlot::of_sort(&effective_sort) == Some(PtrSlot::Thin) && is_pointer_like {
-        let upper = super::super::declare_pending_var(
-            super::super::chc_fresh_name("__nested_call_overapprox"),
-            ay_bindings::Sort::bitvec(32),
-        );
+        let upper = Havoc::booked(booked, name, ay_bindings::Sort::bitvec(32));
         upper.bvor(Expr::bitvec_const(1u64, 32)).concat(Expr::bitvec_const(0u64, 32))
     } else {
-        super::super::declare_pending_var(
-            super::super::chc_fresh_name("__nested_call_overapprox"),
-            effective_sort,
-        )
+        Havoc::booked(booked, name, effective_sort)
     }
-}
-
-/// The `__nested_call_overapprox` SMT variable inside a fallback expression.
-///
-/// The thin-pointer arm wraps the fresh var in `bvor`/`concat`, so the name is
-/// not always the whole expression. Task #78's dependence analysis keys on the
-/// freed var's IDENTITY, so it has to be dug out rather than assumed.
-pub(super) fn nested_call_fallback_freed_var(expr: &Expr) -> Option<String> {
-    let mut stack = vec![expr];
-    while let Some(e) = stack.pop() {
-        if let ay_bindings::ExprValue::Var { name } = e.value()
-            && name.contains("__nested_call_overapprox")
-        {
-            return Some(name.to_string());
-        }
-        stack.extend(e.value().children());
-    }
-    None
 }
 
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
@@ -128,7 +111,12 @@ pub(super) fn build_nested_call_fallback_expr_for_test(
     effective_sort: ay_bindings::Sort,
     is_pointer_like: bool,
 ) -> Expr {
-    build_nested_call_fallback_expr(effective_sort, is_pointer_like)
+    build_nested_call_fallback_expr(
+        crate::codegen_ay::chc::codegen_ctx::Booked::for_test(),
+        super::super::chc_fresh_name("__nested_call_overapprox"),
+        effective_sort,
+        is_pointer_like,
+    )
 }
 
 /// Whether the last path segment names a collection constructor whose result
@@ -175,6 +163,8 @@ fn is_valid_backing_collection_ctor(callee_path: &str) -> bool {
 /// explicit dealloc) on OTHER objects are preserved.
 pub(super) fn try_build_valid_collection_backing_fallback<'tcx, 'body>(
     ctx: &mut ChcCtx<'tcx, 'body>,
+    booked: crate::codegen_ay::chc::codegen_ctx::Booked,
+    name: &str,
     effective_sort: &ay_bindings::Sort,
     callee_path: Option<&str>,
 ) -> Option<Expr> {
@@ -196,10 +186,7 @@ pub(super) fn try_build_valid_collection_backing_fallback<'tcx, 'body>(
     // Symbolic base var supplies the len/cap/data fields (kept over-approx);
     // only `fld_ptr` is pinned to a valid, 8-aligned pointer (offset 0) into
     // the fresh backing object.
-    let base = super::super::declare_pending_var(
-        super::super::chc_fresh_name("__nested_call_overapprox"),
-        effective_sort.clone(),
-    );
+    let base = Havoc::booked(booked, name.to_owned(), effective_sort.clone());
     let valid_ptr = Expr::bitvec_const(i128::from(obj_id), 32).concat(Expr::bitvec_const(0u64, 32));
     let args: Vec<Expr> = fields
         .iter()

@@ -7,7 +7,8 @@
 //!
 //! Covers:
 //! - chc_fresh_name: generates unique prefixed names
-//! - declare_pending_var: creates an Expr and registers VarDecl
+//! - the Rule E constructors (`ExactVar`, over the private `declare_pending_var`):
+//!   create an Expr and register a VarDecl
 //! - take_undef_counter / UNDEF_COUNTER reset
 //! - TYPE_SORT_FALLBACK via ChcDiagnostics (per-ctx counter)
 //! - UNHANDLED_CALL via ChcDiagnostics (per-ctx counter)
@@ -24,8 +25,8 @@ use ay_bindings::Sort;
 
 use super::super::codegen_ctx::globals::{
     PENDING_FRESH_VAR_DECLS, PendingFreshVarDeclsPanicGuard, UNDEF_COUNTER, chc_fresh_name,
-    declare_pending_var, get_chc_fallback_counts, set_chc_fallback_count_for_fn,
-    set_chc_fallback_count_for_test, take_chc_fallback_counts, take_undef_counter,
+    get_chc_fallback_counts, set_chc_fallback_count_for_fn, set_chc_fallback_count_for_test,
+    take_chc_fallback_counts, take_undef_counter,
 };
 
 // =============================================================================
@@ -59,7 +60,7 @@ fn test_chc_fresh_name_empty_prefix() {
 }
 
 // =============================================================================
-// declare_pending_var
+// ExactVar (over the private declare_pending_var)
 // =============================================================================
 
 #[test]
@@ -69,7 +70,7 @@ fn test_declare_pending_var_creates_expr_with_correct_sort() {
 
     let name = chc_fresh_name("dpv_test");
     let sort = Sort::bitvec(32);
-    let expr = declare_pending_var(name.clone(), sort);
+    let expr = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(name.clone(), sort);
 
     assert_eq!(expr.sort().bitvec_width(), Some(32));
     assert!(
@@ -84,7 +85,7 @@ fn test_declare_pending_var_registers_var_decl() {
 
     let name = chc_fresh_name("dpv_reg");
     let sort = Sort::bool();
-    let _expr = declare_pending_var(name.clone(), sort);
+    let _expr = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(name.clone(), sort);
 
     let pending = PENDING_FRESH_VAR_DECLS.with(|decls| decls.borrow().clone());
     assert_eq!(pending.len(), 1, "should have registered one VarDecl");
@@ -95,9 +96,16 @@ fn test_declare_pending_var_registers_var_decl() {
 fn test_declare_pending_var_multiple_accumulate() {
     PENDING_FRESH_VAR_DECLS.with(|decls| decls.borrow_mut().clear());
 
-    let _e1 = declare_pending_var(chc_fresh_name("a"), Sort::bitvec(8));
-    let _e2 = declare_pending_var(chc_fresh_name("b"), Sort::bitvec(16));
-    let _e3 = declare_pending_var(chc_fresh_name("c"), Sort::bool());
+    let _e1 = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(
+        chc_fresh_name("a"),
+        Sort::bitvec(8),
+    );
+    let _e2 = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(
+        chc_fresh_name("b"),
+        Sort::bitvec(16),
+    );
+    let _e3 =
+        crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(chc_fresh_name("c"), Sort::bool());
 
     let pending = PENDING_FRESH_VAR_DECLS.with(|decls| decls.borrow().clone());
     assert_eq!(pending.len(), 3, "should have accumulated 3 VarDecls");
@@ -231,8 +239,14 @@ fn test_pending_fresh_var_decls_guard_clears_on_panic() {
     // Simulate translate_inner(): arm guard, push vars, then panic before drain.
     let result = std::panic::catch_unwind(|| {
         let _guard = PendingFreshVarDeclsPanicGuard::arm();
-        let _e1 = declare_pending_var(chc_fresh_name("leak_a"), Sort::bitvec(8));
-        let _e2 = declare_pending_var(chc_fresh_name("leak_b"), Sort::bitvec(16));
+        let _e1 = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(
+            chc_fresh_name("leak_a"),
+            Sort::bitvec(8),
+        );
+        let _e2 = crate::codegen_ay::chc::codegen_ctx::ExactVar::defined(
+            chc_fresh_name("leak_b"),
+            Sort::bitvec(16),
+        );
         // Simulate a panic before translate_inner() reaches its success-path drain.
         panic!("simulated panic during CHC translation");
     });

@@ -316,7 +316,7 @@ fn test_translation_drop_simd_compare_eliminates_live_bucket() {
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
 
@@ -362,7 +362,7 @@ fn test_translation_drop_simd_assume_compare_eliminates_live_bucket() {
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
 
@@ -409,7 +409,7 @@ fn test_translation_drop_simd_any_assume_assert_eliminates_live_bucket() {
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
 
@@ -511,7 +511,7 @@ fn test_translation_drop_simd_any_compare_eliminates_live_bucket() {
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { array, .. } if array.sort().is_array()),
+            |expr| is_array_read_or_scalarized_lane(expr),
             "Select(Array, lane_idx)",
         );
 
@@ -560,17 +560,21 @@ fn test_translation_drop_str_literal_eq_reports_reason_coded_sites() {
             |expr| matches!(expr.value(), ExprValue::Eq(_, _)),
             "Eq",
         );
-        assert_rule_contains_expr_kind(
-            &vc,
-            fn_name,
-            |expr| matches!(expr.value(), ExprValue::Select { .. }),
-            "Select backing bytes",
-        );
-
         let fallback_count = get_chc_fallback_counts().get(fn_name).copied().unwrap_or(0);
         assert_eq!(
             fallback_count, 0,
             "{fn_name} should avoid CHC fallback while lowering literal str equality"
+        );
+        // The unrolled byte comparison selects the constant "hello" bytes; the
+        // post-translation passes (store/select chain simplification 948cc5d4e, const
+        // folding 2d6974711) fold those selects into constants, so the Select is checked
+        // on the pre-pass VC.
+        let pre = pre_pass_vc(ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default()));
+        assert_rule_contains_expr_kind(
+            &pre,
+            fn_name,
+            |expr| matches!(expr.value(), ExprValue::Select { .. }),
+            "Select backing bytes",
         );
     });
 
@@ -641,12 +645,6 @@ fn test_translation_drop_extend_const_byte_slice_reports_reason_coded_sites() {
         assert_rule_contains_expr_kind(
             &vc,
             fn_name,
-            references_fld_data,
-            "Vec fld_data payload reference",
-        );
-        assert_rule_contains_expr_kind(
-            &vc,
-            fn_name,
             |expr| matches!(expr.value(), ExprValue::Eq(_, _)),
             "Eq",
         );
@@ -655,6 +653,16 @@ fn test_translation_drop_extend_const_byte_slice_reports_reason_coded_sites() {
         assert_eq!(
             fallback_count, 0,
             "{fn_name} should avoid CHC fallback while lowering const-byte-slice extend equality"
+        );
+        // extend_from_slice stores the appended bytes into the Vec payload; const folding
+        // and dead-scalar pruning (7faa74cf9, 6b811318f) remove those stores from the
+        // translated VC, so the payload reference is checked on the pre-pass VC.
+        let pre = pre_pass_vc(ChcCtx::new(ctx.tcx, &body, fn_name, ChcConfig::default()));
+        assert_rule_contains_expr_kind(
+            &pre,
+            fn_name,
+            references_fld_data,
+            "Vec fld_data payload reference",
         );
     });
 

@@ -477,6 +477,8 @@ fn test_mir_to_chc_sqrt_assertion_pipeline_has_clean_translation_metadata() {
 
 #[test]
 fn test_bv_float_binop_chc_normalizes_negative_zero_constants() {
+    // IEEE-754: (-1.0) * 0.0 is -0.0. Folding keeps the sign bit since aa0a9e691, as rustc
+    // and Kani/CBMC do; the old +0.0 normalisation was wrong.
     let f32_result = bv_float_binop_chc(
         BinOp::Mul,
         Expr::bitvec_const(0xBF80_0000u64, 32),
@@ -486,8 +488,8 @@ fn test_bv_float_binop_chc_normalizes_negative_zero_constants() {
     .expect("f32 constant fold should succeed");
     assert_eq!(
         f32_result,
-        Expr::bitvec_const(0x0000_0000u64, 32),
-        "(-1.0f32) * 0.0f32 should normalize to +0.0 bits in CHC constant folding"
+        Expr::bitvec_const(0x8000_0000u64, 32),
+        "(-1.0f32) * 0.0f32 folds to -0.0 bits (sign bit kept, IEEE-754)"
     );
 
     let f64_result = bv_float_binop_chc(
@@ -499,8 +501,8 @@ fn test_bv_float_binop_chc_normalizes_negative_zero_constants() {
     .expect("f64 constant fold should succeed");
     assert_eq!(
         f64_result,
-        Expr::bitvec_const(0x0000_0000_0000_0000u64, 64),
-        "(-1.0f64) * 0.0f64 should normalize to +0.0 bits in CHC constant folding"
+        Expr::bitvec_const(0x8000_0000_0000_0000u64, 64),
+        "(-1.0f64) * 0.0f64 folds to -0.0 bits (sign bit kept, IEEE-754)"
     );
 }
 

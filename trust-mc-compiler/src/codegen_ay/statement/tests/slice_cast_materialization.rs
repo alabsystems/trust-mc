@@ -37,6 +37,8 @@ fn operand_place(operand: &Operand) -> &Place {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => place,
         Operand::Constant(_) => panic!("expected place operand for slice cast"),
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => panic!("expected place operand for slice cast"),
     }
 }
 

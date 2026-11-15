@@ -489,8 +489,8 @@ fn test_prefix_rules_count() {
     // Guard against silent rule additions/removals
     assert_eq!(
         PREFIX_TYPE_KEY_RULES.len(),
-        40,
-        "expected 40 prefix rules (update test if rules were intentionally added/removed)"
+        41,
+        "expected 41 prefix rules (update test if rules were intentionally added/removed)"
     );
 }
 

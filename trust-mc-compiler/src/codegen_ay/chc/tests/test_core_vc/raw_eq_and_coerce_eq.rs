@@ -138,7 +138,11 @@ fn test_coerce_eq_constraint_single_field_datatype_to_bitvec() {
     let eq = coerce_eq_constraint(&dest, result, &out_sort, false);
     assert!(eq.is_some(), "single-field datatype→BV64 should be unwrapped and coerced");
     let smt = eq.unwrap().to_string();
-    assert!(smt.contains("fld_0"), "coercion should select inner field, got: {smt}");
+    // ay folds fld_0 over the constructor (8a7c063209), leaving the field value.
+    assert!(
+        smt.contains("fld_0") || smt == "(= dest #x000000000000000b)",
+        "coercion should select (or fold) the inner field, got: {smt}"
+    );
 }
 
 #[test]
@@ -400,22 +404,21 @@ fn test_coerce_eq_constraint_bv8_to_bv32_unsigned_zero_extends() {
 // ── element→nested-array coercion (Part of #3783) ───────────────────
 
 #[test]
-fn test_coerce_eq_constraint_element_to_nested_array() {
-    // Part of #3783: Vec<[u64; 3]> data field is Array<BV64, Array<BV64, BV64>>.
-    // When the value is Array<BV64, BV64> (a single [u64; 3] element), the
-    // coercion should wrap it in a fresh array with store(0, value).
+fn test_coerce_eq_constraint_element_to_nested_array_needs_a_context() {
+    // Part of #3783: Vec<[u64; 3]> data field is Array<BV64, Array<BV64, BV64>>,
+    // the value a single [u64; 3] element. Wrapping it mints the array's other
+    // cells as a havoc, which only a translation context can book (Rule E:
+    // `ChcCtx::wrap_element_into_array_slot`), so the context-free coercion
+    // refuses the shape rather than mint an unbooked value.
     let inner_sort = Sort::array(Sort::bitvec(64), Sort::bitvec(64));
     let outer_sort = Sort::array(Sort::bitvec(64), inner_sort.clone());
     let dest = Expr::var("dest_data", outer_sort.clone());
     let value = Expr::var("elem_val", inner_sort);
 
-    let eq = coerce_eq_constraint(&dest, value, &outer_sort, false);
     assert!(
-        eq.is_some(),
-        "Element Array<BV64,BV64> → Array<BV64,Array<BV64,BV64>> should produce coerced constraint"
+        coerce_eq_constraint(&dest, value, &outer_sort, false).is_none(),
+        "an element-into-array coercion needs the context that books its havoc"
     );
-    // The result should be a bool (equality expression)
-    assert!(eq.as_ref().unwrap().sort().is_bool());
 }
 
 #[test]

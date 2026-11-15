@@ -28,6 +28,76 @@ use tracing::{debug, warn};
 use crate::codegen_ay::types::bool_sort;
 use trust_mc_core::{BmcVc, ChcVc, Decl};
 
+/// Define a named Boolean flag with an equivalent solver-facing encoding.
+///
+/// A visible datatype carrier selects two exact implications; other conditions
+/// retain Boolean equality. This is a syntactic encoding heuristic, not a claim
+/// that the equality branch is independent of datatype theory. In particular,
+/// separately asserted definitions of Bool leaves are not traversed.
+///
+/// Both representations retain every model of `flag = condition`, including
+/// secondary queries that do not assert the flag. Keep implication nodes in the
+/// datatype branch: a top-level OR of violation flags denotes the driver's
+/// legacy counterexample query goal.
+pub(in crate::codegen_ay) fn define_property_flag(
+    program: &mut AYProgram,
+    flag: Expr,
+    condition: Expr,
+) {
+    if property_condition_has_datatype_witness(&condition) {
+        program.assert(flag.clone().implies(condition.clone()));
+        program.assert(condition.implies(flag));
+    } else {
+        program.assert(flag.eq(condition));
+    }
+}
+
+/// Find positive typed datatype evidence in this condition's visible syntax.
+///
+/// No name matching or program-wide declaration test is used. Unrecognized
+/// forms that provide no visible witness select the default equality encoding;
+/// returning false does not certify absence of transitive datatype dependence.
+fn property_condition_has_datatype_witness(condition: &Expr) -> bool {
+    let mut expressions = vec![condition];
+    let mut sorts = Vec::new();
+    let mut seen_exprs = std::collections::HashSet::<*const ExprValue>::new();
+    let mut seen_sorts = std::collections::HashSet::<*const SortInner>::new();
+
+    while let Some(expr) = expressions.pop() {
+        // The outer sort belongs to Expr, separately from its shared value.
+        // Inspect each occurrence's metadata before deduplicating its children.
+        sorts.push(expr.sort());
+        if !seen_exprs.insert(std::ptr::from_ref(expr.value())) {
+            continue;
+        }
+        match expr.value() {
+            ExprValue::Forall { vars, .. } | ExprValue::Exists { vars, .. } => {
+                sorts.extend(vars.iter().map(|(_, sort)| sort));
+            }
+            _ => {}
+        }
+        if expr.value().is_known_variant() {
+            expressions.extend(expr.children());
+        }
+    }
+
+    while let Some(sort) = sorts.pop() {
+        if !seen_sorts.insert(std::ptr::from_ref(sort.inner())) {
+            continue;
+        }
+        match sort.inner() {
+            SortInner::Datatype(_) | SortInner::DatatypeRef(_) => return true,
+            SortInner::Array(array) => {
+                sorts.push(&array.index_sort);
+                sorts.push(&array.element_sort);
+            }
+            SortInner::Seq(element) => sorts.push(element),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Emits a BMC verification condition to a AY program.
 ///
 /// Converts the abstract `BmcVc` to a concrete `AYProgram` that can be
@@ -57,7 +127,19 @@ use trust_mc_core::{BmcVc, ChcVc, Decl};
 /// ENSURES: Output program contains one assert per constraint
 /// ENSURES: Output program contains violation disjunction or assert false if no violations
 /// ENSURES: Output program ends with check-sat (and get-value if produce_model)
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::codegen_ay) fn emit_bmc(vc: BmcVc) -> AYProgram {
+    emit_bmc_with_logic_override(vc, false)
+}
+
+/// [`emit_bmc`] for a VC whose logic the user may have named (`--ay-logic`,
+/// `AYConfig::logic_override`). A named logic is kept even when the VC uses
+/// floating point: the user's logic takes precedence over automatic selection
+/// (#621). The datatype upgrade still applies, as it always has.
+pub(in crate::codegen_ay) fn emit_bmc_with_logic_override(
+    vc: BmcVc,
+    logic_override: bool,
+) -> AYProgram {
     let mut program = AYProgram::new();
 
     // Set logic if specified
@@ -98,6 +180,7 @@ pub(in crate::codegen_ay) fn emit_bmc(vc: BmcVc) -> AYProgram {
     // sorts already emitted via vc.decls or the implicit vars above are not
     // re-declared. Must run BEFORE the asserts that reference these sorts.
     declare_intermediate_sorts(&mut program, &vc);
+    let uses_floating_point = bmc_vc_uses_floating_point(&vc);
 
     // Emit path constraints (move each Expr — no clones)
     for constraint in vc.constraints {
@@ -107,6 +190,9 @@ pub(in crate::codegen_ay) fn emit_bmc(vc: BmcVc) -> AYProgram {
     // Upgrade logic if datatypes were declared (QF_AUFBV doesn't support datatypes)
     // This must happen after declarations but before the final query.
     program.upgrade_logic_for_datatypes();
+    // Likewise for floating point (`uses_floating_point` was read before the
+    // constraints were moved into the program), unless the user named the logic.
+    upgrade_logic_for_floating_point(&mut program, uses_floating_point && !logic_override);
 
     // Build and emit violation disjunction (consume violations via into_iter)
     let violation_preds: Vec<Expr> = vc
@@ -130,8 +216,7 @@ pub(in crate::codegen_ay) fn emit_bmc(vc: BmcVc) -> AYProgram {
                 }
             };
             let pred = program.declare_const(&*pred_name, bool_sort());
-            // Assert: pred <=> violation_condition (move condition out of Violation)
-            program.assert(pred.clone().eq(v.condition));
+            define_property_flag(&mut program, pred.clone(), v.condition);
             pred
         })
         .collect();
@@ -183,6 +268,82 @@ fn emit_decl(program: &mut AYProgram, decl: &Decl) {
         Decl::Datatype { datatype } => {
             program.declare_datatype(ay_bindings::DatatypeSort::clone(datatype));
         }
+    }
+}
+
+/// Whether some term or declaration of `vc` reaches the floating-point theory.
+///
+/// A Rust float is carried as a bit-vector and enters the theory only inside
+/// an operation (`(fp.to_ieee_bv (fp.rem (fp ..) (fp ..)))` has sort
+/// `BitVec`), so every subterm's sort is read, not only the declarations.
+/// Subterms an `Arc` shares are visited once.
+pub(in crate::codegen_ay) fn bmc_vc_uses_floating_point(vc: &BmcVc) -> bool {
+    fn sort_uses_fp(sort: &Sort) -> bool {
+        match sort.inner() {
+            SortInner::FloatingPoint(..) => true,
+            SortInner::Array(array) => {
+                sort_uses_fp(&array.index_sort) || sort_uses_fp(&array.element_sort)
+            }
+            SortInner::Seq(element) => sort_uses_fp(element),
+            // A datatype already widens the logic to `ALL`
+            // (`upgrade_logic_for_datatypes`), whatever its fields are.
+            _ => false,
+        }
+    }
+    fn expr_uses_fp(expr: &Expr, seen: &mut std::collections::HashSet<*const ExprValue>) -> bool {
+        if sort_uses_fp(expr.sort()) {
+            return true;
+        }
+        seen.insert(std::ptr::from_ref(expr.value()))
+            && expr.children().any(|child| expr_uses_fp(child, seen))
+    }
+    let decl_uses_fp = |decl: &Decl| match decl {
+        Decl::Const { sort, .. } => sort_uses_fp(sort),
+        Decl::Fun { arg_sorts, ret_sort, .. } => {
+            arg_sorts.iter().any(sort_uses_fp) || sort_uses_fp(ret_sort)
+        }
+        Decl::Datatype { .. } => false,
+    };
+    let mut seen = std::collections::HashSet::new();
+    vc.decls.iter().any(decl_uses_fp)
+        || vc.constraints.iter().any(|expr| expr_uses_fp(expr, &mut seen))
+        || vc.violations.iter().any(|violation| expr_uses_fp(&violation.condition, &mut seen))
+        || vc.model_queries.iter().any(|expr| expr_uses_fp(expr, &mut seen))
+}
+
+/// Widen a BMC program's declared logic to `ALL` when its terms use the
+/// floating-point theory, as `upgrade_logic_for_datatypes` does for datatypes.
+///
+/// The default BMC logic is `QF_AUFBV`, which has no floating point, and a
+/// float operation (`fp.rem`, `fp.add`, ..) under it is outside the declared
+/// logic. ay takes a mapped declared logic as its routing, so such a VC goes
+/// to the array/bit-vector procedure, which does not interpret the FP
+/// operations. Its candidate model then fails ay's FP-aware model check and
+/// the verdict is `unknown`: measured on the float `%` / `rem_euclid` /
+/// `div_euclid` e2e tests (`x == 5.0 => x % 3.0 == 2.0`), with every ay CLI
+/// from 501caafdf to d80d17a90 and in process at d80d17a90, and a bare
+/// `fp.add` under `QF_BV` is `unknown` too. Under `ALL` ay picks the procedure
+/// from the content, `QF_ABVFP` for these VCs, and proves them. `ALL` rather
+/// than a named FP logic because the VC can also carry uninterpreted
+/// functions, integers or datatypes, and `ALL` admits each of them.
+///
+/// `HORN` is never widened (CHC semantics), and neither is a logic that
+/// already names floating point (`*FP*`) or is `ALL` / `ALL_SUPPORTED`. An
+/// unset logic stays unset: the solver then reads the content anyway. Callers
+/// skip the widening for a logic the user named (`--ay-logic`), which also
+/// makes `--ay-logic QF_AUFBV` the way to reproduce the narrow logic.
+pub(in crate::codegen_ay) fn upgrade_logic_for_floating_point(
+    program: &mut AYProgram,
+    uses_floating_point: bool,
+) {
+    if !uses_floating_point {
+        return;
+    }
+    let widen = program.get_logic().is_some_and(|logic| {
+        logic != "HORN" && logic != "ALL" && logic != "ALL_SUPPORTED" && !logic.contains("FP")
+    });
+    if widen {
+        program.set_logic("ALL");
     }
 }
 

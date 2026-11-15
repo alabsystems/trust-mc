@@ -56,13 +56,14 @@ fn test_hashmap_iter_next_with_valid_iterator() {
 
         // Create iterator with pos=0, len=2
         let data_val = Expr::var("test_data", data_sort);
-        let present_val = Expr::const_array(Sort::bool(), Expr::bool_const(true));
+        // `Expr::const_array` takes the INDEX sort first: presence is indexed by key.
+        let present_val = Expr::const_array(Sort::bitvec(32), Expr::bool_const(true));
         let keys_val = Expr::var("test_keys", keys_sort);
         let pos_val = Expr::bitvec_const(0u64, POINTER_WIDTH);
         let len_val = Expr::bitvec_const(2u64, POINTER_WIDTH);
         let iter_val = Expr::datatype_constructor(
             "HashMapIntoIter",
-            "HashMapIntoIter",
+            "HashMapIntoIter_mk",
             vec![data_val, present_val, keys_val, pos_val, len_val],
             iter_sort,
         );
@@ -213,7 +214,7 @@ fn test_hashset_iter_next_with_valid_iterator() {
         let len_val = Expr::bitvec_const(3u64, POINTER_WIDTH);
         let iter_val = Expr::datatype_constructor(
             "SetIntoIter",
-            "SetIntoIter",
+            "SetIntoIter_mk",
             vec![set_val, keys_val, pos_val, len_val],
             iter_sort,
         );
@@ -271,7 +272,7 @@ fn test_btreeset_iter_next_with_valid_iterator() {
         let len_val = Expr::bitvec_const(5u64, POINTER_WIDTH);
         let iter_val = Expr::datatype_constructor(
             "SetIntoIter",
-            "SetIntoIter",
+            "SetIntoIter_mk",
             vec![set_val, keys_val, pos_val, len_val],
             iter_sort,
         );

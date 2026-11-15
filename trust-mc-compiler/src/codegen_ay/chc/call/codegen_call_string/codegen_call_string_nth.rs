@@ -33,26 +33,104 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Build the precise `Option<u8>` / `Option<char>` result expression for
     /// `kani_str_bytes_nth` / `kani_str_chars_nth`.
     ///
-    /// Returns `Some(ite(index < len, Some(byte), None))` on success,
-    /// `None` if the Option sort cannot be decomposed.
+    /// Bytes: `ite(index < len, Some(byte), None)`. Chars: the `index`-th
+    /// char is the `index`-th byte only while every byte up to it is ASCII;
+    /// the model read the byte whatever it was, so `"h\u{e9}llo".chars().nth(1)`
+    /// was `Some('\u{c3}')`, proving value assertions Kani fails and
+    /// certifying the true values as Genuine failures (walker fail-closed
+    /// repair round 5, `str_chars_nth_multibyte_dual.rs`). The byte is used
+    /// under an ASCII guard over the bytes up to a constant index (or every
+    /// byte of a constant-length string), and a fresh value, a recorded
+    /// sound havoc, stands for the char otherwise. `None` if the Option sort
+    /// cannot be decomposed.
     pub(in crate::codegen_ay::chc) fn try_build_str_nth_result_expr(
-        &self,
+        &mut self,
         backing: &StringBacking,
         index_expr: Expr,
         dest_sort: &Sort,
         is_chars: bool,
     ) -> Option<Expr> {
         let in_bounds = index_expr.clone().bvult(backing.len.clone());
-        let byte_val = backing.data.clone().select(backing.offset.clone().bvadd(index_expr));
-        let payload = if is_chars {
-            // Zero-extend BV8 → BV32 for char representation
-            byte_val.zero_extend(24)
-        } else {
-            byte_val
-        };
-        let some_expr = self.make_some_expr_for_option(payload, dest_sort)?;
+        let byte_val =
+            backing.data.clone().select(backing.offset.clone().bvadd(index_expr.clone()));
         let none_expr = self.make_none_expr_for_option(dest_sort)?;
-        Some(Expr::ite(in_bounds, some_expr, none_expr))
+        if !is_chars {
+            let some_expr = self.make_some_expr_for_option(byte_val, dest_sort)?;
+            return Some(Expr::ite(in_bounds, some_expr, none_expr));
+        }
+        // Zero-extend BV8 → BV32 for char representation
+        let some_expr = self.make_some_expr_for_option(byte_val.zero_extend(24), dest_sort)?;
+        let multibyte = self.fresh_str_chars_nth_value(dest_sort.clone());
+        let in_bounds_value = match Self::str_ascii_prefix_guard(backing, &index_expr) {
+            Some(ascii) => Expr::ite(ascii, some_expr, multibyte),
+            None => multibyte,
+        };
+        Some(Expr::ite(in_bounds, in_bounds_value, none_expr))
+    }
+
+    /// The bytes of `backing` a char-by-char walk to `index` reads are all
+    /// ASCII: every byte up to a constant `index`, or every byte of a string
+    /// of constant length. `None` past `MAX_ASCII_GUARD_BYTES`, or when
+    /// neither is constant.
+    fn str_ascii_prefix_guard(backing: &StringBacking, index_expr: &Expr) -> Option<Expr> {
+        const MAX_ASCII_GUARD_BYTES: u64 = 256;
+        let count = match Self::try_eval_const_bv(index_expr) {
+            Some(index) => index.checked_add(1)?,
+            None => Self::try_eval_const_bv(&backing.len)?,
+        };
+        if count > MAX_ASCII_GUARD_BYTES {
+            return None;
+        }
+        let byte_width = backing.data.sort().array_sort()?.element_sort.bitvec_width()?;
+        let mut guard = Expr::bool_const(true);
+        for j in 0..count {
+            let byte = backing
+                .data
+                .clone()
+                .select(backing.offset.clone().bvadd(Expr::bitvec_const(j, POINTER_WIDTH)));
+            guard = guard.and(byte.bvult(Expr::bitvec_const(0x80u64, byte_width)));
+        }
+        Some(guard)
+    }
+
+    /// A fresh `Option<char>` for a `chars().nth(..)` whose bytes may hold a
+    /// multi-byte char: universally quantified, so it admits the real value,
+    /// and recorded with itself as the freed variable, so a counterexample
+    /// that reads it is never certified Genuine.
+    fn fresh_str_chars_nth_value(&mut self, sort: Sort) -> Expr {
+        use super::super::super::codegen_ctx::globals::chc_fresh_name;
+        use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
+        let name = chc_fresh_name("__str_chars_nth_multibyte");
+        Havoc::mint(self, sound_havoc::STR_CHARS_NTH_MULTIBYTE_OVERAPPROX, name, sort)
+    }
+
+    /// `kani_str_chars_nth` over the known bytes of a `&str`: the `index`-th
+    /// char of their UTF-8 decoding, exactly, as a chain over the char
+    /// positions when `index` is symbolic. `None` when the bytes are not
+    /// UTF-8 or the Option sort cannot be decomposed.
+    pub(in crate::codegen_ay::chc) fn str_chars_nth_from_bytes(
+        &self,
+        bytes: &[u8],
+        index_expr: &Expr,
+        dest_sort: &Sort,
+    ) -> Option<Expr> {
+        let chars: Vec<char> = std::str::from_utf8(bytes).ok()?.chars().collect();
+        let some_of = |c: char| {
+            self.make_some_expr_for_option(Expr::bitvec_const(u32::from(c), 32), dest_sort)
+        };
+        if let Some(index) = Self::try_eval_const_bv(index_expr) {
+            return match usize::try_from(index).ok().and_then(|index| chars.get(index)) {
+                Some(&c) => some_of(c),
+                None => self.make_none_expr_for_option(dest_sort),
+            };
+        }
+        let width = index_expr.sort().bitvec_width()?;
+        let mut result = self.make_none_expr_for_option(dest_sort)?;
+        for (position, &c) in chars.iter().enumerate().rev() {
+            let at = index_expr.clone().eq(Expr::bitvec_const(position as u64, width));
+            result = Expr::ite(at, some_of(c)?, result);
+        }
+        Some(result)
     }
 
     /// Resolve the whole-call result sort for `kani_str_*_nth`.
@@ -121,6 +199,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<Expr> {
         let (bytes, str_len) = self.try_extract_const_str_bytes(source_arg)?;
         let index_val = self.try_extract_const_usize_operand(index_arg, modified_locals)?;
+        if is_chars {
+            // The UTF-8 decoding, not the byte (`str_chars_nth_from_bytes`).
+            let index = Expr::bitvec_const(index_val as u64, POINTER_WIDTH);
+            return self.str_chars_nth_from_bytes(&bytes[..str_len], &index, dest_sort);
+        }
 
         if index_val < str_len {
             let byte = bytes[index_val];
@@ -146,64 +229,41 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         arg: &Operand,
     ) -> Option<(Vec<u8>, usize)> {
         match arg {
-            Operand::Constant(const_op) => Self::extract_str_bytes_from_const(&const_op.const_),
+            Operand::Constant(const_op) => self.extract_str_bytes_from_const(&const_op.const_),
             Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
                 self.trace_local_to_const_str_bytes(place.local)
             }
             // Part of #4118: handle Copy/Move with projections (e.g. &(*_X).data)
             Operand::Copy(place) | Operand::Move(place) => self.trace_str_field_of_ref(place),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
-    /// Extract concrete str bytes from a MIR constant that is `&str`.
+    /// Extract concrete str bytes from a MIR constant that is `&str`: the
+    /// pointee WINDOW its pointer names (`const_pointer::fixed_pointee`) — at
+    /// the pointer's offset, for the length its metadata word carries — every
+    /// byte initialized data. It read the target from byte 0 (and filled
+    /// uninitialized bytes with 0): `T = "hello".split_at(2).1` iterated as
+    /// `"hel"`, and `T.chars().nth(0) == Some('h')` PROVED.
     fn extract_str_bytes_from_const(
+        &self,
         mir_const: &rustc_public::ty::MirConst,
     ) -> Option<(Vec<u8>, usize)> {
-        use rustc_public::mir::alloc::GlobalAlloc;
-        use rustc_public::ty::{ConstantKind, TyConstKind};
+        use crate::codegen_ay::shared::const_pointer::{self, ConstRead};
 
         let ty = mir_const.ty();
         let TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) = ty.kind() else { return None };
         if !matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Str)) {
             return None;
         }
-
-        let alloc = match mir_const.kind() {
-            ConstantKind::Allocated(alloc) => alloc,
-            ConstantKind::Ty(ty_const) => match ty_const.kind() {
-                TyConstKind::Value(_ty, alloc) => alloc,
-                _ => return None,
-            },
-            _ => return None,
-        };
-
-        // &str fat pointer: [data_ptr (8 bytes), length (8 bytes)]
-        let ptr_bytes = (POINTER_WIDTH / 8) as usize;
-        if alloc.bytes.len() < ptr_bytes * 2 {
+        let bytes = const_pointer::const_bytes(mir_const)?;
+        let (r, window) = const_pointer::fixed_pointee(self.tcx, &bytes, 0, pointee)?;
+        let str_len = usize::try_from(r.metadata?).ok()?;
+        if str_len > 256 || window.len() != str_len {
             return None;
         }
-
-        // Extract length from second word
-        let mut len_arr = [0u8; 8];
-        for (i, opt_byte) in alloc.bytes[ptr_bytes..ptr_bytes * 2].iter().enumerate() {
-            len_arr[i] = (*opt_byte)?;
-        }
-        let str_len = u64::from_le_bytes(len_arr) as usize;
-        if str_len > 256 {
-            return None;
-        }
-
-        // Follow provenance to the actual string data allocation
-        let alloc_id = alloc.provenance.ptrs.first()?.1.0;
-        let GlobalAlloc::Memory(inner_alloc) = GlobalAlloc::from(alloc_id) else {
-            return None;
-        };
-        if inner_alloc.bytes.len() < str_len {
-            return None;
-        }
-        let bytes: Vec<u8> =
-            inner_alloc.bytes.iter().take(str_len).map(|opt| opt.unwrap_or(0)).collect();
-        Some((bytes, str_len))
+        Some((window.read_data_bytes(0, str_len)?, str_len))
     }
 
     /// Trace a local through MIR assignments and known string-passthrough
@@ -222,10 +282,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         continue;
                     }
                     match rhs {
-                        Rvalue::Use(Operand::Constant(const_op)) => {
-                            return Self::extract_str_bytes_from_const(&const_op.const_);
+                        Rvalue::Use(Operand::Constant(const_op), ..) => {
+                            return self.extract_str_bytes_from_const(&const_op.const_);
                         }
-                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
                         | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
                             if src.projection.is_empty() =>
                         {
@@ -379,7 +439,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #4118: When passthrough callee's arg is a direct
         // constant (e.g. String::from("literal")), extract bytes directly.
         if let Operand::Constant(const_op) = &args[0] {
-            if let Some(result) = Self::extract_str_bytes_from_const(&const_op.const_) {
+            if let Some(result) = self.extract_str_bytes_from_const(&const_op.const_) {
                 return Some(CallTraceResult::Resolved(result));
             }
         }

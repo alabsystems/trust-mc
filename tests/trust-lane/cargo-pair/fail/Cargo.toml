@@ -1,0 +1,15 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# T1 cargo pair, failing half: a build script and a proc-macro dependency.
+[package]
+name = "cargo-pair-fail"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pair-macros = { path = "../pair-macros" }
+
+# A workspace of its own, so the fixture never joins a workspace above it.
+[workspace]

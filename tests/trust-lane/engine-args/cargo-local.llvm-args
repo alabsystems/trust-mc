@@ -1,0 +1,13 @@
+# The `-Cllvm-args` group trust-mc-driver's Trustc route passes only to the
+# target package of a cargo build (`cargo rustc -- ...`). rustc concatenates it
+# with cargo-dependency.llvm-args. See standalone.llvm-args.
+--trust-mc-engine-args=pct1:9
+--reachability=harnesses
+--log-level=warn
+--assertion-reach-checks
+--harness
+check_add
+--c-lib
+/opt/Application%20Support/stub.o
+--default-unwind
+3

@@ -223,8 +223,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return None;
         }
 
-        let lhs = self.codegen_ord_operand_value(&args[0])?;
-        let rhs = self.codegen_ord_operand_value(&args[1])?;
+        let (lhs, rhs) = match self.ord_operand_values(&args[..2], destination) {
+            Ok(mut values) => {
+                let rhs = values.pop()?;
+                (values.pop()?, rhs)
+            }
+            Err(Some(())) => return target,
+            Err(None) => return None,
+        };
         let raw_pointer = self.operand_is_raw_pointer_like(&args[0])
             || self.operand_is_raw_pointer_like(&args[1]);
 
@@ -282,6 +288,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // #1043: Non-Int/non-BitVec sort - create fresh Int symbol to avoid sort mismatch
                 warn!(sort = ?lhs.sort(), "Unexpected sort in codegen_ord_cmp, creating Int symbol");
                 let sym_name = self.ctx.fresh_name("ay_ord_cmp_lhs_int");
+                self.ctx.bmc_sound_havoc("ord_cmp_lhs_int");
                 self.ctx.declare_var(&sym_name, int_sort())
             };
             let rhs_int = if rhs_is_int {
@@ -292,6 +299,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // #1043: Non-Int/non-BitVec sort - create fresh Int symbol to avoid sort mismatch
                 warn!(sort = ?rhs.sort(), "Unexpected sort in codegen_ord_cmp, creating Int symbol");
                 let sym_name = self.ctx.fresh_name("ay_ord_cmp_rhs_int");
+                self.ctx.bmc_sound_havoc("ord_cmp_rhs_int");
                 self.ctx.declare_var(&sym_name, int_sort())
             };
             // Int comparison: use arithmetic < operator
@@ -325,6 +333,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 } else {
                     // Unsupported sort - create symbolic result
                     let sym_name = self.ctx.fresh_name("ay_ord_cmp_lhs");
+                    self.ctx.bmc_sound_havoc("ord_cmp_lhs");
                     self.ctx.declare_var(&sym_name, int_sort())
                 };
                 let rhs_int = if rhs_coerced.sort().is_bitvec() {
@@ -333,6 +342,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     rhs_coerced
                 } else {
                     let sym_name = self.ctx.fresh_name("ay_ord_cmp_rhs");
+                    self.ctx.bmc_sound_havoc("ord_cmp_rhs");
                     self.ctx.declare_var(&sym_name, int_sort())
                 };
                 let lt_expr = lhs_int.clone().int_lt(rhs_int.clone());
@@ -358,6 +368,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 "codegen_ord_cmp: sort mismatch in eq comparison, returning symbolic"
             );
             let sym_name = self.ctx.fresh_name("ay_ord_cmp_eq");
+            self.ctx.bmc_sound_havoc("ord_cmp_eq");
             self.ctx.declare_var(&sym_name, bool_sort())
         };
 

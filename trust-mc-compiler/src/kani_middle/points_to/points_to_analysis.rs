@@ -39,16 +39,41 @@ use crate::{
 use rustc_middle::{
     mir::{
         BasicBlock, BinOp, Body, CallReturnPlaces, Location, NonDivergingIntrinsic, Operand, Place,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorEdges,
-        TerminatorKind,
+        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
     },
     ty::{Instance, InstanceKind, List, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_mir_dataflow::{Analysis, Forward, JoinSemiLattice};
 use rustc_public::mir::{Body as StableBody, mono::Instance as StableInstance};
 use rustc_public::rustc_internal;
-use rustc_span::{DUMMY_SP, source_map::Spanned};
+use rustc_span::DUMMY_SP;
+// Trust made the `rustc_span::source_map` re-export of `Spanned` private.
+#[cfg(trust_toolchain)]
+use rustc_span::Spanned;
+#[cfg(not(trust_toolchain))]
+use rustc_span::source_map::Spanned;
 use std::collections::HashSet;
+
+#[cfg(not(all(trust_toolchain, version("1.101"))))]
+type PrimaryTerminatorEffect<'mir, 'tcx> = rustc_middle::mir::TerminatorEdges<'mir, 'tcx>;
+#[cfg(all(trust_toolchain, version("1.101")))]
+type PrimaryTerminatorEffect<'mir, 'tcx> = ();
+
+// Modern dataflow obtains the pure successor edges before the primary
+// effect. The older API requires the identical edges as its return value;
+// neither endpoint changes the graph transfer or edge effects.
+fn finish_terminator_effect<'mir, 'tcx>(
+    terminator: &'mir Terminator<'tcx>,
+) -> PrimaryTerminatorEffect<'mir, 'tcx> {
+    #[cfg(not(all(trust_toolchain, version("1.101"))))]
+    {
+        terminator.edges()
+    }
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    {
+        let _ = terminator;
+    }
+}
 
 /// Main points-to analysis object.
 struct PointsToAnalysis<'a, 'tcx> {
@@ -177,13 +202,14 @@ impl<'tcx> Analysis<'tcx> for PointsToAnalysis<'_, 'tcx> {
             | StatementKind::SetDiscriminant { .. }
             | StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..)
-            | StatementKind::Retag(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
             | StatementKind::ConstEvalCounter
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::Nop => { /* This is a no-op with regard to aliasing. */ }
+            #[cfg(not(trust_toolchain))]
+            StatementKind::Retag(..) => { /* This is a no-op with regard to aliasing. */ }
         }
     }
 
@@ -192,7 +218,7 @@ impl<'tcx> Analysis<'tcx> for PointsToAnalysis<'_, 'tcx> {
         state: &mut Self::Domain,
         terminator: &'mir Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) -> PrimaryTerminatorEffect<'mir, 'tcx> {
         if let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind {
             // Attempt to resolve callee. For now, we panic if the callee cannot be resolved (e.g.,
             // if a function pointer call is used), but we could leverage the call graph to resolve
@@ -201,7 +227,7 @@ impl<'tcx> Analysis<'tcx> for PointsToAnalysis<'_, 'tcx> {
                 Ok(instance) => instance,
                 Err(reason) => {
                     self.apply_unresolved_call_effect(state, args, destination, location, &reason);
-                    return terminator.edges();
+                    return finish_terminator_effect(terminator);
                 }
             };
             match instance.def {
@@ -345,7 +371,7 @@ impl<'tcx> Analysis<'tcx> for PointsToAnalysis<'_, 'tcx> {
                 }
             }
         }
-        terminator.edges()
+        finish_terminator_effect(terminator)
     }
 
     /// We don't care about this and just need to implement this to implement the trait.
@@ -367,6 +393,14 @@ fn try_resolve_instance<'tcx>(
     let ty = func.ty(body, tcx);
     match ty.kind() {
         TyKind::FnDef(def, args) => {
+            // Resolution requires concrete monomorphized arguments. Do not
+            // discard a modern function item's bound variables to obtain
+            // them: the existing unresolved-call path conservatively handles
+            // such an operand instead.
+            #[cfg(all(trust_toolchain, version("1.101")))]
+            let args = args.no_bound_vars().ok_or_else(|| {
+                format!("trust_mc cannot resolve a function operand with bound arguments: {ty:?}")
+            })?;
             // Span here is used for error-reporting, which we don't expect to encounter anyway, so
             // it is ok to use a dummy.
             Ok(Instance::expect_resolve(
@@ -416,6 +450,8 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
                     HashSet::new()
                 }
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => HashSet::new(),
         }
     }
 
@@ -438,6 +474,8 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
                     HashSet::new()
                 }
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => HashSet::new(),
         }
     }
 
@@ -466,6 +504,9 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
                         .join(&state.transitive_closure(state.resolve_place(place, self.instance)));
                 }
                 Operand::Constant(_) => {}
+                // A runtime-checks flag is a `bool`: it cannot carry a pointer.
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => {}
             }
         }
 
@@ -551,6 +592,9 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
                         affected_nodes.insert(MemLoc::new_static_allocation(static_def_id));
                     }
                 }
+                // A runtime-checks flag is a `bool`: it cannot carry a pointer.
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => {}
             }
         }
 
@@ -579,15 +623,23 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
         match rvalue {
             // Using the operand unchanged requires determining where it could point, which
             // `successors_for_operand` does.
-            Rvalue::Use(operand)
-            | Rvalue::ShallowInitBox(operand, _)
+            Rvalue::Use(operand, ..)
             | Rvalue::Cast(_, operand, _)
             | Rvalue::Repeat(operand, ..)
             | Rvalue::WrapUnsafeBinder(operand, _) => self.successors_for_operand(state, operand),
+            #[cfg(not(trust_toolchain))]
+            Rvalue::ShallowInitBox(operand, _) => self.successors_for_operand(state, operand),
             Rvalue::Ref(_, _, ref_place) | Rvalue::RawPtr(_, ref_place) => {
                 // Here, a reference to a place is created, which leaves the place
                 // unchanged.
                 state.resolve_place(*ref_place, self.instance)
+            }
+            // A reborrow is a bitwise copy of the value stored at the place: codegen lowers it
+            // to `Operand::Copy(place)` and the interpreter to `copy_op`. Unlike `Ref`, the
+            // result points wherever that value points, not at the place itself.
+            #[cfg(trust_toolchain)]
+            Rvalue::Reborrow(_, _, place) => {
+                state.successors(&state.resolve_place(*place, self.instance))
             }
             Rvalue::BinaryOp(bin_op, operands) => {
                 let (l_operand, r_operand) = operands.as_ref();
@@ -638,7 +690,12 @@ impl<'tcx> PointsToAnalysis<'_, 'tcx> {
                 // The same story from BinOp applies here, too. Need to track those things.
                 self.successors_for_operand(state, operand)
             }
-            Rvalue::NullaryOp(..) | Rvalue::Discriminant(..) => {
+            Rvalue::Discriminant(..) => {
+                // All of those should yield a constant.
+                HashSet::new()
+            }
+            #[cfg(not(trust_toolchain))]
+            Rvalue::NullaryOp(..) => {
                 // All of those should yield a constant.
                 HashSet::new()
             }
@@ -928,6 +985,97 @@ fn field_then_deref(p: *const (i32, *const i32)) -> i32 {
         )
     }
 
+    #[cfg(all(trust_toolchain, version("1.101")))]
+    #[test]
+    fn native_function_operand_resolves_only_without_bound_arguments() {
+        use rustc_middle::ty::{self, Binder, Ty};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SOURCE: &str = r#"
+            #[inline(never)]
+            pub fn typed_callee<'a: 'a, T: Copy>(value: &'a T) -> &'a T { value }
+            pub fn observed_caller(value: &u8) -> &u8 { typed_callee(value) }
+        "#;
+        let observed = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&observed);
+        with_tcx(SOURCE, move |tcx| {
+            // Diagnostic path printing may omit the local crate prefix. Bind
+            // these root functions by compiler names and ownership instead.
+            let source_function = |name: &str| {
+                let matches: Vec<_> = tcx
+                    .mir_keys(())
+                    .iter()
+                    .map(|id| id.to_def_id())
+                    .filter(|id| {
+                        tcx.def_kind(*id) == rustc_hir::def::DefKind::Fn
+                            && tcx.parent(*id) == rustc_hir::def_id::CRATE_DEF_ID.to_def_id()
+                            && tcx.opt_item_name(*id).is_some_and(|item| item.as_str() == name)
+                    })
+                    .collect();
+                assert_eq!(matches.len(), 1, "unique compiler-owned root function {name}");
+                matches[0]
+            };
+            let caller = source_function("observed_caller");
+            let callee = source_function("typed_callee");
+            let body = tcx.optimized_mir(caller);
+            let original_operand = body
+                .basic_blocks
+                .iter()
+                .find_map(|block| match &block.terminator().kind {
+                    TerminatorKind::Call { func, .. } => {
+                        matches!(func.ty(body, tcx).kind(), TyKind::FnDef(def, _) if *def == callee)
+                            .then_some(func)
+                    }
+                    _ => None,
+                })
+                .expect("real source call to typed_callee must remain in MIR");
+            let resolved = try_resolve_instance(body, original_operand, tcx)
+                .expect("ordinary compiler-produced function operand resolves");
+            assert_eq!(resolved.def_id(), callee);
+
+            // Keep the same actual source definition and u8 instantiation, but
+            // bind its early lifetime in the function-item type. The lifetime
+            // bound in SOURCE ensures that this is a genuine generic argument.
+            let kind = ty::BoundRegionKind::Anon;
+            let region = ty::Region::new_bound(
+                tcx,
+                ty::INNERMOST,
+                ty::BoundRegion { var: ty::BoundVar::ZERO, kind },
+            );
+            let args = tcx.mk_args(&[region.into(), tcx.types.u8.into()]);
+            let variables = tcx.mk_bound_variable_kinds(&[ty::BoundVariableKind::Region(kind)]);
+            let bound_ty = Ty::new_fn_def(tcx, callee, Binder::bind_with_vars(args, variables));
+            let TyKind::FnDef(bound_def, bound_args) = bound_ty.kind() else {
+                panic!("native FnDef constructor must retain its kind");
+            };
+            assert_eq!(*bound_def, callee);
+            assert_eq!(bound_args.bound_vars().len(), 1);
+            assert!(
+                bound_args.no_bound_vars().is_none(),
+                "the argument really contains its binder"
+            );
+
+            let mut bound_body = body.clone();
+            let local = bound_body
+                .local_decls
+                .push(rustc_middle::mir::LocalDecl::new(bound_ty, tcx.def_span(callee)));
+            let bound_operand = Operand::Copy(Place::from(local));
+            assert!(
+                matches!(
+                    try_resolve_instance(&bound_body, &bound_operand, tcx),
+                    Err(reason) if reason.contains("bound arguments"),
+                ),
+                "a bound function item cannot be resolved as the concrete source callee"
+            );
+            completed.store(true, Ordering::Relaxed);
+        });
+        assert!(
+            observed.load(Ordering::Relaxed),
+            "the native callee-resolution callback must finish"
+        );
+    }
+
     struct PlaceCollector<'tcx> {
         places: Vec<Place<'tcx>>,
     }
@@ -1007,6 +1155,8 @@ fn field_then_deref(p: *const (i32, *const i32)) -> i32 {
             let arg_place = match &args[0].node {
                 Operand::Copy(place) | Operand::Move(place) => *place,
                 Operand::Constant(_) => panic!("expected place operand for arg"),
+                #[cfg(trust_toolchain)]
+                Operand::RuntimeChecks(_) => panic!("expected place operand for arg"),
             };
             let arg_base = Place { local: arg_place.local, projection: List::empty() };
             let arg_mem = MemLoc::new_stack_allocation(instance, arg_base);

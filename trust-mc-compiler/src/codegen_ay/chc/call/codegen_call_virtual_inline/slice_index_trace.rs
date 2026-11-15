@@ -14,6 +14,8 @@ fn operand_source_place(operand: &Operand) -> Option<rustc_public::mir::Place> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => Some(place.clone()),
         Operand::Constant(_) => None,
+        #[cfg(trust_toolchain)]
+        Operand::RuntimeChecks(_) => None,
     }
 }
 
@@ -131,7 +133,7 @@ pub(super) fn trace_inline_source_place<'tcx, 'body>(
                     | rustc_public::mir::Rvalue::AddressOf(_, place) => {
                         recurse_or_place(place.clone())
                     }
-                    rustc_public::mir::Rvalue::Use(operand)
+                    rustc_public::mir::Rvalue::Use(operand, ..)
                     | rustc_public::mir::Rvalue::Cast(_, operand, _) => {
                         let source_place = operand_source_place(operand).and_then(|place| {
                             if place.projection.len() == 1

@@ -292,7 +292,15 @@ fn test_emit_goto_rule_extra_refreshes_late_output_args() {
             let instance = find_instance_by_suffix(ctx.tcx, "probe_goto_late_output");
             let body = instance.body().expect("body");
             let mut chc_ctx =
-                ChcCtx::new(ctx.tcx, &body, "probe_goto_late_output", ChcConfig::default());
+                ChcCtx::new(
+                ctx.tcx,
+                &body,
+                "probe_goto_late_output",
+                // Full frame: the arity check below compares the head against the FULL
+                // stale output_args; frame narrowing (default on) projects heads onto a
+                // block's live columns, which is not what this test is about.
+                ChcConfig { frame_narrowing: false, ..ChcConfig::default() },
+            );
 
             chc_ctx.declare_block_relations();
             chc_ctx.declare_error_relation();
@@ -326,10 +334,13 @@ fn test_emit_goto_rule_extra_refreshes_late_output_args() {
             // Build a fresh from_app that includes the late var (source side is fresh).
             let from_app = RelationApp::new(&from_rel, chc_ctx.project_state_args(0));
 
-            let target = *chc_ctx
+            // `block_relations` is a HashMap: pick the target deterministically.
+            let target = chc_ctx
                 .block_relations
                 .keys()
-                .find(|&&idx| idx != 0)
+                .copied()
+                .filter(|&idx| idx != 0)
+                .min()
                 .expect("at least one non-entry block");
 
             let before_len = chc_ctx.vc.rules.len();
@@ -520,6 +531,308 @@ fn test_emit_guarded_goto_rule_false_guard_skips() {
                 chc_ctx.vc.rules.len(),
                 before_len,
                 "guard=false should not emit any rule (dead branch)"
+            );
+        },
+    );
+}
+
+/// A guard folding to `false` on an edge into an `Unreachable` target must leave
+/// a real per-BLOCK obligation, not a ruleless property.
+///
+/// Registering the property and emitting nothing is what the driver reads as
+/// `LostErrorRules` and refuses (it cannot tell that absence from a check the
+/// encoder dropped), which cost 22 Kani-corpus units Kani proves. The obligation
+/// emitted here is the canonical `false => error_p{id}`: a literal-false body
+/// with no body relation, the shape `eliminate_trivially_false_rules` retains and
+/// `prune_orphan_block_rules` cannot orphan, which a solver decides for itself.
+#[test]
+fn test_guard_false_into_unreachable_emits_per_block_obligation() {
+    with_test_ay_ctx_for_source(
+        r#"
+        #![allow(dead_code)]
+        enum Two {
+            A,
+            B,
+        }
+        pub fn probe_unreachable_target(t: Two) -> u32 {
+            // An EXHAUSTIVE match on a two-variant enum: rustc switches on the
+            // discriminant and lowers the `otherwise` arm — which no value can take —
+            // to a MIR `Unreachable` block. That is the shape this file is about.
+            //
+            // `unsafe { unreachable_unchecked() }` does NOT produce one: in
+            // unoptimized MIR it stays a `Call` to the intrinsic, which is why the
+            // first version of these tests panicked looking for an Unreachable block
+            // (and why the corpus units that register `unreachable` properties are
+            // niche/`?` and iterator shapes, not `unreachable_unchecked`).
+            match t {
+                Two::A => 1,
+                Two::B => 2,
+            }
+        }
+        "#,
+        |ctx| {
+            let instance = find_instance_by_suffix(ctx.tcx, "probe_unreachable_target");
+            let body = instance.body().expect("body");
+            let mut chc_ctx =
+                ChcCtx::new(ctx.tcx, &body, "probe_unreachable_target", ChcConfig::default());
+            chc_ctx.declare_block_relations();
+            chc_ctx.declare_error_relation();
+
+            let unreachable_bb = body
+                .blocks
+                .iter()
+                .position(|b| {
+                    matches!(b.terminator.kind, rustc_public::mir::TerminatorKind::Unreachable)
+                })
+                .expect("the wildcard arm lowers to an Unreachable block");
+
+            let output_args: Vec<_> = chc_ctx
+                .state_var_mgr
+                .state_vars
+                .iter()
+                .map(|(name, sort)| Expr::var(name.to_string(), sort.clone()))
+                .collect();
+            let from_rel = chc_ctx.block_relations.get(&0).expect("bb0 relation").clone();
+            let from_app = RelationApp::new(&from_rel, output_args.clone());
+
+            chc_ctx.emit_guarded_goto_rule(
+                &from_app,
+                unreachable_bb,
+                &output_args,
+                &[],
+                Expr::bool_const(false),
+            );
+
+            let unreachable_props: Vec<_> = chc_ctx
+                .vc
+                .properties
+                .iter()
+                .filter(|p| p.kind == trust_mc_core::violation::PropertyKind::Unreachable)
+                .collect();
+            assert_eq!(
+                unreachable_props.len(),
+                1,
+                "exactly one per-block unreachable property is registered"
+            );
+            let relation = unreachable_props[0].relation.clone();
+            assert_eq!(unreachable_props[0].bb, unreachable_bb, "the property is keyed by block");
+
+            let obligation = chc_ctx
+                .vc
+                .rules
+                .iter()
+                .find(|r| r.head.name.as_str() == relation)
+                .expect("the registered property must not be ruleless");
+            assert!(
+                obligation.body.relation.is_none(),
+                "the obligation carries no body relation, so orphan pruning cannot take it"
+            );
+            assert!(
+                obligation
+                    .body
+                    .constraints
+                    .iter()
+                    .all(|c| matches!(c.value(), ay_bindings::ExprValue::BoolConst(false))),
+                "the obligation body is the literal false that const-prop retains"
+            );
+            // NO encode-time credit: the property carries no `discharged_at_encode`
+            // reason and a live `error_p{id}` rule, so the gate that licenses the
+            // whole-VC canonical discharge must refuse. The verdict stays the
+            // solver's to give — main credits this shape as a proof WITHOUT a
+            // solver (`[AY:PROOF] ... (false error obligation)`), which is what
+            // this encoding replaces.
+            assert!(
+                unreachable_props[0].discharged_at_encode.is_none(),
+                "an infeasible EDGE must not mark the block's property discharged"
+            );
+            assert!(
+                !chc_ctx.vc.all_properties_discharged_at_encode(),
+                "the emitted obligation must keep the whole-VC discharge gate shut"
+            );
+        },
+    );
+}
+
+/// Two infeasible edges into the SAME `Unreachable` block register ONE property
+/// and ONE obligation: the obligation is per block, because a block can be
+/// entered by several edges and one dead edge proves nothing about the others.
+#[test]
+fn test_two_infeasible_edges_share_one_unreachable_obligation() {
+    with_test_ay_ctx_for_source(
+        r#"
+        #![allow(dead_code)]
+        enum Two {
+            A,
+            B,
+        }
+        pub fn probe_unreachable_shared(t: Two) -> u32 {
+            // An EXHAUSTIVE match on a two-variant enum: rustc switches on the
+            // discriminant and lowers the `otherwise` arm — which no value can take —
+            // to a MIR `Unreachable` block. That is the shape this file is about.
+            //
+            // `unsafe { unreachable_unchecked() }` does NOT produce one: in
+            // unoptimized MIR it stays a `Call` to the intrinsic, which is why the
+            // first version of these tests panicked looking for an Unreachable block
+            // (and why the corpus units that register `unreachable` properties are
+            // niche/`?` and iterator shapes, not `unreachable_unchecked`).
+            match t {
+                Two::A => 1,
+                Two::B => 2,
+            }
+        }
+        "#,
+        |ctx| {
+            let instance = find_instance_by_suffix(ctx.tcx, "probe_unreachable_shared");
+            let body = instance.body().expect("body");
+            let mut chc_ctx =
+                ChcCtx::new(ctx.tcx, &body, "probe_unreachable_shared", ChcConfig::default());
+            chc_ctx.declare_block_relations();
+            chc_ctx.declare_error_relation();
+
+            let unreachable_bb = body
+                .blocks
+                .iter()
+                .position(|b| {
+                    matches!(b.terminator.kind, rustc_public::mir::TerminatorKind::Unreachable)
+                })
+                .expect("the wildcard arm lowers to an Unreachable block");
+
+            let output_args: Vec<_> = chc_ctx
+                .state_var_mgr
+                .state_vars
+                .iter()
+                .map(|(name, sort)| Expr::var(name.to_string(), sort.clone()))
+                .collect();
+            let from_rel = chc_ctx.block_relations.get(&0).expect("bb0 relation").clone();
+            let from_app = RelationApp::new(&from_rel, output_args.clone());
+
+            for _ in 0..2 {
+                chc_ctx.emit_guarded_goto_rule(
+                    &from_app,
+                    unreachable_bb,
+                    &output_args,
+                    &[],
+                    Expr::bool_const(false),
+                );
+            }
+
+            assert_eq!(
+                chc_ctx
+                    .vc
+                    .properties
+                    .iter()
+                    .filter(|p| p.kind == trust_mc_core::violation::PropertyKind::Unreachable)
+                    .count(),
+                1,
+                "the second dead edge into the same block registers no second property"
+            );
+            let relation = chc_ctx
+                .vc
+                .properties
+                .iter()
+                .find(|p| p.kind == trust_mc_core::violation::PropertyKind::Unreachable)
+                .expect("property")
+                .relation
+                .clone();
+            assert_eq!(
+                chc_ctx.vc.rules.iter().filter(|r| r.head.name.as_str() == relation).count(),
+                1,
+                "one obligation per block, not one per dead edge"
+            );
+        },
+    );
+}
+
+/// A LIVE edge into an `Unreachable` target derives the NAMED per-block property,
+/// not the anonymous aggregate `error`.
+///
+/// `error_only_region_head` used to hand an `Unreachable` target the aggregate
+/// head and register no property at all, so the check reached the driver as
+/// `chc.0` — unnameable, and invisible to every property-keyed test (the hole
+/// 1a3b1a0f6 had to patch in the discharge gate).
+#[test]
+fn test_live_edge_into_unreachable_derives_named_property() {
+    with_test_ay_ctx_for_source(
+        r#"
+        #![allow(dead_code)]
+        enum Two {
+            A,
+            B,
+        }
+        pub fn probe_unreachable_live(t: Two) -> u32 {
+            // An EXHAUSTIVE match on a two-variant enum: rustc switches on the
+            // discriminant and lowers the `otherwise` arm — which no value can take —
+            // to a MIR `Unreachable` block. That is the shape this file is about.
+            //
+            // `unsafe { unreachable_unchecked() }` does NOT produce one: in
+            // unoptimized MIR it stays a `Call` to the intrinsic, which is why the
+            // first version of these tests panicked looking for an Unreachable block
+            // (and why the corpus units that register `unreachable` properties are
+            // niche/`?` and iterator shapes, not `unreachable_unchecked`).
+            match t {
+                Two::A => 1,
+                Two::B => 2,
+            }
+        }
+        "#,
+        |ctx| {
+            let instance = find_instance_by_suffix(ctx.tcx, "probe_unreachable_live");
+            let body = instance.body().expect("body");
+            let mut chc_ctx =
+                ChcCtx::new(ctx.tcx, &body, "probe_unreachable_live", ChcConfig::default());
+            chc_ctx.declare_block_relations();
+            chc_ctx.declare_error_relation();
+
+            let unreachable_bb = body
+                .blocks
+                .iter()
+                .position(|b| {
+                    matches!(b.terminator.kind, rustc_public::mir::TerminatorKind::Unreachable)
+                })
+                .expect("the wildcard arm lowers to an Unreachable block");
+
+            let output_args: Vec<_> = chc_ctx
+                .state_var_mgr
+                .state_vars
+                .iter()
+                .map(|(name, sort)| Expr::var(name.to_string(), sort.clone()))
+                .collect();
+            let from_rel = chc_ctx.block_relations.get(&0).expect("bb0 relation").clone();
+            let from_app = RelationApp::new(&from_rel, output_args.clone());
+            // The error-edge path is reached through the ordinary emitter: an
+            // `Unreachable` block is excluded from relation declaration, so the
+            // transition has no target relation and `try_emit_unreachable_error`
+            // owns the edge.
+            assert!(
+                !chc_ctx.block_relations.contains_key(&unreachable_bb),
+                "an Unreachable block is excluded from relation declaration"
+            );
+            let before = chc_ctx.vc.rules.len();
+
+            chc_ctx.emit_goto_rule_extra(&from_app, unreachable_bb, &output_args, &[], []);
+
+            let emitted = &chc_ctx.vc.rules[before..];
+            assert!(
+                emitted.iter().any(|r| r.head.name.as_str().starts_with("error_p")),
+                "the live edge derives a NAMED per-property head"
+            );
+            assert!(
+                !emitted.iter().any(|r| r.head.name.as_str() == "error"
+                    && r.body
+                        .relation
+                        .as_ref()
+                        .is_none_or(|app| !app.name.as_str().starts_with("error_p"))),
+                "nothing derives the anonymous aggregate error directly"
+            );
+            assert_eq!(
+                chc_ctx
+                    .vc
+                    .properties
+                    .iter()
+                    .filter(|p| p.kind == trust_mc_core::violation::PropertyKind::Unreachable)
+                    .count(),
+                1,
+                "the Unreachable target registers its property"
             );
         },
     );

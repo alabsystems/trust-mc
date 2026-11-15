@@ -29,9 +29,10 @@
 //! `None` = the value went symbolic (havoc — sound, imprecise).
 
 use trust_ir::inst::ICmpOp;
-use trust_ir::value::FuncId;
+use trust_ir::interpret::{InterpretErrorCode, InterpretValue, Interpreter};
+use trust_ir::value::{FuncId, ValueId};
 use trust_ir::{Constant, FieldDef, ProofAnnotation, StructDef, StructRepr, Ty};
-use trust_ir_build::ModuleBuilder;
+use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 use trust_mc_core::chc::ChcVc;
 use trust_mc_core::chc_const_prop::eval::try_eval_to_bool;
 use trust_mc_trust_bmc::{
@@ -65,12 +66,63 @@ enum Target {
 }
 
 struct Probe {
+    module: trust_ir::Module,
+    function: FuncId,
     vc: ChcVc,
+    module_input_refusal: Option<String>,
     diagnostics: Vec<TrustIrChcDiagnostic>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Construction {
+    Complete,
+    LegacyUndef,
+}
+
+fn pair(
+    fb: &mut FunctionBuilder<'_>,
+    ty: Ty,
+    first: ValueId,
+    second: ValueId,
+    construction: Construction,
+) -> ValueId {
+    match construction {
+        Construction::Complete => fb.make_aggregate(ty, vec![first, second]),
+        Construction::LegacyUndef => {
+            let undef = fb.undef(ty.clone());
+            let first = fb.insert_field(ty.clone(), undef, 0, first);
+            fb.insert_field(ty, first, 1, second)
+        }
+    }
+}
+
+fn translate_probe(module: trust_ir::Module, function: FuncId) -> Probe {
+    let out = trust_ir_function_to_chc_translation_output(
+        &module,
+        function,
+        &TranslateOptions::default(),
+    )
+    .expect("interior-pointer fixture translates");
+    Probe {
+        module,
+        function,
+        vc: out.vc,
+        module_input_refusal: out.module_input_refusal,
+        diagnostics: out.diagnostics,
+    }
 }
 
 /// Build `f`, writing `written` into `s.a` through `target`, and translate it.
 fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
+    probe_construction(target, written, valid_borrow, Construction::Complete)
+}
+
+fn probe_construction(
+    target: Target,
+    written: i128,
+    valid_borrow: bool,
+    construction: Construction,
+) -> Probe {
     let mut mb = ModuleBuilder::new("interior_ptr");
     let struct_id = mb.add_struct(StructDef {
         id: trust_ir::value::StructId::new(0),
@@ -82,12 +134,19 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
         size: Some(8),
         align: Some(4),
         repr: StructRepr::Rust,
+        origin: None,
     });
     let sty = Ty::Struct(struct_id);
-    let ft = mb.add_func_type(vec![Ty::U32], vec![Ty::U32]);
+    let has_unknown_pointer = construction == Construction::Complete
+        && matches!(target, Target::UnknownAfterEscape | Target::UnknownWithNoEscape);
+    let params = if has_unknown_pointer { vec![Ty::U32, Ty::Ptr] } else { vec![Ty::U32] };
+    let ft = mb.add_func_type(params, vec![Ty::U32]);
     // A callee an interior pointer can escape into.
-    let sink_ty = mb.add_func_type(vec![Ty::Ptr], vec![Ty::Unit]);
-    let sink_id = mb.peek_next_func_id();
+    // The positive sink returns no values. Keep the original malformed unit
+    // return signature in the retained LegacyUndef input.
+    let returns = if construction == Construction::Complete { vec![] } else { vec![Ty::Unit] };
+    let sink_ty = mb.add_func_type(vec![Ty::Ptr], returns);
+    let sink_id = mb.peek_next_func_id().expect("peek_next_func_id: test fixture");
     {
         let mut sink = mb.function("sink", sink_ty);
         let sink_entry = sink.create_block();
@@ -103,12 +162,11 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
     fb.switch_to_block(entry);
     fb.set_entry(entry);
     let seed = fb.add_block_param(entry, Ty::U32);
+    let unknown_pointer = has_unknown_pointer.then(|| fb.add_block_param(entry, Ty::Ptr));
 
     // s = S { a: 1, b: seed }, spilled to the stack because its address is taken.
     let one = fb.const_value(Ty::U32, Constant::Int(1));
-    let undef = fb.undef(sty.clone());
-    let agg0 = fb.insert_field(sty.clone(), undef, 0, one);
-    let agg1 = fb.insert_field(sty.clone(), agg0, 1, seed);
+    let agg1 = pair(&mut fb, sty.clone(), one, seed, construction);
     let slot = fb.alloca(sty.clone());
     fb.store(sty.clone(), slot, agg1);
 
@@ -134,9 +192,7 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
         }
         Target::WholeBorrow => {
             // `*(&mut s) = S { a: K, b: seed }` — no GEP, the borrow IS the alloca.
-            let undef2 = fb.undef(sty.clone());
-            let n0 = fb.insert_field(sty.clone(), undef2, 0, k);
-            let n1 = fb.insert_field(sty.clone(), n0, 1, seed);
+            let n1 = pair(&mut fb, sty.clone(), k, seed, construction);
             let borrow = fb.borrow_mut(slot);
             fb.store_proven(sty.clone(), borrow, n1, proofs);
         }
@@ -147,11 +203,14 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
             let borrow = fb.borrow_mut(field_ptr);
             fb.call_void(sink_id, vec![borrow]);
             // ...and this store is through a pointer that may be the escaped one.
-            let opaque = fb.null_ptr();
+            // The positive model probe takes an unknown, potentially valid
+            // caller pointer. A null store is not a canonical execution oracle.
+            // The LegacyUndef variant retains the original null instruction.
+            let opaque = unknown_pointer.unwrap_or_else(|| fb.null_ptr());
             fb.store_proven(Ty::U32, opaque, k, proofs);
         }
         Target::UnknownWithNoEscape => {
-            let opaque = fb.null_ptr();
+            let opaque = unknown_pointer.unwrap_or_else(|| fb.null_ptr());
             fb.store_proven(Ty::U32, opaque, k, proofs);
         }
         Target::CallEscapeNoStore => {
@@ -174,14 +233,12 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
     fb.ret(vec![a]);
     fb.build();
 
-    let module = mb.build();
-    let out = trust_ir_function_to_chc_translation_output(
-        &module,
-        FuncId::new(1),
-        &TranslateOptions::default(),
-    )
-    .expect("f translates");
-    Probe { vc: out.vc, diagnostics: out.diagnostics }
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    if construction == Construction::Complete {
+        let errors = trust_ir_build::validate_module(&module);
+        assert!(errors.is_empty(), "positive interior-pointer input must be valid: {errors:?}");
+    }
+    translate_probe(module, FuncId::new(1))
 }
 
 /// TrustIR GEP is `base + index * size_of(pointee_ty)`, not structural field
@@ -193,6 +250,10 @@ fn probe(target: Target, written: i128, valid_borrow: bool) -> Probe {
 /// though the real second field remains zero. The sound fallback is to havoc
 /// the cell because this heterogeneous byte offset has no exact aggregate lane.
 fn heterogeneous_non_lane_gep_probe() -> Probe {
+    heterogeneous_non_lane_gep_construction(Construction::Complete)
+}
+
+fn heterogeneous_non_lane_gep_construction(construction: Construction) -> Probe {
     let mut mb = ModuleBuilder::new("heterogeneous_interior_ptr");
     let struct_id = mb.add_struct(StructDef {
         id: trust_ir::value::StructId::new(0),
@@ -204,6 +265,7 @@ fn heterogeneous_non_lane_gep_probe() -> Probe {
         size: Some(16),
         align: Some(8),
         repr: StructRepr::Rust,
+        origin: None,
     });
     let struct_ty = Ty::Struct(struct_id);
     let fn_ty = mb.add_func_type(vec![], vec![Ty::U32]);
@@ -214,9 +276,7 @@ fn heterogeneous_non_lane_gep_probe() -> Probe {
 
     let wide = fb.const_value(Ty::U64, Constant::Int(0));
     let zero = fb.const_value(Ty::U32, Constant::Int(0));
-    let undef = fb.undef(struct_ty.clone());
-    let with_wide = fb.insert_field(struct_ty.clone(), undef, 0, wide);
-    let aggregate = fb.insert_field(struct_ty.clone(), with_wide, 1, zero);
+    let aggregate = pair(&mut fb, struct_ty.clone(), wide, zero, construction);
     let slot = fb.alloca(struct_ty.clone());
     fb.store(struct_ty.clone(), slot, aggregate);
 
@@ -235,14 +295,8 @@ fn heterogeneous_non_lane_gep_probe() -> Probe {
     fb.ret(vec![divisor]);
     fb.build();
 
-    let module = mb.build();
-    let out = trust_ir_function_to_chc_translation_output(
-        &module,
-        FuncId::new(0),
-        &TranslateOptions::default(),
-    )
-    .expect("heterogeneous GEP fixture translates");
-    Probe { vc: out.vc, diagnostics: out.diagnostics }
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    translate_probe(module, FuncId::new(0))
 }
 
 /// Build a homogeneous `{ u32, u32 }` pair and attempt to write logical field 1
@@ -253,6 +307,16 @@ fn homogeneous_field_one_probe(
     offsets: [Option<u64>; 2],
     size: Option<u64>,
     align: Option<u64>,
+) -> Probe {
+    homogeneous_field_one_construction(name, offsets, size, align, Construction::Complete)
+}
+
+fn homogeneous_field_one_construction(
+    name: &str,
+    offsets: [Option<u64>; 2],
+    size: Option<u64>,
+    align: Option<u64>,
+    construction: Construction,
 ) -> Probe {
     let mut mb = ModuleBuilder::new(name);
     let struct_id = mb.add_struct(StructDef {
@@ -265,6 +329,7 @@ fn homogeneous_field_one_probe(
         size,
         align,
         repr: StructRepr::Rust,
+        origin: None,
     });
     let struct_ty = Ty::Struct(struct_id);
     let fn_ty = mb.add_func_type(vec![], vec![Ty::U32]);
@@ -274,9 +339,7 @@ fn homogeneous_field_one_probe(
     fb.set_entry(entry);
 
     let zero = fb.const_value(Ty::U32, Constant::Int(0));
-    let undef = fb.undef(struct_ty.clone());
-    let with_first = fb.insert_field(struct_ty.clone(), undef, 0, zero);
-    let aggregate = fb.insert_field(struct_ty.clone(), with_first, 1, zero);
+    let aggregate = pair(&mut fb, struct_ty.clone(), zero, zero, construction);
     let slot = fb.alloca(struct_ty.clone());
     fb.store(struct_ty.clone(), slot, aggregate);
 
@@ -295,20 +358,18 @@ fn homogeneous_field_one_probe(
     fb.ret(vec![divisor]);
     fb.build();
 
-    let module = mb.build();
-    let out = trust_ir_function_to_chc_translation_output(
-        &module,
-        FuncId::new(0),
-        &TranslateOptions::default(),
-    )
-    .expect("homogeneous GEP fixture translates");
-    Probe { vc: out.vc, diagnostics: out.diagnostics }
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    translate_probe(module, FuncId::new(0))
 }
 
 /// Two logical fields alias the same four bytes. A write through the field-0
 /// address changes BOTH observable field reads, so updating only logical field 0
 /// would leave field 1 stale and could falsely prove `field1 == 0`.
 fn overlapping_fields_probe() -> Probe {
+    overlapping_fields_construction(Construction::Complete)
+}
+
+fn overlapping_fields_construction(construction: Construction) -> Probe {
     let mut mb = ModuleBuilder::new("overlapping_fields");
     let struct_id = mb.add_struct(StructDef {
         id: trust_ir::value::StructId::new(0),
@@ -320,6 +381,7 @@ fn overlapping_fields_probe() -> Probe {
         size: Some(4),
         align: Some(4),
         repr: StructRepr::Rust,
+        origin: None,
     });
     let struct_ty = Ty::Struct(struct_id);
     let fn_ty = mb.add_func_type(vec![], vec![Ty::U32]);
@@ -329,9 +391,7 @@ fn overlapping_fields_probe() -> Probe {
     fb.set_entry(entry);
 
     let zero = fb.const_value(Ty::U32, Constant::Int(0));
-    let undef = fb.undef(struct_ty.clone());
-    let with_first = fb.insert_field(struct_ty.clone(), undef, 0, zero);
-    let aggregate = fb.insert_field(struct_ty.clone(), with_first, 1, zero);
+    let aggregate = pair(&mut fb, struct_ty.clone(), zero, zero, construction);
     let slot = fb.alloca(struct_ty.clone());
     fb.store(struct_ty.clone(), slot, aggregate);
 
@@ -348,14 +408,8 @@ fn overlapping_fields_probe() -> Probe {
     fb.ret(vec![alias]);
     fb.build();
 
-    let module = mb.build();
-    let out = trust_ir_function_to_chc_translation_output(
-        &module,
-        FuncId::new(0),
-        &TranslateOptions::default(),
-    )
-    .expect("overlapping-field fixture translates");
-    Probe { vc: out.vc, diagnostics: out.diagnostics }
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
+    translate_probe(module, FuncId::new(0))
 }
 
 /// Constant-fold the `error`-head rules' constraints.
@@ -392,6 +446,258 @@ fn error_reachability(vc: &ChcVc) -> Option<bool> {
     }
     assert!(saw_error_rule, "the assert must emit an error rule");
     Some(any_reachable)
+}
+
+#[test]
+fn original_aggregate_undef_constructions_remain_ub_and_refused() {
+    let mut originals = Vec::new();
+    for target in [
+        Target::FieldBorrow,
+        Target::SymbolicLaneBorrow,
+        Target::WholeBorrow,
+        Target::UnknownAfterEscape,
+        Target::UnknownWithNoEscape,
+        Target::CallEscapeNoStore,
+    ] {
+        for written in [0, 7] {
+            for valid_borrow in [false, true] {
+                originals.push(probe_construction(
+                    target,
+                    written,
+                    valid_borrow,
+                    Construction::LegacyUndef,
+                ));
+            }
+        }
+    }
+    originals.push(heterogeneous_non_lane_gep_construction(Construction::LegacyUndef));
+    for (name, offsets, size, align) in [
+        ("explicit_matching_layout", [Some(0), Some(4)], Some(8), Some(4)),
+        ("explicit_offset_mismatch", [Some(0), Some(8)], Some(12), Some(4)),
+        ("missing_layout", [None, None], None, None),
+    ] {
+        originals.push(homogeneous_field_one_construction(
+            name,
+            offsets,
+            size,
+            align,
+            Construction::LegacyUndef,
+        ));
+    }
+    originals.push(overlapping_fields_construction(Construction::LegacyUndef));
+    originals.push(cross_block_projected_construction(1, 1, Construction::LegacyUndef));
+    originals.push(cross_block_projected_construction(1, 0, Construction::LegacyUndef));
+    for original in originals {
+        let arguments = original
+            .module
+            .func_type(original.module.function_by_id(original.function).unwrap().ty)
+            .unwrap()
+            .params
+            .iter()
+            .map(|ty| match ty {
+                Ty::Bool => InterpretValue::bool(true),
+                _ => InterpretValue::int(ty.clone(), 7).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let error = Interpreter::with_module(&original.module)
+            .execute_func(original.function, arguments)
+            .expect_err("the original non-scalar Undef is UB at its definition");
+        assert_eq!(error.code, InterpretErrorCode::UndefinedBehavior, "{error:?}");
+        if trust_ir_build::validate_module(&original.module).is_empty() {
+            assert!(original.module_input_refusal.is_none());
+            assert!(!original.diagnostics.is_empty(), "valid but undefined input stays refused");
+        } else {
+            assert!(original.module_input_refusal.is_some(), "invalid original stays refused");
+            assert!(original.diagnostics.is_empty(), "invalidity has no invented instruction site");
+        }
+        assert_ne!(error_reachability(&original.vc), Some(false));
+    }
+}
+
+#[test]
+fn initialized_interior_pointer_writes_have_canonical_values() {
+    for target in [Target::FieldBorrow, Target::WholeBorrow] {
+        let complete = probe(target, 7, true);
+        let execution = Interpreter::with_module(&complete.module)
+            .execute_func(complete.function, [InterpretValue::int(Ty::U32, 19).unwrap()])
+            .expect("complete fields and a real borrowed pointer execute");
+        assert_eq!(execution.returns, vec![InterpretValue::int(Ty::U32, 7).unwrap()]);
+        assert_eq!(error_reachability(&complete.vc), Some(false));
+    }
+}
+
+fn integer_byte_write_probe(field: Ty, offset: i128, byte: i128) -> Probe {
+    let mut module = ModuleBuilder::new("byte_write_initializedness");
+    let size = if field == Ty::Bool { 1 } else { 4 };
+    let structure = module.add_struct(StructDef {
+        id: trust_ir::value::StructId::new(0),
+        name: "ByteWritten".into(),
+        fields: vec![FieldDef { name: "field".into(), ty: field.clone(), offset: Some(0) }],
+        size: Some(size),
+        align: Some(size),
+        repr: StructRepr::Rust,
+        origin: None,
+    });
+    let ty = Ty::Struct(structure);
+    let signature = module.add_func_type(vec![], vec![field.clone()]);
+    let mut function = module.function("byte_write", signature);
+    let entry = function.create_block();
+    function.set_entry(entry);
+    function.switch_to_block(entry);
+    let initial = if field == Ty::Bool { Constant::Bool(true) } else { Constant::Int(0) };
+    let initial = function.const_value(field.clone(), initial);
+    let aggregate = function.make_aggregate(ty.clone(), vec![initial]);
+    let cell = function.alloca(ty.clone());
+    function.store(ty.clone(), cell, aggregate);
+    let offset = function.const_value(Ty::I64, Constant::Int(offset));
+    let address = function.gep(Ty::U8, cell, vec![offset]);
+    let address = function.borrow_mut(address);
+    let stored = if field == Ty::Char { Ty::U32 } else { Ty::U8 };
+    let byte = function.const_value(stored.clone(), Constant::Int(byte));
+    function.store_proven(stored, address, byte, vec![ProofAnnotation::ValidBorrow]);
+    let loaded = function.load(ty, cell);
+    let field = function.extract_field(field, loaded, 0);
+    let yes = function.bool_const(true);
+    function.assert(yes);
+    function.ret(vec![field]);
+    function.build();
+    translate_probe(module.build().unwrap(), FuncId::new(0))
+}
+
+#[test]
+fn byte_write_preserves_integer_initializedness_without_donating_field_values() {
+    let probe = integer_byte_write_probe(Ty::U32, 0, 255);
+    let result = Interpreter::with_module(&probe.module).execute_func(probe.function, []).unwrap();
+    assert_eq!(result.returns, [InterpretValue::int(Ty::U32, 255).unwrap()]);
+    assert!(probe.diagnostics.is_empty(), "{:?}", probe.diagnostics);
+    assert_eq!(error_reachability(&probe.vc), Some(false));
+}
+
+fn integer_word_write_probe(
+    offset: i128,
+    object_alignment: u64,
+    allocation_alignment: Option<u64>,
+    access_alignment: Option<u64>,
+    prefix_byte: bool,
+) -> Probe {
+    let mut module = ModuleBuilder::new("integer_write_alignment");
+    let structure = module.add_struct(StructDef {
+        id: trust_ir::value::StructId::new(0),
+        name: "ThreeBytes".into(),
+        fields: (0..3)
+            .map(|index| FieldDef { name: format!("byte{index}"), ty: Ty::U8, offset: Some(index) })
+            .collect(),
+        size: Some(if object_alignment == 1 { 3 } else { 4 }),
+        align: Some(object_alignment),
+        repr: StructRepr::Rust,
+        origin: None,
+    });
+    let ty = Ty::Struct(structure);
+    let signature = module.add_func_type(vec![], vec![Ty::U8]);
+    let mut function = module.function("integer_word_write", signature);
+    let entry = function.create_block();
+    function.set_entry(entry);
+    function.switch_to_block(entry);
+    if prefix_byte {
+        // Make under-alignment observable; the first stack address happens to
+        // be word-aligned even when the allocation guarantees only one byte.
+        function.alloca(Ty::U8);
+    }
+    let fields = [1, 2, 3]
+        .into_iter()
+        .map(|byte| function.const_value(Ty::U8, Constant::Int(byte)))
+        .collect();
+    let aggregate = function.make_aggregate(ty.clone(), fields);
+    let cell = match allocation_alignment {
+        Some(align) => function.alloca_aligned(ty.clone(), align),
+        None => function.alloca(ty.clone()),
+    };
+    function.store(ty.clone(), cell, aggregate);
+    let offset = function.const_value(Ty::I64, Constant::Int(offset));
+    let address = function.gep(Ty::U8, cell, vec![offset]);
+    let word = function.const_value(Ty::U16, Constant::Int(0x0605));
+    match access_alignment {
+        Some(align) => function.store_aligned(Ty::U16, address, word, align),
+        None => function.store(Ty::U16, address, word),
+    }
+    let loaded = function.load(ty, cell);
+    let first = function.extract_field(Ty::U8, loaded, 0);
+    let yes = function.bool_const(true);
+    function.assert(yes);
+    function.ret(vec![first]);
+    function.build();
+    translate_probe(module.build().unwrap(), FuncId::new(0))
+}
+
+#[test]
+fn integer_write_preservation_refuses_misaligned_accesses() {
+    for probe in [
+        integer_word_write_probe(1, 1, None, None, false),
+        integer_word_write_probe(0, 1, None, None, true),
+        integer_word_write_probe(0, 2, None, Some(4), true),
+        integer_word_write_probe(0, 2, Some(1), None, true),
+    ] {
+        let error = Interpreter::with_module(&probe.module)
+            .execute_func(probe.function, [])
+            .expect_err("in-range initialized bytes do not prove an aligned access");
+        assert_eq!(error.code, InterpretErrorCode::UndefinedBehavior, "{error:?}");
+        assert!(error.message.contains("not aligned"), "{error:?}");
+        assert!(
+            probe.diagnostics.iter().any(|diagnostic| {
+                diagnostic.reason
+                    == trust_mc_trust_bmc::TrustIrChcUnsupportedReason::OperandConsumption
+            }),
+            "misaligned write must remain refused: {:?}",
+            probe.diagnostics
+        );
+        assert_ne!(error_reachability(&probe.vc), Some(false));
+    }
+}
+
+#[test]
+fn integer_write_preservation_accepts_naturally_aligned_offsets() {
+    for (offset, expected) in [(0, 5), (2, 1)] {
+        let probe = integer_word_write_probe(offset, 2, None, None, true);
+        let result = Interpreter::with_module(&probe.module)
+            .execute_func(probe.function, [])
+            .expect("the natural allocation alignment and byte offset prove this access");
+        assert_eq!(result.returns, [InterpretValue::int(Ty::U8, expected).unwrap()]);
+        assert!(probe.diagnostics.is_empty(), "{:?}", probe.diagnostics);
+        assert_eq!(error_reachability(&probe.vc), Some(false));
+    }
+}
+
+#[test]
+fn initialized_bytes_do_not_validate_char_representations_or_out_of_range_writes() {
+    for probe in
+        [integer_byte_write_probe(Ty::Char, 0, 0x110000), integer_byte_write_probe(Ty::U32, 4, 255)]
+    {
+        let error = Interpreter::with_module(&probe.module)
+            .execute_func(probe.function, [])
+            .expect_err("invalid Char bytes or out-of-bounds writes are real UB");
+        assert_eq!(error.code, InterpretErrorCode::UndefinedBehavior, "{error:?}");
+        assert!(
+            probe.diagnostics.iter().any(|diagnostic| {
+                diagnostic.reason
+                    == trust_mc_trust_bmc::TrustIrChcUnsupportedReason::OperandConsumption
+            }),
+            "{:?}",
+            probe.diagnostics
+        );
+        assert_ne!(error_reachability(&probe.vc), Some(false));
+    }
+}
+
+#[test]
+fn bool_byte_writes_retain_the_conservative_representation_boundary() {
+    // This interpreter normalizes a nonzero Bool byte to true; that is not
+    // Rust validity evidence or permission for the integer-only rule.
+    let probe = integer_byte_write_probe(Ty::Bool, 0, 2);
+    let result = Interpreter::with_module(&probe.module).execute_func(probe.function, []).unwrap();
+    assert_eq!(result.returns, [InterpretValue::bool(true)]);
+    assert!(probe.diagnostics.iter().any(|diagnostic| diagnostic.reason
+        == trust_mc_trust_bmc::TrustIrChcUnsupportedReason::OperandConsumption));
+    assert_ne!(error_reachability(&probe.vc), Some(false));
 }
 
 /// THE REGRESSION. Writing `0` through `&mut s.a` makes `100 / s.a` a genuine
@@ -496,16 +802,23 @@ fn missing_struct_layout_havocs_instead_of_assuming_field_identity() {
 }
 
 /// Exact logical-lane replacement is unsound when another declared field aliases
-/// the written bytes. The whole aggregate must be invalidated.
+/// the written bytes. The canonical validator and interpreter reject this
+/// contradictory layout before a logical lane can authorize a clean execution.
 #[test]
-fn overlapping_declared_fields_havoc_instead_of_leaving_a_sibling_stale() {
+fn overlapping_declared_fields_are_refused_instead_of_leaving_a_sibling_stale() {
     let probe = overlapping_fields_probe();
+    assert!(!trust_ir_build::validate_module(&probe.module).is_empty());
+    assert!(probe.module_input_refusal.is_some());
     assert_eq!(
         error_reachability(&probe.vc),
-        None,
-        "overlapping field 1 must not retain its pre-write zero after field 0 is written"
+        Some(true),
+        "invalid overlapping layout must produce an unconditional input refusal"
     );
-    assert!(probe.diagnostics.is_empty(), "{:?}", probe.diagnostics);
+    let error = Interpreter::with_module(&probe.module)
+        .execute_func(probe.function, [])
+        .expect_err("a declared overlapping struct image is not a valid layout");
+    assert_eq!(error.code, InterpretErrorCode::TypeError, "{error:?}");
+    assert!(probe.diagnostics.is_empty(), "invalidity has no invented instruction site");
 }
 
 /// A `BorrowMut` straight off the alloca (no `GEP`) carries the same provenance.
@@ -625,6 +938,14 @@ fn valid_borrow_annotation_does_not_change_the_modeled_write() {
 /// `{ u64, u64 }` written in both arms, field 0 read back via `GEP` in the join block.
 /// `then_a`/`else_a` are what each arm stores into field 0.
 fn cross_block_projected(then_a: i128, else_a: i128) -> ChcVc {
+    cross_block_projected_construction(then_a, else_a, Construction::Complete).vc
+}
+
+fn cross_block_projected_construction(
+    then_a: i128,
+    else_a: i128,
+    construction: Construction,
+) -> Probe {
     let pair = Ty::Tuple(vec![Ty::U64, Ty::U64]);
     let mut mb = ModuleBuilder::new("cross_block_projected_read");
     let ft = mb.add_func_type(vec![Ty::Bool], vec![Ty::U64]);
@@ -645,9 +966,14 @@ fn cross_block_projected(then_a: i128, else_a: i128) -> ChcVc {
         fb.switch_to_block(blk);
         let av = fb.const_value(Ty::U64, Constant::Int(a));
         let bv = fb.const_value(Ty::U64, Constant::Int(7));
-        let undef = fb.undef(pair.clone());
-        let p0 = fb.insert_field(pair.clone(), undef, 0, av);
-        let p1 = fb.insert_field(pair.clone(), p0, 1, bv);
+        let p1 = match construction {
+            Construction::Complete => fb.make_aggregate(pair.clone(), vec![av, bv]),
+            Construction::LegacyUndef => {
+                let undef = fb.undef(pair.clone());
+                let p0 = fb.insert_field(pair.clone(), undef, 0, av);
+                fb.insert_field(pair.clone(), p0, 1, bv)
+            }
+        };
         fb.store(pair.clone(), cell, p1);
         fb.br(join, vec![]);
     }
@@ -666,12 +992,10 @@ fn cross_block_projected(then_a: i128, else_a: i128) -> ChcVc {
     fb.ret(vec![a]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     // This builder makes exactly ONE function, so it is id 0 — unlike `probe()` above,
     // whose `sink` callee occupies 0 and whose subject is 1.
-    trust_ir_function_to_chc_translation_output(&module, FuncId::new(0), &TranslateOptions::default())
-        .expect("projected_join translates")
-        .vc
+    translate_probe(module, FuncId::new(0))
 }
 
 /// BASELINE / ACCEPTANCE TARGET. Field 0 is the SAME nonzero constant on both paths, so
@@ -725,9 +1049,7 @@ fn why_is_the_cross_block_projected_cell_refused() {
         fb.switch_to_block(blk);
         let av = fb.const_value(Ty::U64, Constant::Int(1));
         let bv = fb.const_value(Ty::U64, Constant::Int(7));
-        let u = fb.undef(pair.clone());
-        let p0 = fb.insert_field(pair.clone(), u, 0, av);
-        let p1 = fb.insert_field(pair.clone(), p0, 1, bv);
+        let p1 = fb.make_aggregate(pair.clone(), vec![av, bv]);
         fb.store(pair.clone(), cell, p1);
         fb.br(join, vec![]);
     }
@@ -737,7 +1059,7 @@ fn why_is_the_cross_block_projected_cell_refused() {
     let a = fb.load(Ty::U64, fp);
     fb.ret(vec![a]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let function = &module.functions[0];
 
     let rejection = single_cell_alloca_rejection(&module, function, cell, &pair);

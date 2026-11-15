@@ -333,6 +333,8 @@ fn test_try_construct_slice_datatype_from_cast() {
         let operand_place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => panic!("expected place operand for slice cast"),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => panic!("expected place operand for slice cast"),
         };
         let base_name = codegen.ssa_base_name(operand_place);
         let ptr_expr = Expr::var(base_name.clone(), Sort::bitvec(POINTER_WIDTH));
@@ -413,6 +415,8 @@ fn test_codegen_cast_fat_pointer_to_usize_uses_fld_ptr() {
         let operand_place = match &operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => panic!("expected place operand for fat-pointer cast"),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => panic!("expected place operand for fat-pointer cast"),
         };
         let src_ty = operand.ty(body.locals()).into_option().expect("cast source type");
         let src_sort =
@@ -465,7 +469,7 @@ fn test_try_extract_str_constant() {
                 let StatementKind::Assign(_, rvalue) = &stmt.kind else {
                     continue;
                 };
-                let Rvalue::Use(operand) = rvalue else {
+                let Rvalue::Use(operand, ..) = rvalue else {
                     continue;
                 };
                 let Some(ty) = operand.ty(body.locals()).into_option() else {
@@ -518,6 +522,8 @@ fn test_rvalue_len_extracts_slice_metadata() {
                         let operand_place = match operand {
                             Operand::Copy(place) | Operand::Move(place) => place.clone(),
                             Operand::Constant(_) => continue,
+                            #[cfg(trust_toolchain)]
+                            Operand::RuntimeChecks(_) => continue,
                         };
                         metadata_place = Some(operand_place);
                     }
@@ -737,6 +743,8 @@ fn test_slice_cast_includes_fld_data_when_array_backing_available() {
         let operand_place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => panic!("expected place operand for slice cast"),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => panic!("expected place operand for slice cast"),
         };
         let ref_base = codegen.ssa_base_name(operand_place);
         let ptr_expr = Expr::var(ref_base.clone(), Sort::bitvec(POINTER_WIDTH));
@@ -845,6 +853,8 @@ fn test_slice_cast_without_tracked_backing_returns_none() {
         let operand_place = match operand {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => panic!("expected place operand for slice cast"),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => panic!("expected place operand for slice cast"),
         };
         let base_name = codegen.ssa_base_name(operand_place);
         let ptr_expr = Expr::var(base_name.clone(), Sort::bitvec(POINTER_WIDTH));

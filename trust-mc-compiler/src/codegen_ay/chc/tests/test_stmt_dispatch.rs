@@ -581,7 +581,9 @@ fn test_mem_level_store_chain_draining() {
             "write_ref",
             ChcConfig { track_level: crate::args::ChcTrackLevel::Mem, ..ChcConfig::default() },
         );
-        let (vc, _) = chc_ctx.translate();
+        // Pre-pass VC: `*r = 42` is never read back, so write-only array elimination
+        // (85da41dad) removes the drained store from the VC `translate()` returns.
+        let vc = pre_pass_vc(chc_ctx);
         let smt = emit_chc(&vc).to_string();
 
         // Mem-level should have store operations for memory writes

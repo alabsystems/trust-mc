@@ -205,9 +205,11 @@ fn test_dispatch_rawvec_new_in_returns_some() {
     });
 }
 
-/// try_codegen_pointer_memory_stub returns Some for CheckedAddUnsigned with args.
+/// CheckedAddUnsigned with fewer than two args fails closed: the handler's
+/// arity guard answers `None`, and `.map(Some)` hands the dispatcher `None`
+/// (`FallthroughToUnsupported`), never `Some(None)` (a diverging call).
 #[test]
-fn test_dispatch_checked_add_unsigned_returns_some() {
+fn test_dispatch_checked_add_unsigned_arity_guard_fails_closed() {
     with_test_ay_ctx_for_source(SIMPLE_PROBE_SOURCE, |mut ctx| {
         let instance = find_instance_by_suffix(&ctx, "probe");
         let body = instance.body().expect("body");
@@ -216,17 +218,13 @@ fn test_dispatch_checked_add_unsigned_returns_some() {
         let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
 
         let dest = local_place(0);
-        // CheckedAddUnsigned with < 2 args falls back to symbolic result
         let result = codegen.try_codegen_pointer_memory_stub(
             StubKind::CheckedAddUnsigned,
             &[],
             &dest,
             Some(1),
         );
-        assert!(
-            result.is_some(),
-            "try_codegen_pointer_memory_stub should handle CheckedAddUnsigned"
-        );
+        assert_eq!(result, None, "CheckedAddUnsigned with no args must fail-closed (#2497)");
     });
 }
 
@@ -350,9 +348,15 @@ fn test_rawvec_capacity_empty_args_fallback() {
 // =============================================================================
 // Fail-closed tests — NonNullAsMutPtr, BoxIntoRawWithAllocator, UniqueNewUnchecked
 // Part of #2497: verify that operand translation failure returns None (fail-closed)
+//
+// Every arm routes a handler's encoding failure with `.map(Some)` (the
+// invariant stated on `try_codegen_stdlib_stub_call`), so the dispatcher
+// answers `None`, never `Some(None)`: `Some(None)` reads as "this call
+// diverges" to a caller that does not know the MIR return target, and the
+// POINTER_MEMORY_STUBS arm maps `None` to `FallthroughToUnsupported`.
 // =============================================================================
 
-/// NonNull::as_mut_ptr with empty args must fail-closed (return Some(None)).
+/// NonNull::as_mut_ptr with empty args must fail-closed (return None).
 #[test]
 fn test_nonnull_as_mut_ptr_empty_args_fail_closed() {
     with_test_ay_ctx_for_source(SIMPLE_PROBE_SOURCE, |mut ctx| {
@@ -365,11 +369,11 @@ fn test_nonnull_as_mut_ptr_empty_args_fail_closed() {
         let dest = local_place(0);
         let result =
             codegen.try_codegen_pointer_memory_stub(StubKind::NonNullAsMutPtr, &[], &dest, Some(5));
-        assert_eq!(result, Some(None), "NonNullAsMutPtr with no args must fail-closed (#2497)");
+        assert_eq!(result, None, "NonNullAsMutPtr with no args must fail-closed (#2497)");
     });
 }
 
-/// Box::into_raw_with_allocator with empty args must fail-closed (return Some(None)).
+/// Box::into_raw_with_allocator with empty args must fail-closed (return None).
 #[test]
 fn test_box_into_raw_with_allocator_empty_args_fail_closed() {
     with_test_ay_ctx_for_source(SIMPLE_PROBE_SOURCE, |mut ctx| {
@@ -386,15 +390,11 @@ fn test_box_into_raw_with_allocator_empty_args_fail_closed() {
             &dest,
             Some(6),
         );
-        assert_eq!(
-            result,
-            Some(None),
-            "BoxIntoRawWithAllocator with no args must fail-closed (#2497)"
-        );
+        assert_eq!(result, None, "BoxIntoRawWithAllocator with no args must fail-closed (#2497)");
     });
 }
 
-/// Unique::new_unchecked with empty args must fail-closed (return Some(None)).
+/// Unique::new_unchecked with empty args must fail-closed (return None).
 #[test]
 fn test_unique_new_unchecked_empty_args_fail_closed() {
     with_test_ay_ctx_for_source(SIMPLE_PROBE_SOURCE, |mut ctx| {
@@ -411,7 +411,7 @@ fn test_unique_new_unchecked_empty_args_fail_closed() {
             &dest,
             Some(7),
         );
-        assert_eq!(result, Some(None), "UniqueNewUnchecked with no args must fail-closed (#2497)");
+        assert_eq!(result, None, "UniqueNewUnchecked with no args must fail-closed (#2497)");
     });
 }
 

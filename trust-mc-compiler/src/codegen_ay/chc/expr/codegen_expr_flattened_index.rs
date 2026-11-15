@@ -161,12 +161,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && first.field_idx < layout.ctor_field_slot[cons_idx].len()
             {
                 let base_slot = layout.payload_slot(cons_idx, first.field_idx)?;
-                let nested_offset = self.enum_payload_nested_slot_offset(
-                    local_idx,
-                    cons_idx,
-                    first.field_idx,
-                    remaining,
-                )?;
+                let nested_offset =
+                    self.enum_payload_nested_slot_offset(local_idx, cons_idx, first, remaining)?;
                 return Some(1 + base_slot + nested_offset);
             }
 
@@ -180,29 +176,25 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             } else {
                 1
             };
-            let nested_offset = self.enum_payload_nested_slot_offset(
-                local_idx,
-                cons_idx,
-                first.field_idx,
-                remaining,
-            )?;
+            let nested_offset =
+                self.enum_payload_nested_slot_offset(local_idx, cons_idx, first, remaining)?;
             return Some(payload_start + nested_offset);
         }
 
         if !field_projections.iter().all(|fp| fp.cons_idx.is_none()) {
             return None;
         }
-        let local_decl = self.body.locals().get(local_idx)?;
-        let sort = Self::translate_ty(local_decl.ty)?;
-        let field_indices: Vec<usize> = field_projections.iter().map(|fp| fp.field_idx).collect();
-        compute_nested_flat_slot(&sort, &field_indices)
+        self.flat_slot_for(local_idx, field_projections).ok()
     }
 
+    /// The slot offset of `remaining` within the payload field `first` names,
+    /// the path checked against the payload's MIR type (`flat_field_path_from`,
+    /// C5b) before it walks the payload's sort.
     fn enum_payload_nested_slot_offset(
         &self,
         local_idx: usize,
         cons_idx: usize,
-        field_idx: usize,
+        first: &FieldProjection,
         remaining: &[FieldProjection],
     ) -> Option<usize> {
         if remaining.is_empty() {
@@ -212,7 +204,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let sort = Self::translate_ty(local_decl.ty)?;
         let dt = sort.datatype_sort()?;
         let variant = dt.constructors.get(cons_idx)?;
-        let payload_sort = &variant.fields.get(field_idx)?.sort;
+        let payload_sort = &variant.fields.get(first.field_idx)?.sort;
+        let payload_ty = first.field_ty?;
+        if Self::translate_ty(payload_ty).as_ref() != Some(payload_sort) {
+            return None;
+        }
+        let remaining = Self::flat_field_path_from(payload_ty, remaining).ok()?;
+        if remaining.is_empty() || remaining.iter().any(|fp| fp.cons_idx.is_some()) {
+            return None;
+        }
         let remaining_indices: Vec<usize> = remaining.iter().map(|fp| fp.field_idx).collect();
         compute_nested_flat_slot(payload_sort, &remaining_indices)
     }

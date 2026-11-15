@@ -178,7 +178,7 @@ fn test_intrinsic_unchecked_add_guards_successor_with_no_overflow() {
         let vc = mir_to_chc(ctx.tcx, &body, "probe_intrinsic_unchecked_add", ChcConfig::default());
 
         let error_rule_has_guard =
-            vc.rules.iter().filter(|rule| &*rule.head.name == "error").any(|rule| {
+            vc.rules.iter().filter(|rule| is_error_check_rule(rule)).any(|rule| {
                 rule.body.constraints.iter().any(|constraint| {
                     constraint_tree_contains(constraint, &|expr| {
                         matches!(expr.value(), ExprValue::BvAddNoOverflowSigned(..))
@@ -190,7 +190,7 @@ fn test_intrinsic_unchecked_add_guards_successor_with_no_overflow() {
         let successor_has_guard = vc
             .rules
             .iter()
-            .filter(|rule| rule.body.relation.is_some() && &*rule.head.name != "error")
+            .filter(|rule| rule.body.relation.is_some() && !is_error_head(&rule.head.name))
             .any(|rule| {
                 let has_no_overflow = rule.body.constraints.iter().any(|constraint| {
                     constraint_tree_contains(constraint, &|expr| {
@@ -207,6 +207,29 @@ fn test_intrinsic_unchecked_add_guards_successor_with_no_overflow() {
         assert!(
             successor_has_guard,
             "unchecked_add normal successor must be constrained to the non-UB path"
+        );
+    });
+}
+
+/// The unchecked overflow obligation carries Kani's property class and
+/// message, as the walker's does (`inline_shared/rvalue_ub.rs`), not a
+/// MemorySafety "CHC verification: memory safety" check (package round of
+/// fix/chc-walker-fail-closed; walker_nested_helper_dual.rs
+/// `bug_unchecked_helper_direct_call`).
+#[test]
+fn test_intrinsic_unchecked_add_obligation_carries_kanis_message() {
+    with_test_ay_ctx_for_source(INTRINSIC_UNCHECKED_ARITH_SOURCE, |ctx| {
+        let instance = find_instance_by_suffix(ctx.tcx, "probe_intrinsic_unchecked_add");
+        let body = instance.body().expect("function body");
+        let vc = mir_to_chc(ctx.tcx, &body, "probe_intrinsic_unchecked_add", ChcConfig::default());
+        assert!(
+            vc.properties.iter().any(|p| {
+                p.kind == trust_mc_core::violation::PropertyKind::ArithmeticOverflow
+                    && p.message.as_deref()
+                        == Some("attempt to compute `unchecked_add` which would overflow")
+            }),
+            "the overflow property names Kani's check, got {:?}",
+            vc.properties.iter().map(|p| (p.kind, p.message.clone())).collect::<Vec<_>>()
         );
     });
 }

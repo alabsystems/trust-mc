@@ -14,6 +14,8 @@ use crate::codegen_ay::chc::call::inline_field_map::{DIRECT_DEREF_FIELD, build_s
 use crate::codegen_ay::chc::call::inline_shared::field_map_projection::{
     resolve_projected_place, try_extract_dt_field_without_accessor,
 };
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
 use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -103,7 +105,7 @@ fn find_receiver_field_place(body: &rustc_public::mir::Body) -> Place {
                     return None;
                 };
                 let place = match rvalue {
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => place,
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) => place,
                     _ => return None,
                 };
                 let is_receiver_field = place.local == 1
@@ -127,7 +129,7 @@ fn find_receiver_enum_payload_place(body: &rustc_public::mir::Body) -> Place {
                     return None;
                 };
                 let place = match rvalue {
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => place,
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), ..) => place,
                     _ => return None,
                 };
                 let is_enum_payload = place.local == 1
@@ -342,7 +344,7 @@ fn test_extract_dt_field_from_bare_constructor() {
     let left = Expr::var("left_val", Sort::bitvec(8));
     let right = Expr::var("right_val", Sort::bitvec(8));
     let ctor =
-        Expr::datatype_constructor("Pair", "Pair", vec![left.clone(), right.clone()], pair_sort);
+        Expr::datatype_constructor("Pair", "Pair_mk", vec![left.clone(), right.clone()], pair_sort);
 
     assert_eq!(
         try_extract_dt_field_without_accessor(&ctor, 0),

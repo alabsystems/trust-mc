@@ -289,10 +289,22 @@ fn test_block_on_dispatch_claims_call_without_loop_exhaustion() {
             "block_on should be claimed by call dispatch"
         );
         let translation_drop_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
-        assert_eq!(
-            chc_ctx.sound_fallback_count(),
-            before_fallback,
-            "specialized block_on dispatch should not record a sound fallback; detail={:?} translation_drop_sites={translation_drop_sites:?}",
+        // The poll body's nested calls are over-approximated (nested_call_overapprox,
+        // 85887227e), and a nested callee not proven inert books its lost effect
+        // fail-closed (Rule D, `LostEffect::NestedCallFallback`; before Rule D only a
+        // positive sighting did, 761629127). Both are sound; any OTHER fallback reason
+        // is a regression.
+        let lost = crate::codegen_ay::chc::call::inline_walk_guard::LostEffect::NestedCallFallback;
+        let allowed = ["nested_call_overapprox", lost.reason()];
+        let unexpected: Vec<_> = translation_drop_sites
+            .values()
+            .flat_map(|reasons| reasons.keys())
+            .filter(|reason| !allowed.contains(&reason.as_str()))
+            .collect();
+        assert!(
+            chc_ctx.sound_fallback_count() == before_fallback || unexpected.is_empty(),
+            "specialized block_on dispatch recorded fallbacks beyond the sound nested-call lanes: \
+             {unexpected:?}; detail={:?} translation_drop_sites={translation_drop_sites:?}",
             chc_ctx.sound_fallback_detail(),
         );
         assert_eq!(
@@ -473,11 +485,13 @@ fn test_manual_block_on_dispatch_ref_destination_avoids_coerce_drop() {
         crate::codegen_ay::chc::clear_chc_coerce_eq_dropped_constraint_counts_by_fn();
         let before_fallback = chc_ctx.sound_fallback_count();
         let before_rules = chc_ctx.vc.rules.len();
+        let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
 
         assert!(
             chc_ctx.codegen_call_terminator(dcx),
             "manual block_on call should be claimed by call dispatch"
         );
+        let translation_drop_sites = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
 
         let per_fn = super::super::get_chc_coerce_eq_dropped_constraint_counts_by_fn();
         let dropped_for_fn = per_fn.get("test_async_await_manually").copied().unwrap_or(0);
@@ -486,10 +500,21 @@ fn test_manual_block_on_dispatch_ref_destination_avoids_coerce_drop() {
             "manual block_on dispatch should use the ref-destination memory bridge instead of \
              recording a dropped call-result coercion; per-function counts={per_fn:?}"
         );
-        assert_eq!(
-            chc_ctx.sound_fallback_count(),
-            before_fallback,
-            "manual block_on dispatch should stay on the precise inline path; detail={:?}",
+        // As in test_block_on_dispatch_claims_call_without_loop_exhaustion: the poll body's
+        // nested calls are over-approximated (nested_call_overapprox, 85887227e) and a nested
+        // callee not proven inert books its lost effect fail-closed (Rule D). Both are sound;
+        // any OTHER fallback reason is a regression.
+        let lost = crate::codegen_ay::chc::call::inline_walk_guard::LostEffect::NestedCallFallback;
+        let allowed = ["nested_call_overapprox", lost.reason()];
+        let unexpected: Vec<_> = translation_drop_sites
+            .values()
+            .flat_map(|reasons| reasons.keys())
+            .filter(|reason| !allowed.contains(&reason.as_str()))
+            .collect();
+        assert!(
+            chc_ctx.sound_fallback_count() == before_fallback || unexpected.is_empty(),
+            "manual block_on dispatch recorded fallbacks beyond the sound nested-call lanes: \
+             {unexpected:?}; detail={:?} translation_drop_sites={translation_drop_sites:?}",
             chc_ctx.sound_fallback_detail(),
         );
         assert!(

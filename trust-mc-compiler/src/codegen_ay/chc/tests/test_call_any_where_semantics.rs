@@ -7,6 +7,42 @@
 use super::common::*;
 use crate::codegen_ay::emit_chc;
 
+#[test]
+fn test_user_any_where_executes_its_actual_body() {
+    let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let source = include_str!("../../../../../tools/soundness-duals/user_any_where_body_dual.rs")
+        .replace("#[kani::proof]", "");
+    for (name, expected) in [
+        ("custom_any_where_wrong_range_bug", "sat"),
+        ("custom_any_where_returns_its_actual_value_safe", "unsat"),
+    ] {
+        for track_level in [crate::args::ChcTrackLevel::Reg, crate::args::ChcTrackLevel::Mem] {
+            clear_chc_fallback_counts();
+            let _ = take_translation_drop_by_fn();
+            let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+            let _ = crate::codegen_ay::take_inferable_predicate_count();
+            with_test_ay_ctx_for_source(&source, |ctx| {
+                let body = find_instance_by_suffix(ctx.tcx, name).body().expect("actual user body");
+                let vc = mir_to_chc(
+                    ctx.tcx,
+                    &body,
+                    name,
+                    ChcConfig { track_level, ..ChcConfig::default() },
+                );
+                assert!(!vc.rules.is_empty(), "{name}: actual body must produce rules");
+                assert_z3_result(&emit_chc(&vc).to_string(), expected);
+            });
+            assert_eq!(get_chc_fallback_counts().get(name).copied().unwrap_or(0), 0, "{name}");
+            let drops = take_translation_drop_by_fn();
+            let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+            assert_eq!(drops.get(name).copied().unwrap_or(0), 0, "{name}: {reasons:?}");
+            assert_eq!(crate::codegen_ay::take_inferable_predicate_count(), 0, "{name}");
+        }
+    }
+}
+
 const ANY_WHERE_CAPTURE_ASSERT_SOURCE: &str = r#"
     #![allow(dead_code)]
     #![feature(register_tool)]
@@ -177,4 +213,72 @@ fn test_any_assume_vec_len_solver_produces_unsat() {
     let _ = take_translation_drop_by_fn();
     let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
     let _ = crate::codegen_ay::take_inferable_predicate_count();
+}
+
+#[test]
+fn readonly_word_rustcall_preserves_actual_referent_and_bug_polarity() {
+    let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let source =
+        include_str!("../../../../../tools/soundness-duals/readonly_reference_rustcall_dual.rs")
+            .replace("#[kani::proof]", "");
+    for (name, expected) in [
+        ("readonly_word_rustcall_safe", "unsat"),
+        ("readonly_word_rustcall_wrong_value_bug", "sat"),
+    ] {
+        with_test_ay_ctx_for_source(&source, |ctx| {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+            let chc = ChcCtx::new(ctx.tcx, &body, name, ChcConfig::default());
+            let (vc, _, diagnostics) = chc.translate_with_diagnostics();
+            let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+            assert_eq!(diagnostics.place_translation_drop.get(), 0, "{name}: {reasons:?}");
+            assert_z3_result(&crate::codegen_ay::emit_chc(&vc).to_string(), expected);
+        });
+    }
+}
+
+#[test]
+fn readonly_symbolic_referent_is_never_replaced_by_an_address_literal() {
+    let _guard = crate::codegen_ay::test_fixtures::METADATA_COUNTER_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut source = String::from(
+        r#"
+        #![feature(register_tool)]
+        #![register_tool(kanitool)]
+        mod kani {
+            #[kanitool::fn_marker = "AnyModel"]
+            pub fn any<T>() -> T { panic!("model-only marker function") }
+            #[kanitool::fn_marker = "AssumeHook"]
+            pub fn assume(_condition: bool) {}
+        }
+    "#,
+    );
+    source.push_str(
+        &include_str!(
+            "../../../../../tools/soundness-duals/readonly_symbolic_reference_rustcall_dual.rs"
+        )
+        .replace("#[kani::proof]", ""),
+    );
+    for (name, expected) in [
+        ("readonly_symbolic_word_rustcall_safe", "unsat"),
+        ("readonly_symbolic_word_wrong_range_bug", "sat"),
+    ] {
+        for track_level in [crate::args::ChcTrackLevel::Reg, crate::args::ChcTrackLevel::Mem] {
+            with_test_ay_ctx_for_source(&source, |ctx| {
+                let body = find_instance_by_suffix(ctx.tcx, name).body().unwrap();
+                let chc = ChcCtx::new(
+                    ctx.tcx,
+                    &body,
+                    name,
+                    ChcConfig { track_level, ..ChcConfig::default() },
+                );
+                let (vc, _, diagnostics) = chc.translate_with_diagnostics();
+                let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+                assert_eq!(diagnostics.place_translation_drop.get(), 0, "{name}: {reasons:?}");
+                assert_z3_result(&crate::codegen_ay::emit_chc(&vc).to_string(), expected);
+            });
+        }
+    }
 }

@@ -203,6 +203,16 @@ pub(super) const CATEGORY_TABLE: &[CategoryEntry] = &[
         handler: |_path| Some(StubKind::SliceIntoVec),
         exclusive: false,
     },
+    // <[T]>::repeat — `str::repeat` lowers to `self.as_bytes().repeat(n)`. The
+    // slice method only: `std::iter::repeat` and `str::repeat` are other items.
+    CategoryEntry {
+        guard: |path| {
+            path.ends_with("::repeat")
+                && (path.contains("slice::<impl [T]>") || path.contains("slice::<impl [u8]>"))
+        },
+        handler: |_path| Some(StubKind::SliceRepeat),
+        exclusive: false,
+    },
     // Try trait stubs (Part of #1100)
     CategoryEntry {
         guard: |path| {

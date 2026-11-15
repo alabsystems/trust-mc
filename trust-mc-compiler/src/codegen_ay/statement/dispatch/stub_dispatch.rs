@@ -31,6 +31,19 @@ use crate::codegen_ay::types::POINTER_WIDTH;
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// Try to codegen a stdlib call via semantic stub registry.
     ///
+    // INVARIANT for every arm below: a handler's `None` means "I could not encode
+    // this", never "this call diverges". Route it with `.map(Some)` (outer None =>
+    // the next dispatcher, and finally the fail-closed unsupported fallback), NOT
+    // `Some(..)`. Inside a handler the same rule reads `return target`, not
+    // `return None`. See docs/dispatch-diverge-hazard-2026-09-17.md.
+    //
+    // Every nested result below is converted by
+    // `CallDispatchOutcome::from_nested_target_for_call`, the backstop for an arm
+    // that still spells `Some(..)`: an inner `None` on a call WITH a MIR return
+    // target is `FallthroughToUnsupported` (recorded, successor edge kept), and
+    // only a call with no return target diverges. Before it, that inner `None`
+    // was `Diverge`, which DELETES the post-call path and makes every later
+    // assertion hold vacuously.
     pub(in crate::codegen_ay::statement) fn try_codegen_stdlib_stub_call(
         &mut self,
         func: &Operand,
@@ -55,7 +68,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if let Some(result) =
             self.try_codegen_btree_internal_precheck(func, &callee_path, args, destination, target)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         // `<String as BoundedArbitrary>::bounded_any::<N>` — model the bound the
@@ -63,14 +76,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if let Some(result) =
             self.try_codegen_bounded_string_precheck(func, &callee_path, destination, target)
         {
-            return CallDispatchOutcome::from_handled_target(result);
+            return CallDispatchOutcome::from_fallthrough_result(result);
         }
 
         // Pre-check for Cow<str>::to_string() which has path that doesn't contain "Cow" (Part of #1738)
         if let Some(result) =
             self.try_codegen_cow_tostring_precheck(func, &callee_path, args, destination, target)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         // Pre-check for MaybeUninit::uninit()/assume_init(): model uninitialized
@@ -79,35 +92,61 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if let Some(result) =
             self.try_codegen_maybe_uninit_precheck(&callee_path, args, destination, target)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         let Some(stub_kind) = self.stub_registry.lookup(&callee_path) else {
             return CallDispatchOutcome::Miss;
         };
+        // The registry matches path text; a callee of the local crate is the
+        // user's code, never std's item (`shared::callee_is_local_item`).
+        if crate::codegen_ay::shared::callee_is_local_item(func, self.body.locals()) {
+            debug!(?stub_kind, %callee_path, "a local item named like a std stub: not a stub");
+            return CallDispatchOutcome::Miss;
+        }
+        // `Iterator::sum` is matched by NAME; only core's numeric `Sum` impls
+        // are a fold the element-wise unroll encodes (a user `Sum`,
+        // `Duration` or `Option<T>` is left to the ordinary call path). The
+        // unroll adds what each of core's impls adds, read from the call
+        // (`iter_sum_summand::classify_iter_sum`): `+` with its overflow check
+        // for a primitive, `wrapping_add` for `Wrapping`, `saturating_add` for
+        // `Saturating`.
+        if stub_kind == StubKind::IterSum
+            && crate::codegen_ay::reduce_loop_rule::iter_sum_call_model(func, self.body.locals())
+                .is_none()
+        {
+            return CallDispatchOutcome::Miss;
+        }
+        // `SliceRepeat` is a CHC-lane model only (chc/call/codegen_call_slice_repeat.rs).
+        // No BMC table routes it, and an unrouted matched stub falls through to
+        // Unsupported; before the stub existed `<[T]>::repeat` was a plain Miss
+        // here. Keep the BMC lane exactly as it was.
+        if stub_kind == StubKind::SliceRepeat {
+            return CallDispatchOutcome::Miss;
+        }
         debug!(?stub_kind, %callee_path, "AY stdlib stub matched");
 
         // Try simple stubs first (constants, identity, no-op, diverging, BigRational)
         if let Some(result) =
             self.try_codegen_simple_stub(stub_kind, args, destination, target, &callee_path)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         if let Some(result) =
             self.try_codegen_slice_comparison_stub(stub_kind, func, args, destination, target)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         if let Some(result) =
             self.try_codegen_alloc_layout_stub(stub_kind, func, args, destination, target)
         {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         if let Some(result) = self.try_codegen_pointer_stub(stub_kind, args, destination, target) {
-            return CallDispatchOutcome::from_nested_target(Some(result));
+            return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
         if stub_in(POINTER_MEMORY_STUBS, stub_kind) {
@@ -119,11 +158,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 );
                 return CallDispatchOutcome::FallthroughToUnsupported;
             }
-            return CallDispatchOutcome::from_nested_target(result);
+            return CallDispatchOutcome::from_nested_target_for_call(result, target);
         }
 
+        // FC-06(bmc): a container model's store through a `&mut` argument is an
+        // env-level update the deref-store hook never sees. Classify it against
+        // the innermost modifies frame before the handler encodes it
+        // (statement::modifies_frame::bmc_modifies_check_stub_mut_args).
+        if [BIGINT_STUBS, HASHMAP_STUBS, VEC_STUBS, STRING_STUBS, HASHSET_STUBS, BTREESET_STUBS]
+            .iter()
+            .any(|family| stub_in(family, stub_kind))
+        {
+            self.bmc_modifies_check_stub_mut_args(args, &callee_path);
+        }
         if stub_in(BIGINT_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_bigint_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_bigint_stub(
                 stub_kind,
                 args,
                 destination,
@@ -132,7 +181,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(HASHMAP_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_hashmap_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_hashmap_stub(
                 stub_kind,
                 args,
                 destination,
@@ -142,8 +191,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         if stub_in(VEC_STUBS, stub_kind) {
             // MEMUB fail-closed: the abstract Vec model has no shadow-init
-            // integration — Vec bodies are prefix-abstracted
-            // (reachability.rs: "std::vec::Vec::"), so the UninitPass never
+            // integration — Vec bodies are abstracted at the reachability
+            // boundary (kani_middle/std_abstraction.rs), so the UninitPass never
             // sees their reads and the stub blesses whatever bytes the model
             // holds. Under -Z uninit-checks that let
             // `Vec::with_capacity` + `set_len` + `index` (an uninitialized
@@ -156,7 +205,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 self.ctx
                     .unsupported_with_fallback("uninit_checks_abstract_vec", callee_path.clone());
             }
-            return CallDispatchOutcome::from_handled_target(self.codegen_vec_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_vec_stub(
                 stub_kind,
                 args,
                 destination,
@@ -165,16 +214,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(ITER_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_iter_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_iter_stub(
                 stub_kind,
                 args,
                 destination,
                 target,
                 &callee_path,
+                Some(func),
             ));
         }
         if stub_in(STRING_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_string_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_string_stub(
                 stub_kind,
                 args,
                 destination,
@@ -183,7 +233,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(BTREESET_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_btreeset_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_btreeset_stub(
                 stub_kind,
                 args,
                 destination,
@@ -192,7 +242,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(HASHSET_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_hashset_stub(
+            return CallDispatchOutcome::from_fallthrough_result(self.codegen_hashset_stub(
                 stub_kind,
                 args,
                 destination,
@@ -201,13 +251,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             ));
         }
         if stub_in(BTREEMAP_INTERNAL_STUBS, stub_kind) {
-            return CallDispatchOutcome::from_handled_target(self.codegen_btreemap_internal_stub(
-                stub_kind,
-                args,
-                destination,
-                target,
-                &callee_path,
-            ));
+            return CallDispatchOutcome::from_fallthrough_result(
+                self.codegen_btreemap_internal_stub(
+                    stub_kind,
+                    args,
+                    destination,
+                    target,
+                    &callee_path,
+                ),
+            );
         }
 
         if stub_in(OPTION_RESULT_STUBS, stub_kind) {
@@ -236,17 +288,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<Option<BasicBlockIdx>> {
         match stub_kind {
             StubKind::SlicePartialEqEqual => {
-                Some(self.codegen_slice_partial_eq_stub(args, destination, target))
+                // `.map(Some)` for the same reason as PrimitivePartialEqEq below:
+                // this stub TAIL-CALLS `codegen_partial_eq` (slice.rs:145), so a
+                // plain `Some(..)` would turn that function's fail-closed `None`
+                // back into a claim that the call diverges.
+                self.codegen_slice_partial_eq_stub(args, destination, target).map(Some)
             }
             StubKind::SliceIndexIndex | StubKind::IndexIndex | StubKind::IndexMut => {
                 self.authenticated_core_index_args(func, args)?;
-                Some(self.codegen_slice_index_stub(args, destination, target))
+                self.codegen_slice_index_stub(args, destination, target).map(Some)
             }
             StubKind::SliceGetUnchecked => {
-                Some(self.codegen_slice_index_stub(args, destination, target))
+                self.codegen_slice_index_stub(args, destination, target).map(Some)
             }
             StubKind::SliceIsEmpty => {
-                Some(self.codegen_slice_is_empty_stub(args, destination, target))
+                self.codegen_slice_is_empty_stub(args, destination, target).map(Some)
             }
             StubKind::SliceFirst => {
                 // Part of #3768: slice::first — BMC fallback (unconstrained destination).
@@ -261,21 +317,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // exactly. On success continue with the encoded Option; on ANY
                 // unresolved case (range index, non-Option dest, unresolved
                 // len/elem) return `None` so dispatch FALLS THROUGH to the
-                // fail-closed fallback. Returning `Some(None)` here would map to
-                // Diverge (call_outcome.rs:35) and UNSOUNDLY prune the post-call
-                // path for a non-diverging `get`.
+                // fail-closed fallback. `Some(None)` would claim the call
+                // diverges (the dispatcher's backstop turns that into the
+                // unsupported fallback only because `get` has a return target).
                 self.codegen_slice_get(args, destination, target).map(Some)
             }
             StubKind::SlicePartitionPoint => {
                 // Part of dterm#6841: partition_point returns 0..=len.
                 // Sound over-approximation: constrain result to [0, len].
-                Some(self.codegen_slice_partition_point(args, destination, target))
+                self.codegen_slice_partition_point(args, destination, target).map(Some)
             }
             StubKind::MemchrMemchr => {
                 // core::slice::memchr::* -> Option<usize>, SOUND over-approximation.
                 // `.map(Some)` (like SliceGet): success -> Some(Some(bb)); an unresolved
                 // Option encoding -> None here -> falls through to the fail-closed
-                // fallback. Returning Some(None) would map to Diverge (unsound).
+                // fallback. `Some(None)` would claim the call diverges.
                 self.codegen_slice_memchr(args, destination, target).map(Some)
             }
             StubKind::SliceLast
@@ -286,32 +342,43 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 debug!("codegen_stubbed_call: {:?} — unconstrained fallback", stub_kind);
                 None
             }
-            StubKind::OptionUnwrap => Some(self.codegen_option_unwrap(args, destination, target)),
+            StubKind::OptionUnwrap => {
+                self.codegen_option_unwrap(args, destination, target).map(Some)
+            }
             StubKind::PrimitivePartialEqEq => {
-                Some(self.codegen_partial_eq(args, destination, target))
+                // `.map(Some)`, not `Some(..)`, for the reason SliceGet and
+                // MemchrMemchr already give: `Some(None)` claims the call
+                // diverges, which would PRUNE the post-call path if the
+                // dispatcher's backstop did not catch it. `eq` does not
+                // diverge, so every `None` here is an unsupported construct —
+                // the #703 sort mismatch, or a reference layer that could not
+                // be dereferenced. Pruning the path would make every later
+                // assertion hold VACUOUSLY; falling through records the
+                // fallback and leaves the result unconstrained.
+                self.codegen_partial_eq(args, destination, target).map(Some)
             }
             StubKind::PrimitivePartialEqNe => {
-                Some(self.codegen_partial_ne(args, destination, target))
+                self.codegen_partial_ne(args, destination, target).map(Some)
             }
             StubKind::PrimitiveClone => {
-                Some(self.codegen_primitive_clone(args, destination, target))
+                self.codegen_primitive_clone(args, destination, target).map(Some)
             }
-            StubKind::OrdCmp => Some(self.codegen_ord_cmp(args, destination, target)),
+            StubKind::OrdCmp => self.codegen_ord_cmp(args, destination, target).map(Some),
             StubKind::PrimitivePartialOrdLt => {
                 debug!("codegen_stubbed_call: PartialOrd::lt");
-                Some(self.codegen_partial_ord_cmp(args, destination, target, "lt"))
+                self.codegen_partial_ord_cmp(args, destination, target, "lt").map(Some)
             }
             StubKind::PrimitivePartialOrdLe => {
                 debug!("codegen_stubbed_call: PartialOrd::le");
-                Some(self.codegen_partial_ord_cmp(args, destination, target, "le"))
+                self.codegen_partial_ord_cmp(args, destination, target, "le").map(Some)
             }
             StubKind::PrimitivePartialOrdGt => {
                 debug!("codegen_stubbed_call: PartialOrd::gt");
-                Some(self.codegen_partial_ord_cmp(args, destination, target, "gt"))
+                self.codegen_partial_ord_cmp(args, destination, target, "gt").map(Some)
             }
             StubKind::PrimitivePartialOrdGe => {
                 debug!("codegen_stubbed_call: PartialOrd::ge");
-                Some(self.codegen_partial_ord_cmp(args, destination, target, "ge"))
+                self.codegen_partial_ord_cmp(args, destination, target, "ge").map(Some)
             }
             _other => None, // partial dispatch: StubKind
         }
@@ -326,35 +393,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<Option<BasicBlockIdx>> {
         match stub_kind {
-            StubKind::RustAlloc => Some(self.codegen_rust_alloc(args, destination, target)),
+            StubKind::RustAlloc => self.codegen_rust_alloc(args, destination, target).map(Some),
             StubKind::RustAllocZeroed => {
-                Some(self.codegen_rust_alloc_zeroed(args, destination, target))
+                self.codegen_rust_alloc_zeroed(args, destination, target).map(Some)
             }
-            StubKind::RustDealloc => Some(self.codegen_rust_dealloc(args, target)),
-            StubKind::RustRealloc => Some(self.codegen_rust_realloc(args, destination, target)),
-            StubKind::LayoutSize => Some(self.codegen_layout_size(args, destination, target)),
-            StubKind::LayoutAlign => Some(self.codegen_layout_align(args, destination, target)),
+            StubKind::RustDealloc => self.codegen_rust_dealloc(args, target).map(Some),
+            StubKind::RustRealloc => self.codegen_rust_realloc(args, destination, target).map(Some),
+            StubKind::LayoutSize => self.codegen_layout_size(args, destination, target).map(Some),
+            StubKind::LayoutAlign => self.codegen_layout_align(args, destination, target).map(Some),
             StubKind::LayoutDangling => {
-                Some(self.codegen_layout_dangling(args, destination, target))
+                self.codegen_layout_dangling(args, destination, target).map(Some)
             }
             StubKind::LayoutIsSizeAlignValid => {
-                Some(self.codegen_layout_is_size_align_valid(destination, target))
+                self.codegen_layout_is_size_align_valid(args, destination, target).map(Some)
             }
             StubKind::LayoutArray => {
                 let (elem_size, elem_align) = self.extract_element_type_layout(func);
-                Some(self.codegen_layout_array_with_type(
+                self.codegen_layout_array_with_type(
                     args,
                     destination,
                     target,
                     elem_size,
                     elem_align,
-                ))
+                )
+                .map(Some)
             }
             StubKind::LayoutArrayInner => {
                 // Part of #3273: Layout::array::inner(element_size, align, n)
                 // Args are runtime values, not generics. Delegate to from_size_align
                 // after computing array_size = element_size * n.
-                Some(self.codegen_layout_array_inner(args, destination, target))
+                self.codegen_layout_array_inner(args, destination, target).map(Some)
             }
             StubKind::LayoutNew => {
                 let (size, align) = self.extract_element_type_layout(func);
@@ -365,23 +433,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 Some(target)
             }
             StubKind::LayoutFromSizeAlignUnchecked => {
-                Some(self.codegen_layout_from_size_align_unchecked(args, destination, target))
+                self.codegen_layout_from_size_align_unchecked(args, destination, target).map(Some)
             }
             StubKind::AllocatorAllocate => {
-                Some(self.codegen_allocator_allocate(args, destination, target))
+                self.codegen_allocator_allocate(args, destination, target).map(Some)
             }
             StubKind::GlobalAllocImpl => {
                 debug!("codegen_stubbed_call: Global::alloc_impl");
-                Some(self.codegen_allocator_allocate(args, destination, target))
+                self.codegen_allocator_allocate(args, destination, target).map(Some)
             }
             StubKind::LayoutFromSizeAlign => {
-                Some(self.codegen_layout_from_size_align(args, destination, target))
+                self.codegen_layout_from_size_align(args, destination, target).map(Some)
             }
             StubKind::LayoutCalculateLayoutFor => {
-                Some(self.codegen_layout_calculate_layout_for(func, args, destination, target))
+                self.codegen_layout_calculate_layout_for(func, args, destination, target).map(Some)
             }
             StubKind::LayoutForValueRaw => {
-                Some(self.codegen_layout_for_value_raw(func, destination, target))
+                self.codegen_layout_for_value_raw(func, destination, target).map(Some)
             }
             // mem::size_of::<T> / mem::align_of::<T>: extract T from func's
             // generic args for correct layout. Moved from simple stubs which
@@ -413,10 +481,41 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // BoxNew's MIR args contain the value to box (not size/align like RustAlloc).
             // Extract T's layout from func's generic args, allocate, return pointer.
             StubKind::BoxNew => {
-                let (size, align) = self.extract_element_type_layout(func);
+                if cfg!(all(trust_toolchain, version("1.101")))
+                    && crate::codegen_ay::shared::native_box_raw::native_bmc_has_custom_global_allocator(self.ctx.tcx) {
+                    self.ctx.unsupported_with_fallback("BoxGlobalAllocator",
+                        "Box allocation must execute the user global allocator's body effects");
+                }
+                let native = self.native_box_new_layout(func, args);
+                let (size, align) = native.unwrap_or_else(|| {
+                    let (size, align) = self.extract_element_type_layout(func);
+                    (size as u64, align as u64)
+                });
                 let size_expr = Expr::bitvec_const(size as u128, POINTER_WIDTH);
                 let align_expr = Expr::bitvec_const(align as u128, POINTER_WIDTH);
-                let ptr = self.ctx.heap_alloc(size_expr, align_expr);
+                let ptr = if native.is_some() && size == 0 {
+                    let pointer = Expr::bitvec_const(align, POINTER_WIDTH);
+                    self.ctx.record_box_numeric_address(pointer.clone());
+                    pointer
+                } else {
+                    let pointer = self.ctx.heap_alloc(size_expr, align_expr);
+                    if native.is_some() && size <= 0x100000 && align <= 0x100000 {
+                        self.ctx.record_native_box_allocation(
+                            pointer.clone(),
+                            size,
+                            align,
+                            self.store_path_condition(),
+                        );
+                    } else if native.is_some() {
+                        self.ctx.unsupported_with_fallback(
+                            "BoxAllocationExtent",
+                            "native allocation exceeds BMC region capacity",
+                        );
+                    }
+                    pointer
+                };
+                // The boxed value lives at the allocation (box_new_payload.rs).
+                self.store_box_new_payload(func, args, &ptr);
                 self.assign_value_to_place(destination, ptr);
                 Some(target)
             }
@@ -432,46 +531,48 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<Option<BasicBlockIdx>> {
         match stub_kind {
-            StubKind::PtrAdd => Some(self.codegen_ptr_add(args, destination, target)),
-            StubKind::PtrSub => Some(self.codegen_ptr_sub(args, destination, target)),
+            StubKind::PtrAdd => self.codegen_ptr_add(args, destination, target).map(Some),
+            StubKind::PtrSub => self.codegen_ptr_sub(args, destination, target).map(Some),
             StubKind::PtrWrappingAdd => {
-                Some(self.codegen_ptr_wrapping_add(args, destination, target))
+                self.codegen_ptr_wrapping_add(args, destination, target).map(Some)
             }
             StubKind::PtrWrappingSub => {
-                Some(self.codegen_ptr_wrapping_sub(args, destination, target))
+                self.codegen_ptr_wrapping_sub(args, destination, target).map(Some)
             }
             StubKind::PtrWrappingOffset => {
-                Some(self.codegen_ptr_wrapping_offset(args, destination, target))
+                self.codegen_ptr_wrapping_offset(args, destination, target).map(Some)
             }
             // Part of #3510: wrapping_byte_offset does NOT scale by sizeof(T).
             StubKind::PtrWrappingByteOffset => {
-                Some(self.codegen_ptr_wrapping_byte_offset(args, destination, target))
+                self.codegen_ptr_wrapping_byte_offset(args, destination, target).map(Some)
             }
             // Part of #3514: wrapping_byte_add/sub do NOT scale by sizeof(T).
             StubKind::PtrWrappingByteAdd => {
-                Some(self.codegen_ptr_wrapping_byte_add(args, destination, target))
+                self.codegen_ptr_wrapping_byte_add(args, destination, target).map(Some)
             }
             StubKind::PtrWrappingByteSub => {
-                Some(self.codegen_ptr_wrapping_byte_sub(args, destination, target))
+                self.codegen_ptr_wrapping_byte_sub(args, destination, target).map(Some)
             }
             StubKind::PtrWithMetadataOf => {
-                Some(self.codegen_ptr_with_metadata_of(args, destination, target))
+                self.codegen_ptr_with_metadata_of(args, destination, target).map(Some)
             }
-            StubKind::PtrWrite => Some(self.codegen_ptr_write(args, target)),
-            StubKind::PtrRead => Some(self.codegen_ptr_read(args, destination, target)),
-            StubKind::NonNullNew => Some(self.codegen_nonnull_new(args, destination, target)),
-            StubKind::NonNullCast => Some(self.codegen_nonnull_cast(args, destination, target)),
+            StubKind::PtrWrite => self.codegen_ptr_write(args, target).map(Some),
+            StubKind::PtrRead => self.codegen_ptr_read(args, destination, target).map(Some),
+            StubKind::NonNullNew => self.codegen_nonnull_new(args, destination, target).map(Some),
+            StubKind::NonNullCast => self.codegen_nonnull_cast(args, destination, target).map(Some),
             StubKind::NonNullSliceFromRawParts => {
-                Some(self.codegen_nonnull_slice_from_raw_parts(args, destination, target))
+                self.codegen_nonnull_slice_from_raw_parts(args, destination, target).map(Some)
             }
-            StubKind::OptionOkOr => Some(self.codegen_option_ok_or(args, destination, target)),
+            StubKind::OptionOkOr => self.codegen_option_ok_or(args, destination, target).map(Some),
             StubKind::NonNullAsNonNullPtr => {
-                Some(self.codegen_nonnull_as_nonnull_ptr(args, destination, target))
+                self.codegen_nonnull_as_nonnull_ptr(args, destination, target).map(Some)
             }
-            StubKind::TryBranch => Some(self.codegen_try_branch(args, destination, target)),
+            StubKind::TryBranch => self.codegen_try_branch(args, destination, target).map(Some),
             // Part of #3532: ptr.with_addr(addr) returns the addr argument as a pointer.
             // Mirrors CHC handler in stubs_util_intrinsics.rs:659.
-            StubKind::PtrWithAddr => Some(self.codegen_ptr_with_addr(args, destination, target)),
+            StubKind::PtrWithAddr => {
+                self.codegen_ptr_with_addr(args, destination, target).map(Some)
+            }
             _other => None, // internal enum: StubKind
         }
     }

@@ -526,11 +526,18 @@ fn test_unsupported_flattened_deref_projection_increments_counter() {
 // Unmodified local with state_vars OOB in encode_datatype_field_update
 // =============================================================================
 
-/// Datatype field update on an unmodified local where state_vars is too small
-/// must increment sound_fallback_count().
+/// Datatype field update on an unmodified local where state_vars is too small:
+/// the field update itself books no fallback (its encoding no longer needs the
+/// truncated state variable).
 ///
-/// Production site: codegen_stmt_assign_projection.rs line 273.
-/// Part of #2783.
+/// Production site: `encode_datatype_field_update` in
+/// codegen_stmt_assign_projection.rs. Part of #2783.
+///
+/// The truncation is the test's own corruption of the context, and other
+/// statements of the block read through it: a whole-`Pair` copy then reads one
+/// leaf of a two-leaf local and is booked fail-closed
+/// (`flatten_dest_leaf_count_mismatch`), as it must be. So the assertion names
+/// the field update's own reasons rather than the block's total.
 #[test]
 fn test_datatype_field_update_unmodified_local_state_vars_oob_increments_counter() {
     with_test_ay_ctx_for_source(SOURCE_STRUCT_FIELD, |ctx| {
@@ -555,17 +562,20 @@ fn test_datatype_field_update_unmodified_local_state_vars_oob_increments_counter
         // before the projection statement. Truncating state_vars for ALL
         // locals makes earlier statements fail to modify as well.
 
-        let before = chc_ctx.sound_fallback_count();
+        let _ = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
         let (_constraints, _output_args, _modified, _safety_checks) =
             chc_ctx.encode_block_statements(bb_idx);
-        let after = chc_ctx.sound_fallback_count();
+        let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn();
+        let site_reasons =
+            ["state_idx_missing_dt_field_update", "proj_missing_state_var", "proj_sort_mismatch"];
 
         // Production now handles this path without fallback (improved encoding).
-        // Verify no regression — fallback count should not increase.
         assert!(
-            after == before,
-            "datatype field update with unmodified local should NOT increment \
-             sound_fallback_count() after encoding improvement (before={before}, after={after})"
+            reasons.get("probe_struct_field").is_none_or(|by_reason| {
+                site_reasons.iter().all(|reason| !by_reason.contains_key(*reason))
+            }),
+            "datatype field update with unmodified local should book none of \
+             {site_reasons:?}, got {reasons:?}"
         );
     });
 }

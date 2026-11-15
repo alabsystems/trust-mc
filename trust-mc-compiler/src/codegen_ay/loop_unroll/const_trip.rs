@@ -59,9 +59,8 @@ use rustc_public::mir::{
     AggregateKind, BinOp, Body, CastKind, ConstOperand, Local, Operand, Place, ProjectionElem,
     Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
 };
-use rustc_public::ty::{AdtKind, ConstantKind, RigidTy, Ty, TyConstKind, TyKind};
+use rustc_public::ty::{AdtKind, RigidTy, Ty, TyKind};
 use std::collections::HashMap;
-use trust_mc_codegen_shared::IntoOption;
 use trust_mc_codegen_types::types::{int_ty_to_bitvec_width, uint_ty_to_bitvec_width};
 
 /// Hard cap on simulated basic-block transitions. A body that has not reached a
@@ -135,24 +134,17 @@ fn int_shape(ty: Ty) -> Option<(u32, bool)> {
 fn const_val(c: &ConstOperand) -> Option<Val> {
     let mir_const = &c.const_;
     let ty = mir_const.ty();
-    let alloc = match mir_const.kind() {
-        ConstantKind::Allocated(alloc) => alloc.clone(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            TyConstKind::Value(_, alloc) => alloc.clone(),
-            _ => return None,
-        },
-        _ => return None,
-    };
+    use crate::codegen_ay::shared::const_pointer;
     match ty.kind() {
-        TyKind::RigidTy(RigidTy::Bool) => Some(Val::Bool(alloc.read_bool().into_option()?)),
+        TyKind::RigidTy(RigidTy::Bool) => Some(Val::Bool(const_pointer::const_bool(mir_const)?)),
         TyKind::RigidTy(RigidTy::Int(int_ty)) => {
             let width = int_ty_to_bitvec_width(int_ty);
-            let v = alloc.read_int().into_option()?;
+            let v = const_pointer::const_int(mir_const)?;
             Some(Val::Int { bits: truncate(v as u128, width), width, signed: true })
         }
         TyKind::RigidTy(RigidTy::Uint(uint_ty)) => {
             let width = uint_ty_to_bitvec_width(uint_ty);
-            let v = alloc.read_uint().into_option()?;
+            let v = const_pointer::const_uint(mir_const)?;
             Some(Val::Int { bits: truncate(v, width), width, signed: false })
         }
         _ => None,
@@ -386,12 +378,16 @@ impl Simulator {
         match op {
             Operand::Constant(c) => const_val(c),
             Operand::Copy(place) | Operand::Move(place) => self.store.get(place, &self.poisoned),
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(checks) => {
+                Some(Val::Bool(crate::rustc_compat::runtime_checks_value(checks)))
+            }
         }
     }
 
     fn rvalue(&self, rvalue: &Rvalue) -> Option<Val> {
         match rvalue {
-            Rvalue::Use(op) => self.operand(op),
+            Rvalue::Use(op, ..) => self.operand(op),
             Rvalue::BinaryOp(op, a, b) => eval_binop(*op, self.operand(a)?, self.operand(b)?),
             Rvalue::UnaryOp(UnOp::Not, a) => match self.operand(a)? {
                 Val::Bool(b) => Some(Val::Bool(!b)),

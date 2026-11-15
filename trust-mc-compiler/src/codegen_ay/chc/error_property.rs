@@ -88,6 +88,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             location: None,
             // Task #78: filled in at VC finalization by the dependence analysis.
             approximation_dependent: None,
+            discharged_at_encode: None,
         });
 
         RelationApp::new(relation, Vec::new())

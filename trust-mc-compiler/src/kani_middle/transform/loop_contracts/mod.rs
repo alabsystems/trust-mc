@@ -11,7 +11,7 @@
 mod analysis;
 mod rewrite;
 mod rule;
-pub(crate) use rule::TRANSFORMED_NESTED_LEGACY;
+pub(crate) use rule::{TRANSFORMED_LEGACY_LATCH, TRANSFORMED_NESTED_LEGACY};
 mod smt2;
 mod transform;
 
@@ -128,8 +128,35 @@ pub(crate) fn get_loop_invariants(fn_name: &str) -> Option<Vec<ExtractedLoopInva
     registry.get(fn_name).cloned()
 }
 
+/// The environment variable the driver's two-lane loop-contract retry sets in
+/// each child (`trust-mc-driver/src/loop_two_lane.rs`, `LANE_ENV`).
+const TWO_LANE_ENV: &str = "TRUST_MC_LOOP_LANE";
+
+/// Is this compilation the two-lane retry's PROPERTIES lane
+/// (`TRUST_MC_LOOP_LANE=properties`)?
+///
+/// That lane runs the loop on the legacy encoding ON PURPOSE (rule off,
+/// bounded unroll) to prove the user properties; the parent accepts its success
+/// only beside the obligations lane's proof of the loop contract
+/// (`loop_two_lane::merge`), which itself books every legacy latch. The legacy
+/// latch check and the legacy-latch booking are therefore waived there, and
+/// only there: the obligations lane (`obligations`) and a run with the
+/// `TRUST_MC_NO_LOOP_RULE` triage lever alone keep both.
+///
+/// Nothing authenticates the variable. What keeps a hand-set one from minting
+/// a proof is the driver: a properties-lane process never prints its success
+/// as a proof (`trust-mc-driver/src/loop_two_lane.rs`,
+/// `demote_properties_lane_success`), and only the parent's merge reads it.
+pub(crate) fn is_two_lane_properties_lane() -> bool {
+    std::env::var(TWO_LANE_ENV).is_ok_and(|lane| lane == "properties")
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct LoopContractPass {
+    /// `--ay-chc`: loops the #47 rule declines get the reachable-state latch
+    /// check (`rule.rs`, `instrument_declined_loops`). The BMC lane walks the
+    /// register fn's swapped body instead and keeps its encoding.
+    chc_legacy_latch: bool,
     /// Cache KaniRunContract function used to implement contracts.
     run_contract_fn: Option<FnDef>,
     /// The map from original loop head to the new loop latch.
@@ -231,6 +258,7 @@ impl LoopContractPass {
             let run_contract_fn = kani_fns.get(&KaniModel::RunLoopContract.into()).copied();
             assert!(run_contract_fn.is_some(), "Failed to find trust_mc run contract function");
             LoopContractPass {
+                chc_legacy_latch: queries.args().ay_chc,
                 run_contract_fn,
                 new_loop_latches: HashMap::new(),
                 extracted_invariants: Vec::new(),

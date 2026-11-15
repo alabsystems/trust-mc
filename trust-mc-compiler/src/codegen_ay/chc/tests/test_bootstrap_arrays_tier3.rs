@@ -605,8 +605,8 @@ fn assert_internal_struct_vecpop_contract(
 
     let rule = chc_ctx.vc.rules.last().expect("internal VecPop rule");
     let owner_out_name = &chc_ctx.state_var_mgr.output_state_vars[struct_state_idx].0;
-    let owner_promoted =
-        rule.head.args[struct_state_idx].to_string().contains(owner_out_name.as_ref());
+    let owner_promoted = head_arg_for_state_idx(chc_ctx, rule, struct_state_idx)
+        .is_some_and(|arg| arg.to_string().contains(owner_out_name.as_ref()));
     let owner_bound = rule.body.constraints.iter().any(|constraint| {
         constraint_tree_contains(constraint, &|expr| {
             matches!(expr.value(), ExprValue::Var { name } if name == owner_out_name.as_ref())
@@ -630,7 +630,8 @@ fn assert_internal_struct_vecpop_contract(
 
     let promoted = (0..field_count).all(|offset| {
         let out_name = &chc_ctx.state_var_mgr.output_state_vars[dest_vec_idx + offset].0;
-        rule.head.args[dest_vec_idx + offset].to_string().contains(out_name.as_ref())
+        head_arg_for_state_idx(chc_ctx, rule, dest_vec_idx + offset)
+            .is_some_and(|arg| arg.to_string().contains(out_name.as_ref()))
     });
     let bound = (0..field_count).all(|offset| {
         let out_name = &chc_ctx.state_var_mgr.output_state_vars[dest_vec_idx + offset].0;
@@ -808,7 +809,10 @@ fn test_array_solver_datatype_is_not_accepted_as_vec_fields() {
         let solver_expr = Expr::var("solver", solver_sort);
 
         assert_eq!(
-            solver_expr.sort().datatype_name(),
+            solver_expr
+                .sort()
+                .datatype_name()
+                .map(crate::codegen_ay::test_support::local_sort_name),
             Some("ArraySolver"),
             "regression precondition: expected ArraySolver datatype expression"
         );

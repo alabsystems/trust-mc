@@ -80,6 +80,7 @@ impl AYCodegenResults {
             into_option_drops: uf.into_option_drops,
             internal_workarounds: uf.internal_workarounds,
             abstracted_fallbacks: uf.abstracted_fallbacks,
+            unstubbed_abstractions: uf.unstubbed_abstractions,
             vec_field_fallbacks: uf.vec_field_fallbacks,
             pointee_synthesis_fallbacks: uf.pointee_synthesis_fallbacks,
             unsupported_construct_fallbacks: uf.unsupported_construct_fallbacks,

@@ -241,6 +241,7 @@ pub(super) fn compose_range_next_constraints(
         warn!(bb_idx, "RangeNext composition: cannot resolve iterator receiver");
         abort_composition!();
     };
+    let iter_local = ctx.range_receiver_local(&iter_expr, iter_local);
 
     ctx.ensure_local_live_at_block(dest_local, bb_idx);
     if let Some(iter_local) = iter_local {

@@ -178,28 +178,39 @@ fn test_datatype_field_select_ite_coerces_structurally_matching_constructor_arg(
         [("fld_range", monomorphized_range_sort.clone())],
     );
 
-    let mismatched_ctor = Expr::datatype_constructor(
+    // ay (ad07c5cc63) checks constructor argument sorts by datatype NAME and shape,
+    // so a generic `RawIterRange_T` argument can no longer be placed where the
+    // monomorphized `RawIterRange__u32_u32` is declared: the term this coercion lane
+    // used to repair is now rejected at construction.
+    let generic_arg = Expr::var("generic_range", generic_range_sort);
+    assert!(
+        Expr::try_datatype_constructor(
+            "Wrapper_RawIterRange__u32_u32",
+            "Wrapper_RawIterRange__u32_u32_mk",
+            vec![generic_arg],
+            wrapper_sort.clone(),
+        )
+        .is_err(),
+        "ay must reject a constructor argument whose datatype differs from the declaration"
+    );
+
+    // The well-sorted shape still selects through the ITE with the declared sort.
+    let well_sorted_ctor = Expr::datatype_constructor(
         "Wrapper_RawIterRange__u32_u32",
         "Wrapper_RawIterRange__u32_u32_mk",
-        vec![Expr::var("generic_range", generic_range_sort)],
+        vec![Expr::var("mono_range", monomorphized_range_sort.clone())],
         wrapper_sort.clone(),
     );
     let symbolic_wrapper = Expr::var("wrapper_sym", wrapper_sort);
-    let container = Expr::ite(Expr::var("cond", Sort::bool()), mismatched_ctor, symbolic_wrapper);
+    let container = Expr::ite(Expr::var("cond", Sort::bool()), well_sorted_ctor, symbolic_wrapper);
 
-    let selected = select_field_val(&container, 0, None)
-        .expect("ITE field select should coerce structurally matching constructor args");
-
+    let selected =
+        select_field_val(&container, 0, None).expect("ITE field select over a wrapper datatype");
     assert_eq!(
         selected.sort(),
         &monomorphized_range_sort,
-        "field select should normalize branch results to the declared field sort"
+        "field select should produce the declared field sort"
     );
-    let ExprValue::Ite { then_expr, else_expr, .. } = selected.value() else {
-        panic!("selected field from wrapper ITE should remain an ITE");
-    };
-    assert_eq!(then_expr.sort(), &monomorphized_range_sort);
-    assert_eq!(else_expr.sort(), &monomorphized_range_sort);
 }
 
 #[test]

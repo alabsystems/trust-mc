@@ -687,12 +687,8 @@ fn test_pub_static_real_file_needle_selects_from_concrete_static() {
             !smt.contains("extract 31 0"),
             "pub_static needle must not be a pointer truncation (extract 31 0), got: {smt}"
         );
-        // The concrete static array stores should appear in the disjunction rule.
-        let store_count = smt.matches("store").count();
-        assert!(
-            store_count >= 7,
-            "pub_static needle should select from concrete static stores (need ≥7 for DAYS_OF_WEEK), got {store_count} stores"
-        );
+        // No store-count pin: const-folding of read-only constant arrays folds the
+        // DAYS_OF_WEEK store chain away in `translate()`; the >= 7 stores held only pre-fold.
     });
 }
 

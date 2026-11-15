@@ -70,12 +70,32 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
         ub: OffsetUb,
     ) -> Option<BasicBlockIdx> {
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
         if args.len() < 2 {
-            return None;
+            self.ctx.unsupported_with_fallback("ptr_offset_arity", "fewer than 2 args");
+            self.codegen_symbolic_result(destination);
+            return target;
         }
 
-        let ptr_operand_expr = self.codegen_operand(&args[0])?;
-        let count_expr = self.codegen_operand(&args[1])?;
+        let Some(ptr_operand_expr) = self.codegen_operand(&args[0]) else {
+            self.ctx.unsupported_with_fallback(
+                "ptr_offset_operand",
+                "pointer operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+        let Some(count_expr) = self.codegen_operand(&args[1]) else {
+            self.ctx
+                .unsupported_with_fallback("ptr_offset_operand", "count operand did not translate");
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
 
         // ESTABLISH that args[0] really is `*T` / `&T`.
         //
@@ -130,6 +150,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // there is no obligation here. The deref site carries it.
         } else if let Some(base) = Self::establish_pointer_base_address(&ptr_operand_expr) {
             self.emit_offset_overflow_check(&base, &count, pointee_size);
+            self.emit_offset_same_allocation_check(
+                &ptr_operand_expr,
+                &ptr_expr,
+                &count_expr,
+                pointee_size,
+            );
         } else {
             // No address exists here, so `pointer_invalid` cannot be asked and
             // the wrap checks would be about a fabricated base. Fail closed via
@@ -171,14 +197,36 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
         unsigned: bool,
     ) -> Option<BasicBlockIdx> {
+        // FAIL CLOSED. A `None` from here means "could not encode", but callers
+        // routed it through `from_handled_target` -> Diverge, which DELETES the
+        // post-call path and makes every later assertion hold vacuously. Record
+        // the gap and continue with an unconstrained result — the shape this
+        // file already uses for a non-pointer base (ptr_arithmetic.rs:93).
+        // See docs/dispatch-diverge-hazard-2026-09-17.md.
         if args.len() < 2 {
-            return None;
+            self.ctx.unsupported_with_fallback("ptr_offset_from_arity", "fewer than 2 args");
+            self.codegen_symbolic_result(destination);
+            return target;
         }
 
-        let lhs_expr = self.codegen_operand(&args[0])?;
-        let rhs_expr = self.codegen_operand(&args[1])?;
-        let lhs_ptr = self.coerce_to_ptr_width(lhs_expr);
-        let rhs_ptr = self.coerce_to_ptr_width(rhs_expr);
+        let Some(lhs_expr) = self.codegen_operand(&args[0]) else {
+            self.ctx.unsupported_with_fallback(
+                "ptr_offset_from_operand",
+                "lhs operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+        let Some(rhs_expr) = self.codegen_operand(&args[1]) else {
+            self.ctx.unsupported_with_fallback(
+                "ptr_offset_from_operand",
+                "rhs operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+        let lhs_ptr = self.coerce_to_ptr_width(lhs_expr.clone());
+        let rhs_ptr = self.coerce_to_ptr_width(rhs_expr.clone());
         let ptr_width = lhs_ptr.sort().bitvec_width().unwrap_or(POINTER_WIDTH);
 
         let pointee_size = if let Some(ptr_ty) = args[0].ty(self.body.locals()).into_option() {
@@ -217,14 +265,37 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // assert-then-assume lowering (code after a failed check is
         // path-constrained).
         let differs = lhs_ptr.clone().eq(rhs_ptr.clone()).not();
-        let same_alloc = self
-            .ctx
-            .heap_pointer_object(lhs_ptr.clone())
-            .eq(self.ctx.heap_pointer_object(rhs_ptr.clone()));
+        // Exact when both allocations can be named (alloc_view.rs); otherwise
+        // the region predicate, which can MISS an out-of-bounds pointer, so
+        // the site is recorded and a proof leaning on it is demoted.
+        let same_alloc = match self.same_allocation_exact(&lhs_expr, &lhs_ptr, &rhs_expr, &rhs_ptr)
+        {
+            Some(exact) => exact,
+            // A zero-sized pointee never reaches this intrinsic on a live
+            // path: `offset_from` asserts `0 < pointee_size` first (Kani's
+            // expected output pins that panic). Recording an unresolved
+            // allocation here tainted the should_panic harness
+            // offset-bounds-check/offset_from_unsigned.rs
+            // `check_offset_from_unsigned_unit_panic` with a check it never
+            // executes.
+            None if pointee_size == 0 => self
+                .ctx
+                .heap_pointer_object(lhs_ptr.clone())
+                .eq(self.ctx.heap_pointer_object(rhs_ptr.clone())),
+            None => {
+                self.ctx.bmc_offset_provenance_unresolved("ptr_offset_from");
+                self.ctx
+                    .heap_pointer_object(lhs_ptr.clone())
+                    .eq(self.ctx.heap_pointer_object(rhs_ptr.clone()))
+            }
+        };
         self.record_violation_guarded_with_message(
             differs.clone().and(same_alloc.clone().not()),
             "ptr_offset_from_same_alloc",
-            Some("Offset result and original pointer should point to the same allocation".to_string()),
+            Some(
+                "Offset result and original pointer should point to the same allocation"
+                    .to_string(),
+            ),
         );
         let mut no_ub = differs.clone().not().or(same_alloc);
         if elem_size > 1 {
@@ -281,8 +352,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return target;
         }
 
-        let ptr_operand_expr = self.codegen_operand(&args[0])?;
-        let count_expr = self.codegen_operand(&args[1])?;
+        let Some(ptr_operand_expr) = self.codegen_operand(&args[0]) else {
+            self.ctx.unsupported_with_fallback(
+                "model_offset_operand",
+                "pointer operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
+        let Some(count_expr) = self.codegen_operand(&args[1]) else {
+            self.ctx.unsupported_with_fallback(
+                "model_offset_operand",
+                "count operand did not translate",
+            );
+            self.codegen_symbolic_result(destination);
+            return target;
+        };
 
         // ESTABLISH the pointer type, exactly as `codegen_ptr_offset_intrinsic`
         // does — the `_ => 1` / `else { 1 }` arms that used to sit here let a
@@ -316,6 +401,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let count = Val::of_value(count_extended.clone());
         if let Some(base) = Self::establish_pointer_base_address(&ptr_operand_expr) {
             self.emit_offset_overflow_check(&base, &count, pointee_size);
+            self.emit_offset_same_allocation_check(
+                &ptr_operand_expr,
+                &ptr_coerced,
+                &count_extended,
+                pointee_size,
+            );
         } else {
             warn!(
                 sort = ?ptr_operand_expr.sort(),
@@ -374,6 +465,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let ptr_place = match ptr_arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return,
         };
         let ptr_base = self.root_ssa_base_name(ptr_place);
         let Some(array_base) = self.ref_pointees.get(ptr_base.as_str()).cloned() else {
@@ -387,6 +480,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let count_place = match count_arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return,
         };
         if !count_place.projection.is_empty() {
             return;

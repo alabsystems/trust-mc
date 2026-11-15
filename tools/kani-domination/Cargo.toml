@@ -4,9 +4,10 @@
 
 # STANDALONE workspace. kani-domination is a plain CLI that DRIVES the trust-mc
 # verifier as a subprocess; it deliberately does NOT join the trust-mc workspace,
-# so building it needs only stable Rust — no nightly, no rustc-dev/rust-src
-# components, and no ay/trust-ir/trust-vc git-dep resolution. (The verifier still
-# has to be built separately to actually run a measurement.)
+# so building it needs no rustc_private crates and no ay/trust-ir/trust-vc git-dep
+# resolution: `targo --unverified build --release` in this directory, on the
+# repository's Trust pin. (The verifier still has to be built separately to
+# actually run a measurement: `targo --unverified build-dev` at the root.)
 [workspace]
 
 [package]
@@ -29,3 +30,6 @@ serde_json = "1"
 walkdir = "2.5"
 sha2 = "0.10"
 which = "8"
+# wait4 (per-child rusage), process-group kill, and signal forwarding for the
+# per-unit resource accounting in `runner.rs`.
+libc = "0.2"

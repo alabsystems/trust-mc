@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "fork_commit": "c4d858036efec56e02caa743f8732582da973d5a",
+  "historical_total": 818,
+  "corrections": [
+    {
+      "file": "tests/expected/function-contract/modifies/expr_replace_pass.rs",
+      "harness": "modify_harness",
+      "before": "PROOF",
+      "after": "CTREX",
+      "main_harness_unchanged": "PROOF",
+      "source_blob": "95dd20e34b06ac01cbb11c2cbc173792e3c2cfb4",
+      "source_sha256": "16eefff48e6159c50b7e555f206842ea253b2c67d750ddb174afcad55f129869",
+      "expectation_file": "tests/expected/function-contract/modifies/expr_replace_pass.expected",
+      "expectation_blob": "4058753347638104a8e18d6c3e63d46f670d6d8b",
+      "expectation_sha256": "f221c0cc46029f0ca689320cff4bc5bd53cf9532b6ebd5d729a2d8d1a336e05c",
+      "witness": {
+        "initial_target": 0,
+        "prior": 1,
+        "actual_post_target": 1,
+        "required_post_target": 2
+      },
+      "reason": "The selected proof_for_contract harness supplies an independent arbitrary prior. Its precondition only bounds target, and incrementing target does not establish target==prior+1. Original expected SUCCESSFUL text names only the separate main harness, which passes prior equal to the initial target."
+    },
+    {
+      "file": "tests/expected/function-contract/modifies/field_replace_pass.rs",
+      "harness": "modify_harness",
+      "before": "PROOF",
+      "after": "CTREX",
+      "main_harness_unchanged": "PROOF",
+      "source_blob": "737a811db4318f4956f142a812e5c03ef5a431bc",
+      "source_sha256": "f096230ffa37e8b93984507a4172b5237d6b4541f2c78ceab18ae94c816134bd",
+      "expectation_file": "tests/expected/function-contract/modifies/field_replace_pass.expected",
+      "expectation_blob": "64dedf3f511aceb39655fe514c9e20be856dc35f",
+      "expectation_sha256": "7b333e41467b709c17040c19546dd7de4c610a3d9f6376ee94fc8fa5a7973833",
+      "witness": {
+        "initial_target": 0,
+        "prior": 1,
+        "actual_post_target": 1,
+        "required_post_target": 2
+      },
+      "reason": "The selected proof_for_contract harness supplies an independent arbitrary prior. Its precondition only bounds target, and incrementing target does not establish target==prior+1. Original expected SUCCESSFUL text names only the separate main harness, which passes prior equal to the initial target."
+    }
+  ],
+  "partition": {
+    "proof": 477,
+    "negative": 341,
+    "active_proof": 445,
+    "active_negative": 341
+  },
+  "scope": "Per-harness semantic corrections, with unchanged source programs and all historical identities. Do not reinterpret the separate passing main harness as proof of its contract."
+}

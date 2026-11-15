@@ -10,6 +10,8 @@
 //! Extracted from include!() to proper module via extension trait pattern.
 //! Part of #2306: include!() to proper module migration.
 
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
 use rustc_middle::ty::tls;
 use rustc_public::CrateDef;
@@ -42,6 +44,11 @@ pub(in crate::codegen_ay::chc) trait CodegenTypes<'tcx, 'body> {
         args: &GenericArgs,
         payload_ty: rustc_public::ty::Ty,
     ) -> String;
+    fn option_like_constructors(
+        def: AdtDef,
+        option_name: &str,
+        payload_sort: Sort,
+    ) -> Vec<(String, Vec<(String, Sort)>)>;
     #[must_use]
     fn translate_ty(ty: rustc_public::ty::Ty) -> Option<Sort>;
 }
@@ -117,6 +124,41 @@ impl<'tcx, 'body> CodegenTypes<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         } else {
             Self::adt_sort_name(def, args)
         }
+    }
+
+    /// The constructors of an Option-like ADT's datatype sort (one variant with
+    /// one field, one with none), in the ADT's VARIANT order.
+    ///
+    /// The encoder reads a constructor's position as its variant index in many
+    /// places: the BV-flattened enum layouts (`EnumBvLayout`, whose Bool tag is
+    /// "variant 1"), `build_enum_bv_destination_values`, the flattened-local
+    /// reconstruction, `dt.constructors.get(variant_idx)` in downcasts and the
+    /// inline walker. `names::option_constructors` lists the empty variant
+    /// first, which is the variant order of `Option` and of every payload-last
+    /// enum, but the reverse of a payload-FIRST one (`enum Rev { Has(Box<u16>),
+    /// Empty }`, `core::task::Poll`). For those the datatype value and the
+    /// flattened local disagreed about which variant was which: a `Poll::Ready`
+    /// stored in a `Vec` or a tuple read back as `Pending` (missed bugs and
+    /// certified false counterexamples on main), and the round-1 niche
+    /// transmute decode read `transmute::<*mut u16, Rev>(null)` as `Has`
+    /// (review of fix/chc-lost-writes, lostwrite track round 2, finding 1).
+    ///
+    /// Constructors keep their names (`Some_*` is the payload variant,
+    /// `None_*` the empty one), so every reader that goes by name is
+    /// unchanged. `Option` itself shares its sort name across payload types
+    /// (`option_sort_name_for_payload`), so its order is the shared one.
+    fn option_like_constructors(
+        def: AdtDef,
+        option_name: &str,
+        payload_sort: Sort,
+    ) -> Vec<(String, Vec<(String, Sort)>)> {
+        let mut constructors = names::option_constructors(option_name, payload_sort);
+        let payload_first = def.trimmed_name() != "Option"
+            && def.variants().first().is_some_and(|variant| variant.fields().len() == 1);
+        if payload_first {
+            constructors.reverse();
+        }
+        constructors
     }
 
     /// Translates a Rust type to a AY sort.

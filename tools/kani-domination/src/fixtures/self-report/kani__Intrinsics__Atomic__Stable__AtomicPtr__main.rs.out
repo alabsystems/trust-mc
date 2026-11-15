@@ -1,0 +1,32 @@
+# Reconstructed transcript: the results-verification-bmc unit log this fixture was cut from was never committed (the root .gitignore's `*.out` hid it) and is lost. Driver-shaped, carrying the markers runner.rs pins; not a byte-for-byte driver log.
+Checking harness check_atomic_ptr_load_store...
+[AY:PROOF] BMC verification: no violation within bound
+[AY:PROOF_QUALIFIERS:clean]
+Check 1: check_atomic_ptr_load_store.assertion.1
+	 - Status: SUCCESS
+	 - Description: "assertion failed: unsafe { *p.load(Ordering::SeqCst) } == 1"
+	 - Location: /corpus/kani/Intrinsics/Atomic/Stable/AtomicPtr/main.rs:18:5 in function check_atomic_ptr_load_store
+
+SUMMARY:
+ ** 0 of 1 failed
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 0.4s
+
+Checking harness check_atomic_ptr_swap...
+[AY:UNKNOWN_QUALITY:EncodingGap:unconstrained_assignment=2]
+[AY:UNKNOWN_REASON:SolverUnknown]
+Check 1: check_atomic_ptr_swap.assertion.1
+	 - Status: UNDETERMINED
+	 - Description: "assertion failed: unsafe { *old } == 1"
+	 - Location: /corpus/kani/Intrinsics/Atomic/Stable/AtomicPtr/main.rs:31:5 in function check_atomic_ptr_swap
+
+SUMMARY:
+ ** 0 of 1 failed (1 undetermined)
+
+VERIFICATION:- INCONCLUSIVE (solver undecided)
+Verification Time: 0.4s
+
+Manual Harness Summary:
+Verification failed for - check_atomic_ptr_swap
+Complete - 1 successfully verified harnesses, 1 failures, 2 total.

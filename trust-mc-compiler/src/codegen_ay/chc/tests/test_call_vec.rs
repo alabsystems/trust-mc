@@ -445,8 +445,10 @@ fn test_vec_iter_next_nested_coroutine_payload_constrains_all_flattened_fields()
             );
             assert_eq!(
                 chc_ctx.vc.rules.len(),
-                before_rules + 1,
-                "{fn_name} should emit exactly one rule for IntoIterNext"
+                // translate_vec_into_iter_next_branches (ac4a401f4) emits a guarded Some
+                // rule and a guarded None rule.
+                before_rules + 2,
+                "{fn_name} should emit the Some and None rules for IntoIterNext"
             );
 
             let dest_vec_idx = chc_ctx.state_idx_for_local(destination.local);
@@ -585,7 +587,18 @@ fn test_vec_push_stores_value_in_fld_data() {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_vec_push_data");
         let body = instance.body().expect("function body");
 
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_vec_push_data", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the pushed Vec is never read, so
+        // write-only array elimination (85da41dad) removes the fld_data Store.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_vec_push_data",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_vec_push_data", body.blocks.len());
 
@@ -1098,7 +1111,19 @@ fn test_vec_builder_from_u64_seeds_bool_backing_array() {
     with_test_ay_ctx_for_source(SOURCE, |ctx| {
         let instance = find_instance_by_suffix(ctx.tcx, "probe_bits_from_u64");
         let body = instance.body().expect("body");
-        let vc = mir_to_chc(ctx.tcx, &body, "probe_bits_from_u64", ChcConfig::default());
+        // Pre-pass VC, full frame as `mir_to_chc` encodes first: the returned backing array is
+        // never read, so write-only array elimination (85da41dad) removes the ConstArray seed and
+        // bit Store.
+        let vc = pre_pass_vc(ChcCtx::new(
+            ctx.tcx,
+            &body,
+            "probe_bits_from_u64",
+            ChcConfig {
+                frame_narrowing: false,
+                frame_narrowing_flattened: false,
+                ..ChcConfig::default()
+            },
+        ));
 
         assert_vc_structure(&vc, "probe_bits_from_u64", body.blocks.len());
         assert_has_nontrivial_transition_constraints(&vc, "probe_bits_from_u64");
@@ -1295,9 +1320,12 @@ fn test_vec_macro_data_values_propagate_to_assertions() {
             "into_vec must produce data array reference in CHC output.\nSMT (first 2000 chars):\n{}",
             &smt[..smt.len().min(2000)]
         );
-        // The concrete value 42 must appear somewhere in the constraints.
+        // The concrete value 42 must appear as a 32-bit constant. A bare
+        // `contains("42")` held for any spelling with those two digits, a
+        // fresh name's process-global counter suffix among them, so the test
+        // passed in the full suite and failed alone (REDS-REST).
         assert!(
-            has_store_42 || has_store_42_dec || smt.contains("42"),
+            has_store_42 || has_store_42_dec,
             "Concrete value 42 must propagate into CHC data array constraints.\nSMT (first 2000 chars):\n{}",
             &smt[..smt.len().min(2000)]
         );

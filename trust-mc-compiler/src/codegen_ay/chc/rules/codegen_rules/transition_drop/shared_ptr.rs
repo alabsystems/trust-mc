@@ -15,6 +15,7 @@
 //!
 //! Split from `codegen_drop.rs` — Part of #3927.
 
+use crate::callee_body::CalleeBody;
 use crate::codegen_ay::chc::ChcCtx;
 use crate::codegen_ay::chc::call::inline_body::InlineReturn;
 use crate::codegen_ay::chc::rules::codegen_rules_helpers::{
@@ -23,6 +24,7 @@ use crate::codegen_ay::chc::rules::codegen_rules_helpers::{
 };
 use crate::codegen_ay::provenance::{Loc, Val};
 use crate::codegen_ay::ptr_repr::PtrRepr;
+use crate::codegen_ay::shared::mono_ty;
 
 pub(in crate::codegen_ay::chc) struct SharedPointerDeallocEffects {
     pub pending_checks: Vec<ay_bindings::Expr>,
@@ -165,9 +167,13 @@ pub(in crate::codegen_ay::chc) fn collect_shared_pointer_dealloc_effects(
     };
     use ay_bindings::Expr;
 
-    let storage = match known_alloc_id {
-        Some(alloc_id) => rust_dealloc_base_ptr_for_known_alloc_id(alloc_id),
-        None => shared_pointer_storage_expr(wrapper_expr)?.into_expr(),
+    // Split the pointer actually being freed so the base-pointer (offset == 0)
+    // check constrains it. Substituting concat(known_id, 0) made that check
+    // trivially true. The known id is used only when the wrapper's storage
+    // pointer cannot be recovered (same preference as box_drop / arc_drop).
+    let storage = match shared_pointer_storage_expr(wrapper_expr) {
+        Some(storage) => storage.into_expr(),
+        None => rust_dealloc_base_ptr_for_known_alloc_id(known_alloc_id?),
     };
     let (raw_obj_id_expr, offset_expr) = ctx.split_pointer(&storage)?;
     let obj_id_expr = rust_dealloc_obj_id_expr(raw_obj_id_expr, known_alloc_id);
@@ -203,16 +209,17 @@ pub(in crate::codegen_ay::chc) fn try_translate_shared_pointer_inner_drop(
     bb_idx: usize,
     inline_depth: usize,
 ) -> Option<InlineReturn> {
-    use rustc_public::mir::mono::Instance;
-
     if super::no_drop::ty_trivially_no_drop(pointee_ty) || is_mutex_rwlock_drop(pointee_ty) {
         return None;
     }
-    let drop_instance = Instance::resolve_drop_in_place(pointee_ty);
+    let Some(drop_instance) = mono_ty::drop_in_place(pointee_ty) else {
+        ctx.record_sound_fallback_reason(mono_ty::DROP_GLUE_UNRESOLVED);
+        return None;
+    };
     if drop_instance.is_empty_shim() {
         return None;
     }
-    let Some(body) = drop_instance.body() else {
+    let Some(body) = drop_instance.callee_body() else {
         return None;
     };
     let Some(self_expr) = wrapper_alloc_id
@@ -224,7 +231,7 @@ pub(in crate::codegen_ay::chc) fn try_translate_shared_pointer_inner_drop(
         return None;
     };
     let params = [self_expr];
-    ctx.register_callee_body_statics(&body);
+    ctx.register_callee_body_consts(&body);
     ctx.mark_inline_field_reads(&body, &params, bb_idx);
     let mut caller_vtable_ids = std::collections::HashMap::new();
     // Seed vtable IDs for dyn members inside the pointee type so that
@@ -238,16 +245,19 @@ pub(in crate::codegen_ay::chc) fn try_translate_shared_pointer_inner_drop(
         &body,
         &mut caller_vtable_ids,
     );
-    let result = crate::codegen_ay::chc::call::inline_body::translate_inline_body(
-        ctx,
-        &body,
-        &params,
-        bb_idx,
-        &caller_vtable_ids,
-        Some(drop_instance),
-        inline_depth,
-    );
-    result
+    // Every caller emits or parks the walk's checks (arc_drop.rs,
+    // generic_preroutes.rs, inline_shared_drop.rs, drop_placeholders.rs).
+    crate::codegen_ay::chc::call::inline_body::walk_drop_body(ctx, |ctx| {
+        crate::codegen_ay::chc::call::inline_body::translate_inline_body(
+            ctx,
+            &body,
+            &params,
+            bb_idx,
+            &caller_vtable_ids,
+            Some(drop_instance),
+            inline_depth,
+        )
+    })
 }
 
 /// Seed vtable discriminant IDs for dyn trait members within an Rc/Arc inner

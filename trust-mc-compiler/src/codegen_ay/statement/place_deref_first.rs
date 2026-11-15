@@ -74,6 +74,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // Build ITE chain: ite(addr==a1, v1, ite(addr==a2, v2, ..., fresh))
             let fallback_name = self.ctx.fresh_name("symbolic_deref_fallback");
             let mut result = self.ctx.declare_var(&fallback_name, expected_sort.clone());
+            self.ctx.bmc_sound_havoc("symbolic_deref_fallback");
             for (known_addr, stored_val) in candidates.iter().rev() {
                 let cond = addr.clone().eq(known_addr.clone());
                 result = Expr::ite(cond, stored_val.clone(), result);
@@ -101,6 +102,40 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             symbolic_value.sort()
         );
         Some(symbolic_value)
+    }
+
+    /// Whether `value`, found under the pointer `local`'s heap key, is that pointer's own
+    /// trait-object fat pointer rather than what it points to.
+    ///
+    /// `heap_pointees` / `ptr_source_map` can hold the `Dyn_*` value of a `*const dyn Trait`
+    /// or `&dyn Trait` under the pointer's key. A `dyn Trait` pointee is unsized and is never
+    /// represented as a `Dyn_*` term, so handing that term back as `*local` makes the fat
+    /// pointer stand in for the object: its `fld_ptr` then reads as the object's first field.
+    /// A pointer to a POINTER to `dyn Trait` (`&&dyn T`, `*const Box<dyn T>`) keeps its
+    /// fat-pointer pointee.
+    fn value_is_the_trait_object_pointer(&self, value: &Expr, local: usize) -> bool {
+        let is_dyn_fat_pointer = value
+            .sort()
+            .datatype_sort()
+            .is_some_and(|dt| crate::codegen_ay::names::is_dyn_sort_name(&dt.name));
+        if !is_dyn_fat_pointer {
+            return false;
+        }
+        let Some(ptr_ty) = self.body.locals().get(local).map(|decl| decl.ty) else {
+            return false;
+        };
+        let pointee = match ptr_ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => inner,
+            _ => return false,
+        };
+        let discarded = matches!(pointee.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)));
+        if discarded {
+            debug!(
+                local,
+                "codegen_place Deref: heap entry is the trait-object pointer itself, not its pointee"
+            );
+        }
+        discarded
     }
 
     /// Handle the deref-first path: when the first projection is Deref.
@@ -166,8 +201,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     pointee_expr.sort(),
                     pointee_base
                 );
+                let raw_alias = pointee_base.ends_with("_deref");
                 if place.projection.len() == 1 {
-                    return DerefFirstResult::Resolved(pointee_expr.clone());
+                    let pointee_expr = pointee_expr.clone();
+                    if raw_alias {
+                        self.guard_cached_raw_read(place, &pointee_expr);
+                    }
+                    return DerefFirstResult::Resolved(pointee_expr);
                 }
                 // #3133: Try piecewise env lookup for flattened Options before
                 // applying post-deref projections (which can't handle Downcast on BV64).
@@ -190,7 +230,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     false, // hard failure
                     "Deref projection",
                 ) {
-                    DerefProjectionResult::Success(expr) => DerefFirstResult::Resolved(expr),
+                    DerefProjectionResult::Success(expr) => {
+                        if raw_alias {
+                            self.guard_cached_raw_read(place, &expr);
+                        }
+                        DerefFirstResult::Resolved(expr)
+                    }
                     DerefProjectionResult::Fallthrough | DerefProjectionResult::Unsupported => {
                         DerefFirstResult::Unsupported
                     }
@@ -338,6 +383,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     heap_key,
                     heap_value.sort()
                 );
+                self.guard_cached_raw_read(place, &heap_value);
                 return DerefFirstResult::Resolved(heap_value);
             }
 
@@ -392,7 +438,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     }
                 }
             }
-            let heap_value_opt = chain_value.or(direct_value);
+            let heap_value_opt = chain_value
+                .or(direct_value)
+                .filter(|value| !self.value_is_the_trait_object_pointer(value, place.local));
             if let Some(heap_value) = heap_value_opt {
                 debug!(
                     "codegen_place Deref: found in heap_pointees[{}] (ptr base, sort={:?})",
@@ -400,6 +448,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     heap_value.sort()
                 );
                 if place.projection.len() == 1 {
+                    self.guard_cached_raw_read(place, &heap_value);
                     return DerefFirstResult::Resolved(heap_value);
                 }
                 self.stage_bridge_enum_read(place, 1);
@@ -410,6 +459,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     true,  // fallthrough on failure
                     "Deref heap_pointees projection",
                 ) {
+                    self.guard_cached_raw_read(place, &expr);
                     return DerefFirstResult::Resolved(expr);
                 }
                 // fall through to raw pointer / memory load handlers
@@ -424,13 +474,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         {
             // #1210: Check heap_pointees first for ADT types stored symbolically.
             let ptr_heap_key = self.root_ssa_base_name(&ptr_place);
-            if let Some(heap_value) = self.heap_pointees.get(ptr_heap_key.as_str()).cloned() {
+            if let Some(heap_value) = self
+                .heap_pointees
+                .get(ptr_heap_key.as_str())
+                .cloned()
+                .filter(|value| !self.value_is_the_trait_object_pointer(value, place.local))
+            {
                 debug!(
                     "codegen_place raw ptr: found heap_pointees[{}] (sort={:?})",
                     ptr_heap_key,
                     heap_value.sort()
                 );
                 if place.projection.len() == 1 {
+                    self.guard_cached_raw_read(place, &heap_value);
                     return DerefFirstResult::Resolved(heap_value);
                 }
                 self.stage_bridge_enum_read(place, 1);
@@ -441,6 +497,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     true,  // fallthrough on failure
                     "Deref raw ptr heap projection",
                 ) {
+                    self.guard_cached_raw_read(place, &expr);
                     return DerefFirstResult::Resolved(expr);
                 }
                 // fall through to byte memory load
@@ -533,6 +590,105 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Deref was first projection but couldn't resolve through any path
         DerefFirstResult::Unresolved
+    }
+
+    /// The value the byte memory holds NOW for a raw-pointer place `(*p)` or
+    /// `(*p).f.g`. `None` for any other base or projection, an unknown or zero
+    /// size, or an address holding a symbolic (non-byte) store, which a byte load
+    /// must not read.
+    fn raw_place_memory_value(&mut self, place: &Place) -> Option<Expr> {
+        let ptr_place = Place { local: place.local, projection: vec![] };
+        let ptr_ty = ptr_place.ty(self.body.locals()).into_option()?;
+        let TyKind::RigidTy(RigidTy::RawPtr(pointee_ty, _)) = ptr_ty.kind() else {
+            return None;
+        };
+        let mut offset: usize = 0;
+        let mut current_ty = pointee_ty;
+        for proj in place.projection.iter().skip(1) {
+            let ProjectionElem::Field(field_idx, field_ty) = proj else {
+                return None;
+            };
+            offset += LayoutOf::new(current_ty).field_offset(*field_idx)?;
+            current_ty = *field_ty;
+        }
+        let size = LayoutOf::new(current_ty).size_of()?;
+        if size == 0 {
+            return None;
+        }
+        let ptr_expr = self.codegen_place(&ptr_place)?;
+        let addr = if offset > 0 {
+            ptr_expr.bvadd(Expr::bitvec_const(offset as i64, POINTER_WIDTH))
+        } else {
+            ptr_expr
+        };
+        let num_bytes = u32::try_from(size).ok()?;
+        if self.memory_bytes_hold_symbolic_store(&addr, num_bytes) {
+            return None;
+        }
+        let loaded = self.ctx.load_memory_bytes(addr, num_bytes);
+        Some(if matches!(current_ty.kind(), TyKind::RigidTy(RigidTy::Bool)) {
+            loaded.ne(Expr::bitvec_const(0, 8))
+        } else {
+            loaded
+        })
+    }
+
+    /// Check a raw-pointer read answered from a cached value against the byte
+    /// memory.
+    ///
+    /// Two caches answer such reads: the `*_deref` snapshot taken when the
+    /// pointer was formed, and `heap_pointees`, the value last stored through
+    /// the pointer's own name (a flow-insensitive map). Byte memory is what every
+    /// store through ANY pointer updates, path by path; neither cache is
+    /// refreshed by a store through a different pointer to the same object.
+    /// `let d = *outer; *d = 9; assert!(*inner == 1)` read `inner`'s snapshot
+    /// and verified SUCCESSFUL.
+    ///
+    /// When the cached term is the current memory load itself nothing can
+    /// differ. Otherwise the two must agree on this path: a model where they
+    /// differ fails the harness, and `bmc_sound_havoc` keeps that counterexample
+    /// from being certified Genuine. A proof in which they always agree is
+    /// unaffected. A value that cannot be compared fails closed.
+    fn guard_cached_raw_read(&mut self, place: &Place, cached: &Expr) {
+        let ptr_place = Place { local: place.local, projection: vec![] };
+        let is_raw = ptr_place
+            .ty(self.body.locals())
+            .into_option()
+            .is_some_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))));
+        if !is_raw || !(cached.sort().is_bitvec() || cached.sort().is_bool()) {
+            return;
+        }
+        let Some(current) = self.raw_place_memory_value(place) else {
+            self.ctx.unsupported_with_fallback(
+                "raw pointer read from a cached value",
+                format!("the cached value of {place:?} cannot be compared with byte memory"),
+            );
+            return;
+        };
+        if current == *cached {
+            return;
+        }
+        if current.sort() != cached.sort() {
+            self.ctx.unsupported_with_fallback(
+                "raw pointer read from a cached value",
+                format!("the cached value of {place:?} and byte memory differ in sort"),
+            );
+            return;
+        }
+        // Fold what codegen can decide about both reads on this path, the only
+        // place the check is posed. Terms it proves equal need no check;
+        // otherwise the check is posed over the folded terms, which equal the
+        // originals wherever the path holds. Over the raw select chains ay
+        // produced models it could not validate (`unknown (incomplete)`) and ran
+        // out of memory on the swap and copy shapes.
+        let current = self.fold_memory_reads_on_path(&current);
+        let cached = self.fold_memory_reads_on_path(cached);
+        if current == cached {
+            return;
+        }
+        self.record_violation_guarded(cached.ne(current), "unsound_raw_ptr_cached_read");
+        self.ctx.bmc_sound_havoc("raw_ptr_cached_read_guard");
+        debug!(?place, "raw pointer read from a cached value checked against byte memory");
     }
 
     /// Try to resolve remaining projections via piecewise env lookup (#3133).

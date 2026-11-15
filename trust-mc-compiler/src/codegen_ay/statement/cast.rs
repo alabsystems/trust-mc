@@ -3,6 +3,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Type cast codegen for AY - Part of #1354.
 
+use crate::codegen_ay::shared::mono_ty;
+#[allow(unused_imports)]
+use crate::rustc_compat::prelude::*;
 use ay_bindings::Expr;
 use ay_bindings::SortInner;
 use rustc_abi::VariantIdx as InternalVariantIdx;
@@ -38,7 +41,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let variant = variants.first()?;
         let fields = variant.fields();
         let field = fields.first()?;
-        let field_ty = Self::resolve_generic_ty(field.ty(), &args)?;
+        let field_ty = mono_ty::field_ty(field, &args)?;
         Self::ty_signedness(field_ty)
     }
 
@@ -52,19 +55,74 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         operand: &Operand,
         target_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
+        let value = self.codegen_cast_with_kind_inner(kind, operand, target_ty)?;
+        self.box_cast_transport(operand, target_ty, value)
+    }
+
+    fn codegen_cast_with_kind_inner(
+        &mut self,
+        kind: &super::CastKind,
+        operand: &Operand,
+        target_ty: rustc_public::ty::Ty,
+    ) -> Option<Expr> {
         // Entry trace, not a diagnostic: this fires on EVERY cast, and `a as u64`
         // is not something to warn a user about. At warn! it reached the default
         // output, so any real crate printed a line per cast between the harness
         // name and its verdict.
         debug!(?kind, "ENTRY codegen_cast_with_kind");
+        #[cfg(all(trust_toolchain, version("1.101")))]
+        if matches!(kind, super::CastKind::BoxDerefTransmute) {
+            return self.codegen_native_box_deref(operand, target_ty);
+        }
         // Part of #3809: Transmute gets a dedicated handler that checks
         // rustc layout compatibility before allowing DT→DT structural coercion.
         // Part of #3192: Subtype is handled identically to Transmute, matching
         // Kani upstream (kani rvalue.rs:797 handles both in a single arm).
         // Subtype casts are used for lifetime/variance coercions where the
         // types are structurally identical.
+        // A Subtype cast changes no bits and no layout: the target type IS the
+        // source type up to lifetimes / variance (and an opaque alias that
+        // normalizes to it). The operand's value is the result. Routing it
+        // through the transmute path required a sort for the TARGET type, which
+        // does not exist for a closure capturing a `type T = impl Copy` value, so
+        // `let x = move || { .. foo .. }` left `x` unconstrained and demoted a
+        // harness with no checks at all (kani/ProjectionElem/OpaqueCast
+        // check_opaque_cast.rs `check_unconstrained_upvar`).
+        if matches!(kind, super::CastKind::Subtype)
+            && let Some(value) = self.codegen_operand(operand)
+            && Self::infer_sort_from_ty(target_ty).is_none_or(|s| s == *value.sort())
+        {
+            return Some(value);
+        }
         if matches!(kind, super::CastKind::Transmute | super::CastKind::Subtype) {
+            if matches!(kind, super::CastKind::Transmute) && self.is_native_box_target(target_ty) {
+                let source = operand.ty(self.body.locals()).into_option()?;
+                if crate::codegen_ay::shared::native_box_raw::native_thin_global_box_pointee(
+                    self.ctx.tcx,
+                    source,
+                )
+                .is_none()
+                {
+                    self.ctx.unsupported_with_fallback("BoxConstructionTransmute",
+                        "raw-to-Box transmute has no checked ownership transfer; preserve the refusal outside native constructor APIs");
+                    return None;
+                }
+                return self.codegen_box_construction_cast(operand, target_ty);
+            }
             return self.codegen_transmute_cast(operand, target_ty);
+        }
+        // Numeric float casts are value conversions, not bit reinterpretation.
+        // Floats are bitvector-sorted in this lane, so letting them reach the
+        // BV→BV arm of `codegen_cast` extended or truncated the IEEE bits
+        // (`x as f32` read the integer's bits as a float, `f as u8` took the
+        // float's low byte) — a false-proof vector. See cast_float.rs.
+        if matches!(
+            kind,
+            super::CastKind::IntToFloat
+                | super::CastKind::FloatToInt
+                | super::CastKind::FloatToFloat
+        ) {
+            return self.codegen_float_numeric_cast(kind, operand, target_ty);
         }
         // Part of #3848/#3793: PointerCoercion::Unsize gets a dedicated wrapper-walk
         // path that constructs fat pointers at the leaf instead of relying on generic
@@ -83,7 +141,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // handled separately at the terminator level by try_codegen_fn_ptr_call.
         // Cross-port from CHC translate_reify_fn_pointer (cast_dispatch.rs:329).
         if let super::CastKind::PointerCoercion(
-            PointerCoercion::ReifyFnPointer | PointerCoercion::ClosureFnPointer(_),
+            PointerCoercion::ReifyFnPointer { .. } | PointerCoercion::ClosureFnPointer(_),
         ) = kind
         {
             return Some(self.codegen_reify_fn_pointer(operand));
@@ -113,24 +171,20 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// `try_codegen_fn_ptr_call`; this only ensures the assignment variable is
     /// constrained (preventing false CTREX from unconstrained locals).
     fn codegen_reify_fn_pointer(&mut self, operand: &Operand) -> Expr {
-        let key = operand.ty(self.body.locals()).into_option().and_then(|ty| match ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(def, args)) => {
-                Some(format!("{}_{:?}", def.trimmed_name(), args))
-            }
-            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                Some(format!("closure_{}_{:?}", def.trimmed_name(), args))
-            }
-            _ => None,
-        });
-        let id: u128 = match key {
-            Some(ref k) => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                k.hash(&mut hasher);
-                let h = hasher.finish() as u128;
-                (h & ((1u128 << POINTER_WIDTH) - 1)) | 1
-            }
+        // Keyed by instance, not by trimmed name: `m1::op2` and `m2::op2` are
+        // two functions (design 3, D1: `crate::codegen_ay::fn_ptr_identity`).
+        //
+        // The value is `fn_ptr_identity`'s: a pure function of the instance,
+        // the one a pointer to the same function stored in a constant or a
+        // static gets (`const_ptr_value`), and the one the CHC lane uses. A
+        // per-lane hash here made `F == add as fn(..)` false for `const F:
+        // fn(..) = add`.
+        let id: u128 = match operand
+            .ty(self.body.locals())
+            .into_option()
+            .and_then(crate::codegen_ay::fn_ptr_identity::fn_ptr_target_of_ty)
+        {
+            Some(target) => u128::from(target.identity_value()),
             None => 1,
         };
         Expr::bitvec_const(id, POINTER_WIDTH)
@@ -177,6 +231,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     "ArrayToPointer: Array→BV sort mismatch, producing symbolic pointer"
                 );
                 let name = self.ctx.fresh_name("__array_to_ptr");
+                self.ctx.bmc_sound_havoc("array_to_ptr");
                 return Some(self.ctx.declare_var(&name, target_sort));
             }
         }
@@ -510,5 +565,47 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod modern_box_cast_tests {
+    #![cfg(all(trust_toolchain, version("1.101")))]
+    use super::*;
+    use crate::codegen_ay::context::with_test_ay_ctx_for_source;
+    use crate::codegen_ay::test_fixtures::find_instance_by_suffix;
+    use crate::kani_middle::tuple_usage::TupleUsageAnalysis;
+    use rustc_public::mir::{CastKind, Rvalue, StatementKind};
+
+    #[test]
+    fn actual_box_cast_is_unsupported_in_bmc_without_validity_instrumentation() {
+        with_test_ay_ctx_for_source("pub fn probe_box(b: Box<u32>) -> u32 { *b }", |mut ctx| {
+            let args = crate::args::parse_llvm_args(&[]).expect("default engine arguments");
+            assert!(args.ub_check.is_empty(), "the validity pass must not provide this refusal");
+            ctx.queries.set_args(args);
+            let instance = find_instance_by_suffix(ctx.tcx, "probe_box");
+            let body = instance.body().expect("box dereference body");
+            ctx.set_current_fn(instance);
+            let tuple_usage = TupleUsageAnalysis::run(&body);
+            let mut codegen = StatementCodegen::new(&mut ctx, &body, tuple_usage);
+            let mut observed = 0;
+            for block in &body.blocks {
+                for stmt in &block.statements {
+                    if let StatementKind::Assign(
+                        _,
+                        Rvalue::Cast(kind @ CastKind::BoxDerefTransmute, operand, target),
+                    ) = &stmt.kind
+                    {
+                        assert!(codegen.codegen_cast_with_kind(kind, operand, *target).is_none());
+                        observed += 1;
+                    }
+                }
+            }
+            assert!(observed > 0, "the genuine compiler must supply the BoxDerefTransmute control");
+            assert_eq!(
+                codegen.ctx.unsupported_constructs.get("BoxDerefTransmute").map(Vec::len),
+                Some(observed),
+            );
+        });
     }
 }

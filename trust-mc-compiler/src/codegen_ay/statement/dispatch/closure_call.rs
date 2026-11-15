@@ -7,6 +7,7 @@
 //! Normalizes the RustCall ABI (`receiver`, tupled arguments) into the callee MIR
 //! signature so the BMC mini-inliner can execute small closure bodies directly.
 
+use crate::callee_body::CalleeBody;
 use ay_bindings::{Expr, SortInner};
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{BasicBlockIdx, Operand, Place, ProjectionElem};
@@ -33,8 +34,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
+        // Every decline below leaves the destination a FREE value while the callee's body
+        // — its effects, its checks — is dropped. That is an under-approximation of the
+        // call, so it is counted (`unsupported_with_fallback`): a proof over it is demoted,
+        // and a counterexample that reads the free result is never certified Genuine.
+        // Measured before the count: `apply(f32::min, 3.0, -1.0) == -1.0` through `F: Fn` was
+        // FAILED [Genuine] on both routes, and on Trust the refusal to inline a renamed
+        // float intrinsic's fallback body (`callee_body`) landed exactly here, uncounted.
         if args.is_empty() {
             warn!("codegen_closure_call: no arguments");
+            self.ctx.unsupported_with_fallback("closure_call", "closure call with no arguments");
             self.codegen_symbolic_result(destination);
             return target;
         }
@@ -42,6 +51,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let closure_arg = &args[0];
         let Some(closure_ty) = closure_arg.ty(self.body.locals()).into_option() else {
             warn!("codegen_closure_call: could not recover closure type");
+            self.ctx.unsupported_with_fallback(
+                "closure_call",
+                format!("closure call whose receiver type is unknown: {closure_arg:?}"),
+            );
             self.codegen_symbolic_result(destination);
             return target;
         };
@@ -49,6 +62,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let Some(instance) = self.resolve_closure_instance(closure_ty) else {
             debug!("codegen_closure_call: not a resolvable closure type");
+            self.ctx.unsupported_with_fallback(
+                "closure_call",
+                format!("call through an unresolvable callable: {closure_ty:?}"),
+            );
             self.codegen_symbolic_result(destination);
             return target;
         };
@@ -57,6 +74,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             debug!(
                 callee = instance.name(),
                 "codegen_closure_call: could not normalize RustCall tuple arguments"
+            );
+            self.ctx.unsupported_with_fallback(
+                "closure_call",
+                format!("RustCall arguments not normalized for {}", instance.name()),
             );
             self.codegen_symbolic_result(destination);
             return target;
@@ -70,6 +91,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         debug!(callee = instance.name(), "codegen_closure_call: mini-inline declined closure body");
+        self.ctx.unsupported_with_fallback(
+            "closure_call",
+            format!("closure body not inlined: {}", instance.name()),
+        );
         self.codegen_symbolic_result(destination);
         target
     }
@@ -95,7 +120,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         for kind in kinds {
             if let Ok(instance) = Instance::resolve_closure(def, &generic_args, kind)
-                && instance.body().is_some()
+                && instance.callee_body().is_some()
             {
                 return Some(instance);
             }
@@ -194,6 +219,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     })
                     .collect()
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 
@@ -255,6 +282,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     })
                     .collect()
             }
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => None,
         }
     }
 }

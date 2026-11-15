@@ -22,38 +22,8 @@ use super::codegen_types::CodegenTypes;
 use super::{FieldProjection, UnknownProjectionPolicy, collect_field_projections};
 
 use rustc_public::mir::{Place, ProjectionElem};
-use rustc_public::ty::{RigidTy, TyKind};
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
-    /// Drop the leading field projections that name a transparent
-    /// single-element tuple wrapper.
-    ///
-    /// `translate_ty` maps `(T,)` to `T`'s own sort (#1979), so the wrapper has
-    /// no field in the sort world and its `.0` is the identity. Every step is
-    /// checked against the MIR type, so nothing is dropped unless the type says
-    /// the wrapper really is single-element.
-    fn peel_transparent_tuple_fields(
-        &self,
-        local_idx: usize,
-        field_projections: &[FieldProjection],
-    ) -> Vec<FieldProjection> {
-        let Some(local_decl) = self.body.locals().get(local_idx) else {
-            return field_projections.to_vec();
-        };
-        let mut ty = local_decl.ty;
-        let mut consumed = 0;
-        while let Some(fp) = field_projections.get(consumed) {
-            if fp.cons_idx.is_some() || fp.field_idx != 0 {
-                break;
-            }
-            let TyKind::RigidTy(RigidTy::Tuple(elems)) = ty.kind() else { break };
-            let [sole] = elems[..] else { break };
-            ty = sole;
-            consumed += 1;
-        }
-        field_projections[consumed..].to_vec()
-    }
-
     /// Part of #3041 Category E: Reconstruct a Datatype expression from flattened state vars.
     ///
     /// For a flattened local with N scalar state vars (fld0..fldN-1), reconstructs
@@ -139,16 +109,39 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             UnknownProjectionPolicy::ReturnEmpty(&self.diagnostics),
         );
 
-        // Companion to #1979: `translate_ty` unwraps a single-element tuple to
-        // its element's sort, so the local's flattened slots describe the
-        // ELEMENT, not the wrapper. The MIR place still spells the wrapper's
-        // `.0`, and resolving that against the unwrapped sort reads the
-        // ELEMENT's own field 0 — one level too deep. For
-        // `_w: ((*mut u32, *mut u32),)` the read of `_w.0` returned the first
-        // pointer instead of the pair, so the destination's second slot was
-        // never constrained and the `modifies` footprint was built from a free
-        // pointer. Peel the transparent steps off before resolving.
-        let peeled = self.peel_transparent_tuple_fields(local_idx, &field_projections);
+        // The slots follow the SORT tree, which has no level for a step
+        // `translate_ty` collapses (`(T,)`, #1979; a wrapper modeled as its
+        // content: UnsafeCell, Cell, ManuallyDrop, ...). Resolving such a step
+        // against the collapsed sort read the CONTENT's own field: `_w.0` on
+        // `_w: ((*mut u32, *mut u32),)` returned the first pointer instead of
+        // the pair, and `RefCell::into_inner`'s `self.value` step returned the
+        // tuple's field 0 for the whole tuple. `faithful_flat_field_path`
+        // drops those steps wherever they are and refuses a step whose sort
+        // disagrees with its type (C5b).
+        let peeled = match self.faithful_flat_field_path(local_idx, &field_projections) {
+            Ok(path) => path,
+            Err(why) => {
+                // `String.vec` has no level in the String model, but the
+                // model determines it (`codegen_expr_string_vec_view.rs`).
+                if let Some(view) =
+                    self.string_vec_field_view(local_idx, &field_projections, modified_locals)
+                {
+                    return Some(view);
+                }
+                self.diagnostics.place_translation_drop.inc();
+                record_translation_drop_site_reason_for_fn(
+                    &self.fn_name,
+                    "flattened_nested_path_unfaithful",
+                );
+                warn!(
+                    local_idx,
+                    why,
+                    projections = ?place.projection,
+                    "translate_place: flattened path has no faithful slot (fail closed)"
+                );
+                return None;
+            }
+        };
         let all_field_like = place
             .projection
             .iter()
@@ -179,6 +172,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             );
         }
         // C. Multi-level struct field projections (stays inline — 31 lines).
+        // The path is `faithful_flat_field_path`'s, checked above.
         if field_projections.len() > 1 && field_projections.iter().all(|fp| fp.cons_idx.is_none()) {
             if let Some(local_decl) = self.body.locals().get(local_idx)
                 && let Some(sort) = Self::translate_ty(local_decl.ty)
@@ -186,6 +180,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 let field_indices: Vec<usize> =
                     field_projections.iter().map(|fp| fp.field_idx).collect();
                 if let Some(leaf_offset) = compute_nested_flat_slot(&sort, &field_indices) {
+                    // The value this block last wrote to the slot, as case B
+                    // and `flattened_local_field_expr` already read it. The
+                    // `__out` variable is the block's FINAL value: reading it
+                    // here made `r.inner.a = 7; r.inner.a ^= 1;` in one block
+                    // emit `fld0__out == bvxor(fld0__out, 1)`, an UNSAT
+                    // transition that proves everything after it, and made
+                    // `let y = r.inner.a; r.inner.a = 9;` bind `y` to 9.
+                    if let Some(expr) =
+                        self.encode.flattened_field_env.get(&(local_idx, leaf_offset))
+                    {
+                        return Some(expr.clone());
+                    }
                     let slot = vec_idx + leaf_offset;
                     let vars = if modified_locals.contains(&local_idx) {
                         &self.state_var_mgr.output_state_vars

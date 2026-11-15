@@ -48,43 +48,45 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<Option<BasicBlockIdx>> {
         if matches!(stub_kind, StubKind::NonNullDangling) {
-            return Some(self.codegen_nonnull_dangling_stub(destination, target));
+            return self.codegen_nonnull_dangling_stub(destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::NonNullAsMutPtr) {
-            return Some(self.codegen_nonnull_as_mut_ptr_stub(args, destination, target));
+            return self.codegen_nonnull_as_mut_ptr_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::BoxIntoRawWithAllocator) {
-            return Some(self.codegen_box_into_raw_with_allocator_stub(args, destination, target));
+            return self
+                .codegen_box_into_raw_with_allocator_stub(args, destination, target)
+                .map(Some);
         }
         if matches!(stub_kind, StubKind::UniqueNewUnchecked) {
-            return Some(self.codegen_unique_new_unchecked_stub(args, destination, target));
+            return self.codegen_unique_new_unchecked_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::VecFromRawPartsIn) {
-            return Some(self.codegen_vec_from_raw_parts_in_stub(args, destination, target));
+            return self.codegen_vec_from_raw_parts_in_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecNewIn) {
-            return Some(self.codegen_rawvec_new_in_stub(destination, target));
+            return self.codegen_rawvec_new_in_stub(destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecCapacity) {
-            return Some(self.codegen_rawvec_capacity_stub(args, destination, target));
+            return self.codegen_rawvec_capacity_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecGrowOne) {
-            return Some(self.codegen_rawvec_grow_one_stub(args, target));
+            return self.codegen_rawvec_grow_one_stub(args, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecPtr) {
-            return Some(self.codegen_rawvec_ptr_stub(args, destination, target));
+            return self.codegen_rawvec_ptr_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecFromNonNullIn) {
-            return Some(self.codegen_rawvec_from_nonnull_in_stub(args, destination, target));
+            return self.codegen_rawvec_from_nonnull_in_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::RawVecDrop | StubKind::RawVecShrinkToFit) {
-            return Some(self.codegen_rawvec_drop_stub(target));
+            return self.codegen_rawvec_drop_stub(target).map(Some);
         }
         if matches!(stub_kind, StubKind::CheckedAddUnsigned) {
-            return Some(self.codegen_checked_add_unsigned_stub(args, destination, target));
+            return self.codegen_checked_add_unsigned_stub(args, destination, target).map(Some);
         }
         if matches!(stub_kind, StubKind::SliceAsPtr | StubKind::SliceAsMutPtr) {
-            return Some(self.codegen_slice_as_ptr_stub(args, destination, target));
+            return self.codegen_slice_as_ptr_stub(args, destination, target).map(Some);
         }
         None
     }
@@ -147,7 +149,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // If it's a Slice datatype, extract fld_ptr.
         let ptr = if arg_expr.sort().is_bitvec() {
             self.coerce_to_ptr_width(arg_expr)
-        } else if arg_expr.sort().datatype_name().is_some_and(|n| n.contains("Slice")) {
+        } else if arg_expr
+            .sort()
+            .datatype_name()
+            .is_some_and(crate::codegen_ay::names::sort_name_mentions_slice)
+        {
             // Clone the Sort (cheap Arc increment) to borrow the datatype name without
             // conflicting with the consumption of arg_expr by field_select. Avoids a
             // String allocation from .to_string(). Part of #2267.
@@ -186,6 +192,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let arg_place = match arg {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return,
+            #[cfg(trust_toolchain)]
+            Operand::RuntimeChecks(_) => return,
         };
         let mut base: std::sync::Arc<str> =
             std::sync::Arc::from(self.root_ssa_base_name(arg_place));
@@ -215,6 +223,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
         debug!("codegen_stubbed_call: Box::into_raw_with_allocator - decomposing Box");
+        if cfg!(all(trust_toolchain, version("1.101"))) {
+            self.ctx.unsupported_with_fallback(
+                "BoxAllocatorMetadata",
+                "into_raw_with_allocator has no authenticated native allocator tuple codec",
+            );
+        }
         let box_expr = args.first().and_then(|a| self.codegen_operand(a))?;
         let ptr = self.coerce_to_ptr_width(box_expr);
         self.assign_value_to_place(destination, ptr);
@@ -267,6 +281,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let data_name = self.ctx.fresh_name("vec_data");
         let data = self.ctx.declare_var(&data_name, array_sort.clone());
+        self.ctx.bmc_sound_havoc("vec_from_raw_parts_data");
 
         let vec_sort = struct_sort(vec_sort_name.clone(), names::vec_fields(array_sort));
         let ctor_name = crate::codegen_ay::names::cons_name(&vec_sort_name);
@@ -290,6 +305,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let rawvec_sort = struct_sort("RawVec", names::rawvec_fields());
         let ptr_name = self.ctx.fresh_name("rawvec_ptr");
         let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
+        self.ctx.bmc_sound_havoc("rawvec_new_in_ptr");
         let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
         self.ctx.assert(ptr.clone().bvugt(zero.clone()));
         if self.ctx.config.extra_pointer_checks {
@@ -320,11 +336,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 );
                 let name = self.ctx.fresh_name("rawvec_cap_fallback");
                 let cap = self.ctx.declare_var(&name, ptr_sort());
+                self.ctx.bmc_sound_havoc("rawvec_capacity_fallback");
                 self.assign_value_to_place(destination, cap);
             }
         } else {
             let name = self.ctx.fresh_name("rawvec_cap");
             let cap = self.ctx.declare_var(&name, ptr_sort());
+            self.ctx.bmc_sound_havoc("rawvec_capacity_no_arg");
             self.assign_value_to_place(destination, cap);
         }
         target
@@ -354,6 +372,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let one = Expr::bitvec_const(1u64, POINTER_WIDTH);
                 let cap_name = self.ctx.fresh_name("rawvec_new_cap");
                 let new_cap = self.ctx.declare_var(&cap_name, ptr_sort());
+                self.ctx.bmc_sound_havoc("rawvec_grow_one_cap");
                 self.ctx.assert(new_cap.clone().bvugt(old_cap.clone()));
                 self.ctx.assert(new_cap.clone().bvuge(old_cap.bvadd(one)));
                 let new_rawvec = make_rawvec(ptr, Val::of_value(new_cap));
@@ -387,11 +406,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 );
                 let name = self.ctx.fresh_name("rawvec_ptr_fallback");
                 let ptr = self.ctx.declare_var(&name, ptr_sort());
+                self.ctx.bmc_sound_havoc("rawvec_ptr_fallback");
                 self.assign_value_to_place(destination, ptr);
             }
         } else {
             let name = self.ctx.fresh_name("rawvec_ptr");
             let ptr = self.ctx.declare_var(&name, ptr_sort());
+            self.ctx.bmc_sound_havoc("rawvec_ptr_no_arg");
             self.assign_value_to_place(destination, ptr);
         }
         target
@@ -431,12 +452,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         let cap = args.get(1).and_then(|a| self.codegen_operand(a)).unwrap_or_else(|| {
             let name = self.ctx.fresh_name("rawvec_cap");
+            self.ctx.bmc_sound_havoc("rawvec_from_nonnull_cap");
             self.ctx.declare_var(&name, ptr_sort())
         });
         let cap = if cap.sort().is_bitvec() && cap.sort().bitvec_width() != Some(POINTER_WIDTH) {
             Val::of_value(Self::coerce_to_width(cap, POINTER_WIDTH))
         } else if !cap.sort().is_bitvec() {
             let name = self.ctx.fresh_name("rawvec_cap_fallback");
+            self.ctx.bmc_sound_havoc("rawvec_from_nonnull_cap_fallback");
             Val::of_value(self.ctx.declare_var(&name, ptr_sort()))
         } else {
             Val::of_value(cap)
@@ -454,6 +477,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// with nothing guessed.
     fn fresh_rawvec_slot(&mut self, hint: &str) -> Loc {
         let name = self.ctx.fresh_name(hint);
+        self.ctx.bmc_sound_havoc("fresh_rawvec_slot");
         Loc::of_address(self.ctx.declare_var(&name, ptr_sort()))
     }
 

@@ -51,6 +51,22 @@ use rewrite::{RewriteMaps, rewrite_expr_children};
 /// replacement harnesses that compare all lanes of `[u8; 16]`.
 const MAX_SCALARS_PER_ARRAY: usize = 16;
 
+/// `TRUST_MC_CHC_MAX_SCALARS_PER_ARRAY=<n>` overrides [`MAX_SCALARS_PER_ARRAY`]
+/// for one run. Measurement lever only: the corpus's ArrayParamLimit rows carry
+/// `obj_valid`/`obj_size`-shaped arrays indexed by more than 16 distinct
+/// constants, and this is how to find out whether widening the cap converts
+/// any of them. Read ONCE.
+fn max_scalars_per_array() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TRUST_MC_CHC_MAX_SCALARS_PER_ARRAY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_SCALARS_PER_ARRAY)
+    })
+}
+
 /// Stack red-zone / segment sizes for `stacker::maybe_grow`, mirroring
 /// ay-bindings `fold_expr` (#8414). The `rewrite_expr` / `rewrite_expr_children`
 /// mutual recursion descends deep dyn-trait Store chains that can overflow the
@@ -77,11 +93,16 @@ pub(super) struct ConstIdx {
     pub(super) width: u32,
 }
 
-impl ConstIdx {
-    /// Format as a hex string for use in variable names.
-    pub(super) fn hex_label(&self) -> String {
-        format!("0x{:x}_bv{}", self.value, self.width)
-    }
+/// The scalar variable a constant-index cell of `array` becomes:
+/// `{array}_at_0x{index:x}_bv{width}`. The one spelling, read by the
+/// scalarization and by whoever names a cell before it runs (Rule C's
+/// backstop, `heap/memory_cell_backstop.rs`).
+pub(in crate::codegen_ay::chc) fn scalarized_cell_name(
+    array: &str,
+    index: &impl std::fmt::LowerHex,
+    width: u32,
+) -> String {
+    format!("{array}_at_0x{index:x}_bv{width}")
 }
 
 /// Information about a scalarizable array variable pair (input + output).
@@ -515,11 +536,22 @@ fn scan_array_usage(
     let mut non_scalarizable: HashSet<String> = HashSet::new();
     let mut dependencies = Vec::new();
     let scan_constraints = collect_scan_constraints(vc);
+    // Variable -> positions of the scan constraints that mention it. The loop
+    // below used to hash-probe EVERY constraint's variable set for EVERY
+    // candidate array (O(arrays x constraints)); a constraint that mentions
+    // neither the input nor the output is skipped anyway, so visiting exactly
+    // the mentioning ones, in the same order, is the same computation
+    // (multiple_loops.rs, conditional-drop.rs: scalarize dominated every
+    // gdb sample).
+    let mentions = scan_constraint_mentions(&scan_constraints);
 
     for (input_name, _sort) in input_vars {
         let output_name = format!("{input_name}__out");
         let mut all_indices: HashSet<ConstIdx> = HashSet::new();
-        for scan_constraint in &scan_constraints {
+        for scan_constraint in mentioning_in_order(&mentions, input_name, &output_name)
+            .into_iter()
+            .map(|pos| &scan_constraints[pos])
+        {
             let mentions_input = scan_constraint.vars.contains(input_name.as_str());
             let mentions_output = scan_constraint.vars.contains(output_name.as_str());
             if !mentions_input && !mentions_output {
@@ -625,7 +657,7 @@ fn scan_array_usage(
         &mut non_scalarizable,
         &dependencies,
         input_vars,
-        MAX_SCALARS_PER_ARRAY,
+        max_scalars_per_array(),
     );
 
     (var_indices, non_scalarizable)
@@ -635,6 +667,56 @@ struct ScanConstraint<'a> {
     expr: &'a Expr,
     is_entry_rule: bool,
     vars: HashSet<String>,
+}
+
+/// Variable name -> ascending positions of the scan constraints mentioning it.
+fn scan_constraint_mentions<'s>(
+    scan_constraints: &'s [ScanConstraint<'_>],
+) -> HashMap<&'s str, Vec<usize>> {
+    let mut mentions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (pos, scan_constraint) in scan_constraints.iter().enumerate() {
+        for var in &scan_constraint.vars {
+            mentions.entry(var.as_str()).or_default().push(pos);
+        }
+    }
+    mentions
+}
+
+/// Ascending, deduplicated positions of the constraints mentioning `a` or `b`.
+fn mentioning_in_order(mentions: &HashMap<&str, Vec<usize>>, a: &str, b: &str) -> Vec<usize> {
+    let empty: &[usize] = &[];
+    let xs = mentions.get(a).map_or(empty, Vec::as_slice);
+    let ys = mentions.get(b).map_or(empty, Vec::as_slice);
+    let mut merged = Vec::with_capacity(xs.len() + ys.len());
+    let (mut i, mut j) = (0, 0);
+    while i < xs.len() || j < ys.len() {
+        let next = match (xs.get(i), ys.get(j)) {
+            (Some(&x), Some(&y)) if x == y => {
+                i += 1;
+                j += 1;
+                x
+            }
+            (Some(&x), Some(&y)) if x < y => {
+                i += 1;
+                x
+            }
+            (Some(_), Some(&y)) => {
+                j += 1;
+                y
+            }
+            (Some(&x), None) => {
+                i += 1;
+                x
+            }
+            (None, Some(&y)) => {
+                j += 1;
+                y
+            }
+            (None, None) => break,
+        };
+        merged.push(next);
+    }
+    merged
 }
 
 fn collect_scan_constraints(vc: &ChcVc) -> Vec<ScanConstraint<'_>> {
@@ -706,15 +788,18 @@ fn build_scalar_infos(
     non_scalarizable: &HashSet<String>,
 ) -> Vec<ScalarInfo> {
     let mut result = Vec::new();
+    // Name order: the infos' order is the order of the scalar columns and
+    // conjuncts the rewrite emits, so `HashMap` order made the CHC text differ
+    // from run to run.
+    let mut var_indices: Vec<(String, HashSet<ConstIdx>)> = var_indices.into_iter().collect();
+    var_indices.sort_by(|a, b| a.0.cmp(&b.0));
     for (input_name, indices) in var_indices {
         // Empty index sets are still useful: the array is only initialized or
         // forwarded, so relation-app expansion can drop the Array parameter.
-        if indices.len() > MAX_SCALARS_PER_ARRAY {
+        let cap = max_scalars_per_array();
+        if indices.len() > cap {
             if chc_debug_enabled() {
-                tracing::debug!(
-                    "scalarize: SKIP {input_name} — {} > MAX {MAX_SCALARS_PER_ARRAY}",
-                    indices.len()
-                );
+                tracing::debug!("scalarize: SKIP {input_name} — {} > MAX {cap}", indices.len());
             }
             continue;
         }
@@ -730,7 +815,7 @@ fn build_scalar_infos(
 
         let mut index_to_scalar = BTreeMap::new();
         for idx in &sorted_indices {
-            let scalar_name = format!("{}_at_{}", input_name, idx.hex_label());
+            let scalar_name = scalarized_cell_name(&input_name, &idx.value, idx.width);
             index_to_scalar.insert(idx.clone(), scalar_name);
         }
 

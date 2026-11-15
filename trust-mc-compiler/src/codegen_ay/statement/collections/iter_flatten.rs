@@ -54,12 +54,19 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let dt_name: &str = sort_ref.datatype_sort().map_or("VecIntoIter", |dt| &*dt.name);
 
         let vec_sort = self.infer_iter_vec_sort(&iter_expr);
-        let vec = iter_expr.clone().field_select(dt_name, "fld_vec", vec_sort);
-        // Last use of `iter_expr` — move instead of clone
-        let pos = iter_expr.field_select(dt_name, "fld_pos", ptr_sort());
+        let fields = iter_expr
+            .clone()
+            .try_field_select(dt_name, "fld_vec", vec_sort)
+            .and_then(|vec| Ok((vec, iter_expr.clone().try_field_select(dt_name, "fld_pos", ptr_sort())?)));
+        let Ok((vec, pos)) = fields else {
+            error!("UNSOUND: codegen_iter_collect_vec on {:?} has no fld_vec/fld_pos signature - forcing verification failure", iter_expr.sort());
+            self.record_violation_guarded(Expr::bool_const(true), "iterator_sort_mismatch_unsound");
+            return None;
+        };
         let pos_zero = pos.eq(Expr::bitvec_const(0u64, POINTER_WIDTH));
         let sym_name = self.ctx.fresh_name("iter_collect_vec");
         let sym_vec = self.ctx.declare_var(&sym_name, vec.sort().clone());
+        self.ctx.bmc_sound_havoc("iter_collect_vec");
         Some(Expr::ite(pos_zero, vec, sym_vec))
     }
 
@@ -126,6 +133,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let vec_out = self.make_vec_from_parts(elem_sort, len_out, data_out);
         let sym_name = self.ctx.fresh_name("flatten_vec");
         let sym_vec = self.ctx.declare_var(&sym_name, vec_out.sort().clone());
+        self.ctx.bmc_sound_havoc("iter_flatten_vec");
         let result_vec = Expr::ite(len_is_two, vec_out, sym_vec);
 
         let iter_out = self.make_vec_into_iter(result_vec);
@@ -143,6 +151,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let vec_sort = struct_sort(vec_sort_name.clone(), names::vec_fields(data.sort().clone()));
         let ptr_name = self.ctx.fresh_name("flatten_ptr");
         let ptr = self.ctx.declare_var(&ptr_name, ptr_sort());
+        self.ctx.bmc_sound_havoc("vec_from_parts_ptr");
         let ctor_name = names::resolve_ctor_name(&vec_sort, &vec_sort_name);
         Expr::datatype_constructor(
             vec_sort_name,
@@ -176,5 +185,27 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let flatten_sort = struct_sort(flatten_sort_name.clone(), [("fld_iter", iter_sort)]);
         let ctor_name = names::resolve_ctor_name(&flatten_sort, &flatten_sort_name);
         Expr::datatype_constructor(flatten_sort_name, ctor_name, vec![inner_iter], flatten_sort)
+    }
+}
+
+impl StatementCodegen<'_, '_, '_> {
+    /// The adapter `collect`'s receiver `recv` is, when it is one of core's
+    /// iterator adapters other than those that keep every element as it is
+    /// (`Copied`, `Cloned`, and the `Flatten` `codegen_iter_collect_vec` was
+    /// written for): `Map`, `Filter`, `FilterMap`, `Take`, `Rev`, ....
+    pub(in crate::codegen_ay::statement) fn collect_receiver_changing_adapter(
+        &self,
+        recv: &rustc_public::mir::Operand,
+    ) -> Option<String> {
+        use rustc_public::CrateDef;
+        use rustc_public::ty::{RigidTy, TyKind};
+        let ty = recv.ty(self.body.locals()).ok()?;
+        let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+            return None;
+        };
+        let name = def.name();
+        let in_adapters = name.starts_with("std::iter::") || name.starts_with("core::iter::");
+        let last = name.rsplit("::").next().unwrap_or(&name);
+        (in_adapters && !matches!(last, "Copied" | "Cloned" | "Flatten")).then(|| name.clone())
     }
 }
