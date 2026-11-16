@@ -26,6 +26,7 @@ use num_bigint::BigInt;
 
 use super::eval::{eval_bv_binary_const, eval_select_store_const};
 use super::is_scalar_constant;
+use super::range_copy::lower_small_range_copy;
 
 /// Substitutes known-constant variables in an expression tree.
 ///
@@ -213,6 +214,28 @@ fn substitute_vars_compound(expr: &Expr, known: &HashMap<String, Expr>) -> Expr 
         }
         ExprValue::Select { array, index } => fold_select(array, index, known),
         ExprValue::Store { array, index, value } => fold_store(array, index, value, known),
+        ExprValue::ArrayRangeCopy { dst, src, lo, hi, src_start } => {
+            let new_dst = substitute_vars_inner(dst, known);
+            let new_src = substitute_vars_inner(src, known);
+            let new_lo = substitute_vars_inner(lo, known);
+            let new_hi = substitute_vars_inner(hi, known);
+            let new_start = substitute_vars_inner(src_start, known);
+            // Some existing cross-view fact maps carry another sort. Reject
+            // that substitution before constructing any select/store terms.
+            if [
+                (&new_dst, dst),
+                (&new_src, src),
+                (&new_lo, lo),
+                (&new_hi, hi),
+                (&new_start, src_start),
+            ]
+            .into_iter()
+            .any(|(new, old)| new.sort() != old.sort())
+            {
+                return expr.clone();
+            }
+            lower_small_range_copy(expr, new_dst, new_src, new_lo, new_hi, new_start)
+        }
         // DT, quantifier, function — keep special-case handling.
         _ => substitute_vars_dt_quant(expr, known),
     }

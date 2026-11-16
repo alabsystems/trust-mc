@@ -270,7 +270,7 @@ impl ChcCtx<'_, '_> {
 
     /// Exactly one initialized scalar byte. Padding, pointer representations,
     /// enum layouts and unsupported values decline without fabricating bits.
-    fn initialized_value_byte(
+    pub(in crate::codegen_ay::chc) fn initialized_value_byte(
         &mut self,
         value: &Expr,
         ty: Ty,

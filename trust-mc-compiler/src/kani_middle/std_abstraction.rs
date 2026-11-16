@@ -93,6 +93,11 @@ use rustc_span::symbol::kw;
 
 use crate::rustc_compat::{LangItem, skip_normalization};
 
+mod wrapper_identity;
+pub(crate) use wrapper_identity::{
+    NativeWrapperKind, is_compiler_library_definition, native_wrapper_kind,
+};
+
 /// The sysroot crate an anchor is defined in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SysrootCrate {
@@ -1162,6 +1167,11 @@ fn sysroot_crate(tcx: TyCtxt<'_>, krate: SysrootCrate) -> SysrootLookup {
 /// defining its own lang items must not acquire standard-library semantics.
 pub(crate) fn is_sysroot_core_definition(tcx: TyCtxt<'_>, def: DefId) -> bool {
     is_sysroot_definition(tcx, def, SysrootCrate::Core)
+}
+
+/// An Alloc definition supplied by this session's compiler libraries.
+pub(crate) fn is_sysroot_alloc_definition(tcx: TyCtxt<'_>, def: DefId) -> bool {
+    is_sysroot_definition(tcx, def, SysrootCrate::Alloc)
 }
 
 fn is_sysroot_definition(tcx: TyCtxt<'_>, def: DefId, krate: SysrootCrate) -> bool {

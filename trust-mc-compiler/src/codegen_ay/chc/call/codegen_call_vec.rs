@@ -98,6 +98,11 @@ pub(in crate::codegen_ay::chc) trait CallVec {
     fn codegen_call_array_index_range_next(&mut self, dcx: &DispatchCallContext<'_>);
 
     fn codegen_call_vec_core(&mut self, cx: &ChcCallContext<'_>);
+    fn codegen_call_vec_core_with_callee(
+        &mut self,
+        cx: &ChcCallContext<'_>,
+        callee: Option<&Operand>,
+    );
 
     /// Try to handle an array-inner OptionMap call precisely.
     ///
@@ -136,6 +141,14 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
     /// Dispatches to per-category helpers in codegen_call_vec_ops.rs and
     /// codegen_call_vec_element.rs (Part of #2884).
     fn codegen_call_vec_core(&mut self, cx: &ChcCallContext<'_>) {
+        self.codegen_call_vec_core_with_callee(cx, None);
+    }
+
+    fn codegen_call_vec_core_with_callee(
+        &mut self,
+        cx: &ChcCallContext<'_>,
+        callee: Option<&Operand>,
+    ) {
         let stub = cx.stub;
         let args = cx.args;
         let destination = cx.destination;
@@ -182,20 +195,9 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
         {
             self.invalidate_vec_adapter_source_data(coll);
         }
-        // Fix 4: the append call moves `other`'s elements into `self`, then
-        // invalidates `other`'s adapter source data below. Capture the source's
-        // concrete literal element values FIRST so `vec_op_append` can store the
-        // real moved values into `self`'s data array (else appended slots read
-        // the construction fill → spurious Unsafe on safe programs).
-        let mut append_src_concrete_elems: Option<Vec<Expr>> = None;
         if matches!(stub, StubKind::VecAppend | StubKind::VecAppendElements)
             && let Some(other) = resolve_collection_local_from_operand(self, args.get(1))
         {
-            append_src_concrete_elems = self
-                .collections
-                .adapter_source_data
-                .get(&other)
-                .and_then(|d| d.concrete_elems.clone());
             self.invalidate_vec_adapter_source_data(other);
         }
         if vec_stub_overwrites_dest_adapter_source_data(stub) {
@@ -205,7 +207,14 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
         match stub {
             StubKind::VecNew | StubKind::VecWithCapacity => {
                 self.vec_op_new(
-                    VecOpNewContext { stub, args, modified_locals, dest_local, dest_vec_idx },
+                    VecOpNewContext {
+                        stub,
+                        args,
+                        modified_locals,
+                        dest_local,
+                        dest_vec_idx,
+                        callee,
+                    },
                     &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
                 );
             }
@@ -376,9 +385,9 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                 );
             }
             StubKind::VecExtendFromSlice | StubKind::VecExtendRange
-                if args.get(1).and_then(|op| op.ty(self.body.locals()).ok()).is_some_and(|ty| {
-                    !crate::codegen_ay::reduce_loop_rule::extend_source_is_modelled(ty)
-                }) =>
+                if args.get(1).and_then(|op| op.ty(self.body.locals()).ok()).is_some_and(
+                    |ty| !crate::codegen_ay::reduce_loop_rule::extend_source_is_modelled(ty),
+                ) =>
             {
                 // An adapter source (`map`, `filter`, `take`, a user iterator):
                 // the models read only the sequence underneath, never the
@@ -452,11 +461,10 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
             }
             // Part of #4135: Vec::append(&mut self, &mut other).
             StubKind::VecAppend | StubKind::VecAppendElements => {
-                self.vec_op_append(
+                extend_capacity_check = self.vec_op_append(
                     args,
                     modified_locals,
                     collection_local,
-                    append_src_concrete_elems.as_deref(),
                     &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
                 );
             }
@@ -571,6 +579,23 @@ impl<'tcx, 'body> CallVec for ChcCtx<'tcx, 'body> {
                 return;
             }
         }
+
+        let sidecar_receiver = if self.resolve_collection_field_projections(args).is_empty()
+            && args.first().is_some_and(|arg| match arg {
+                Operand::Copy(place) | Operand::Move(place) => place.projection.is_empty(),
+                _ => false,
+            }) {
+            collection_local
+        } else {
+            None
+        };
+        self.finish_sidecar_vec_mutation(
+            stub,
+            sidecar_receiver,
+            destination.projection.is_empty().then_some(dest_local),
+            modified_locals,
+            &mut CallAccumulator::new(&mut extra_constraints, &mut extra_dests),
+        );
 
         // Drain pending_checks from build_memory_store (VecPop Mem-level mirror).
         // VecPop's memory mirror writes to stack locals, which are always valid.

@@ -39,12 +39,6 @@ use super::codegen_call_vec::ChcVecFields;
 use super::codegen_ctx::types::CollectionProjectionKind;
 use crate::codegen_ay::stubs::StubKind;
 
-/// Maximum number of moved source elements unrolled into `store` constraints by
-/// `vec_op_append` when the source length is a concrete constant. Beyond this,
-/// the data array is left as the sound unconstrained over-approximation. Part
-/// of Fix 4.
-const MAX_APPEND_MOVE_ELEMS: usize = 16;
-
 /// Largest receiver length for which `vec_op_reverse` emits the EXACT reversal
 /// fact `new[i] == old[len-1-i]`.
 ///
@@ -492,120 +486,6 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // (`FalseProofRejected`), while the identity collapses the call away.
         let short = len_idx.bvule(Expr::bitvec_const(1u64, idx_width));
         Some(Expr::ite(short, old_data.clone(), fresh))
-    }
-
-    /// VecAppend: `self.append(&mut other)`.
-    ///
-    /// Moves all elements from `other` into `self`. After the call:
-    /// - `self.len = self.len + other.len`
-    /// - `other.len = 0`
-    /// - `self.cap >= self.len` (may grow)
-    /// - Data contents unconstrained (sound over-approximation).
-    pub(in crate::codegen_ay::chc) fn vec_op_append(
-        &mut self,
-        args: &[Operand],
-        modified_locals: &HashSet<usize>,
-        collection_local: Option<usize>,
-        // Fix 4: the source Vec's concrete literal element values, captured from
-        // `adapter_source_data` BEFORE the append call invalidates it (see
-        // `codegen_call_vec.rs`). `Some` only when the source was built from a
-        // compile-time-known literal (e.g. `vec![3]`); `None` otherwise.
-        src_concrete_elems: Option<&[Expr]>,
-        acc: &mut CallAccumulator<'_>,
-    ) {
-        let Some(self_local) = collection_local else {
-            self.record_sound_fallback_reason("vec_append_no_self_local");
-            return;
-        };
-        let Some(self_len_var) = self.collections.len_state.get_len_var(self_local).cloned() else {
-            self.record_sound_fallback_reason("vec_append_no_self_len");
-            return;
-        };
-        let self_old_len = self.collection_current_len(&self_len_var);
-
-        // Resolve other's collection local from args[1].
-        let other_local = args.get(1).and_then(|op| match op {
-            Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
-                Some(place.local)
-            }
-            _ => None,
-        });
-
-        // Try to resolve other's ref target for length lookup.
-        let other_resolved = other_local
-            .and_then(|l| self.ref_resolution.ref_targets.get(&l).map(|rt| rt.local).or(Some(l)));
-
-        let other_len_var =
-            other_resolved.and_then(|l| self.collections.len_state.get_len_var(l).cloned());
-
-        let other_len = other_len_var.as_ref().map(|v| self.collection_current_len(v));
-
-        if let Some(ref src_len) = other_len {
-            // self.len = self.len + other.len
-            let new_self_len = self_old_len.clone().bvadd(src_len.clone());
-            // Guard against unsigned overflow
-            acc.constraints.push(new_self_len.clone().bvuge(self_old_len.clone()));
-            self.collection_len_set(&self_len_var, new_self_len.clone(), acc);
-
-            // Capacity growth: `append_elements` reserves the count, RawVec's
-            // amortized growth.
-            if let Some(cap_var) = self.collections.len_state.get_cap_var(self_local).cloned() {
-                let old_cap = self.collection_current_cap(&cap_var);
-                let new_cap = self.vec_reserved_cap(
-                    Some(self.body.locals()[self_local].ty),
-                    &old_cap,
-                    &new_self_len,
-                    crate::codegen_ay::shared::vec_capacity::VecGrowth::Amortized,
-                    acc.constraints,
-                );
-                self.collection_cap_set(&cap_var, new_cap.clone(), acc);
-                Self::emit_cap_ge_len(new_cap, new_self_len, acc.constraints);
-            }
-
-            // other.len = 0
-            if let Some(ref other_lv) = other_len_var {
-                self.collection_len_set(other_lv, Expr::bitvec_const(0u64, POINTER_WIDTH), acc);
-            }
-
-            // Fix 4: when the source was built from a compile-time-known literal
-            // (its concrete element values were captured before this call
-            // invalidated the adapter source data), store the MOVED element
-            // VALUES into self's data array so reads of the appended slots
-            // (`self[self_old_len + i]`) return the real moved values instead of
-            // the construction fill. `append` moves ALL of other's elements, and
-            // `src_concrete_elems` are exactly those values in order. This adds
-            // only genuine facts, tightening the sound over-approximation.
-            // Anything without a concrete literal source keeps the unconstrained
-            // data model (do not store) — sound.
-            if let Some(elems) = src_concrete_elems
-                && (1..=MAX_APPEND_MOVE_ELEMS).contains(&elems.len())
-            {
-                self.vec_store_appended_elements(
-                    self_local,
-                    &self_old_len,
-                    elems,
-                    modified_locals,
-                    acc,
-                );
-            }
-
-            debug!(
-                fn_name = %self.fn_name,
-                self_local,
-                ?other_resolved,
-                "VecAppend: self.len += other.len, other.len = 0"
-            );
-        } else {
-            // Cannot resolve other's length — leave self.len unconstrained
-            // (sound over-approximation).
-            debug!(
-                fn_name = %self.fn_name,
-                self_local,
-                ?other_local,
-                "VecAppend: other length unresolved — fallback"
-            );
-            self.record_sound_fallback_reason("vec_append_other_len_unresolved");
-        }
     }
 
     /// VecTruncate: `self.truncate(new_len)`.

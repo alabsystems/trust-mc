@@ -11,6 +11,7 @@
 
 use ay_bindings::Expr;
 use rustc_public::mir::{Place, ProjectionElem};
+use rustc_public::ty::{RigidTy, TyKind};
 use tracing::{debug, warn};
 
 use crate::args::ChcTrackLevel;
@@ -366,10 +367,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // and main's `projections_after_leading_deref_add_zero_bytes` over the
         // whole projection. Either refusing refuses the hop.
         (projection_tail_at_offset_zero(pointee, tail)
-            && self.projections_after_leading_deref_add_zero_bytes(
-                target.local,
-                &target.projections,
-            ))
+            && self
+                .projections_after_leading_deref_add_zero_bytes(target.local, &target.projections))
         .then_some(target.local)
     }
 
@@ -780,8 +779,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                         Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
                             if matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
                                 stack.push(place.local);
-                            } else if has_state(place.local) && !candidates.contains(&place.local)
-                            {
+                            } else if has_state(place.local) && !candidates.contains(&place.local) {
                                 candidates.push(place.local);
                             }
                         }
@@ -1092,7 +1090,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // `*vec.as_ptr().add(5)` returns an unconstrained value because mem_u8
         // was never written. This mirrors the read-side guard in
         // try_resolve_deref_via_ref_targets (codegen_expr_deref_field.rs).
-        if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx) {
+        let mut exact_field_address = None;
+        if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx).cloned() {
+            let raw_field_target = matches!(
+                self.resolve_body_ty(self.body.locals()[local_idx].ty).kind(),
+                TyKind::RigidTy(RigidTy::RawPtr(..))
+            ) && !ref_target.projections.is_empty()
+                && ref_target.projections.iter().all(|p| matches!(p, ProjectionElem::Field(..)));
+            if raw_field_target {
+                // Address formation proves no later lifetime. Check the owner
+                // at this actual use, including the Reg fallback route.
+                self.emit_ptr_obj_valid_check(local_idx, acc.modified);
+                if self.exact_raw_field_stack_address(local_idx, &ref_target) {
+                    exact_field_address = self.known_stack_addr_expr(local_idx);
+                }
+            }
             let has_state = self.try_state_idx_for_local(ref_target.local).is_some();
             let proj_1 = lhs.projection.len() == 1;
             let has_offset = self.ref_resolution.subslice_offset.contains_key(&local_idx);
@@ -1133,6 +1145,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // `a04_bug_moved_copy_dst_then_read`).
             let foreign_heap_owner = self.ref_target_is_foreign_heap_owner(local_idx);
             if has_state
+                && exact_field_address.is_none()
                 && !has_offset
                 && !drills_heap_pointer
                 && !foreign_heap_owner
@@ -1207,7 +1220,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // through a reference at a symbolic address that doesn't match the constant
         // load address, breaking store-to-load forwarding.
         let trace_result = self.trace_deref_store_alloc_id(local_idx);
-        let ptr_expr = if let Some(obj_id) = trace_result {
+        // A proven field address carries its complete nonzero offset.
+        // Allocation ids below are base-only and must not erase that offset.
+        let ptr_expr = if let Some(address) = exact_field_address {
+            address
+        } else if let Some(obj_id) = trace_result {
             Expr::bitvec_const(obj_id as i128, 32).concat(Expr::bitvec_const(0, 32))
         } else {
             ptr_expr
@@ -1487,8 +1504,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // keeps a state variable for writes that state variable too, along the
         // static place path (`decl::static_path`), so a read of the static
         // through its state variable sees it.
-        let routed_static =
-            !skip_memory_store && self.route_exact_static_store_stmt(&addr_expr, store_ty, rhs_expr, acc);
+        let routed_static = !skip_memory_store
+            && self.route_exact_static_store_stmt(&addr_expr, store_ty, rhs_expr, acc);
         self.end_static_store_routing();
 
         // Part of #1957: Also update the local array when writing through a ref.
@@ -1526,8 +1543,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
                 self.emit_ref_target_array_update(&ref_target, rhs_expr, local_idx, bb_idx, acc);
             }
-        } else if let Some(ref_target) =
-            self.ref_resolution.ref_targets.get(&local_idx).cloned()
+        } else if let Some(ref_target) = self.ref_resolution.ref_targets.get(&local_idx).cloned()
             && let Some(offset) = self.ref_resolution.subslice_offset.get(&local_idx).cloned()
         {
             // OFFSET case, narrowed. The guard above exists because MIRRORING a
@@ -1556,14 +1572,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             // fix/chc-false-certificates, 2026-09-27: `u8_add_into_u16arr_safe`
             // FAILED certified Genuine and its `should_panic` twin passed, on
             // main and the branch).
-            let element_typed = Place {
-                local: ref_target.local,
-                projection: ref_target.projections.clone(),
-            }
-            .ty(self.body.locals())
-            .ok()
-            .and_then(|referent| self.get_array_element_ty(self.resolve_body_ty(referent)))
-            .is_some_and(|elem| self.resolve_body_ty(elem) == self.resolve_body_ty(store_ty));
+            let element_typed =
+                Place { local: ref_target.local, projection: ref_target.projections.clone() }
+                    .ty(self.body.locals())
+                    .ok()
+                    .and_then(|referent| self.get_array_element_ty(self.resolve_body_ty(referent)))
+                    .is_some_and(|elem| {
+                        self.resolve_body_ty(elem) == self.resolve_body_ty(store_ty)
+                    });
             if is_array_target && !element_typed {
                 // A narrower store whose byte offset the pointer's definition
                 // chain establishes is the array's memory image with those
@@ -1614,9 +1630,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && !self.element_offset_metadata_agrees(
                     local_idx,
                     &ref_target,
-                    self.get_type_size(store_ty)
-                        .and_then(|b| i128::try_from(b).ok())
-                        .unwrap_or(-1),
+                    self.get_type_size(store_ty).and_then(|b| i128::try_from(b).ok()).unwrap_or(-1),
                     Self::const_usize_from_expr(&offset).and_then(|o| i128::try_from(o).ok()),
                 )
             {

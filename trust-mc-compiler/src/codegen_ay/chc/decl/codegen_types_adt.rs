@@ -9,6 +9,7 @@
 //! Extracted from include!() via extension trait. Part of #2306.
 
 use crate::codegen_ay::shared::mono_ty;
+use crate::kani_middle::std_abstraction::{NativeWrapperKind as Wrapper, native_wrapper_kind};
 #[allow(unused_imports)]
 use crate::rustc_compat::prelude::*;
 use ay_bindings::Sort;
@@ -53,8 +54,8 @@ fn extract_polymorphic_iter_elem(args: &GenericArgs) -> Sort {
     // array_elem should be MaybeUninit<T> — unwrap to get T.
     let inner_ty = match elem_ty.kind() {
         TyKind::RigidTy(RigidTy::Adt(def, mu_args))
-            if def.trimmed_name() == "MaybeUninit"
-                || def.trimmed_name() == "std::mem::MaybeUninit" =>
+            if rustc_middle::ty::tls::with(|tcx| native_wrapper_kind(tcx, def))
+                == Some(Wrapper::MaybeUninit) =>
         {
             mu_args
                 .0
@@ -124,10 +125,8 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // so only rustc's lang-item identity authorizes that representation.
         // Use Rule A's instantiated, normalized storage type: a generic
         // atomic's field may name <T as AtomicPrimitive>::Storage.
-        let is_unsafe_cell = rustc_middle::ty::tls::with(|tcx| {
-            rustc_public::rustc_internal::internal(tcx, def).is_unsafe_cell()
-        });
-        if is_unsafe_cell {
+        let wrapper = rustc_middle::ty::tls::with(|tcx| native_wrapper_kind(tcx, def));
+        if wrapper == Some(Wrapper::UnsafeCell) {
             return Self::translate_ty(mono_ty::single_field_storage_ty(def, &args)?);
         }
 
@@ -179,7 +178,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
 
         // NonNull/Unique: transparent pointer wrappers (Part of #912)
-        if name == "NonNull" || name == "Unique" {
+        if matches!(wrapper, Some(Wrapper::NonNull | Wrapper::Unique)) {
             debug!(adt_name = ?name, "pointer wrapper type -> bv64 sort");
             return Some(ptr_sort());
         }
@@ -190,13 +189,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // which fails on internal RcInner/ArcInner fields, returning None and
         // cascading into bv32 fallback at state var declaration.
         // Matches BMC encoder: sort_inference_adt.rs line 75.
-        if name == "Rc"
-            || name == "Arc"
-            || name == "Weak"
-            || name == "std::rc::Rc"
-            || name == "std::sync::Arc"
-            || name == "std::rc::Weak"
-            || name == "std::sync::Weak"
+        if matches!(wrapper, Some(Wrapper::Rc | Wrapper::Arc | Wrapper::RcWeak | Wrapper::ArcWeak))
         {
             debug!(adt_name = ?name, "Rc/Arc/Weak -> bv64 sort (pointer wrapper)");
             return Some(ptr_sort());
@@ -206,7 +199,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Contains strong/weak counts + data. Model as opaque pointer since
         // Rc<T> is already modeled as ptr_sort() and internal fields are not
         // directly accessed in verification.
-        if name == "RcInner" || name == "alloc::rc::RcInner" {
+        if wrapper == Some(Wrapper::RcInner) {
             debug!(adt_name = ?name, "RcInner -> bv64 sort (opaque)");
             return Some(ptr_sort());
         }
@@ -215,7 +208,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Encode as pointer-width bitvec to match fat-pointer metadata expectations.
         // Without this, DynMetadata is translated as a Datatype which causes
         // sort mismatches when assigned to BV64 locals in pointer metadata ops.
-        if name == "DynMetadata" {
+        if wrapper == Some(Wrapper::DynMetadata) {
             debug!(adt_name = ?name, "DynMetadata -> bv64 sort (vtable pointer)");
             return Some(ptr_sort());
         }
@@ -226,12 +219,16 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
             return Some(struct_sort(names::RUST_STRING_SORT, names::string_fields()));
         }
 
-        // #1166, #1632, #1835: Vec<T>
-        if name == "Vec"
-            || name == "std::vec::Vec"
-            || name == "alloc::vec::Vec"
-            || name.ends_with("::Vec")
-        {
+        // Only the compiler's actual Vec owns this logical buffer model.
+        // A user Vec, including one without type arguments, keeps its declared
+        // fields through the ordinary ADT path below.
+        if rustc_middle::ty::tls::with(|tcx| {
+            crate::kani_middle::std_abstraction::is_sysroot_alloc_definition_at(
+                tcx,
+                rustc_public::rustc_internal::internal(tcx, def.def_id()),
+                &["vec", "Vec"],
+            )
+        }) {
             let elem_sort = Self::translate_type_arg_sort_or_param_bv(
                 args.0.first(),
                 "Vec element sort",
@@ -274,7 +271,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
 
         // #1166: Box<T>
-        if name == "Box" || name == "std::boxed::Box" {
+        if wrapper == Some(Wrapper::Box) {
             debug!(adt_name = ?name, "Box -> bv64 sort (pointer)");
             return Some(ptr_sort());
         }
@@ -283,7 +280,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Cow's Owned variant field type is an associated type projection
         // (<B as ToOwned>::Owned) which translate_adt_sort cannot resolve.
         // Model as pointer-sized bitvec, consistent with Box/NonNull.
-        if name == "Cow" && !args.0.is_empty() {
+        if wrapper == Some(Wrapper::Cow) && !args.0.is_empty() {
             debug!(adt_name = ?name, "Cow -> bv64 sort (pointer-like wrapper)");
             return Some(ptr_sort());
         }
@@ -300,68 +297,39 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
             return Some(bool_sort());
         }
 
-        // Transparent wrappers: delegate to inner type
-        // Transparent single-field wrappers: delegate to inner T.
-        // Includes mem wrappers, cell wrappers, and (#4067) sync wrappers + ArcInner.
-        // Sync wrappers gated on non-empty args to exclude internal platform types.
+        // These are the existing logical payload models, authorized by the
+        // compiler-library definition. RefCell deliberately retains its full
+        // datatype sort; memory-key peeling is a separate existing model.
         let is_transparent_wrapper = matches!(
-            name.as_str(),
-            "ManuallyDrop"
-                | "std::mem::ManuallyDrop"
-                | "MaybeUninit"
-                | "std::mem::MaybeUninit"
-                | "Cell"
-                | "std::cell::Cell"
-        ) || (!args.0.is_empty()
-            && matches!(
-                name.as_str(),
-                "Mutex"
-                    | "std::sync::Mutex"
-                    | "RwLock"
-                    | "std::sync::RwLock"
-                    | "MutexGuard"
-                    | "std::sync::MutexGuard"
-                    | "RwLockReadGuard"
-                    | "std::sync::RwLockReadGuard"
-                    | "RwLockWriteGuard"
-                    | "std::sync::RwLockWriteGuard"
-                    | "PoisonError"
-                    | "std::sync::PoisonError"
-                    | "ArcInner"
-                    | "alloc::sync::ArcInner"
-            ));
+            wrapper,
+            Some(
+                Wrapper::ManuallyDrop
+                    | Wrapper::MaybeUninit
+                    | Wrapper::Cell
+                    | Wrapper::Mutex
+                    | Wrapper::RwLock
+                    | Wrapper::MutexGuard
+                    | Wrapper::RwLockReadGuard
+                    | Wrapper::RwLockWriteGuard
+                    | Wrapper::PoisonError
+                    | Wrapper::ArcInner
+                    | Wrapper::Ref
+                    | Wrapper::RefMut
+            )
+        );
         if is_transparent_wrapper {
             if let Some(GenericArgKind::Type(inner_ty)) = args.0.first() {
                 return Self::translate_ty(*inner_ty);
             }
         }
-        // Part of #4251: Ref/RefMut — borrow guards from RefCell.
-        // Use full path to avoid matching other types named "Ref".
-        // These wrap a reference to the inner T; model as transparent around T.
-        // Without this, field-by-field translation fails on the BorrowRef/BorrowRefMut
-        // internal fields, cascading into bv32 fallback.
-        // Part of #4067: Platform sync types as transparent scalars.
-        // Use def.0.name() (full path) since trimmed_name() strips module prefix.
         let full_name = def.0.name();
-        if (name == "Ref" || name == "RefMut") && full_name.contains("cell") {
-            if let Some(GenericArgKind::Type(inner_ty)) = args.0.first() {
-                debug!(adt_name = ?name, "cell::Ref/RefMut -> delegate to inner type");
-                return Self::translate_ty(*inner_ty);
-            }
-        }
-        if full_name.contains("sys::sync::mutex")
-            || full_name.contains("sys::pal::unix::sync")
-            || full_name.contains("sync::poison::Flag")
-        {
+        if wrapper == Some(Wrapper::PlatformSync) {
             return Some(Sort::bitvec(32));
         }
-        if full_name.contains("once_box::OnceBox")
-            || name == "AtomicPtr"
-            || name == "std::sync::atomic::AtomicPtr"
-        {
+        if matches!(wrapper, Some(Wrapper::OnceBox | Wrapper::AtomicPtr)) {
             return Some(ptr_sort());
         }
-        if name == "NonZero" || name == "std::num::NonZero" || name.ends_with("::NonZero") {
+        if wrapper == Some(Wrapper::NonZero) {
             if let Some(GenericArgKind::Type(inner_ty)) = args.0.first() {
                 debug!(adt_name = ?name, "NonZero -> delegate to inner type");
                 return Self::translate_ty(*inner_ty);
@@ -406,7 +374,7 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
 
         // #4117: str::pattern internals + PhantomData → Bool (opaque ZST)
-        if is_bool_adt_name(&name, &full_name, &args) {
+        if wrapper == Some(Wrapper::PhantomData) || is_bool_adt_name(&name, &full_name, &args) {
             return Some(bool_sort());
         }
         // These small core adapters are executed through their real MIR bodies.
@@ -666,8 +634,6 @@ fn is_bool_adt_name(n: &str, full: &str, args: &GenericArgs) -> bool {
             | "SplitWhitespace"
             | "SplitInternal"
             | "CharPredicateSearcher"
-            | "PhantomData"
-            | "std::marker::PhantomData"
     ) || (n == "Split" && full.contains("str"))
         || (n == "Filter" && format!("{args:?}").contains("IsWhitespace"))
 }

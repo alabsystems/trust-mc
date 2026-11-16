@@ -158,6 +158,9 @@ pub(super) fn eval_bv_binary_const(op: &ExprValue, a: &Expr, b: &Expr) -> Option
 /// Uses structural equality for the matching case: `select(store(a, i, v), i) = v`.
 /// Only requires constant indices for the recursion case (different indices).
 pub(super) fn eval_select_store_const(array: &Expr, sel_index: &Expr) -> Option<Expr> {
+    if let ExprValue::ConstArray { value, .. } = array.value() {
+        return Some(value.clone());
+    }
     if let ExprValue::Store { array: inner_arr, index: store_idx, value: store_val } = array.value()
     {
         // Sound: select(store(a, i, v), i) = v for ALL i (McCarthy 1962).

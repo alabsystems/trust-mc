@@ -215,11 +215,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             StatementKind::Assign(place, rvalue) => {
                 // RHS locals are source operands.
                 Self::collect_rvalue_used_locals(rvalue, used);
-                // LHS projections (e.g., Index) can also read locals.
-                Self::collect_place_index_locals(place, used);
+                // Evaluating a destination reads its dereferenced base and indices.
+                Self::collect_destination_place_reads(place, used);
             }
             StatementKind::SetDiscriminant { place, .. } => {
-                Self::collect_place_index_locals(place, used);
+                Self::collect_destination_place_reads(place, used);
             }
             StatementKind::Intrinsic(intrinsic) => {
                 // Intrinsic statements generate constraints from their operands
@@ -257,8 +257,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 for arg in args {
                     Self::collect_operand_local(arg, used);
                 }
-                // destination place projections can read locals.
-                Self::collect_place_index_locals(destination, used);
+                // A pointee result destination reads the pointer value too.
+                Self::collect_destination_place_reads(destination, used);
             }
             TerminatorKind::Assert { cond, msg, .. } => {
                 Self::collect_operand_local(cond, used);
@@ -284,6 +284,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             #[cfg(trust_toolchain)]
             Operand::RuntimeChecks(_) => {}
         }
+    }
+
+    /// Evaluating a write through a pointer reads its value, not its old pointee.
+    /// A direct whole/field destination does not read the base merely by writing.
+    fn collect_destination_place_reads(
+        place: &rustc_public::mir::Place,
+        used: &mut HashSet<usize>,
+    ) {
+        if place.projection.iter().any(|projection| matches!(projection, ProjectionElem::Deref)) {
+            used.insert(place.local);
+        }
+        Self::collect_place_index_locals(place, used);
     }
 
     /// Extract locals from Index projections on a place.

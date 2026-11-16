@@ -11,6 +11,10 @@
 mod addressable_storage;
 #[path = "tests/complete_aggregate_definedness.rs"]
 mod complete_aggregate_definedness;
+#[path = "tests/native_bool_resize.rs"]
+mod native_bool_resize;
+#[path = "tests/native_division_domain.rs"]
+mod native_division_domain;
 #[path = "tests/native_unary.rs"]
 mod native_unary;
 #[path = "tests/native_wire_identity.rs"]
@@ -21,6 +25,8 @@ mod runtime_closure;
 pub(crate) mod tensor_region;
 #[path = "tests/typed_signature_abi.rs"]
 mod typed_signature_abi;
+#[path = "tests/wire74.rs"]
+mod wire74;
 
 use ay_bindings::{Expr, ExprValue};
 use trust_ir::dialect::{AttrValue, trust_rust};
@@ -2872,17 +2878,18 @@ fn typed_chc_translation_lowers_bool_to_integer_cast_without_unsupported_diagnos
         "supported bool-to-integer cast should not introduce unsupported error rules"
     );
     let branch_arg = &head_arg_suffix(output, "bb1", 1)[0];
-    let one = Expr::bitvec_const(1u64, 8);
-    let zero = Expr::bitvec_const(0u64, 8);
+    let one = Expr::bitvec_const(1u64, 1);
+    let zero = Expr::bitvec_const(0u64, 1);
     assert!(
         matches!(
             branch_arg.value(),
-            ExprValue::Ite { cond, then_expr, else_expr }
-                if matches!(cond.value(), ExprValue::Var { name } if name == "bb0_v0")
-                    && then_expr == &one
-                    && else_expr == &zero
+            ExprValue::BvZeroExtend { extra_bits: 7, expr }
+                if matches!(expr.value(), ExprValue::Ite { cond, then_expr, else_expr }
+                    if matches!(cond.value(), ExprValue::Var { name } if name == "bb0_v0")
+                        && then_expr == &one
+                        && else_expr == &zero)
         ),
-        "zext Bool to u8 should lower to ite(cond, #x01, #x00)"
+        "zext Bool to u8 must resize the canonical one-bit Boolean lane"
     );
 }
 

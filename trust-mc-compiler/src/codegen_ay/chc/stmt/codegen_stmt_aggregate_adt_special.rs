@@ -93,8 +93,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
 
         // Part of #912 / #2075: Transparent wrapper dispatch.
-        if let Some(result) =
-            self.try_translate_transparent_wrapper(&base_name, operands, modified_locals)
+        if let Some(result) = self.try_translate_transparent_wrapper(def, operands, modified_locals)
         {
             return Some(result);
         }

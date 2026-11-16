@@ -78,7 +78,7 @@ pub const SEMANTICS_COVERAGE: &[SemanticsCoverage] = &[
     SemanticsCoverage {
         family: SemanticsFamily::MemoryProvenance,
         status: SemanticsStatus::Conservative,
-        notes: "BMC uses array-backed regions; CHC diagnostic lowering has stack/borrow/provenance shortcuts (including ValidBorrow) that are non-authoritative, while the driver proof-grade bundle gate rejects public borrow, alloca, GEP, and unchecked pointer-cast shapes; MemCopy/MemSet of one whole object of a stack cell are exact in a size independent of the byte count (CHC: any object starting at the pointer, with exact in-bounds and memcpy-overlap UB; BMC: a whole single-cell Alloca), a defined lane run of a tracked CHC cell havocs it and fails closed (no lambda arrays on the CHC path), and through any other pointer they havoc every cell they could write and fail closed (BMC always, CHC whenever memory bounds are checked)",
+        notes: "BoxDeref validity assumptions fail closed by name in both lanes; BMC uses array-backed regions; CHC diagnostic lowering has stack/borrow/provenance shortcuts (including ValidBorrow) that are non-authoritative, while the driver proof-grade bundle gate rejects public borrow, alloca, GEP, and unchecked pointer-cast shapes; MemCopy/MemSet of one whole object of a stack cell are exact in a size independent of the byte count (CHC: any object starting at the pointer, with exact in-bounds and memcpy-overlap UB; BMC: a whole single-cell Alloca), a defined lane run of a tracked CHC cell havocs it and fails closed (no lambda arrays on the CHC path), and through any other pointer they havoc every cell they could write and fail closed (BMC always, CHC whenever memory bounds are checked)",
     },
     SemanticsCoverage {
         family: SemanticsFamily::SafetyProperties,
@@ -98,7 +98,7 @@ pub const SEMANTICS_COVERAGE: &[SemanticsCoverage] = &[
     SemanticsCoverage {
         family: SemanticsFamily::Calls,
         status: SemanticsStatus::Conservative,
-        notes: "bounded acyclic scalar direct calls inline typed return/safety summaries; the diagnostic name-only wrapping intrinsic shortcut is non-authoritative and rejected by the driver proof-grade gate; unknown, recursive, and indirect calls fail closed, and so do drop glue (`Drop`, `DropInvoke`), the unwinding indirect call (`InvokeIndirect`) and the no-unwind boundary calls (`CallCannotUnwind`, `CallIndirectCannotUnwind`) in both lanes",
+        notes: "nominal FnItem values have no SMT carrier and are refused before translation; bounded acyclic scalar direct calls inline typed return/safety summaries; the diagnostic name-only wrapping intrinsic shortcut is non-authoritative and rejected by the driver proof-grade gate; unknown, recursive, and indirect calls fail closed, and so do drop glue (`Drop`, `DropInvoke`), the unwinding indirect call (`InvokeIndirect`) and the no-unwind boundary calls (`CallCannotUnwind`, `CallIndirectCannotUnwind`) in both lanes",
     },
     SemanticsCoverage {
         family: SemanticsFamily::Casts,
@@ -211,7 +211,8 @@ pub fn family_for_inst(inst: &Inst) -> SemanticsFamily {
         | Inst::IsUnique { .. }
         | Inst::Dealloc { .. }
         | Inst::MemCopy { .. }
-        | Inst::MemSet { .. } => SemanticsFamily::MemoryProvenance,
+        | Inst::MemSet { .. }
+        | Inst::BoxDeref { .. } => SemanticsFamily::MemoryProvenance,
         Inst::DialectOp(op) if is_thread_local_addr(op) => SemanticsFamily::MemoryProvenance,
         Inst::Br { .. }
         | Inst::CondBr { .. }
@@ -263,6 +264,7 @@ pub fn family_for_inst(inst: &Inst) -> SemanticsFamily {
         Inst::Const { value: trust_ir::constant::Constant::SymbolAddr { .. }, .. } => {
             SemanticsFamily::MemoryProvenance
         }
+        Inst::Const { value: trust_ir::constant::Constant::FnItem(_), .. } => SemanticsFamily::Calls,
         // v50 `Splat`: the uniform array literal `[elem; len]` is an aggregate
         // construction, the constant twin of `ArraySplat` above.
         Inst::Const { value: trust_ir::constant::Constant::Splat { .. }, .. } => {

@@ -34,13 +34,42 @@ import generate_inventory as inventory_generator
 import zero_fallback_proof_gate as proof_gate
 
 
-def cover_output(properties: list[dict[str, str]]) -> str:
+def cover_output(properties: list[dict[str, str]], *, start: int = 1) -> str:
     return "".join(
-        f'Check {index + 1}: cover.{index}\n'
+        f'Check {index + start}: cover.{index}\n'
         f'\t - Status: {prop["status"]}\n'
         f'\t - Description: "{prop["description"]}"\n\n'
         for index, prop in enumerate(properties)
     )
+
+
+def checked_output(harness: str, expected: str, *, start: int = 1) -> str:
+    status = "SUCCESS" if expected == "PROOF" else "FAILURE"
+    return (
+        f'Check {start}: {harness}.assertion.1\n'
+        f'\t - Status: {status}\n\t - Description: "assertion failed"\n\n'
+        f'VERIFICATION:- {"SUCCESSFUL" if expected == "PROOF" else "FAILED"}\n'
+    )
+
+
+def clean_ay_descendant_pair(directory: Path) -> tuple[str, str]:
+    """Create the real ancestry accepted by the driver's development lane."""
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(directory), "-c", "user.name=Attestation test",
+             "-c", "user.email=attestation@example.invalid",
+             "-c", "core.hooksPath=/dev/null", *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "--quiet", "--initial-branch=main", ".")
+    git("commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "pin")
+    pin = git("rev-parse", "HEAD")
+    git("commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "descendant")
+    descendant = git("rev-parse", "HEAD")
+    git("merge-base", "--is-ancestor", pin, descendant)
+    assert pin != descendant and not git("status", "--porcelain")
+    return pin, descendant
 
 
 class ReplacementCoverAccountingTests(unittest.TestCase):
@@ -58,8 +87,10 @@ class ReplacementCoverAccountingTests(unittest.TestCase):
         return public_runner.parse_driver_result(row, public_runner.ProcessResult(
             0 if row["expected"] == "PROOF" else 1,
             f'Checking harness {row["harness"]}...\n' + text + extra
-            + '[AY:CTREX_CAT:Genuine]\n[AY:PROOF_QUALIFIERS:clean]\n'
-            + f'[AY:{row["expected"]}]\n', 0.01,
+            + ('[AY:CTREX_CAT:Genuine]\n' if row["expected"] == "CTREX" else '')
+            + '[AY:PROOF_QUALIFIERS:clean]\n'
+            + f'[AY:{row["expected"]}]\n'
+            + checked_output(row['harness'], row['expected'], start=20), 0.01,
         ))
 
     def test_all_five_oracles_match_exact_original_objects(self) -> None:
@@ -95,6 +126,16 @@ class ReplacementCoverAccountingTests(unittest.TestCase):
                 flat, runtime = self.parse(row, list(reversed(props)))
                 self.assertEqual(flat["status"], "PASS")
                 self.assertEqual(runtime["cover_properties"], flat["cover_properties"])
+
+    def test_source_bound_cover_only_success_retains_its_actual_cover_evidence(self) -> None:
+        row = next(r for r in self.rows if r["harness"] == "cover_sorted")
+        properties = dispositions.cover_expectations(row)
+        output = (f'Checking harness {row["harness"]}...\n[AY:PROOF]\n'
+                  + cover_output(properties) + 'VERIFICATION:- SUCCESSFUL\n')
+        flat, _ = public_runner.parse_driver_result(row, public_runner.ProcessResult(0, output, 0.1))
+        self.assertEqual(flat["status"], "PASS")
+        self.assertEqual(flat["checked_properties"], [])
+        self.assertEqual(flat["cover_properties"], properties)
 
     def test_safety_markers_and_aggregate_cover_counts_supply_no_property_credit(self) -> None:
         for row in self.rows:
@@ -250,6 +291,199 @@ class ReplacementCoverAccountingTests(unittest.TestCase):
                 dispositions.cover_expectations(row)
 
 
+class ReplacementCheckedVerdictTests(unittest.TestCase):
+    def parse(self, expected, body, *, exit_code=None):
+        row = dict(file="tests/checked.rs", harness="probe", driver_harness="probe",
+                   expected=expected)
+        safe = expected in {"PROOF", "BMC_SAFE"}
+        markers = "[AY:PROOF]\n" if safe else "[AY:CTREX]\n[AY:CTREX_CAT:Genuine]\n"
+        return public_runner.parse_driver_result(row, public_runner.ProcessResult(
+            (0 if safe else 1) if exit_code is None else exit_code,
+            "Checking harness probe...\n" + markers + body, 0.1,
+        ))
+
+    def test_complete_checked_proof_is_credited_and_recorded(self):
+        flat, runtime = self.parse("PROOF", checked_output("probe", "PROOF"))
+        self.assertEqual(flat["status"], "PASS")
+        self.assertTrue(flat["trusted_proof"])
+        self.assertEqual(flat["verification_result"], "SUCCESSFUL")
+        self.assertEqual(flat["checked_properties"], runtime["checked_properties"])
+        self.assertEqual(flat["checked_properties"][0]["status"], "SUCCESS")
+
+    def test_checked_safe_requires_normal_exit_without_discarding_evidence(self):
+        for expected in ("PROOF", "BMC_SAFE"):
+            for code in (0, -11, -9, 1, 2, 101):
+                with self.subTest(expected=expected, returncode=code):
+                    flat, runtime = self.parse(expected, checked_output("probe", "PROOF"),
+                                               exit_code=code)
+                    self.assertEqual(flat["status"], "PASS" if code == 0 else "FAIL")
+                    self.assertEqual(runtime["status"], flat["status"])
+                    self.assertEqual(flat["verdict"], "PROOF")
+                    self.assertTrue(flat["validated_semantic_evidence"])
+                    self.assertEqual(flat["checked_properties"][0]["status"], "SUCCESS")
+                    self.assertEqual(flat["expected_returncode"], 0)
+                    self.assertEqual(flat["returncode"], code)
+                    self.assertEqual(runtime["metadata"]["execution"]["returncode"], code)
+                    self.assertEqual(runtime["validated_semantic_evidence"], True)
+                    self.assertNotIn("semantic_evidence_error", flat)
+                    if code:
+                        self.assertIn("cli_completion_error", flat)
+                        self.assertNotIn("trusted_proof", flat)
+                    else:
+                        self.assertNotIn("cli_completion_error", flat)
+
+    def test_checked_bug_requires_normal_failure_exit_without_losing_refutation(self):
+        unknown = ('Check 2: probe.memory_safety.2\n - Status: UNDETERMINED\n'
+                   ' - Description: "other pointer check"\n')
+        body = checked_output("probe", "CTREX").replace("VERIFICATION:", unknown + "VERIFICATION:")
+        for code in (1, -11, -9, 0, 2, 101):
+            with self.subTest(returncode=code):
+                flat, runtime = self.parse("CTREX", body, exit_code=code)
+                self.assertEqual(flat["status"], "PASS" if code == 1 else "FAIL")
+                self.assertEqual(runtime["status"], flat["status"])
+                self.assertEqual(flat["verdict"], "CTREX")
+                self.assertEqual(flat["ctrex_category"], "Genuine")
+                self.assertTrue(flat["validated_semantic_evidence"])
+                self.assertEqual([p["status"] for p in flat["checked_properties"]],
+                                 ["FAILURE", "UNDETERMINED"])
+                self.assertEqual(flat["expected_returncode"], 1)
+                self.assertEqual(flat["returncode"], code)
+                self.assertEqual(runtime["checked_properties"], flat["checked_properties"])
+                self.assertEqual(runtime["ctrex_category"], "Genuine")
+                self.assertEqual(runtime["metadata"]["execution"]["returncode"], code)
+                self.assertNotIn("semantic_evidence_error", flat)
+                self.assertEqual("cli_completion_error" in flat, code != 1)
+
+    def test_exact_expected_panic_protocol_requires_normal_success_exit(self):
+        body = ("[AY:EFFECTIVE_SUCCESS:should_panic_panics_only]\n"
+                + checked_output("probe", "CTREX").replace(
+                    "VERIFICATION:- FAILED",
+                    "VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)"))
+        for code in (0, 1, 2, -11):
+            with self.subTest(returncode=code):
+                flat, runtime = self.parse("CTREX", body, exit_code=code)
+                self.assertEqual(flat["status"], "PASS" if code == 0 else "FAIL")
+                self.assertEqual(flat["expected_returncode"], 0)
+                self.assertTrue(flat["validated_semantic_evidence"])
+                self.assertEqual(flat["ctrex_category"], "Genuine")
+                self.assertEqual(runtime["returncode"], code)
+                self.assertEqual("cli_completion_error" in flat, code != 0)
+        for wrong in (body.replace("[AY:EFFECTIVE_SUCCESS:should_panic_panics_only]\n", ""),
+                      body.replace("should_panic_panics_only", "should_panic")):
+            flat, _ = self.parse("CTREX", wrong, exit_code=0)
+            self.assertEqual(flat["status"], "FAIL")
+            self.assertEqual(flat["expected_returncode"], 1)
+            self.assertFalse(flat["validated_semantic_evidence"])
+
+    def test_diagnostic_negative_classes_have_no_invented_exit_convention(self):
+        for expected, final in (("UNKNOWN", "INCONCLUSIVE"), ("ERROR", "FAILED")):
+            row = dict(file="tests/diagnostic.rs", harness="probe", driver_harness="probe",
+                       expected=expected)
+            output = f"Checking harness probe...\n[AY:{expected}]\nVERIFICATION:- {final}\n"
+            for code in (1, 2, 101):
+                with self.subTest(expected=expected, returncode=code):
+                    flat, runtime = public_runner.parse_driver_result(
+                        row, public_runner.ProcessResult(code, output, 0.1))
+                    self.assertEqual(flat["status"], "PASS")
+                    self.assertEqual(flat["verdict"], expected)
+                    self.assertEqual(runtime["returncode"], code)
+                    self.assertNotIn("expected_returncode", flat)
+                    self.assertNotIn("validated_semantic_evidence", flat)
+                    self.assertNotIn("cli_completion_error", flat)
+
+    def test_safe_marker_cannot_hide_an_undecided_or_failed_check(self):
+        for status in ("UNDETERMINED", "FAILURE", "UNREACHABLE"):
+            with self.subTest(status=status):
+                flat, _ = self.parse("PROOF", checked_output("probe", "PROOF").replace(
+                    "Status: SUCCESS", "Status: " + status))
+                self.assertEqual(flat["status"], "FAIL")
+                self.assertEqual(flat["verdict"], "PROOF")
+                self.assertEqual(flat["execution_state"], "complete")
+                self.assertNotIn("trusted_proof", flat)
+
+    def test_success_marker_cannot_override_the_final_rendered_result(self):
+        for final in ("INCONCLUSIVE", "FAILED", "SUCCESSFUL (UNVALIDATED)"):
+            with self.subTest(final=final):
+                flat, _ = self.parse("PROOF", checked_output("probe", "PROOF").replace(
+                    "VERIFICATION:- SUCCESSFUL", "VERIFICATION:- " + final))
+                self.assertEqual(flat["status"], "FAIL")
+                self.assertNotIn("trusted_proof", flat)
+        for tail in ("", "VERIFICATION:- SUCCESSFUL\nVERIFICATION:- FAILED\n"):
+            flat, _ = self.parse("PROOF", checked_output("probe", "PROOF").replace(
+                "VERIFICATION:- SUCCESSFUL\n", tail))
+            self.assertEqual(flat["status"], "FAIL")
+
+    def test_one_genuine_failure_suffices_despite_an_unrelated_unknown(self):
+        unknown = ('Check 2: probe.memory_safety.2\n - Status: UNDETERMINED\n'
+                   ' - Description: "other pointer check"\n')
+        body = checked_output("probe", "CTREX").replace("VERIFICATION:", unknown + "VERIFICATION:")
+        flat, _ = self.parse("CTREX", body)
+        self.assertEqual(flat["status"], "PASS")
+        self.assertEqual([p["status"] for p in flat["checked_properties"]],
+                         ["FAILURE", "UNDETERMINED"])
+
+    def test_genuine_marker_without_a_failing_property_is_not_a_refutation(self):
+        for status in ("SUCCESS", "UNDETERMINED"):
+            flat, _ = self.parse("CTREX", checked_output("probe", "CTREX").replace(
+                "Status: FAILURE", "Status: " + status))
+            self.assertEqual(flat["status"], "FAIL")
+            self.assertEqual(flat["ctrex_category"], "Genuine")
+        flat, _ = self.parse("CTREX", "VERIFICATION:- FAILED\n")
+        self.assertEqual(flat["status"], "FAIL")
+
+    def test_failed_marker_does_not_override_unvalidated_or_successful_result(self):
+        for final in ("SUCCESSFUL", "INCONCLUSIVE", "UNVALIDATED (DT+BV)"):
+            flat, _ = self.parse("CTREX", checked_output("probe", "CTREX").replace(
+                "VERIFICATION:- FAILED", "VERIFICATION:- " + final))
+            self.assertEqual(flat["status"], "FAIL")
+
+    def test_malformed_property_tables_cannot_manufacture_a_decided_check(self):
+        valid = checked_output("probe", "PROOF")
+        for body in (
+            valid.replace("Check 1:", "Check 0:"),
+            valid.replace(" - Status: SUCCESS", " - Status: SUCCESS\n - status: FAILURE"),
+            valid.replace(' - Description: "assertion failed"', " - Description: unquoted"),
+            valid.replace("Status: SUCCESS", "Status: GUESSED"),
+            valid.replace("VERIFICATION:", 'Check broken header\nVERIFICATION:'),
+            valid.replace("VERIFICATION:", 'Check 1: probe.assertion.2\n - Status: SUCCESS\n - Description: "x"\nVERIFICATION:'),
+            valid.replace("VERIFICATION:", 'Check 2: probe.assertion.1\n - Status: SUCCESS\n - Description: "x"\nVERIFICATION:'),
+        ):
+            with self.subTest(body=body):
+                flat, _ = self.parse("PROOF", body)
+                self.assertEqual(flat["status"], "FAIL")
+                self.assertIn("property_error", flat)
+
+    def test_no_check_qualifier_without_artifact_authority_is_not_proof_credit(self):
+        for suffix in ("", " (no checks — compiler-certified obligation-free)"):
+            flat, _ = self.parse("PROOF",
+                "[AY:PROOF_QUALIFIERS:compiler-certified-obligation-free]\n"
+                + "VERIFICATION:- SUCCESSFUL" + suffix + "\n")
+            self.assertEqual(flat["status"], "FAIL")
+            self.assertNotIn("trusted_proof", flat)
+
+    def test_checks_outside_the_selected_result_cannot_supply_evidence(self):
+        check = checked_output("probe", "PROOF").split("VERIFICATION:")[0]
+        for output in (
+            check + "Checking harness probe...\n[AY:PROOF]\nVERIFICATION:- SUCCESSFUL\n",
+            "Checking harness probe...\n[AY:PROOF]\nVERIFICATION:- SUCCESSFUL\n" + check,
+        ):
+            row = dict(file="tests/checked.rs", harness="probe", driver_harness="probe", expected="PROOF")
+            flat, _ = public_runner.parse_driver_result(row, public_runner.ProcessResult(0, output, 0.1))
+            self.assertEqual(flat["status"], "FAIL")
+            self.assertIn("outside", flat["semantic_evidence_error"])
+
+    def test_other_harness_debt_does_not_convert_unknown_into_semantic_credit(self):
+        row = dict(file="tests/checked.rs", harness="probe", driver_harness="probe", expected="CTREX")
+        output = ("Checking harness probe...\n[AY:UNKNOWN]\n"
+                  "[AY:TRANSLATION_DROP_REASON:other_harness:untracked_pointer_value=1]\n"
+                  + checked_output("probe", "CTREX").replace("Status: FAILURE", "Status: UNDETERMINED")
+                    .replace("VERIFICATION:- FAILED", "VERIFICATION:- INCONCLUSIVE"))
+        flat, _ = public_runner.parse_driver_result(row, public_runner.ProcessResult(1, output, 0.1))
+        self.assertEqual(flat["status"], "FAIL")
+        self.assertEqual(flat["verdict"], "UNKNOWN")
+        self.assertEqual(flat["translation_drop_reasons"], {"untracked_pointer_value": 1})
+
+
 class DriverBinaryAttestationTests(unittest.TestCase):
     TRUST_MC_SHA = "89abcdef0123456789abcdef0123456789abcdef"
     AY_PIN = "0123456789abcdef0123456789abcdef01234567"
@@ -279,6 +513,46 @@ class DriverBinaryAttestationTests(unittest.TestCase):
         self.assertEqual(attestation["trust_mc_sha"], self.TRUST_MC_SHA)
         self.assertEqual(attestation["ay_linked_sha"], self.AY_PIN)
         self.assertRegex(attestation["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_exact_path_patched_driver_is_attested(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            driver = Path(raw) / "trust-mc-driver"
+            driver.write_text("#!/bin/sh\n", encoding="utf-8")
+            driver.chmod(0o755)
+            line = self.authority_line().replace("ay_authority=matched", "ay_authority=contains-pin")
+            with mock.patch.object(driver_attestation.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 0, line, "")):
+                attestation = driver_attestation.attest_driver_binary(
+                    driver, expected_trust_mc_sha=self.TRUST_MC_SHA,
+                    expected_ay_pin=self.AY_PIN,
+                )
+        self.assertEqual(attestation["ay_linked_sha"], self.AY_PIN)
+        self.assertEqual(attestation["ay_authority"], "contains-pin")
+
+    def test_clean_development_descendant_cannot_qualify_the_declared_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            pin, descendant = clean_ay_descendant_pair(directory)
+            # This is valid producer metadata for checked development ancestry.
+            # Parsing retains its actual source; measurement must reject it.
+            line = (self.authority_line().replace(self.AY_PIN, pin)
+                    .replace(f"ay_linked_sha={pin}", f"ay_linked_sha={descendant}")
+                    .replace("ay_authority=matched", "ay_authority=contains-pin"))
+            fields = driver_attestation.parse_authority_output(line)
+            self.assertEqual(fields["ay_pin"], pin)
+            self.assertEqual(fields["ay_linked_sha"], descendant)
+            driver = directory / "trust-mc-driver"
+            driver.write_text("#!/bin/sh\n", encoding="utf-8")
+            driver.chmod(0o755)
+            with mock.patch.object(driver_attestation.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 0, line, "")):
+                with self.assertRaisesRegex(driver_attestation.DriverAttestationError,
+                                            f"ay_linked_sha.*{descendant}.*{pin}"):
+                    driver_attestation.attest_driver_binary(
+                        driver, expected_trust_mc_sha=self.TRUST_MC_SHA,
+                        expected_ay_pin=pin,
+                    )
+            self.assertEqual(driver_attestation.parse_authority_output(line), fields)
 
     def test_driver_authority_rejects_noise_dirty_and_wrong_commit(self) -> None:
         with self.assertRaises(driver_attestation.DriverAttestationError):
@@ -493,7 +767,8 @@ impl Second {
             with self.subTest(marker=marker):
                 result = public_runner.ProcessResult(
                     returncode=1 if "CTREX" in marker else 0,
-                    output="Checking harness main...\n" + marker + "\n",
+                    output="Checking harness main...\n" + marker + "\n"
+                           + checked_output("main", "CTREX"),
                     elapsed_seconds=0.1,
                 )
                 flat, _runtime = public_runner.parse_driver_result(row, result)
@@ -1048,6 +1323,37 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
             target_dir=root / "target",
         )
 
+    def test_descendant_linkage_refuses_before_replacement_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            driver = directory / "driver"
+            driver.write_text("#!/bin/sh\nprintf '%s\\n' '" +
+                              DriverBinaryAttestationTests.authority_line()
+                              .replace("ay_linked_sha=" + DriverBinaryAttestationTests.AY_PIN,
+                                       "ay_linked_sha=" + "b" * 40)
+                              .replace("ay_authority=matched", "ay_authority=contains-pin") +
+                              "'\n", encoding="utf-8")
+            driver.chmod(0o755)
+            args = public_runner.build_parser().parse_args([
+                "--driver", str(driver), "--report-dir", str(directory),
+            ])
+            with (
+                mock.patch.object(public_runner, "checked_disposition_report", return_value=self.artifact),
+                mock.patch.object(public_runner, "clean_measurement_fingerprint", return_value="frozen"),
+                mock.patch.object(public_runner, "expected_ay_pin_from_cargo_toml",
+                                  return_value=DriverBinaryAttestationTests.AY_PIN),
+                mock.patch.object(public_runner, "_current_head",
+                                  return_value=DriverBinaryAttestationTests.TRUST_MC_SHA),
+                mock.patch.object(public_runner, "solver_attestation", return_value={}),
+                mock.patch.object(public_runner, "execute_plan", side_effect=AssertionError(
+                    "replacement execution started with off-pin linked AY")) as execute,
+            ):
+                with self.assertRaisesRegex(driver_attestation.DriverAttestationError,
+                                            "ay_linked_sha"):
+                    public_runner.run(args)
+                execute.assert_not_called()
+            self.assertFalse((directory / public_runner.DEFAULT_REPORT.name).exists())
+
     def test_actual_exit_manifest_survives_final_validation_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
@@ -1262,6 +1568,7 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
                     "[AY:SOUND_FALLBACK:0]\n"
                     "[AY:PROOF_QUALIFIERS:clean]\n"
                     "[AY:PROOF]\n"
+                    + checked_output(row['driver_harness'], "PROOF")
                 ),
                 elapsed_seconds=0.125,
             ),
@@ -1274,7 +1581,8 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
             row,
             public_runner.ProcessResult(
                 returncode=0,
-                output=f"Checking harness {row['driver_harness']}...\n[AY:PROOF]\n",
+                output=f"Checking harness {row['driver_harness']}...\n[AY:PROOF]\n"
+                       + checked_output(row['driver_harness'], "PROOF"),
                 elapsed_seconds=0.125,
             ),
         )
@@ -1327,6 +1635,9 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
             f"Checking harness {row['driver_harness']}...\n"
             "[AY:CTREX]\n[AY:CTREX_CAT:Genuine]\n"
             "[AY:EFFECTIVE_SUCCESS:should_panic_panics_only]\n"
+            + checked_output(row['driver_harness'], "CTREX").replace(
+                "VERIFICATION:- FAILED", "VERIFICATION:- SUCCESSFUL (encountered one or more panics as expected)"
+            )
         )
         result = public_runner.ProcessResult(0, output, 0.125)
         flat, runtime = public_runner.parse_driver_result(row, result)
@@ -1396,6 +1707,7 @@ class ReplacementPublicRunnerTests(unittest.TestCase):
             covers = dispositions.cover_expectations(row)
             if covers is not None:
                 output += cover_output(covers)
+            output += checked_output(row['driver_harness'], row['expected'], start=20)
             return public_runner.ProcessResult(
                 returncode=return_code,
                 output=output,
@@ -1886,6 +2198,35 @@ class AyProofContractTests(unittest.TestCase):
             expected_harnesses=1,
         )
         self.assertEqual(failures, [])
+
+    def test_descendant_linkage_is_diagnostic_not_current_replacement_authority(self) -> None:
+        report = self.clean_report()
+        driver = report["driver_binary"]
+        assert isinstance(driver, dict)
+        driver["ay_linked_sha"] = "b" * 40
+        driver["ay_authority"] = "contains-pin"
+        failures = proof_gate.find_gate_failures(
+            report, expected_ay_pin=self.AY_PIN, expected_harnesses=1,
+        )
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("ay_linked_sha", failures[0])
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "report.json"
+            original = json.dumps(report)
+            path.write_text(original, encoding="utf-8")
+            with (
+                mock.patch.object(report_contract, "_current_head", return_value=report["commit"]),
+                mock.patch.object(report_contract, "_current_tree_state", return_value="clean"),
+                mock.patch.object(report_contract, "_current_tree_fingerprint",
+                                  return_value=report["tree_fingerprint"]),
+            ):
+                with self.assertRaisesRegex(ValueError, "ay_linked_sha"):
+                    report_contract.load_schema_v2_report(path, repo_root=REPO_ROOT)
+            diagnostic = report_contract.load_schema_v2_report(
+                path, repo_root=REPO_ROOT, require_current_head=False,
+            )
+            self.assertEqual(diagnostic["driver_binary"], driver)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_zero_fallback_gate_rejects_legacy_z4_attestation(self) -> None:
         report = self.clean_report()

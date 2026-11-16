@@ -184,10 +184,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 return false;
             };
             let name = def.name();
+            let last = name.rsplit("::").next().unwrap_or(&name);
+            if last == "Vec" {
+                return Self::detect_collection_type(ty).is_some();
+            }
             matches!(
-                name.rsplit("::").next().unwrap_or(&name),
-                "Vec"
-                    | "String"
+                last,
+                "String"
                     | "VecDeque"
                     | "HashMap"
                     | "HashSet"
@@ -230,17 +233,20 @@ pub(in crate::codegen_ay::chc) fn ty_holds_collection(
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             let name = def.name();
             let last = name.rsplit("::").next().unwrap_or(&name);
-            if matches!(
-                last,
-                "Vec"
-                    | "String"
-                    | "VecDeque"
-                    | "HashMap"
-                    | "HashSet"
-                    | "BTreeMap"
-                    | "BTreeSet"
-                    | "BinaryHeap"
-            ) {
+            // A user Vec can still HOLD a real collection, so a failed
+            // native identity test falls through to its actual fields.
+            if (last == "Vec" && ChcCtx::detect_collection_type(ty).is_some())
+                || matches!(
+                    last,
+                    "String"
+                        | "VecDeque"
+                        | "HashMap"
+                        | "HashSet"
+                        | "BTreeMap"
+                        | "BTreeSet"
+                        | "BinaryHeap"
+                )
+            {
                 return true;
             }
             if matches!(last, "Box" | "Rc" | "Arc" | "NonNull" | "PhantomData") {

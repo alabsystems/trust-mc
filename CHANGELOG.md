@@ -18,6 +18,20 @@ per-release record until it is.
 
 ## [Unreleased]
 
+### Fixed (RL-131: build-dev and bundle take a toolchain's std sources only when they are complete)
+- `choose_std_source` (`tools/build-trust-mc/src/dev_std.rs`) took a toolchain's
+  `lib/rustlib/src/rust/library` whenever its `Cargo.lock` existed. Trust seal
+  16387 ships `library/` without `crates/trust-bignum` and `crates/trust-memchr`,
+  which `library/sysroot` and the library `[patch]` name by path, so `targo
+  --unverified bundle` chose those sources and cargo refused the `-Z build-std`
+  rebuild ("failed to load manifest for dependency `trust-bignum`"). The
+  sources now count as shipped only when every path cargo resolves for the
+  library workspace (members, their path and workspace-inherited dependencies,
+  the path packages reached from them, `[patch]` and `[replace]`) is a
+  directory with a `Cargo.toml` inside them; otherwise the superproject or a
+  named checkout serves them, and the refusal names each missing path. Seals
+  15698 and 16387 are refused; 20882 and 27009 are taken.
+
 ### Fixed (TI-P-0a: trust-mc builds against trust-ir v70 and refuses its tensor region by name)
 - trust-ir bd313b4fb (wire v67-v70) adds `Ty::Tensor`, the six `Inst::Tensor*`
   instructions, `Constant::TensorBlob` and `Module.blobs`, which trust-mc's

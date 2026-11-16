@@ -456,7 +456,10 @@ impl<'tcx, 'body> StmtStoreRef for ChcCtx<'tcx, 'body> {
             let Some(new_whole) = new_whole else {
                 // The part could not be updated: the static is havoced, and no
                 // verdict rests on it (fail closed).
-                debug!(local_idx, static_vec_idx, "CHC: static path store not encodable — havoc (D6)");
+                debug!(
+                    local_idx,
+                    static_vec_idx, "CHC: static path store not encodable — havoc (D6)"
+                );
                 let booked = self.record_sound_fallback_reason(
                     crate::codegen_ay::chc::decl::codegen_decl_static::CONST_PTR_INTO_LIVE_STATIC,
                 );
@@ -674,7 +677,9 @@ impl<'tcx, 'body> StmtStoreRef for ChcCtx<'tcx, 'body> {
         // failed where these verified clean (walker fail-closed repair round
         // 5, `walker_invalid_enum_dual.rs`, the three statement-path rows).
         // The target is left unconstrained and the store fails closed.
-        if lhs.projection.len() == 1 && deref_store_puns_an_enum(self.body.locals(), lhs, &ref_target) {
+        if lhs.projection.len() == 1
+            && deref_store_puns_an_enum(self.body.locals(), lhs, &ref_target)
+        {
             warn!(
                 ref_local = local_idx,
                 ?ref_target,
@@ -796,8 +801,7 @@ impl<'tcx, 'body> StmtStoreRef for ChcCtx<'tcx, 'body> {
                     .iter()
                     .all(|p| matches!(p, ProjectionElem::Field(..) | ProjectionElem::Downcast(_)))
             {
-                field_projs
-                    .extend(collect_field_projections(tail, UnknownProjectionPolicy::Break));
+                field_projs.extend(collect_field_projections(tail, UnknownProjectionPolicy::Break));
             } else {
                 // A further index or dereference after the referenced element:
                 // no handler below encodes it, and dropping it is a false proof.
@@ -870,10 +874,9 @@ impl<'tcx, 'body> StmtStoreRef for ChcCtx<'tcx, 'body> {
         // element (`(*p).a[1].x = 9`): they are carried to the handler, which
         // applies them to the element. Dropping them was a false proof of the
         // same family as R3.
-        if let Some(pos) = lhs.projection[1..]
-            .iter()
-            .position(|p| matches!(p, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. }))
-        {
+        if let Some(pos) = lhs.projection[1..].iter().position(|p| {
+            matches!(p, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+        }) {
             let idx_proj = &lhs.projection[1 + pos];
             let lhs_tail = &lhs.projection[1 + pos + 1..];
             if lhs_tail
@@ -1120,7 +1123,8 @@ fn deref_store_puns_an_enum(
     let Ok(stored_ty) = lhs.ty(locals) else {
         return false;
     };
-    let target_place = Place { local: ref_target.local, projection: ref_target.projections.clone() };
+    let target_place =
+        Place { local: ref_target.local, projection: ref_target.projections.clone() };
     let Ok(target_ty) = target_place.ty(locals) else {
         return false;
     };

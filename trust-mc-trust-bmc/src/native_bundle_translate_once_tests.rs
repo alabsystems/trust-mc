@@ -251,6 +251,9 @@ fn per_request_reference_metadata(
         trust_ir::NativeAdapterInput::RustMir { body_digest } => {
             ("rust-mir", Some(proof_digest_metadata(body_digest)))
         }
+        trust_ir::NativeAdapterInput::RustThir { source_digest } => {
+            ("rust-thir", Some(proof_digest_metadata(source_digest)))
+        }
         trust_ir::NativeAdapterInput::TrustIrModule => ("trust_ir-module", None),
     };
     let metadata = NativeTypedChcObligationMetadata::new(

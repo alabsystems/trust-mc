@@ -29,8 +29,8 @@ use crate::signature_abi::first_typed_signature_abi;
 use crate::translate::{
     TranslateOptions, binop_is_floating_point, bounded_output_out_of_range, bv_rotate,
     const_to_expr, integer_binop_div_by_zero_condition, integer_binop_no_overflow_condition,
-    integer_rotate_is_unencodable, is_eq_comparable_ty, is_ordered_scalar_ty, normalize_expr_to_ty,
-    overflow_op_to_binop, switch_case_expr, ty_to_sort,
+    integer_binop_overflow_obligation, integer_rotate_is_unencodable, is_eq_comparable_ty,
+    is_ordered_scalar_ty, normalize_expr_to_ty, overflow_op_to_binop, switch_case_expr, ty_to_sort,
 };
 
 const ERROR_REL: &str = "error";
@@ -292,6 +292,8 @@ pub enum TrustIrChcUnsupportedReason {
     /// refute the postcondition, so it fails closed instead.
     UnsupportedBoundedOutput,
     Cast,
+    /// BoxDeref's site-scoped Box validity hypothesis has no CHC model.
+    BoxDerefValidity,
     UnaryOperation,
     OverflowIntrinsic,
     AggregateProjection,
@@ -2405,6 +2407,17 @@ impl<'a> ChcFuncTranslator<'a> {
             );
         }
         match &node.inst {
+            Inst::BoxDeref { .. } => {
+                self.add_unsupported_error(
+                    block,
+                    instruction_index,
+                    node,
+                    TrustIrChcUnsupportedReason::BoxDerefValidity,
+                    from,
+                    path_constraints,
+                );
+                false
+            }
             Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 self.translate_integer_binop(*op, ty, *lhs, *rhs, node, from, path_constraints);
                 // A float op on an INTEGER type is ill-typed IR; eval_binop
@@ -4651,15 +4664,10 @@ impl<'a> ChcFuncTranslator<'a> {
         let lhs_expr = normalize_expr_to_ty(&self.resolve(lhs, ty), ty);
         let rhs_expr = normalize_expr_to_ty(&self.resolve(rhs, ty), ty);
 
-        // Trust Gap 3: a `Wrapping`-tagged op (e.g. `wrapping_add`) is intentionally
-        // modular — wrap-around is defined, not UB — so it carries no no-overflow
-        // obligation. (Div-by-zero still applies; wrapping never affects it.)
-        if !node.proofs.contains(&ProofAnnotation::Wrapping) {
-            if let Some(no_overflow) =
-                integer_binop_no_overflow_condition(op, ty, &lhs_expr, &rhs_expr, self.options)
-            {
-                self.add_error_rule(from, path_constraints, no_overflow.not());
-            }
+        if let Some(no_overflow) =
+            integer_binop_overflow_obligation(op, ty, &lhs_expr, &rhs_expr, node, self.options)
+        {
+            self.add_error_rule(from, path_constraints, no_overflow.not());
         }
 
         if let Some(is_zero) = integer_binop_div_by_zero_condition(op, ty, &rhs_expr, self.options)
@@ -5494,20 +5502,18 @@ impl<'a> ChcFuncTranslator<'a> {
                             "int_binop_rhs_unbound",
                             line!(),
                         )?;
-                        // Trust Gap 3: `Wrapping`-tagged ops carry no overflow obligation.
-                        if !node.proofs.contains(&ProofAnnotation::Wrapping) {
-                            if let Some(no_overflow) = integer_binop_no_overflow_condition(
-                                *op,
-                                ty,
-                                &lhs_expr,
-                                &rhs_expr,
-                                self.options,
-                            ) {
-                                error_conditions.push(call_summary_guarded_condition(
-                                    &state.path_conditions,
-                                    no_overflow.not(),
-                                ));
-                            }
+                        if let Some(no_overflow) = integer_binop_overflow_obligation(
+                            *op,
+                            ty,
+                            &lhs_expr,
+                            &rhs_expr,
+                            node,
+                            self.options,
+                        ) {
+                            error_conditions.push(call_summary_guarded_condition(
+                                &state.path_conditions,
+                                no_overflow.not(),
+                            ));
                         }
                         if let Some(is_zero) =
                             integer_binop_div_by_zero_condition(*op, ty, &rhs_expr, self.options)
@@ -8580,10 +8586,22 @@ fn eval_cast_expr(op: CastOp, src_ty: &Ty, dst_ty: &Ty, operand: Expr) -> Option
     let operand = cast_operand_in_src_carrier(src_ty, operand)?;
     match op {
         CastOp::ZExt | CastOp::SExt | CastOp::Trunc
-            if src_ty.is_integer() && dst_ty.is_integer() =>
+            if (src_ty.is_integer() || matches!(src_ty, Ty::Bool)) && dst_ty.is_integer() =>
         {
             let src_width = src_ty.bit_width_with(HOST_POINTER_BITS)?;
             let dst_width = dst_ty.bit_width_with(HOST_POINTER_BITS)?;
+            // Canonical TrustIR treats Bool as a one-bit resize lane. Adapt
+            // its SMT Bool carrier once, then use the same opcode-defined
+            // resize below: SExt(true) is all ones, while ZExt(true) is one.
+            let operand = if matches!(src_ty, Ty::Bool) {
+                Expr::ite(
+                    operand,
+                    Expr::bitvec_const(1u64, src_width),
+                    Expr::bitvec_const(0u64, src_width),
+                )
+            } else {
+                operand
+            };
             match op {
                 CastOp::ZExt | CastOp::SExt | CastOp::Trunc if src_width == dst_width => {
                     Some(operand)
@@ -8597,23 +8615,6 @@ fn eval_cast_expr(op: CastOp, src_ty: &Ty, dst_ty: &Ty, operand: Expr) -> Option
                 CastOp::Trunc if src_width > dst_width => Some(operand.extract(dst_width - 1, 0)),
                 _ => None,
             }
-        }
-        // A `bool -> <int>` cast is `ite(b, 1, 0)` — a bool is 0 or 1, so the result
-        // is in {0, 1} — for WHATEVER `CastOp` the bridge cast-op selector assigned
-        // it, not only `ZExt`. A bool source that reached here with any other op
-        // previously fell through to the `_ => None` fail-closed path (fresh
-        // UNCONSTRAINED symbolic result), so a SUM of such casts — flag/edge counts
-        // like `(a != b) as u32 + (b != c) as u32 + ...` — could not bound its
-        // operands and spuriously REFUTED its arithmetic-overflow VC. Matching any
-        // op for a bool source is SOUND and exact: the {0,1} semantics is the same
-        // regardless of the op label. (over-refutation audit: body cast semantics.)
-        _ if matches!(src_ty, Ty::Bool) && dst_ty.is_integer() => {
-            let dst_width = dst_ty.bit_width_with(HOST_POINTER_BITS)?;
-            Some(Expr::ite(
-                operand,
-                Expr::bitvec_const(1u64, dst_width),
-                Expr::bitvec_const(0u64, dst_width),
-            ))
         }
         CastOp::Bitcast if src_ty.is_integer() && dst_ty.is_integer() => {
             let src_width = src_ty.bit_width_with(HOST_POINTER_BITS)?;
@@ -8663,7 +8664,9 @@ fn collect_inst_value_uses(inst: &Inst, uses: &mut Vec<ValueId>) -> bool {
             uses.push(*rhs);
             false
         }
-        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } => {
+        Inst::UnOp { operand, .. }
+        | Inst::Cast { operand, .. }
+        | Inst::BoxDeref { operand, .. } => {
             uses.push(*operand);
             false
         }

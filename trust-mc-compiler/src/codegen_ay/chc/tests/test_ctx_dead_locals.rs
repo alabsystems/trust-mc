@@ -418,3 +418,146 @@ fn test_intrinsic_assume_operand_in_used_locals() {
         );
     });
 }
+
+#[cfg(trust_toolchain)]
+const DEREF_DESTINATION_SOURCE: &str = r#"
+    #![allow(dead_code)]
+    pub fn destination_write(pointer: *mut u64) {
+        unsafe { *pointer = 9; }
+    }
+    pub fn destination_index_write(pointer: *mut [u64; 2], index: usize) {
+        unsafe { (*pointer)[index] = 9; }
+    }
+    #[inline(never)] pub fn destination_nine() -> u64 { 9 }
+    pub fn destination_call(pointer: *mut u64) {
+        unsafe { *pointer = destination_nine(); }
+    }
+"#;
+
+/// Evaluating an indirect destination reads its base pointer before writing
+/// pointee bytes. Narrowing must retain that value, plus any index operands.
+#[cfg(trust_toolchain)]
+#[test]
+fn test_deref_assignment_destination_keeps_pointer_in_used_set_and_frame() {
+    use rustc_public::mir::{ProjectionElem, StatementKind};
+    super::test_trust_box_new::with_native_box_ctx(DEREF_DESTINATION_SOURCE, |ctx| {
+        for name in ["destination_write", "destination_index_write"] {
+            let body = find_instance_by_suffix(ctx.tcx, name).body().expect("actual typed MIR");
+            let mut context = ChcCtx::new(
+                ctx.tcx,
+                &body,
+                name,
+                ChcConfig {
+                    track_level: crate::args::ChcTrackLevel::Mem,
+                    frame_narrowing: true,
+                    ..ChcConfig::default()
+                },
+            );
+            context.declare_block_relations();
+            let mut sites = 0;
+            let mut indexes = 0;
+            for (bb, block) in body.blocks.iter().enumerate() {
+                for statement in &block.statements {
+                    let StatementKind::Assign(place, _) = &statement.kind else { continue };
+                    if !place.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)) {
+                        continue;
+                    }
+                    sites += 1;
+                    let mut used = HashSet::new();
+                    ChcCtx::collect_statement_used_locals(&statement.kind, &mut used);
+                    assert!(
+                        used.contains(&place.local),
+                        "evaluating the actual destination reads _{}: {name} bb{bb}: {body:#?}",
+                        place.local
+                    );
+                    for projection in &place.projection {
+                        if let ProjectionElem::Index(index) = projection {
+                            indexes += 1;
+                            assert!(
+                                used.contains(index),
+                                "destination index remains a source operand"
+                            );
+                        }
+                    }
+                    let state = context.state_var_mgr.local_to_state_idx[&place.local];
+                    assert!(
+                        context.state_var_mgr.live_state_indices[bb].contains(&state),
+                        "the pointer value is bound by the narrowed relation at the actual write"
+                    );
+                }
+            }
+            assert!(sites > 0, "retain actual indirect assignments: {name}");
+            if name == "destination_index_write" {
+                assert!(indexes > 0, "retain actual indexed destination coverage");
+            }
+        }
+    });
+}
+
+/// MIR Call destinations have the same place-evaluation reads. Moving an
+/// existing scalar result into its typed pointee is a collector-only control;
+/// it receives no semantic or memory-safety credit.
+#[cfg(trust_toolchain)]
+#[test]
+fn test_deref_call_destination_reads_pointer_but_direct_destination_does_not() {
+    use rustc_public::mir::mono::Instance;
+    use rustc_public::mir::{ProjectionElem, Rvalue, StatementKind, TerminatorKind};
+    super::test_trust_box_new::with_native_box_ctx(DEREF_DESTINATION_SOURCE, |ctx| {
+        let body =
+            find_instance_by_suffix(ctx.tcx, "destination_call").body().expect("actual typed MIR");
+        let nine = find_instance_by_suffix(ctx.tcx, "destination_nine");
+        let (call, temporary) = body
+            .blocks
+            .iter()
+            .find_map(|block| {
+                let TerminatorKind::Call { func, destination, .. } = &block.terminator.kind else {
+                    return None;
+                };
+                let TyKind::RigidTy(RigidTy::FnDef(def, args)) =
+                    func.ty(body.locals()).ok()?.kind()
+                else {
+                    return None;
+                };
+                (Instance::resolve(def, &args).ok()?.def == nine.def)
+                    .then_some((block.terminator.kind.clone(), destination.clone()))
+            })
+            .expect("actual no-argument scalar call");
+        let destination = body
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block.statements.iter().find_map(|statement| {
+                    let StatementKind::Assign(
+                        place,
+                        Rvalue::Use(Operand::Copy(value) | Operand::Move(value), ..),
+                    ) = &statement.kind
+                    else {
+                        return None;
+                    };
+                    (place.projection.iter().any(|p| matches!(p, ProjectionElem::Deref))
+                        && *value == temporary)
+                        .then_some(place.clone())
+                })
+            })
+            .expect("actual result-to-pointee assignment");
+        assert_eq!(temporary.ty(body.locals()).unwrap(), destination.ty(body.locals()).unwrap());
+        let mut direct_used = HashSet::new();
+        ChcCtx::collect_terminator_used_locals(&call, &mut direct_used);
+        assert!(!direct_used.contains(&temporary.local), "a direct result destination is not read");
+        assert!(
+            !direct_used.contains(&destination.local),
+            "the no-argument call does not otherwise read this pointer"
+        );
+        let mut indirect = call;
+        let TerminatorKind::Call { destination: actual, .. } = &mut indirect else {
+            unreachable!()
+        };
+        *actual = destination.clone();
+        let mut indirect_used = HashSet::new();
+        ChcCtx::collect_terminator_used_locals(&indirect, &mut indirect_used);
+        assert!(
+            indirect_used.contains(&destination.local),
+            "a pointee destination reads its base pointer"
+        );
+    });
+}

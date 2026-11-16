@@ -434,6 +434,8 @@ fn propagate_through_equalities(constraints: &Constraints, known: &mut HashMap<S
 #[path = "chc_const_prop_eval.rs"]
 pub mod eval;
 
+#[path = "chc_const_prop_range_copy.rs"]
+mod range_copy;
 #[path = "chc_const_prop_subst.rs"]
 mod subst;
 

@@ -775,13 +775,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             // arity reduction (no loop invariant for PDR), but const-prop can
             // weaken a violated postcondition edge into a form the discharge/PDR
             // false-proves. Skip it there; cyclic contract harnesses keep it.
-            let const_prop_unsound_for_contract = self.config.is_contract_proof
-                && !trust_mc_core::chc_const_prop::has_block_relation_cycle(&chc_vc);
             let const_prop_disabled_for_heap_liveness =
-                trust_mc_core::chc_const_prop::has_scalarized_obj_valid_liveness(&chc_vc)
-                    || trust_mc_core::chc_const_prop::has_scalarized_obj_size_bounds(&chc_vc)
-                    || trust_mc_core::chc_const_prop::has_signed_overflow_error_edge(&chc_vc)
-                    || const_prop_unsound_for_contract;
+                chc_requires_unreduced_obligations(&chc_vc, self.config.is_contract_proof);
             if const_prop_disabled_for_heap_liveness && !const_prop_disabled_by_env {
                 tracing::debug!(
                     "CHC: skipped constant propagation to preserve a reachable safety obligation"
@@ -1036,11 +1031,25 @@ pub(in crate::codegen_ay) use testing::{
 #[cfg(test)]
 mod tests;
 
+/// Existing guards against reducing a reachable safety/contract obligation.
+pub(in crate::codegen_ay) fn chc_requires_unreduced_obligations(
+    vc: &trust_mc_core::chc::ChcVc,
+    is_contract_proof: bool,
+) -> bool {
+    trust_mc_core::chc_const_prop::has_scalarized_obj_valid_liveness(vc)
+        || trust_mc_core::chc_const_prop::has_scalarized_obj_size_bounds(vc)
+        || trust_mc_core::chc_const_prop::has_signed_overflow_error_edge(vc)
+        || (is_contract_proof && !trust_mc_core::chc_const_prop::has_block_relation_cycle(vc))
+}
+
 /// The emit-time optimization passes (const-prop, orphan prune, dead scalars,
 /// scalarization, dead constraints, arity fixup, canonicalization), factored out
 /// of `split_emit` so the lost-checks recovery can re-run them over the
 /// pre-optimization VC in keep-error-obligations mode.
-fn run_emit_time_chc_passes(chc_vc: &mut trust_mc_core::chc::ChcVc, const_prop_disabled: bool) {
+pub(in crate::codegen_ay) fn run_emit_time_chc_passes(
+    chc_vc: &mut trust_mc_core::chc::ChcVc,
+    const_prop_disabled: bool,
+) {
     if !const_prop_disabled {
         let propagated = chc_vc.propagate_constants();
         if propagated > 0 {

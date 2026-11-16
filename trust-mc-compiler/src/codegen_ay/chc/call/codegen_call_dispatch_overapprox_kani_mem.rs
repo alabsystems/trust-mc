@@ -7,6 +7,7 @@
 //! Keeps the main dispatch module under the file-size guard while localizing the
 //! packed-value validity encoding added for Part of #3470.
 
+use crate::codegen_ay::chc::codegen_types::CodegenTypes;
 use crate::codegen_ay::shared::mono_ty;
 #[allow(unused_imports)]
 use crate::rustc_compat::prelude::*;
@@ -28,6 +29,12 @@ use tracing::{debug, warn};
 /// over-approximate soundly (return `true` with the overapprox flag set) rather
 /// than emitting an intractably large formula.
 const KANI_MEM_ARRAY_VALIDITY_MAX: u64 = 256;
+
+enum BoolByteForward {
+    Exact(Expr),
+    Absent,
+    Unsupported,
+}
 
 impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// Returns the precise pointer-alignment predicate when the pointee type and
@@ -366,7 +373,32 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => {
-                self.compute_scalar_memory_validity(addr, ty, Self::bool_validity_predicate)
+                // Validity observes the byte representation, before decoding it
+                // as a Bool (whose sort cannot express invalid bytes such as 2).
+                match self.forward_bool_memory_byte(&addr) {
+                    BoolByteForward::Exact(byte) => {
+                        // Preserve the normal memory-entry F1/drop-consumer
+                        // bookkeeping when the typed store answers the read.
+                        self.note_inline_walk_memory_read();
+                        return Self::bool_validity_predicate(byte)
+                            .map_or((Expr::bool_const(true), true), |predicate| {
+                                (predicate, false)
+                            });
+                    }
+                    BoolByteForward::Unsupported => return (Expr::bool_const(true), true),
+                    BoolByteForward::Absent => {}
+                }
+                // A missing cell at a symbolic address, or inside a wider
+                // scalar store, need not have an identity in the backstop.
+                // Retain the byte predicate, but do not certify its provenance.
+                let endian = self.tcx.data_layout.endian;
+                let pending_checks_len = self.heap_state.pending_checks.len();
+                let loaded = self.load_validity_byte(addr);
+                self.heap_state.pending_checks.truncate(pending_checks_len);
+                match loaded.and_then(|value| Self::bool_byte_validity_predicate(value, endian)) {
+                    Some(predicate) => (predicate, true),
+                    None => (Expr::bool_const(true), true),
+                }
             }
             TyKind::RigidTy(RigidTy::Char) => {
                 self.compute_scalar_memory_validity(addr, ty, Self::char_validity_predicate)
@@ -552,6 +584,103 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
     }
 
+    /// The generic memory loader also forwards compact datatype encodings.
+    /// They are values, not physical bytes (even when their BV width equals
+    /// the layout size). Only a typed scalar/array-element store authenticates
+    /// the byte representation consumed by Bool validity here.
+    fn forward_bool_memory_byte(&mut self, addr: &Expr) -> BoolByteForward {
+        let Some((obj, offset)) = Self::try_extract_constant_addr(addr) else {
+            return BoolByteForward::Absent;
+        };
+        let key = (u64::from(obj) << 32) | u64::from(offset);
+        let Some(owner) = self.heap_state.local_idx_for_obj_id(obj) else {
+            return if self
+                .heap_state
+                .store_forward_map
+                .get(&key)
+                .is_some_and(|(bb, _, _)| *bb == self.current_encode_bb)
+            {
+                BoolByteForward::Unsupported
+            } else {
+                BoolByteForward::Absent
+            };
+        };
+        let Some(local) = self.body.locals().get(owner) else {
+            return BoolByteForward::Unsupported;
+        };
+        let owner_ty = self.resolve_body_ty(local.ty);
+        let element_ty = match owner_ty.kind() {
+            TyKind::RigidTy(RigidTy::Array(element, _)) => element,
+            _ => owner_ty,
+        };
+        // Compiler-library memory keys can peel wrappers as logical model
+        // choices. That is not physical layout authority: real `Mutex<u8>`
+        // has synchronization state as well as the modeled payload.
+        // Admit declared primitive storage here; aggregate byte representations
+        // require their own field-layout and mutation-custody evidence.
+        let scalar_ty = element_ty;
+        if !matches!(
+            scalar_ty.kind(),
+            TyKind::RigidTy(RigidTy::Bool | RigidTy::Char | RigidTy::Int(_) | RigidTy::Uint(_))
+        ) || self.body_stores_through_deref()
+            // Intrinsic byte copies can rewrite a local without updating the
+            // same-block typed store-forwarding map. Its older value is no
+            // longer evidence of the physical bytes at the copied address.
+            || self.body.blocks.iter().any(|block| {
+                block.statements.iter().any(|statement| {
+                    matches!(&statement.kind, rustc_public::mir::StatementKind::Intrinsic(kind)
+                        if !matches!(kind, rustc_public::mir::NonDivergingIntrinsic::Assume(_)))
+                })
+            })
+            || crate::kani_middle::transform::unit_has_stubs()
+        {
+            return BoolByteForward::Unsupported;
+        }
+        let Some(size) = self
+            .get_type_size(scalar_ty)
+            .map(|size| size as u64)
+            .filter(|size| (1..=16).contains(size))
+        else {
+            return BoolByteForward::Unsupported;
+        };
+        if self.get_type_size(owner_ty).is_none_or(|size| u64::from(offset) >= size as u64) {
+            return BoolByteForward::Unsupported;
+        }
+        let base = u64::from(offset) / size * size;
+        // A partial store can replace bytes of the base value. The map has no
+        // intra-block ordering proof for overlapping entries, so refuse them.
+        for inner in base + 1..base + size {
+            let inner_key = (u64::from(obj) << 32) | inner;
+            if self
+                .heap_state
+                .store_forward_map
+                .get(&inner_key)
+                .is_some_and(|(bb, _, _)| *bb == self.current_encode_bb)
+            {
+                return BoolByteForward::Unsupported;
+            }
+        }
+        let base_key = (u64::from(obj) << 32) | base;
+        let Some((bb, value, stored_key)) =
+            self.heap_state.store_forward_map.get(&base_key).cloned()
+        else {
+            return BoolByteForward::Absent;
+        };
+        if bb != self.current_encode_bb {
+            return BoolByteForward::Absent;
+        }
+        if (self.type_key_for_body_ty(owner_ty).as_ref() != stored_key.as_ref()
+            && self.type_key_for_body_ty(element_ty).as_ref() != stored_key.as_ref())
+            || Self::translate_ty(scalar_ty).as_ref() != Some(value.sort())
+        {
+            return BoolByteForward::Unsupported;
+        }
+        match self.initialized_value_byte(&value, scalar_ty, u64::from(offset) - base, 8) {
+            Some(byte) => BoolByteForward::Exact(byte),
+            None => BoolByteForward::Unsupported,
+        }
+    }
+
     fn compute_alignment_predicate(
         &self,
         ptr_expr: Expr,
@@ -725,6 +854,29 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
     fn pointer_with_offset(&self, addr: Expr, offset: u64) -> Expr {
         if offset == 0 { addr } else { addr.bvadd(Expr::bitvec_const(offset, POINTER_WIDTH)) }
+    }
+
+    pub(in crate::codegen_ay::chc) fn bool_byte_validity_predicate(
+        value: Expr,
+        endian: rustc_abi::Endian,
+    ) -> Option<Expr> {
+        // Same-address forwarding can supply a wider stored scalar. Observe
+        // its first physical byte, honoring the target's byte order. A value
+        // without a complete byte representation cannot answer this query.
+        let value = match value.sort().bitvec_width() {
+            Some(8) => value,
+            Some(width) if width > 8 && width % 8 == 0 => {
+                let low = match endian {
+                    rustc_abi::Endian::Little => 0,
+                    rustc_abi::Endian::Big => width - 8,
+                };
+                value.extract(low + 7, low)
+            }
+            // A forwarded, typed Bool store already proves a valid byte.
+            None if value.sort().is_bool() => value,
+            _ => return None,
+        };
+        Self::bool_validity_predicate(value)
     }
 
     pub(in crate::codegen_ay::chc) fn bool_validity_predicate(value: Expr) -> Option<Expr> {

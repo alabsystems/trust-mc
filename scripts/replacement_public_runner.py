@@ -352,45 +352,96 @@ def _retry_fields(output: str) -> dict[str, Any]:
     return fields
 
 
-def _cover_properties(output: str) -> tuple[list[dict[str, str]], str | None]:
-    """Read actual named cover checks; summaries and safety markers cannot replace them."""
+def _is_cover_property(name: str) -> bool:
+    return name == "cover" or name.startswith("cover.") or ".cover." in name
+
+
+def _property_rows(output: str) -> tuple[list[dict[str, str]], str | None]:
+    """Read real ordinary and cover checks through the same strict field parser."""
     properties = []
     blocks = list(re.finditer(
-        r"^Check ([^:\n]+): ([^\n]+)\n(.*?)(?=^Check [^\n]*|^\s*SUMMARY:|\Z)",
+        r"^Check ([^:\n]+): ([^\n]+)\n(.*?)(?=^Check [^\n]*|^\s*SUMMARY:|^VERIFICATION:|\Z)",
         output, re.MULTILINE | re.DOTALL,
     ))
     if len(blocks) != len(re.findall(r"^Check [^\n]*", output, re.MULTILINE)):
         return properties, "malformed property header"
-    seen = set()
-    cover_names = set()
+    seen_numbers = set()
+    seen_names = set()
     for block in blocks:
         number, name, body = block.groups()
-        if not re.fullmatch(r"[1-9][0-9]*", number) or number in seen:
+        if not re.fullmatch(r"[1-9][0-9]*", number) or number in seen_numbers or name in seen_names:
             return properties, "invalid or repeated property check identity"
-        seen.add(number)
-        if not (name == "cover" or name.startswith("cover.") or ".cover." in name):
-            continue
-        if not re.fullmatch(r"(?:[^\s]+\.)?cover\.[0-9]+", name):
+        seen_numbers.add(number)
+        seen_names.add(name)
+        cover = _is_cover_property(name)
+        if cover and not re.fullmatch(r"(?:[^\s]+\.)?cover\.[0-9]+", name):
             return properties, "invalid cover check identity"
-        if name in cover_names:
-            return properties, "repeated cover property identity"
-        cover_names.add(name)
-        # Count every field prefix before validating its spelling and value.
-        # Otherwise a second lowercase status or unquoted description is
-        # invisible to a regex that only counts valid fields.
+        label = "cover check" if cover else "property check"
+        # Count every field prefix, including malformed case/quoting, before
+        # validating it. An ignored second field could hide a failed check.
         fields: dict[str, list[str]] = {"status": [], "description": []}
         for line in body.splitlines():
             field = re.match(r"^[ \t]*(?:-[ \t]*)?(status|description)\b", line, re.IGNORECASE)
             if field is not None:
                 fields[field[1].lower()].append(line)
         if len(fields["status"]) != 1 or len(fields["description"]) != 1:
-            return properties, f"malformed cover check {number}"
+            return properties, f"malformed {label} {number}"
         status = re.fullmatch(r"[ \t]*- Status: ([A-Z]+)[ \t]*", fields["status"][0])
         description = re.fullmatch(r'[ \t]*- Description: "([^\r\n]*)"[ \t]*', fields["description"][0])
-        if status is None or description is None:
-            return properties, f"malformed cover check {number}"
-        properties.append({"description": description[1], "status": status[1]})
+        if (status is None or description is None or not re.fullmatch(r"\S+", name)
+                or (not cover and status[1] not in {"SUCCESS", "FAILURE", "UNDETERMINED", "UNREACHABLE"})):
+            return properties, f"malformed {label} {number}"
+        properties.append({"name": name, "description": description[1], "status": status[1]})
     return properties, None
+
+
+def _cover_properties(output: str) -> tuple[list[dict[str, str]], str | None]:
+    """Read named cover checks; preserve the existing cover-oracle interface."""
+    properties, error = _property_rows(output)
+    return [{"description": p["description"], "status": p["status"]}
+            for p in properties if _is_cover_property(p["name"])], error
+
+
+def _semantic_evidence_error(
+    row: dict[str, Any], result: ProcessResult, checks: list[dict[str, str]],
+    property_error: str | None, cover_mismatch: str | None,
+) -> tuple[str | None, str | None]:
+    finals = list(re.finditer(r"(?m)^VERIFICATION:- ([^\r\n]+)$", result.output))
+    if len(finals) != 1:
+        return None, "missing or repeated verification result"
+    final = finals[0][1].strip()
+    selected = list(CHECKING_HARNESS_RE.finditer(result.output))
+    if len(selected) == 1 and any(
+        not selected[0].end() < check.start() < finals[0].start()
+        for check in re.finditer(r"(?m)^Check ", result.output)
+    ):
+        return final, "property check outside the selected harness result"
+    if property_error:
+        return final, property_error
+    if "UNVALIDATED" in final:
+        return final, "unvalidated verification result"
+    if row["expected"] in {"PROOF", "BMC_SAFE"}:
+        if final != "SUCCESSFUL":
+            return final, "safety expectation lacks validated successful result"
+        if any(check["status"] != "SUCCESS" for check in checks):
+            return final, "safety expectation has an undecided or unsuccessful check"
+        # A source-bound cover oracle can establish a cover-only outcome.
+        # A no-check marker, including the compiler-certified qualifier, is
+        # not a replacement proof without a matching artifact authority.
+        if not checks and not (
+            dispositions.cover_expectations(row) is not None and cover_mismatch is None
+        ):
+            return final, "safety expectation has no checked property evidence"
+    elif row["expected"] == "CTREX":
+        expected_panic = (
+            final == "SUCCESSFUL (encountered one or more panics as expected)"
+            and _last(MARKER_RES["effective_success"], result.output) == "should_panic_panics_only"
+        )
+        if final != "FAILED" and not expected_panic:
+            return final, "bug expectation lacks a failed semantic result"
+        if not any(check["status"] == "FAILURE" for check in checks):
+            return final, "bug expectation has no failing checked property"
+    return final, None
 
 
 def parse_driver_result(
@@ -451,8 +502,6 @@ def parse_driver_result(
     matched = execution_state == "complete" and verdict == expected
     if expected == "BMC_SAFE":
         matched = execution_state == "complete" and verdict in {"BMC", "PROOF"}
-    if expected == "PROOF" and result.returncode != 0:
-        matched = False
     # A bug oracle requires an actual validated refutation. A coarse CTREX
     # marker from unsupported/over-approximate execution is not that evidence.
     # Other negative expectations retain their own checked closure semantics.
@@ -460,9 +509,39 @@ def parse_driver_result(
     ctrex_category = _split_label_details(ctrex)[0] if ctrex else ""
     if expected == "CTREX" and ctrex_category != "Genuine":
         matched = False
-    covers, cover_error = _cover_properties(output)
+    properties, property_error = _property_rows(output)
+    covers = [{"description": p["description"], "status": p["status"]}
+              for p in properties if _is_cover_property(p["name"])]
+    cover_error = property_error
     cover_mismatch = dispositions.cover_mismatch(row, covers, cover_error)
     if cover_mismatch is not None:
+        matched = False
+    checks = [p for p in properties if not _is_cover_property(p["name"])]
+    verification_result, semantic_error = _semantic_evidence_error(
+        row, result, checks, property_error, cover_mismatch,
+    )
+    if semantic_error is not None:
+        matched = False
+    # A complete checked result can survive an abnormal process exit, but
+    # that process did not complete the CLI control. Preserve its evidence
+    # independently of the execution credit. UNKNOWN/ERROR keep their own
+    # closure semantics; they have no universal normal-exit convention.
+    checked_outcome = expected in {"PROOF", "BMC_SAFE", "CTREX"}
+    validated_semantic_evidence = checked_outcome and matched
+    expected_returncode = None
+    if expected in {"PROOF", "BMC_SAFE"}:
+        expected_returncode = 0
+    elif expected == "CTREX":
+        expected_panic = (
+            verification_result == "SUCCESSFUL (encountered one or more panics as expected)"
+            and effective_success == "should_panic_panics_only"
+        )
+        expected_returncode = 0 if expected_panic else 1
+    completion_error = None
+    if expected_returncode is not None and result.returncode != expected_returncode:
+        completion_error = (
+            f"expected normal exit {expected_returncode}, got returncode {result.returncode}"
+        )
         matched = False
     status = "PASS" if matched else "FAIL"
 
@@ -478,7 +557,20 @@ def parse_driver_result(
         "execution_state": execution_state,
         "execution_details": execution_details,
         "time_sec": round(result.elapsed_seconds, 3),
+        "checked_properties": checks,
+        "returncode": result.returncode,
     }
+    if checked_outcome:
+        flat["validated_semantic_evidence"] = validated_semantic_evidence
+        flat["expected_returncode"] = expected_returncode
+    if completion_error is not None:
+        flat["cli_completion_error"] = completion_error
+    if verification_result is not None:
+        flat["verification_result"] = verification_result
+    if semantic_error is not None:
+        flat["semantic_evidence_error"] = semantic_error
+    if property_error is not None:
+        flat["property_error"] = property_error
     if verdict == "PROOF" and status == "PASS":
         flat["trusted_proof"] = True
     if effective_success:
@@ -524,10 +616,14 @@ def parse_driver_result(
             "execution": {
                 "state": execution_state,
                 "details": execution_details,
+                "returncode": result.returncode,
             }
         },
     }
-    for field in ("cover_properties", "cover_error", "cover_mismatch"):
+    for field in ("cover_properties", "cover_error", "cover_mismatch", "checked_properties",
+                  "verification_result", "semantic_evidence_error", "property_error",
+                  "returncode", "expected_returncode", "validated_semantic_evidence",
+                  "cli_completion_error", "ctrex_category", "ctrex_details"):
         if field in flat:
             runtime_record[field] = flat[field]
     return flat, runtime_record

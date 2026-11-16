@@ -362,7 +362,7 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         // Part of #3669: Union types — model as bitvector of the union's byte size.
         // Unions overlay all variants in the same memory, so the sort must represent
         // the full allocation. MaybeUninit<T> is the primary consumer (array iterators).
-        // Name-based transparent wrappers (codegen_types_adt.rs) catch MaybeUninit
+        // Authenticated transparent wrappers (codegen_types_adt.rs) catch MaybeUninit
         // before reaching here, but this handles the general case.
         if def.kind() == AdtKind::Union {
             if let Ok(layout) =
@@ -395,8 +395,13 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         let name = def.trimmed_name();
         let full_path = def.0.name();
 
-        if matches!(name.as_str(), "Layout" | "Alignment" | "AllocError" | "Infallible" | "NonNull")
-        {
+        if rustc_middle::ty::tls::with(|tcx| {
+            crate::kani_middle::std_abstraction::native_wrapper_kind(tcx, def)
+                == Some(crate::kani_middle::std_abstraction::NativeWrapperKind::NonNull)
+        }) {
+            return true;
+        }
+        if matches!(name.as_str(), "Layout" | "Alignment" | "AllocError" | "Infallible") {
             return true;
         }
         if name == "Arguments" && full_path.contains("fmt") {
@@ -411,7 +416,13 @@ impl<'tcx, 'body> CodegenTypesAdtSort<'tcx, 'body> for ChcCtx<'tcx, 'body> {
             || full_path.contains("std::alloc::");
         let is_fmt_module = full_path.contains("core::fmt::") || full_path.contains("std::fmt::");
 
-        is_alloc_module || is_fmt_module
+        (is_alloc_module || is_fmt_module)
+            && rustc_middle::ty::tls::with(|tcx| {
+                crate::kani_middle::std_abstraction::is_compiler_library_definition(
+                    tcx,
+                    rustc_public::rustc_internal::internal(tcx, def.def_id()),
+                )
+            })
     }
 
     /// Returns true if this ADT is a hashbrown internal type that should be

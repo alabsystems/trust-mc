@@ -389,6 +389,11 @@ impl<'tcx, 'body> CallDispatchFnInline for ChcCtx<'tcx, 'body> {
             return true;
         }
 
+        if self.try_inline_storage_address(dcx, &body, instance) {
+            self.inline_self_field_hints = None;
+            return true;
+        }
+
         // Part of #3830: Pre-populate field hints before arg translation.
         populate_inline_self_field_hints(self, dcx);
         let comparison_callee =

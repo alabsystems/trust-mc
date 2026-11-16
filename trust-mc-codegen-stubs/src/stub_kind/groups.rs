@@ -121,6 +121,7 @@ impl StubKind {
             | Self::VecReserveExact
             | Self::VecShrinkToFit
             | Self::VecPop
+            | Self::VecInsert
             | Self::VecRemove
             | Self::VecLen
             | Self::VecCapacity
@@ -404,8 +405,7 @@ impl StubKind {
             | Self::VecExtendFromSlice
             | Self::RangeBoundsContains
             | Self::StringFromRawParts
-            | Self::VecExtendRange
-            | Self::VecInsert => 0,
+            | Self::VecExtendRange => 0,
         }
     }
 

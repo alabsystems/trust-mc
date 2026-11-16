@@ -31,11 +31,14 @@ impl StubKind {
                 | Self::VecReserveExact
                 | Self::VecShrinkToFit
                 | Self::VecPop
+                | Self::VecInsert
+                | Self::VecRemove
                 | Self::VecLen
                 | Self::VecCapacity
                 | Self::VecResize
                 | Self::VecSetLen
                 | Self::VecClear
+                | Self::VecTruncate
                 | Self::VecClone
                 | Self::VecDrop
                 | Self::VecAsSlice

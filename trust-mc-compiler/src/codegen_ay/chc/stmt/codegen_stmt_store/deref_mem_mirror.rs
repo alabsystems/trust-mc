@@ -9,9 +9,9 @@
 //!
 //! Part of #2278: Extracted from `deref_mem.rs` for #2884 file decomposition.
 
+use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 #[allow(unused_imports)]
 use crate::rustc_compat::prelude::*;
-use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use rustc_public::CrateDef;
 use rustc_public::mir::{Place, ProjectionElem};
 use rustc_public::ty::{RigidTy, TyKind};
@@ -163,8 +163,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 && !self.ref_resolution.subslice_offset.contains_key(&local_idx)
                 && let Some(chain) = self.store_pointer_referent_byte_offset(local_idx, ref_target)
                 && chain != 0
-                && let Some(written) =
-                    written_ty.layout().ok().and_then(|l| usize::try_from(l.shape().size.bytes()).ok())
+                && let Some(written) = written_ty
+                    .layout()
+                    .ok()
+                    .and_then(|l| usize::try_from(l.shape().size.bytes()).ok())
             {
                 return self.wider_ref_store(
                     ref_target, lhs, rhs_expr, written_ty, written, local_idx, modified,
@@ -259,11 +261,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // same-size transmute below, written at the wrong offset).
         let chain = self.store_pointer_referent_byte_offset(local_idx, ref_target);
         if !element_store
-            && let (Some(written), Some(referent_size)) = (size_of(written_ty), size_of(referent_ty))
+            && let (Some(written), Some(referent_size)) =
+                (size_of(written_ty), size_of(referent_ty))
             && (written > referent_size
                 || (written == referent_size && chain.is_some_and(|offset| offset != 0)))
         {
-            return self.wider_ref_store(ref_target, lhs, rhs_expr, written_ty, written, local_idx, modified);
+            return self.wider_ref_store(
+                ref_target, lhs, rhs_expr, written_ty, written, local_idx, modified,
+            );
         }
         if !element_store
             && let (Some(written), Some(total)) = (size_of(written_ty), size_of(referent_ty))
@@ -344,14 +349,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         modified: &std::collections::HashSet<usize>,
     ) -> RefStoreReinterpretation {
         let local_ty = self.resolve_body_ty(self.body.locals()[ref_target.local].ty);
-        let Some(local_size) = local_ty
-            .layout()
-            .ok()
-            .and_then(|l| usize::try_from(l.shape().size.bytes()).ok())
+        let Some(local_size) =
+            local_ty.layout().ok().and_then(|l| usize::try_from(l.shape().size.bytes()).ok())
         else {
-            return RefStoreReinterpretation::Unmodeled("a wider store into a local of unknown size");
+            return RefStoreReinterpretation::Unmodeled(
+                "a wider store into a local of unknown size",
+            );
         };
-        let Some(field_offset) = self.field_path_byte_offset(local_ty, &ref_target.projections) else {
+        let Some(field_offset) = self.field_path_byte_offset(local_ty, &ref_target.projections)
+        else {
             return RefStoreReinterpretation::Unmodeled(
                 "a wider store through a referent whose offset in its local is unknown",
             );
@@ -367,7 +373,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             return RefStoreReinterpretation::OutOfBounds;
         }
         if lhs.projection.len() != 1 {
-            return RefStoreReinterpretation::Unmodeled("a wider store with a projection past the deref");
+            return RefStoreReinterpretation::Unmodeled(
+                "a wider store with a projection past the deref",
+            );
         }
         let Ok(offset) = u64::try_from(start) else {
             return RefStoreReinterpretation::OutOfBounds;
@@ -384,7 +392,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     AggregateTransmute::NotApplicable => RefStoreReinterpretation::Unmodeled(
                         "stored value is not its type's encoding",
                     ),
-                    AggregateTransmute::Unsupported(why) => RefStoreReinterpretation::Unmodeled(why),
+                    AggregateTransmute::Unsupported(why) => {
+                        RefStoreReinterpretation::Unmodeled(why)
+                    }
                 };
             }
             let local_sort = Self::translate_ty(local_ty);
@@ -396,7 +406,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         }
         let local = Place { local: ref_target.local, projection: Vec::new() };
         let Some(old) = self.translate_place_with_modified(&local, modified) else {
-            return RefStoreReinterpretation::Unmodeled("the containing local's value is unavailable");
+            return RefStoreReinterpretation::Unmodeled(
+                "the containing local's value is unavailable",
+            );
         };
         use crate::codegen_ay::chc::stmt::codegen_stmt_union_bits::UnionLane;
         match self.splice_bytes_at(&old, local_ty, rhs_expr, written_ty, offset) {
@@ -417,7 +429,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for projection in projections {
             let ProjectionElem::Field(index, field_ty) = projection else { return None };
             let layout = ty.layout().ok()?;
-            let rustc_public::abi::FieldsShape::Arbitrary { offsets } = layout.shape().fields else {
+            let rustc_public::abi::FieldsShape::Arbitrary { offsets } = layout.shape().fields
+            else {
                 return None;
             };
             offset = offset.checked_add(offsets.get(*index)?.bytes() as u64)?;
@@ -466,14 +479,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 else {
                     return false;
                 };
-                let mut data = fields.into_iter().filter(
-                    |field_ty| {
-                        self.resolve_body_ty(*field_ty)
-                            .layout()
-                            .ok()
-                            .is_none_or(|layout| layout.shape().size.bytes() != 0)
-                    },
-                );
+                let mut data = fields.into_iter().filter(|field_ty| {
+                    self.resolve_body_ty(*field_ty)
+                        .layout()
+                        .ok()
+                        .is_none_or(|layout| layout.shape().size.bytes() != 0)
+                });
                 match (data.next(), data.next()) {
                     (Some(only), None) => self.ty_is_pointer_to(only, pointee, depth - 1),
                     _ => false,
@@ -537,6 +548,21 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         acc: &mut StmtAccumulator<'_>,
     ) {
         let target_local = ref_target.local;
+        // The caller has emitted the physical memory write already. An
+        // authenticated native Vec accessor addresses its buffer, not the
+        // owner header named by ref_targets. Never splice this element into
+        // or havoc that header; later logical-model reads retain their own
+        // vec_model_read_after_buffer_write refusal.
+        if lhs.projection.as_slice() == [rustc_public::mir::ProjectionElem::Deref]
+            && self.native_vec_primitive_store_owner(local_idx, ref_target, store_ty)
+                == Some(target_local)
+        {
+            // Custody alone does not synchronize Vec.data. Close or refuse
+            // every reverse owner/model alias path before preserving header
+            // fields; this runs independently of printed buffer-root names.
+            self.book_native_vec_store_model_boundary(local_idx, target_local);
+            return;
+        }
         // Part of #3768: graceful fallback instead of panic
         let Some(target_vec_idx) = self.try_state_idx_for_local(target_local) else {
             debug!(target_local, "CHC: scalar ref store target not in state map — skipping");

@@ -148,7 +148,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         let callee_path = self
             .resolve_callee_path_with_locals(func, locals)
             .or_else(|| self.resolve_fn_def_name_with_locals(func, locals))?;
-        if let Some(stub) = self.detect_string_eq_shared_impl_with_locals(func, &callee_path, locals)
+        if let Some(stub) =
+            self.detect_string_eq_shared_impl_with_locals(func, &callee_path, locals)
         {
             return Some(stub);
         }
@@ -163,7 +164,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // are the fold the reduction arms encode. Any other impl (a user
         // `Sum`, `Wrapping`, `Saturating`) is no stub: the ordinary call path
         // walks the impl the call runs.
-        if stub == StubKind::IterSum && !crate::codegen_ay::reduce_loop_rule::iter_sum_call_is_core_numeric_fold(func, locals) {
+        if stub == StubKind::IterSum
+            && !crate::codegen_ay::reduce_loop_rule::iter_sum_call_is_core_numeric_fold(
+                func, locals,
+            )
+        {
             debug!(%callee_path, "Iterator::sum over a non-core-numeric Sum impl: not a stub");
             return None;
         }
@@ -394,7 +399,16 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
 
                 // Vec: Part of #1632 — track Vec length for push/pop/len stubs
                 if name == "Vec" {
-                    return Some(("vec", full_name));
+                    // Auxiliary state belongs to the actual native definition,
+                    // exactly like its logical datatype representation.
+                    return rustc_middle::ty::tls::with(|tcx| {
+                        crate::kani_middle::std_abstraction::is_sysroot_alloc_definition_at(
+                            tcx,
+                            rustc_public::rustc_internal::internal(tcx, def.def_id()),
+                            &["vec", "Vec"],
+                        )
+                    })
+                    .then_some(("vec", full_name));
                 }
 
                 // String: track logical length like Vec/String stubs expect.
@@ -636,4 +650,3 @@ mod chc_stub_lookup_path_tests {
         }
     }
 }
-

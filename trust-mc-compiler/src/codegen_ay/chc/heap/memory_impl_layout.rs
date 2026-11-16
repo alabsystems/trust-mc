@@ -7,6 +7,7 @@
 use super::ChcCtx;
 use crate::codegen_ay::shared::mono_ty;
 use crate::kani_middle::abi::LayoutOf;
+use crate::kani_middle::std_abstraction::{NativeWrapperKind as Wrapper, native_wrapper_kind};
 use rustc_middle::ty::TypingEnv;
 use rustc_public::CrateDef;
 use rustc_public::abi::VariantsShape;
@@ -21,19 +22,22 @@ pub(in crate::codegen_ay::chc) fn unwrap_heap_transparent_ty(
         let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
             return ty;
         };
+        let wrapper = rustc_middle::ty::tls::with(|tcx| native_wrapper_kind(tcx, def));
         let is_wrapper = matches!(
-            def.trimmed_name().as_str(),
-            "UnsafeCell"
-                | "Cell"
-                | "RefCell"
-                | "MaybeUninit"
-                | "ManuallyDrop"
-                | "Mutex"
-                | "RwLock"
-                | "MutexGuard"
-                | "RwLockReadGuard"
-                | "RwLockWriteGuard"
-                | "PoisonError"
+            wrapper,
+            Some(
+                Wrapper::UnsafeCell
+                    | Wrapper::Cell
+                    | Wrapper::RefCell
+                    | Wrapper::MaybeUninit
+                    | Wrapper::ManuallyDrop
+                    | Wrapper::Mutex
+                    | Wrapper::RwLock
+                    | Wrapper::MutexGuard
+                    | Wrapper::RwLockReadGuard
+                    | Wrapper::RwLockWriteGuard
+                    | Wrapper::PoisonError
+            )
         );
         let Some(GenericArgKind::Type(inner_ty)) = args.0.first() else {
             return ty;

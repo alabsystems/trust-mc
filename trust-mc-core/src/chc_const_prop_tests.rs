@@ -15,6 +15,8 @@ use super::subst::substitute_vars;
 
 #[path = "chc_const_prop_array_store_tests.rs"]
 mod array_store_tests;
+#[path = "chc_const_prop_range_copy_tests.rs"]
+mod range_copy_tests;
 #[path = "chc_const_prop_rule_preservation_tests.rs"]
 mod rule_preservation_tests;
 

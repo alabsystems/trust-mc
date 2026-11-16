@@ -32,12 +32,13 @@ impl<'module> ModuleInput<'module> {
             )
         });
         // Allocation-only Storage is valid IR geometry, but this consumer's
-        // Alloca model requires initialized array elements. Refuse the entire
+        // Alloca model requires initialized array elements. Nominal FnItem
+        // singletons likewise have no SMT carrier in either lane. Refuse the entire
         // module before any function, array or SSA symbol is translated. Scan
         // every declared type, including unused rows and pointer pointees;
         // unsupported input must not become a vacuous empty-success batch.
         let refusal = refusal.or_else(|| {
-            storage_sort_refusal(module).map(|reason| {
+            value_sort_refusal(module).map(|reason| {
                 format!("unsupported trust_ir module `{}`: {}", module.name, reason.message())
             })
         });
@@ -109,12 +110,14 @@ impl<'module> ModuleInput<'module> {
     }
 }
 
-/// Allocation geometry has no value interpretation in either SMT model.
-pub(crate) fn storage_sort_refusal(module: &Module) -> Option<crate::translate::UnsupportedSort> {
+/// Refuse types with no value carrier before allocating any SMT symbol.
+pub(crate) fn value_sort_refusal(module: &Module) -> Option<crate::translate::UnsupportedSort> {
     let mut unsupported = None;
     module.visit_types(|ty| {
         if matches!(ty, trust_ir::Ty::Storage(_)) {
             unsupported = Some(crate::translate::UnsupportedSort::AddressableStorage);
+        } else if unsupported.is_none() && matches!(ty, trust_ir::Ty::FnItem(_)) {
+            unsupported = Some(crate::translate::UnsupportedSort::FunctionItem);
         }
     });
     unsupported

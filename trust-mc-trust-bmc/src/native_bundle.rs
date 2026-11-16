@@ -397,6 +397,9 @@ pub enum NativeTrustMcBundleError {
         "native verification bundle contains addressable storage geometry; trust_mc has no initialized SMT value model for it"
     )]
     AddressableStorageNotModeled,
+    /// A nominal zero-byte function item has no value carrier in either lane.
+    #[error("native verification bundle contains Ty::FnItem without a modeled nominal value")]
+    FunctionItemNotModeled,
     /// The module stores trust-ir tensor-region constructs (wire v67-v70:
     /// `Ty::Tensor`, the six `Inst::Tensor*` instructions,
     /// `Constant::TensorBlob`, a non-empty `Module.blobs`), used or not. No
@@ -453,8 +456,15 @@ fn validate_native_bundle(
     if let Some(func_ty) = first_typed_signature_abi(&bundle.module) {
         return Err(NativeTrustMcBundleError::TypedSignatureAbiNotModeled { func_ty });
     }
-    if crate::input::storage_sort_refusal(&bundle.module).is_some() {
-        return Err(NativeTrustMcBundleError::AddressableStorageNotModeled);
+    match crate::input::value_sort_refusal(&bundle.module) {
+        Some(crate::translate::UnsupportedSort::AddressableStorage) => {
+            return Err(NativeTrustMcBundleError::AddressableStorageNotModeled);
+        }
+        Some(crate::translate::UnsupportedSort::FunctionItem) => {
+            return Err(NativeTrustMcBundleError::FunctionItemNotModeled);
+        }
+        // Tensor admission below retains its complete construct inventory.
+        Some(crate::translate::UnsupportedSort::Tensor) | None => {}
     }
     let constructs = crate::tensor_region::tensor_region_constructs(&bundle.module);
     if !constructs.is_empty() {
@@ -837,6 +847,9 @@ impl<'b> NativeChcMetadataContext<'b> {
         let (adapter_input, source_digest) = match bundle.input {
             NativeAdapterInput::RustMir { body_digest } => {
                 ("rust-mir", Some(proof_digest_metadata(body_digest)))
+            }
+            NativeAdapterInput::RustThir { source_digest } => {
+                ("rust-thir", Some(proof_digest_metadata(source_digest)))
             }
             NativeAdapterInput::TrustIrModule => ("trust_ir-module", None),
         };

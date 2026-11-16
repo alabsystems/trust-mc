@@ -21,7 +21,9 @@
 //! audited sound havoc `memory_cell_unwritten_under_key` with the cell's
 //! identity: the scalarized cell (`<array>_at_0x<addr>_bv64`) when
 //! scalarization made it a variable, else the array itself (every read of it
-//! then counts as tainted, the fail-closed direction).
+//! then counts as tainted). If neither survives in the final rules, the
+//! approximation remains unaccounted: a folded-away load must not acquire a
+//! phantom identity that certifies an unrelated-looking failing guard.
 //!
 //! Not covered: a read at a symbolic address, and a cell no store at a
 //! constant address wrote under any key (design §10, residual 5).
@@ -29,11 +31,18 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use ay_bindings::ExprValue;
+use trust_mc_core::chc::normalize_approx_var;
+
 use super::ChcCtx;
 use super::heap_state::ConstantCellLoad;
 use crate::codegen_ay::chc::codegen_ctx::sound_havoc;
 use crate::codegen_ay::chc::scalarize_arrays::scalarized_cell_name;
 use crate::codegen_ay::types::POINTER_WIDTH;
+
+// A bookkeeping guard, not a solver budget. Exhaustion leaves all affected
+// approximations unaccounted; it must never authorize independence.
+const IDENTITY_WALK_LIMIT: usize = 100_000;
 
 /// The cells read under a key nothing wrote them under: `(address, array)`
 /// for each load whose type key is absent from the keys stored at its address,
@@ -74,24 +83,111 @@ impl ChcCtx<'_, '_> {
             return;
         }
         let declared: HashSet<&str> =
-            self.vc.vars().iter().map(|decl| decl.name.as_ref()).collect();
-        let identities: Vec<String> = unwritten
+            self.vc.vars().iter().map(|decl| normalize_approx_var(&decl.name)).collect();
+        let mut referenced = HashSet::new();
+        let mut selected_cells = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut steps = 0usize;
+        let mut complete_walk = true;
+        let roots = self.vc.rules.iter().flat_map(|rule| {
+            rule.body
+                .constraints
+                .iter()
+                .chain(rule.head.args.iter())
+                .chain(rule.body.relation.iter().flat_map(|relation| relation.args.iter()))
+        });
+        'roots: for root in roots {
+            let mut stack = vec![root];
+            while let Some(expr) = stack.pop() {
+                steps += 1;
+                if steps > IDENTITY_WALK_LIMIT {
+                    complete_walk = false;
+                    break 'roots;
+                }
+                if !seen.insert(std::ptr::from_ref(expr.value())) {
+                    continue;
+                }
+                if let ExprValue::Var { name } = expr.value() {
+                    referenced.insert(normalize_approx_var(name));
+                }
+                if let ExprValue::Select { array, index } = expr.value()
+                    && let Some((obj, offset)) = Self::try_extract_constant_addr(index)
+                {
+                    let address = (u64::from(obj) << 32) | u64::from(offset);
+                    let mut base = Some(array);
+                    while let Some(current) = base {
+                        steps += 1;
+                        if steps > IDENTITY_WALK_LIMIT {
+                            complete_walk = false;
+                            break 'roots;
+                        }
+                        match current.value() {
+                            ExprValue::Store { array, index, .. } => {
+                                // A same-cell or possibly-aliasing write masks
+                                // the base cell; it cannot authenticate a lost
+                                // earlier read of that cell.
+                                let different = Self::try_extract_constant_addr(index).is_some_and(
+                                    |(obj, offset)| {
+                                        ((u64::from(obj) << 32) | u64::from(offset)) != address
+                                    },
+                                );
+                                base = different.then_some(array);
+                            }
+                            ExprValue::Var { name } => {
+                                selected_cells.insert((address, normalize_approx_var(name)));
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                for child in expr.children() {
+                    if stack.len() >= IDENTITY_WALK_LIMIT {
+                        complete_walk = false;
+                        break 'roots;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+        let identities: Vec<Option<String>> = unwritten
             .iter()
             .map(|(addr, array)| {
+                if !complete_walk {
+                    return None;
+                }
+                let array = normalize_approx_var(array);
                 let cell = scalarized_cell_name(array, addr, POINTER_WIDTH);
-                if declared.contains(cell.as_str()) { cell } else { array.to_string() }
+                if declared.contains(cell.as_str()) && referenced.contains(cell.as_str()) {
+                    Some(cell)
+                } else if selected_cells.contains(&(*addr, array)) {
+                    Some(array.to_string())
+                } else {
+                    None
+                }
             })
             .collect();
         for identity in identities {
             tracing::debug!(
                 fn_name = %self.fn_name,
-                identity = %identity,
+                identity = ?identity,
                 "CHC: a cell is read under a type key no store wrote it under (Rule C backstop)"
             );
-            let _ = self.record_sound_fallback_reason_identified(
-                sound_havoc::MEMORY_CELL_UNWRITTEN_UNDER_KEY.as_str(),
-                Some(&identity),
-            );
+            match identity {
+                Some(identity) => {
+                    let _ = self.record_sound_fallback_reason_identified(
+                        sound_havoc::MEMORY_CELL_UNWRITTEN_UNDER_KEY.as_str(),
+                        Some(&identity),
+                    );
+                }
+                None => {
+                    // None in the identified API means *proven dead*. A lost
+                    // read has no such proof, so keep this event unaccounted.
+                    let _ = self.record_sound_fallback_reason(
+                        sound_havoc::MEMORY_CELL_UNWRITTEN_UNDER_KEY.as_str(),
+                    );
+                }
+            }
         }
     }
 

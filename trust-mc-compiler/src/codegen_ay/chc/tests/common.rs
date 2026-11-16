@@ -33,6 +33,22 @@ pub(super) use super::super::super::test_fixtures::{
     hashmap_iter_sort, hashset_iter_sort, option_datatype_sort, tuple_sort,
 };
 
+/// Keep the original assertion call available for source-bound native controls.
+/// Inlining its formatting/runtime implementation loses the literal-bearing
+/// call site these controls authenticate. This changes only test body selection.
+pub(super) fn native_assertion_panic_boundary(
+    tcx: TyCtxt<'_>,
+    instance: rustc_public::mir::mono::Instance,
+) -> bool {
+    !crate::kani_middle::transform::unit_has_stubs()
+        && !crate::kani_middle::transform::instance_has_unit_stub(&instance)
+        && crate::kani_middle::std_abstraction::is_sysroot_core_definition_at(
+            tcx,
+            rustc_internal::internal(tcx, instance.def.def_id()),
+            &["panicking", "panic"],
+        )
+}
+
 /// Helper: Find a function signature by name suffix in the current crate.
 pub(super) fn fn_sig_by_suffix(tcx: TyCtxt<'_>, suffix: &str) -> FnSig {
     let matches: Vec<_> = rustc_public::all_local_items()

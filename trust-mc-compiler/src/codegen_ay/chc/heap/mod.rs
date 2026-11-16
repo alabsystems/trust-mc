@@ -28,11 +28,15 @@ mod memory_impl_addr_normalize;
 // existing `super::super::heap::is_value_widened_into_address` imports still resolve.
 pub(in crate::codegen_ay::chc) use crate::codegen_ay::provenance::is_value_widened_into_address;
 mod memory_impl_addr_stack;
-pub(in crate::codegen_ay::chc) mod stack_address;
-mod vec_buffer_access;
 mod memory_impl_layout;
 mod memory_impl_layout_query;
 mod memory_impl_region;
 mod memory_impl_type_keys;
 pub(in crate::codegen_ay::chc) mod memory_model;
 pub(in crate::codegen_ay::chc) mod memory_type_key_tables;
+pub(in crate::codegen_ay::chc) mod stack_address;
+mod vec_buffer_access;
+mod vec_buffer_coherence;
+mod vec_buffer_shared_types;
+mod vec_buffer_store_owner;
+mod vec_model_read_aliases;

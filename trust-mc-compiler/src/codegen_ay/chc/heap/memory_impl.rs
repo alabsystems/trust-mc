@@ -166,6 +166,18 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         self.load_from_memory_view(addr.into_expr(), pointee_ty, false).map(Val::of_value)
     }
 
+    /// Read a physical byte for value-validity checks. A region can contain a
+    /// compact datatype encoding with the same sort as a byte; its sort alone
+    /// does not authenticate a physical representation. Use the keyed byte
+    /// view and retain its ordinary access checks and missing-view accounting.
+    pub(in crate::codegen_ay::chc) fn load_validity_byte(&mut self, addr: Expr) -> Option<Expr> {
+        self.load_from_memory_view(
+            addr,
+            rustc_public::ty::Ty::unsigned_ty(rustc_public::ty::UintTy::U8),
+            false,
+        )
+    }
+
     fn load_from_memory_view(
         &mut self,
         addr: Expr,

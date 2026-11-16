@@ -124,6 +124,10 @@ fn stubkind_is_fmt() {
 
 #[test]
 fn stubkind_is_vec_core() {
+    for stub in [StubKind::VecInsert, StubKind::VecRemove, StubKind::VecTruncate] {
+        assert!(stub.is_vec_core(), "modeled mutation must reach its handler: {stub:?}");
+        assert!(stub.in_group(crate::stub_kind::groups::VEC_CORE));
+    }
     assert!(StubKind::VecNew.is_vec_core());
     assert!(StubKind::VecPush.is_vec_core());
     assert!(StubKind::VecReserve.is_vec_core());

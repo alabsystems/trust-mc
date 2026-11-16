@@ -239,7 +239,8 @@ A replacement claim must bind all evidence to one tuple:
   pinned AY revision;
 - the exact executable TrustMC driver path and SHA-256, plus its live
   `--version-authority` evidence for the current clean TrustMC commit and the
-  clean linked AY authority;
+  clean linked AY source equal to the pinned revision; development ancestry
+  (`contains-pin`) alone does not qualify a different linked revision;
 - one schema-v2 report containing all 818 historical rows;
 - a proof-only report containing exactly the **453 active** `PROOF` rows, plus
   a `replacement_bar` block naming all 32 upstream-inactive rows it excludes

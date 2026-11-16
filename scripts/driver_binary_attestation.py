@@ -89,7 +89,11 @@ def validate_attestation(
     expected_trust_mc_sha: str,
     expected_ay_pin: str,
 ) -> list[str]:
-    """Return every structural or authority failure in a report attestation."""
+    """Require the report's driver to link the exact measured AY pin.
+
+    The driver's development ``contains-pin`` diagnostic establishes ancestry,
+    not qualification of a changed linked solver under an earlier revision.
+    """
 
     if not isinstance(attestation, dict):
         return ["driver_binary attestation is missing or not an object"]
@@ -145,6 +149,11 @@ def validate_attestation(
         failures.append(
             f"driver_binary.ay_linked_sha {linked_sha!r} is not a lowercase full SHA"
         )
+    elif linked_sha != expected_ay_pin:
+        failures.append(
+            f"driver_binary.ay_linked_sha {linked_sha!r} "
+            f"!= expected exact AY pin {expected_ay_pin!r}"
+        )
     if attestation.get("ay_linked_dirty") is not False:
         failures.append(
             f"driver_binary.ay_linked_dirty {attestation.get('ay_linked_dirty')!r} "
@@ -155,10 +164,6 @@ def validate_attestation(
     if authority not in {"matched", "contains-pin"}:
         failures.append(
             f"driver_binary.ay_authority {authority!r} is not an accepted authority"
-        )
-    elif authority == "matched" and linked_sha != expected_ay_pin:
-        failures.append(
-            "driver_binary matched authority does not link the exact expected AY pin"
         )
     return failures
 

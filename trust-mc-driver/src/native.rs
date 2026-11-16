@@ -3041,6 +3041,17 @@ fn validate_native_bundle_proof_authority_input(
                     // unmodeled, and the `Uninit` check above walks its element (once,
                     // whatever its length) like any other constant carrier.
                     trust_ir::Inst::ArraySplat { .. } => {}
+                    // Wire-74 BoxDeref carries a site-scoped validity hypothesis,
+                    // not checked Box semantics. Both translators refuse it by
+                    // name; source identity cannot supply the missing model.
+                    trust_ir::Inst::BoxDeref { .. } => {
+                        return Err(native_bundle_proof_authority_input_error(
+                            "module.functions.instructions",
+                            format!(
+                                "{location} executes BoxDeref; Box validity assumptions are not modeled for proof authority"
+                            ),
+                        ));
+                    }
                     // v63 runtime capture construction has no proof-grade
                     // value/target model yet. Source provenance cannot grant
                     // semantic support, including for an unused result.
@@ -10718,6 +10729,8 @@ mod tests {
         ArraySplat,
         /// A runtime capture remains unsupported even when its result is unused.
         RuntimeClosure,
+        /// A valid Box hypothesis cannot supply an unimplemented Box model.
+        BoxDeref,
         /// trust-ir v50 `Constant::Splat` whose ONE element carries an unwritten
         /// (`Uninit`) lane, repeated `u64::MAX` times (refused by trust-ir's
         /// validator before trust-mc's own `Uninit` arm).
@@ -10739,6 +10752,25 @@ mod tests {
         let mut builder = ModuleBuilder::new(format!("proof_authority_attack_{shape:?}"));
 
         match shape {
+            ProofAuthorityAttackShape::BoxDeref => {
+                use trust_ir::box_validity::{
+                    BoxDerefSite, BoxFactSession, BoxValidityFact, PremiseRoot,
+                };
+                let ty = builder.add_func_type(vec![Ty::Ptr], vec![]);
+                let mut function = builder.function("attack", ty);
+                let entry = function.create_block();
+                function.switch_to_block(entry);
+                function.set_entry(entry);
+                let pointer = function.add_block_param(entry, Ty::Ptr);
+                let fact = BoxValidityFact::premise(
+                    BoxDerefSite { item: [0xab; 16], ordinal: 0 },
+                    BoxFactSession::PROOF_SNAPSHOT,
+                    PremiseRoot::ParamByValue,
+                );
+                function.box_deref(Ty::I64, pointer, fact);
+                function.ret(vec![]);
+                function.build();
+            }
             ProofAuthorityAttackShape::Assume => {
                 let ty = builder.add_func_type(vec![], vec![]);
                 let mut function = builder.function("attack", ty);
@@ -11422,6 +11454,7 @@ mod tests {
             (ProofAuthorityAttackShape::Assume, "unauthenticated Assume"),
             (ProofAuthorityAttackShape::Undef, "executes Undef"),
             (ProofAuthorityAttackShape::RuntimeClosure, "runtime closure construction"),
+            (ProofAuthorityAttackShape::BoxDeref, "executes BoxDeref"),
             (ProofAuthorityAttackShape::UninitLaneConst, "unwritten (Uninit) aggregate lane"),
             (ProofAuthorityAttackShape::ValidBorrowLoad, "public ValidBorrow"),
             (ProofAuthorityAttackShape::ValidBorrowStore, "public ValidBorrow"),
@@ -11476,6 +11509,33 @@ mod tests {
             };
             assert_eq!(field, "native_trust_ir_bundle.module.functions.instructions");
             assert!(detail.contains("runtime closure construction"), "{detail}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "ay-chc-native", feature = "native-trust-ir-bundle"))]
+    fn box_deref_source_authority_does_not_grant_semantics() {
+        let mut bundle = proof_authority_attack_bundle(ProofAuthorityAttackShape::BoxDeref);
+        assert!(trust_ir_build::validate_module(&bundle.module).is_empty());
+        let mut control = bundle.clone();
+        let body = &mut control.module.functions[0].blocks[0].body;
+        let before = body.len();
+        body.retain(|node| !matches!(node.inst, trust_ir::Inst::BoxDeref { .. }));
+        assert_eq!(body.len() + 1, before, "remove exactly the original BoxDeref");
+        refresh_native_test_bundle_module_identity(&mut control);
+        validate_native_bundle_proof_authority_input(&control, None)
+            .expect("the same pointer-param body without BoxDeref is admitted");
+
+        let authority = trust_ir::SourceGenerationAuthority::mint_from_live_lowering(&mut bundle)
+            .expect("valid live Box hypothesis fixture");
+        for source in [None, Some(&authority)] {
+            let error = validate_native_bundle_proof_authority_input(&bundle, source)
+                .expect_err("source identity cannot supply a Box validity model");
+            let NativeSolveError::InvalidInput { field, detail } = error else {
+                panic!("BoxDeref must fail at proof admission");
+            };
+            assert_eq!(field, "native_trust_ir_bundle.module.functions.instructions");
+            assert!(detail.contains("executes BoxDeref"), "{detail}");
         }
     }
 

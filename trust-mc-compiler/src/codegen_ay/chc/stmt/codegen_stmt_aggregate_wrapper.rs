@@ -12,7 +12,11 @@
 use std::collections::HashSet;
 
 use ay_bindings::Expr;
+use rustc_public::CrateDef;
 use rustc_public::mir::Operand;
+use rustc_public::ty::AdtDef;
+
+use crate::kani_middle::std_abstraction::{NativeWrapperKind as Wrapper, native_wrapper_kind};
 use tracing::{debug, warn};
 
 use crate::codegen_ay::types::{POINTER_WIDTH, SignExtension, coerce_bitvec_width_safe};
@@ -31,18 +35,22 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// operand directly rather than building a datatype value.
     pub(in crate::codegen_ay::chc) fn try_translate_transparent_wrapper(
         &mut self,
-        base_name: &str,
+        def: AdtDef,
         operands: &[Operand],
         modified_locals: &HashSet<usize>,
     ) -> Option<Option<Expr>> {
+        let wrapper = native_wrapper_kind(self.tcx, def)?;
+        let base_name = def.trimmed_name();
+        // A printed basename never authorizes dropping any aggregate fields.
         // ManuallyDrop, MaybeUninit, UnsafeCell, Cell, NonZero — single-operand passthrough
-        if base_name == "ManuallyDrop"
-            || base_name == "MaybeUninit"
-            || base_name == "UnsafeCell"
-            || base_name == "Cell"
-            || base_name == "NonZero"
-            || base_name.starts_with("NonZero")
-        {
+        if matches!(
+            wrapper,
+            Wrapper::ManuallyDrop
+                | Wrapper::MaybeUninit
+                | Wrapper::UnsafeCell
+                | Wrapper::Cell
+                | Wrapper::NonZero
+        ) {
             if operands.len() != 1 {
                 warn!(
                     "translate_adt_aggregate: {} expected 1 operand, got {}",
@@ -64,12 +72,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // NonNull, Unique, Box, Rc, Arc — pointer wrappers. Rc/Arc aggregates
         // include PhantomData/allocator operands in MIR, but the CHC model uses
         // only the first operand (the inner pointer) as the wrapper value.
-        if base_name == "NonNull"
-            || base_name == "Unique"
-            || base_name == "Box"
-            || base_name == "Rc"
-            || base_name == "Arc"
-        {
+        if matches!(
+            wrapper,
+            Wrapper::NonNull | Wrapper::Unique | Wrapper::Box | Wrapper::Rc | Wrapper::Arc
+        ) {
             if operands.len() == 1 {
                 let Some(expr) =
                     self.translate_operand_with_modified(&operands[0], modified_locals)
@@ -90,7 +96,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     base_name
                 );
                 return Some(Some(expr));
-            } else if (base_name == "Rc" || base_name == "Arc") && operands.len() >= 2 {
+            } else if matches!(wrapper, Wrapper::Rc | Wrapper::Arc) && operands.len() >= 2 {
                 let Some(expr) =
                     self.translate_operand_with_modified(&operands[0], modified_locals)
                 else {
@@ -110,7 +116,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     base_name
                 );
                 return Some(Some(expr));
-            } else if base_name == "Box" && operands.len() == 2 {
+            } else if wrapper == Wrapper::Box && operands.len() == 2 {
                 // Box<T, A> can include allocator payload in MIR. We model Box as
                 // pointer-only and ignore allocator metadata for now.
                 let Some(expr) =
@@ -130,7 +136,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     "translate_adt_aggregate: Box with 2 operands -> returning pointer, ignoring allocator field"
                 );
                 return Some(Some(expr));
-            } else if base_name == "Unique" && operands.len() == 2 {
+            } else if wrapper == Wrapper::Unique && operands.len() == 2 {
                 // Unique<T> has 2 fields: NonNull<T> pointer and PhantomData<T> (zero-sized marker)
                 let Some(expr) =
                     self.translate_operand_with_modified(&operands[0], modified_locals)
@@ -161,7 +167,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // Part of #4067: OnceBox — internal platform type mapped to ptr_sort()
         // in type translation. Contains a single AtomicPtr operand. Treat as
         // pointer-wrapper passthrough so aggregate construction doesn't fall back.
-        if base_name == "OnceBox" {
+        if wrapper == Wrapper::OnceBox {
             if operands.len() == 1 {
                 let expr = self.translate_operand_with_modified(&operands[0], modified_locals);
                 if let Some(expr) = expr {
@@ -187,7 +193,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         // a pointer wrapper — ArcInner is allocated on heap and data is the meaningful
         // content. Extracting last field avoids aggregate sort mismatch when the type
         // translator makes Mutex<T> transparent.
-        if base_name == "Mutex" || base_name == "RwLock" || base_name == "ArcInner" {
+        if matches!(wrapper, Wrapper::Mutex | Wrapper::RwLock | Wrapper::ArcInner) {
             if operands.is_empty() {
                 warn!("translate_adt_aggregate: {} expected >=1 operand, got 0", base_name);
                 return Some(None);

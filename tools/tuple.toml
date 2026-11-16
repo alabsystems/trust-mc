@@ -40,12 +40,12 @@ channel = "nightly-2025-12-03"
 # never in ../ay) into ~/Library/Caches/trust-mc-ay-cli-<first 9 of rev>/release
 # and prints the binary's path; name that with TRUST_MC_AY_BIN.
 [ay]
-rev = "688dd4b3b22d82fdd5021e42e99a002d751dc0cc"
+rev = "87e7b61d2a96e22dfeb4fd331c303b61d104547d"
 
 # TrustIR: the one rev trust-mc's member manifests declare, and the clean HEAD
 # of the ../trust-ir checkout the [patch] table links.
 [trust_ir]
-rev = "bd313b4fbfae2c2826bade463e23224f1df9a61a"
+rev = "6ae19a661cc254e33a578b492ebe56ccc796a7dd"
 
 # trust-vc: the rev trust-mc-trust-vc-ingest declares and Cargo.lock resolves.
 [trust_vc]
@@ -55,7 +55,7 @@ rev = "0ed96de07900249cb9155b38b22e7d74ceefa9dc"
 # manifests declare, and the commit Cargo.lock resolves clean-kernel at. It is a
 # frozen content pin, so ../clean's own HEAD may be later.
 [clean]
-rev = "550ad0858df6a00c61a7cdabc7f37fa0bc975258"
+rev = "7722f8495bc4a4fa60ccf79fd78723f5b18ea949"
 
 # Kani. `corpus_rev` is the upstream checkout the corpus is measured against
 # (tools/kani-domination's DEFAULT_KANI_REV, and the HEAD of the checkout it

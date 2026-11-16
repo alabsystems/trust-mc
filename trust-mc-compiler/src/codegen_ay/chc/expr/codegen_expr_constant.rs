@@ -9,6 +9,7 @@
 
 use crate::codegen_ay::chc::codegen_ctx::{Havoc, sound_havoc};
 use crate::codegen_ay::shared::mono_ty;
+use crate::kani_middle::std_abstraction::{NativeWrapperKind, native_wrapper_kind};
 #[allow(unused_imports)]
 use crate::rustc_compat::prelude::*;
 use ay_bindings::{Expr, Sort};
@@ -242,11 +243,17 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     ) -> Option<Expr> {
         let name = def.trimmed_name();
 
+        if matches!(
+            native_wrapper_kind(self.tcx, def),
+            Some(NativeWrapperKind::NonNull | NativeWrapperKind::Unique)
+        ) {
+            // A real pointer wrapper carries the relocation's address. A
+            // user NonNull has ordinary fields and takes the ADT reader below.
+            return self.pointer_scalar_expr(alloc);
+        }
+
         // Part of #2075: Opaque ADT types, each read under the slot clause.
         match name.as_str() {
-            // A pointer word: its relocation's address (`NonNull::from(&S)`
-            // is S's address), never the offset its bytes carry.
-            "NonNull" | "Unique" => return self.pointer_scalar_expr(alloc),
             "Alignment" => {
                 let value = alloc.read_uint_at(0, (POINTER_WIDTH / 8) as usize)?;
                 return Some(Expr::bitvec_const(value, POINTER_WIDTH));

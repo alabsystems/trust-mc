@@ -19,3 +19,5 @@ anyhow = { workspace = true }
 cargo_metadata = "0.23"
 clap = { workspace = true }
 libc = "0.2"
+# Reads the library workspace manifests a toolchain ships (dev_std.rs).
+toml = "0.9"

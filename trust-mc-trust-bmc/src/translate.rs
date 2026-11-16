@@ -37,11 +37,14 @@ const HOST_POINTER_BITS: u32 = 64;
 /// Options controlling VC generation.
 #[derive(Debug, Clone)]
 pub struct TranslateOptions {
-    /// Emit signed overflow checks (default: true).
+    /// Emit signed add/sub/mul overflow checks and shift-range checks
+    /// (default: true).
+    /// Native signed division/remainder definedness is always checked.
     pub check_signed_overflow: bool,
     /// Emit unsigned overflow checks (default: true).
     pub check_unsigned_overflow: bool,
-    /// Emit division-by-zero checks (default: true).
+    /// Legacy request option (default: true). Native division/remainder
+    /// definedness is mandatory even when this field is false.
     pub check_div_by_zero: bool,
     /// Emit memory bounds checks for Load/Store (default: true).
     pub check_memory_bounds: bool,
@@ -786,6 +789,15 @@ impl<'a> FuncTranslator<'a> {
     /// Translate a single instruction node.
     fn translate_node(&mut self, node: &InstrNode) {
         match &node.inst {
+            // BoxDeref preserves pointer bits but requires a separately checked,
+            // site-scoped Box validity assumption. This lane has no such model:
+            // do not perform a load or turn the supplied fact into authority.
+            Inst::BoxDeref { .. } => {
+                self.add_unsupported_semantics(
+                    "BoxDeref validity assumptions are not modeled",
+                    node,
+                );
+            }
             // --- Arithmetic ---
             Inst::BinOp { op, ty, lhs, rhs } if ty.is_integer() => {
                 self.translate_integer_binop(*op, ty, *lhs, *rhs, node);
@@ -1804,7 +1816,11 @@ impl<'a> FuncTranslator<'a> {
         if let Some(no_overflow) =
             integer_binop_no_overflow_condition(op, ty, &lhs_expr, &rhs_expr, self.options)
         {
-            let signedness = if ty.is_signed() { "signed" } else { "unsigned" };
+            let signedness = if ty.is_signed() || matches!(op, BinOp::SDiv | BinOp::SRem) {
+                "signed"
+            } else {
+                "unsigned"
+            };
             // Violation when no_overflow is false.
             let overflow_occurs = no_overflow.not();
             self.add_violation(
@@ -2687,10 +2703,12 @@ pub(crate) fn normalize_expr_to_ty(expr: &Expr, ty: &Ty) -> Expr {
     }
 }
 
-/// A type with no SMT value carrier: geometry-only storage, or a tensor.
+/// A type with no SMT value carrier: storage, a nominal function item, or a tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnsupportedSort {
     AddressableStorage,
+    /// A zero-byte nominal singleton, not a code pointer or an integer.
+    FunctionItem,
     /// trust-ir v67 `Ty::Tensor(elem, rank)`: extents and a row-major element
     /// sequence that no bit-vector, Boolean or uninterpreted sort denotes
     /// (`crate::tensor_region`).
@@ -2702,6 +2720,9 @@ impl UnsupportedSort {
         match self {
             Self::AddressableStorage => {
                 "addressable storage is allocation geometry, not a modeled SMT value"
+            }
+            Self::FunctionItem => {
+                "Ty::FnItem is a nominal function-item singleton, not a modeled SMT pointer or integer"
             }
             Self::Tensor => "Ty::Tensor (the trust-ir tensor region) has no modeled SMT value",
         }
@@ -2727,6 +2748,7 @@ pub(crate) fn checked_ty_to_sort(ty: &Ty) -> Result<Sort, UnsupportedSort> {
         Ty::Char => Sort::bitvec(32),
         Ty::Error => unreachable!("Ty::Error is rejected by validate_module"),
         Ty::Storage(_) => return Err(UnsupportedSort::AddressableStorage),
+        Ty::FnItem(_) => return Err(UnsupportedSort::FunctionItem),
         // trust-ir v67 `Ty::Tensor`: no placeholder sort is invented for it. A
         // 64-bit carrier would let a contraction, map, view, gather or scatter
         // result flow as an unconstrained word with no extent or bounds
@@ -2884,11 +2906,12 @@ pub(crate) fn handle_sort_name(handle: &trust_ir::ty::HandleTy) -> String {
 /// (store/load, select, block-parameter binding).
 pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Option<Expr> {
     use trust_ir::constant::Constant;
-    // Storage never denotes an initialized constant, including inline
-    // compounds. Public module admission additionally resolves table types.
-    let mut storage = false;
-    ty.visit_types(|child| storage |= matches!(child, Ty::Storage(_)));
-    if storage {
+    // Storage never denotes an initialized constant; a nominal FnItem has no
+    // numeric carrier either, including inside compounds. Public module
+    // admission additionally resolves table types.
+    let mut unmodeled = false;
+    ty.visit_types(|child| unmodeled |= matches!(child, Ty::Storage(_) | Ty::FnItem(_)));
+    if unmodeled {
         return None;
     }
     // Trust: a nominal dialect type has no bit pattern the schema grants, so no
@@ -2929,6 +2952,9 @@ pub(crate) fn const_to_expr(ty: &Ty, value: &trust_ir::constant::Constant) -> Op
         // Trust (trust-ir v25): a byte-array constant has no scalar SMT
         // model — same exact-bits-or-nothing rule as floats (fail closed).
         Constant::Bytes { .. } => None,
+        // A nominal zero-byte singleton never acquires FnDef's pointer-sized
+        // placeholder, including when a caller bypasses module validation.
+        Constant::FnItem(_) => None,
         // trust-ir v49 `Uninit` is an UNWRITTEN aggregate lane, not a value:
         // nothing may read it, and trust-ir-build's validator admits it only
         // as a direct element of a struct/tuple `Aggregate`. As a whole
@@ -3253,6 +3279,25 @@ fn mul_by_power_of_two_as_shift(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
     None
 }
 
+/// The existing CHC Wrapping policy, shared by main translation and call
+/// summaries. Wrapping never suppresses the signed division/remainder domain.
+/// Keep unrelated nondivision policy unchanged. Checked-overflow result flags
+/// use the underlying predicate without adding an unconditional trap.
+pub(crate) fn integer_binop_overflow_obligation(
+    op: BinOp,
+    ty: &Ty,
+    lhs: &Expr,
+    rhs: &Expr,
+    node: &InstrNode,
+    options: &TranslateOptions,
+) -> Option<Expr> {
+    if node.proofs.contains(&ProofAnnotation::Wrapping) && !matches!(op, BinOp::SDiv | BinOp::SRem)
+    {
+        return None;
+    }
+    integer_binop_no_overflow_condition(op, ty, lhs, rhs, options)
+}
+
 pub(crate) fn integer_binop_no_overflow_condition(
     op: BinOp,
     ty: &Ty,
@@ -3321,9 +3366,10 @@ pub(crate) fn integer_binop_no_overflow_condition(
         (BinOp::Mul, true) if options.check_signed_overflow => {
             Some(lhs.clone().bvmul_no_overflow_signed(rhs.clone()))
         }
-        (BinOp::SDiv | BinOp::SRem, true) if options.check_signed_overflow => {
-            Some(lhs.clone().bvsdiv_no_overflow(rhs.clone()))
-        }
+        // Signedness belongs to the opcode, not the carrier type. Unlike
+        // optional add/sub/mul overflow policy, MIN / -1 and MIN % -1 are
+        // outside the canonical IR domain (even on U8, or with Wrapping).
+        (BinOp::SDiv | BinOp::SRem, _) => Some(lhs.clone().bvsdiv_no_overflow(rhs.clone())),
         (BinOp::Add, false) if options.check_unsigned_overflow => {
             Some(lhs.clone().bvadd_no_overflow_unsigned(rhs.clone()))
         }
@@ -3472,12 +3518,11 @@ pub(crate) fn integer_binop_div_by_zero_condition(
     op: BinOp,
     ty: &Ty,
     rhs: &Expr,
-    options: &TranslateOptions,
+    _options: &TranslateOptions,
 ) -> Option<Expr> {
-    if !options.check_div_by_zero
-        || !ty.is_integer()
-        || !matches!(op, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem)
-    {
+    // This is canonical instruction definedness, not a selectable source
+    // overflow policy. No native division/remainder is defined at zero.
+    if !ty.is_integer() || !matches!(op, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem) {
         return None;
     }
 

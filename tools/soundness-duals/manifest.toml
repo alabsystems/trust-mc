@@ -36345,3 +36345,306 @@ expected = "SUCCESSFUL"
 name = "heap_value_is_not_replaced_on_pointer_holder_exit"
 expected = "FAILED"
 property = "assertion"
+
+[[entry]]
+path = "vec_append_transfer_dual.rs"
+kind = "dual"
+flags = []
+lanes = ["chc"]
+oracle = "Rust Vec::append moves the current elements, preserves the destination prefix and clears the source; clear/truncate affect the moved count."
+note = "Strict Safe/Bug expectations; current raw-MIR AY688 semantic attempts are Unknown and remain incomplete. Raw alias control retains the existing reallocation/mutation refusal."
+
+[[entry.harness]]
+name = "append_literal_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "append_literal_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "append_updated_source_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "append_updated_source_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "append_empty_destination_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "append_empty_destination_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "append_cleared_source_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "append_cleared_source_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "append_truncated_source_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "append_truncated_source_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "append_buffer_alias_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "append_partial_remove_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry]]
+path = "vec_buffer_after_growth_dual.rs"
+kind = "dual"
+flags = ["-Z", "mem-predicates"]
+lanes = ["chc"]
+oracle = "Rust Vec fresh pointer sees current live allocation and bytes; raw scalar stores survive a fresh getter; clear retains backing bytes."
+note = "Mutation-before-getter cases require refusal until physical and logical Vec states are coherent. Native-MIR prescan controls are separate from pending actual SDK/CLI semantics."
+
+[[entry.harness]]
+name = "append_then_getter_read_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "append_then_getter_extent_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "push_then_getter_read_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "index_then_getter_read_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "mutation_then_move_then_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "unchanged_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "unchanged_getter_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "physical_store_then_fresh_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "physical_store_then_fresh_getter_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "clear_then_fresh_getter_keeps_bytes_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "local_shadow_name_then_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "local_shadow_raw_name_then_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "mutation_then_owner_reference_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "mutation_then_raw_owner_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "mutation_then_aggregate_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "mutation_then_projected_move_getter_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "unchanged_aggregate_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "unchanged_aggregate_getter_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "unchanged_projected_move_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "unchanged_projected_move_getter_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry]]
+path = "vec_empty_dangling_dual.rs"
+kind = "dual"
+flags = []
+lanes = ["chc"]
+oracle = "Held Trust29ebb native RawVec uses without-provenance declared-element alignment at zero capacity; non-ZST dereference has no allocation."
+note = "Native implementation address controls, separate from Kani cross-toolchain comparison. Actual declared aligned wrapper layout and both pointer-check configurations; no ZST claim."
+
+[[entry.harness]]
+name = "empty_u8_address_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "empty_u8_address_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "empty_u64_address_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "empty_u64_address_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "empty_actual_layout_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "empty_actual_layout_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "zero_capacity_address_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "zero_capacity_dereference_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "empty_dereference_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry]]
+path = "vec_primitive_store_dual.rs"
+kind = "dual"
+flags = ["-Z", "mem-predicates"]
+lanes = ["chc"]
+oracle = "Primitive same-element buffer writes preserve physical bytes and owner pointer/len/cap; user Vec keeps ordinary field semantics."
+note = "Safe/Bug rows keep strict CLI semantics. Shared old3Bug/new9Safe both require own vec_model_read_after_buffer_write refusal with incomplete target VC and zero semantic credit. Growth retains vec_buffer_access_after_mutation. Original u64 physical_store_then_fresh_getter twins remain registered in vec_buffer_after_growth_dual.rs."
+
+[[entry.harness]]
+name = "primitive_u8_store_fresh_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "primitive_u8_store_fresh_getter_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "primitive_copied_pointer_fresh_getter_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "primitive_buffer_store_preserves_owner_header_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "user_vec_fields_store_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "user_vec_fields_store_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "shared_old3_bug_reverse_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shared_new9_safe_reverse_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shared_header_queries_then_fresh_raw_read_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "growth_before_primitive_store_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shadow_name_read_after_growth_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shadow_name_write_after_growth_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shadow_name_write_then_model_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry.harness]]
+name = "shadow_name_write_bytes_then_model_refusal"
+expected = "FAILED"
+forbid_genuine = true
+
+[[entry]]
+path = "vec_canonical_shadow_dual.rs"
+kind = "dual"
+flags = ["-Z", "uninit-checks"]
+lanes = ["chc"]
+oracle = "Initialized unchanged native Vec buffer with real Kani shadow instrumentation."
+note = "Require actual retained canonical model calls; local marker mocks grant no authority."
+[[entry.harness]]
+name = "canonical_shadow_unchanged_safe"
+expected = "SUCCESSFUL"
+[[entry.harness]]
+name = "canonical_shadow_unchanged_bug"
+expected = "FAILED"
+property = "assertion"

@@ -615,6 +615,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 .vec_store_appended_elements(coll_local, &old_len, &values, modified_locals, acc),
             _ => false,
         };
+        if !stored && known_count.is_none() {
+            self.synchronize_sidecar_vec_fields(Some(coll_local), modified_locals, true, acc);
+        }
         if !stored && let Some(count) = known_count {
             // The source's length is known and its values are not: the Vec's
             // own `len` field still moves by the count (an index check reads

@@ -577,7 +577,11 @@ impl<'tcx, 'body> CallDispatchCollections for ChcCtx<'tcx, 'body> {
                     stmt_constraints,
                     modified_locals,
                 };
-                handler(self, &cx);
+                if matches!(stub, StubKind::VecNew | StubKind::VecWithCapacity) {
+                    self.codegen_call_vec_core_with_callee(&cx, Some(func));
+                } else {
+                    handler(self, &cx);
+                }
             } else {
                 self.record_diverging_call_drop(
                     func,

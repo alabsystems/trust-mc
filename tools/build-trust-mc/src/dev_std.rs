@@ -8,21 +8,25 @@
 //! `build-dev` rebuilds std with the trust-mc-compiler driver, so cargo needs the
 //! library sources of the exact compiler commit the driver links. A toolchain
 //! that ships them (`lib/rustlib/src/rust/library`: rustup's `rust-src`, or a
-//! Trust seal's `trust-src`) serves them as `-Z build-std` always did. A Trust
-//! seal that ships none -- seal 9192 has no `lib/rustlib/src` -- is served the
-//! way `build-keyed --trust-checkout` is (keyed.rs): `library/` and the paths it
-//! resolves outside itself are extracted by `git archive` from a trust checkout
-//! at the compiler's own `commit-hash`, and cargo reads them through
-//! `__CARGO_TESTS_ONLY_SRC_ROOT`. Nothing is taken from another revision: a
-//! checkout without that commit is refused, and after the binaries are built the
-//! driver itself must report the same commit.
+//! Trust seal's `trust-src`) serves them as `-Z build-std` always did, but only
+//! when every path the library workspace depends on is shipped with it
+//! ([`check_shipped_library`]): seal 16387 shipped `library/` without the
+//! `crates/` its `sysroot` member depends on, and cargo refused that rebuild. A
+//! Trust seal that ships none -- seal 9192 has no `lib/rustlib/src` -- or ships
+//! them incomplete is served the way `build-keyed --trust-checkout` is
+//! (keyed.rs): `library/` and the paths it resolves outside itself are extracted
+//! by `git archive` from a trust checkout at the compiler's own `commit-hash`,
+//! and cargo reads them through `__CARGO_TESTS_ONLY_SRC_ROOT`. Nothing is taken
+//! from another revision: a checkout without that commit is refused, and after
+//! the binaries are built the driver itself must report the same commit.
 
 use crate::keyed::{TRUST_SRC_COMPONENT, materialize_sources, require_commit, run_capture};
 use crate::sysroot::trust_mc_repo_root;
 use anyhow::{Context, Result, bail, format_err};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// Environment spelling of `build-dev --trust-checkout`, for gate scripts that run
@@ -45,14 +49,225 @@ pub(crate) struct DevCompiler {
 }
 
 impl DevCompiler {
-    /// Where a toolchain that ships its library sources keeps them.
-    fn sysroot_library(&self) -> PathBuf {
-        self.sysroot.join(TRUST_SRC_COMPONENT).join("library")
+    /// Where a toolchain that ships its library sources keeps them
+    /// (`library/` and the paths it depends on outside itself).
+    fn sysroot_sources(&self) -> PathBuf {
+        self.sysroot.join(TRUST_SRC_COMPONENT)
+    }
+}
+
+/// Dependency tables of a manifest, and whether each holds dev-dependencies:
+/// the top-level ones and those of every `[target.<cfg>]`, since cargo's
+/// lock-preserving resolve loads the dependencies of every target.
+fn dependency_tables(manifest: &toml::Table) -> Vec<(&toml::Table, bool)> {
+    const KINDS: [(&str, bool); 5] = [
+        ("dependencies", false),
+        ("build-dependencies", false),
+        ("build_dependencies", false),
+        ("dev-dependencies", true),
+        ("dev_dependencies", true),
+    ];
+    let targets = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values().filter_map(toml::Value::as_table));
+    std::iter::once(manifest)
+        .chain(targets)
+        .flat_map(|table| {
+            KINDS.iter().filter_map(move |(key, dev)| Some((table.get(*key)?.as_table()?, *dev)))
+        })
+        .collect()
+}
+
+/// Whether anything in `manifest` outside its own `[workspace]` is inherited
+/// from a workspace (`version.workspace = true`, `dep = { workspace = true }`,
+/// `[lints] workspace = true`): cargo then needs that workspace's root manifest.
+fn inherits_from_workspace(manifest: &toml::Table) -> bool {
+    fn inherits(table: &toml::Table) -> bool {
+        table.iter().any(|(key, value)| match value {
+            toml::Value::Boolean(true) => key == "workspace",
+            toml::Value::Table(inner) => inherits(inner),
+            _ => false,
+        })
+    }
+    manifest.iter().any(|(key, value)| key != "workspace" && value.as_table().is_some_and(inherits))
+}
+
+/// `path` with `.` and `..` resolved lexically, as cargo resolves a path
+/// dependency (it does not follow symbolic links to do so).
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other.as_os_str()),
+        }
+    }
+    normal
+}
+
+fn read_manifest(path: &Path) -> Result<toml::Table> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    text.parse().with_context(|| format!("cannot parse {}", path.display()))
+}
+
+fn strings(value: Option<&toml::Value>) -> impl Iterator<Item = &str> {
+    value.and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str)
+}
+
+/// Refuse unless `sources` (a toolchain's `lib/rustlib/src/rust`) ships a library
+/// workspace cargo can load as shipped: `library/Cargo.lock`, the workspace
+/// manifest `library/Cargo.toml`, and a directory with a `Cargo.toml` inside
+/// `sources` for every path cargo resolves -- the workspace members, every
+/// `path` (or workspace-inherited) dependency of a member, of every kind and
+/// target, and of each path package reached from them (normal and build
+/// dependencies), and the `[patch]` and `[replace]` entries. Packages inside
+/// `library/` and not excluded count as members (cargo makes path dependencies
+/// there implicit members); counting one that is not is only stricter. The
+/// error names every missing path and the manifest that names it.
+pub(crate) fn check_shipped_library(sources: &Path) -> Result<()> {
+    let sources = normalize(sources);
+    let library = sources.join("library");
+    let lock = library.join("Cargo.lock");
+    if !lock.is_file() {
+        bail!("{} is missing", lock.display());
+    }
+    let root_path = library.join("Cargo.toml");
+    let root = read_manifest(&root_path)?;
+    let workspace = root
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format_err!("{} declares no [workspace]", root_path.display()))?;
+    let excluded: Vec<PathBuf> =
+        strings(workspace.get("exclude")).map(|path| normalize(&library.join(path))).collect();
+    let root_dependencies =
+        workspace.get("dependencies").and_then(toml::Value::as_table).cloned().unwrap_or_default();
+
+    let mut pending: Vec<(PathBuf, String)> = Vec::new();
+    for member in strings(workspace.get("members")) {
+        if member.contains(['*', '?', '[']) {
+            bail!(
+                "{} names the member pattern `{member}`; only literal members are checked",
+                root_path.display()
+            );
+        }
+        pending.push((
+            normalize(&library.join(member)),
+            format!("member `{member}` of {}", root_path.display()),
+        ));
+    }
+    if root.contains_key("package") {
+        pending.push((library.clone(), format!("the root package of {}", root_path.display())));
+    }
+    let patches = root
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|sources| sources.values().filter_map(toml::Value::as_table));
+    for table in patches.chain(root.get("replace").and_then(toml::Value::as_table)) {
+        for (name, spec) in table {
+            if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                pending.push((
+                    normalize(&library.join(path)),
+                    format!("`{name}` in the [patch]/[replace] of {}", root_path.display()),
+                ));
+            }
+        }
     }
 
-    fn sysroot_ships_library(&self) -> bool {
-        self.sysroot_library().join("Cargo.lock").is_file()
+    let mut visited = BTreeSet::new();
+    let mut missing = BTreeSet::new();
+    while let Some((dir, named_by)) = pending.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let manifest_path = dir.join("Cargo.toml");
+        if !dir.starts_with(&sources) {
+            missing.insert(format!(
+                "{named_by} resolves to {}, outside the shipped sources",
+                dir.display()
+            ));
+            continue;
+        }
+        if !manifest_path.is_file() {
+            missing.insert(format!(
+                "{named_by} resolves to {}, which is not shipped (no Cargo.toml)",
+                dir.display()
+            ));
+            continue;
+        }
+        let manifest = read_manifest(&manifest_path)?;
+        let member =
+            dir.starts_with(&library) && !excluded.iter().any(|path| dir.starts_with(path));
+        // Where `workspace = true` dependencies resolve: the library workspace
+        // for its members; for another package, the nearest shipped manifest
+        // at or above it that declares a [workspace], as cargo searches.
+        let workspace_root = if member {
+            Some((library.clone(), root_dependencies.clone()))
+        } else if inherits_from_workspace(&manifest) {
+            let found = dir
+                .ancestors()
+                .take_while(|ancestor| ancestor.starts_with(&sources))
+                .find_map(|ancestor| {
+                    let candidate = read_manifest(&ancestor.join("Cargo.toml")).ok()?;
+                    let table = candidate.get("workspace")?.as_table()?;
+                    let dependencies = table
+                        .get("dependencies")
+                        .and_then(toml::Value::as_table)
+                        .cloned()
+                        .unwrap_or_default();
+                    Some((ancestor.to_path_buf(), dependencies))
+                });
+            if found.is_none() {
+                missing.insert(format!(
+                    "{} inherits from a workspace, and no Cargo.toml declaring [workspace] is \
+                     shipped at or above it",
+                    manifest_path.display()
+                ));
+            }
+            found
+        } else {
+            None
+        };
+        for (table, dev) in dependency_tables(&manifest) {
+            if dev && !member {
+                continue;
+            }
+            for (name, spec) in table {
+                let Some(spec) = spec.as_table() else { continue };
+                let target = if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
+                    dir.join(path)
+                } else if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                    // Cargo looks the dependency up by its key, relative to the root.
+                    let Some((root_dir, dependencies)) = &workspace_root else { continue };
+                    let Some(path) = dependencies
+                        .get(name.as_str())
+                        .and_then(|inherited| inherited.get("path"))
+                        .and_then(toml::Value::as_str)
+                    else {
+                        continue;
+                    };
+                    root_dir.join(path)
+                } else {
+                    continue;
+                };
+                pending
+                    .push((normalize(&target), format!("`{name}` in {}", manifest_path.display())));
+            }
+        }
     }
+    if !missing.is_empty() {
+        bail!(
+            "the shipped library does not resolve as cargo would resolve it: {}",
+            missing.into_iter().collect::<Vec<_>>().join("; ")
+        );
+    }
+    Ok(())
 }
 
 /// Run `rustc -vV` and `rustc --print sysroot`.
@@ -152,9 +367,9 @@ fn superproject_of(repo: &Path) -> Option<PathBuf> {
 }
 
 /// Choose the source. An explicit checkout (flag, then environment) wins and must
-/// hold the commit; otherwise the sysroot's own sources; otherwise the
-/// superproject when it holds the commit. `holds_commit` is injected so the
-/// order is testable without git.
+/// hold the commit; otherwise the sysroot's own sources, when they are complete
+/// ([`check_shipped_library`]); otherwise the superproject when it holds the
+/// commit. `holds_commit` is injected so the order is testable without git.
 pub(crate) fn choose_std_source(
     compiler: &DevCompiler,
     candidates: &CheckoutCandidates,
@@ -172,9 +387,10 @@ pub(crate) fn choose_std_source(
         })?;
         return Ok(StdSource::Checkout(checkout.clone()));
     }
-    if compiler.sysroot_ships_library() {
-        return Ok(StdSource::Sysroot);
-    }
+    let unshipped = match check_shipped_library(&compiler.sysroot_sources()) {
+        Ok(()) => return Ok(StdSource::Sysroot),
+        Err(gap) => gap,
+    };
     let mut tried = String::new();
     if let (Some(superproject), Some(commit)) = (&candidates.superproject, &compiler.commit) {
         match holds_commit(superproject, commit) {
@@ -188,14 +404,13 @@ pub(crate) fn choose_std_source(
         }
     }
     bail!(
-        "{} ({}) ships no standard-library sources ({} is missing), and `-Z build-std` \
+        "{} ({}) ships no usable standard-library sources ({unshipped:#}), and `-Z build-std` \
          needs them to rebuild std with trust-mc-compiler.{tried}\n\
          Name a trust checkout that contains the compiler's commit {}:\n    \
          targo --unverified build-dev --trust-checkout <trust checkout>\n\
          (or set {TRUST_CHECKOUT_ENV}); `--skip-libs` builds only the binaries.",
         compiler.rustc.display(),
         compiler.version,
-        compiler.sysroot_library().join("Cargo.lock").display(),
         compiler.commit.as_deref().unwrap_or("<the compiler reports no commit-hash>"),
     )
 }
@@ -275,6 +490,7 @@ fn stamp_text(commit: &str, tree: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a panicking assertion is the point in tests")]
 mod tests {
     use super::*;
 
@@ -297,10 +513,32 @@ mod tests {
         }
     }
 
-    fn ship_library(sysroot: &Path) {
+    fn write_manifest(dir: &Path, text: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("Cargo.toml"), text).unwrap();
+    }
+
+    /// A shipped library workspace whose `sysroot` member reaches `std` inside
+    /// `library/` and `trust-bignum` outside it, as a Trust seal's does.
+    fn ship_library_without_crates(sysroot: &Path) {
         let library = sysroot.join(TRUST_SRC_COMPONENT).join("library");
-        fs::create_dir_all(&library).unwrap();
+        write_manifest(&library, "[workspace]\nmembers = [\"sysroot\"]\n");
         fs::write(library.join("Cargo.lock"), "").unwrap();
+        write_manifest(
+            &library.join("sysroot"),
+            "[package]\nname = \"sysroot\"\n\n[dependencies]\n\
+             std = { path = \"../std\" }\n\
+             trust-bignum = { path = \"../../crates/trust-bignum\", public = true }\n",
+        );
+        write_manifest(&library.join("std"), "[package]\nname = \"std\"\n");
+    }
+
+    fn ship_library(sysroot: &Path) {
+        ship_library_without_crates(sysroot);
+        write_manifest(
+            &sysroot.join(TRUST_SRC_COMPONENT).join("crates/trust-bignum"),
+            "[package]\nname = \"trust-bignum\"\n",
+        );
     }
 
     fn holds(ok: &'static [&'static str]) -> impl Fn(&Path, &str) -> Result<()> {
@@ -324,6 +562,38 @@ mod tests {
             &holds(&["/trust"]),
         )
         .unwrap();
+        assert_eq!(chosen, StdSource::Sysroot);
+    }
+
+    /// Trust seal 16387 shipped `library/Cargo.lock` but not `crates/trust-bignum`,
+    /// which `library/sysroot` depends on by path; cargo then refused the
+    /// `-Z build-std` rebuild ("failed to load manifest for dependency
+    /// `trust-bignum`"). Such a library is not chosen: the superproject serves the
+    /// sources, and with no checkout the refusal names the missing path.
+    #[test]
+    fn a_sysroot_library_missing_a_path_dependency_is_not_chosen() {
+        let sysroot = scratch("missing-path-dep");
+        ship_library_without_crates(&sysroot);
+        let compiler = compiler(&sysroot, Some(COMMIT));
+
+        let candidates =
+            CheckoutCandidates { superproject: Some("/trust".into()), ..Default::default() };
+        let chosen = choose_std_source(&compiler, &candidates, &holds(&["/trust"])).unwrap();
+        assert_eq!(chosen, StdSource::Checkout("/trust".into()));
+
+        let error = choose_std_source(&compiler, &CheckoutCandidates::default(), &holds(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`trust-bignum`"), "{error}");
+        assert!(error.contains("crates/trust-bignum"), "{error}");
+        assert!(error.contains("--trust-checkout <trust checkout>"), "{error}");
+
+        // Once the dependency is shipped, the sysroot serves the sources again.
+        write_manifest(
+            &sysroot.join(TRUST_SRC_COMPONENT).join("crates/trust-bignum"),
+            "[package]\nname = \"trust-bignum\"\n",
+        );
+        let chosen = choose_std_source(&compiler, &candidates, &holds(&["/trust"])).unwrap();
         assert_eq!(chosen, StdSource::Sysroot);
     }
 

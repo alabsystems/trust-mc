@@ -23,6 +23,7 @@ use super::super::codegen_types::CodegenTypes;
 use super::shared::{ProjectedVecState, coerce_array_element};
 
 pub(in crate::codegen_ay::chc) struct VecOpNewContext<'a> {
+    pub(in crate::codegen_ay::chc) callee: Option<&'a Operand>,
     pub(in crate::codegen_ay::chc) stub: StubKind,
     pub(in crate::codegen_ay::chc) args: &'a [Operand],
     pub(in crate::codegen_ay::chc) modified_locals: &'a HashSet<usize>,
@@ -190,9 +191,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         stub: StubKind,
         cap: &Val,
         ptr: &Loc,
+        no_provenance: bool,
         extra_constraints: &mut Vec<Expr>,
     ) {
-        if !self.extra_pointer_checks || self.int_lift {
+        if (!self.extra_pointer_checks && !(no_provenance && self.memory_safety_checks))
+            || self.int_lift
+        {
             return;
         }
 
@@ -236,8 +240,14 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         cx: VecOpNewContext<'_>,
         acc: &mut CallAccumulator<'_>,
     ) {
-        let VecOpNewContext { stub, args, modified_locals, dest_local, dest_vec_idx } = cx;
+        let VecOpNewContext { stub, args, modified_locals, dest_local, dest_vec_idx, callee } = cx;
         let cap_expr = self.vec_new_cap_expr(stub, args, modified_locals);
+        let native_empty_ptr = self.native_zero_capacity_vec_pointer(
+            callee,
+            self.body.locals()[dest_local].ty,
+            cap_expr.as_expr(),
+        );
+        let no_provenance = native_empty_ptr.is_some();
         // Length tracking: set to 0 on the destination local
         if let Some(len_var_name) = self.collections.len_state.get_len_var(dest_local).cloned() {
             self.collection_len_set(&len_var_name, Expr::bitvec_const(0u64, POINTER_WIDTH), acc);
@@ -323,7 +333,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             {
                 self.taint_vec_capacity_size(*obj_id);
             }
-            let concrete_ptr = concrete_ptr.map(|(_, ptr)| ptr);
+            let concrete_ptr =
+                concrete_ptr.map(|(_, ptr)| ptr).or_else(|| native_empty_ptr.clone());
             // Part of #2267: pre-allocate instead of format!().
             // Both lanes MINT this Vec's buffer base here: either the offset-0
             // base of the heap object just registered above, or a freshly
@@ -376,7 +387,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     data_sort,
                 )
             };
-            self.emit_vec_dangling_provenance_constraints(stub, &cap_expr, &ptr, acc.constraints);
+            self.emit_vec_dangling_provenance_constraints(
+                stub,
+                &cap_expr,
+                &ptr,
+                no_provenance,
+                acc.constraints,
+            );
             // Part of #1037 V2: cap >= len background invariant.
             Self::emit_cap_ge_len(cap_expr.as_expr().clone(), zero_len.clone(), acc.constraints);
             if !self.constrain_projected_vec_fields_for_call(
@@ -407,12 +424,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             ptr_name.push_str(&out_name);
             ptr_name.push_str("_init_ptr");
             // Minted here, same as the projected lane above: an ADDRESS.
-            let ptr = Loc::of_address(Havoc::mint(
-                self,
-                sound_havoc::UNTRACKED_POINTER_VALUE,
-                ptr_name,
-                ptr_sort(),
-            ));
+            let ptr = Loc::of_address(native_empty_ptr.unwrap_or_else(|| {
+                Havoc::mint(self, sound_havoc::UNTRACKED_POINTER_VALUE, ptr_name, ptr_sort())
+            }));
             let data_sort = dt
                 .constructors
                 .first()
@@ -422,7 +436,13 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             data_name.push_str(&out_name);
             data_name.push_str("_init_data");
             let data = ExactVar::nondet(data_name, data_sort);
-            self.emit_vec_dangling_provenance_constraints(stub, &cap_expr, &ptr, acc.constraints);
+            self.emit_vec_dangling_provenance_constraints(
+                stub,
+                &cap_expr,
+                &ptr,
+                no_provenance,
+                acc.constraints,
+            );
             // Part of #1037 V2: cap >= len background invariant.
             Self::emit_cap_ge_len(cap_expr.as_expr().clone(), zero_len.clone(), acc.constraints);
             acc.constraints.push(Self::build_vec_datatype_eq(

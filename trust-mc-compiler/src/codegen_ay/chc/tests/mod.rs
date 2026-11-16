@@ -176,6 +176,7 @@ mod test_flat_field_path;
 mod test_float_binop_table_identity;
 mod test_hashmap_translate;
 mod test_hashset;
+mod test_inline_storage_address;
 mod test_memory_addr;
 mod test_memory_cell_backstop;
 mod test_memory_impl;
@@ -200,6 +201,15 @@ mod test_stmt_flatten;
 mod test_stmt_ref_metadata;
 mod test_stmt_rvalue;
 mod test_string_metadata_rebind;
+mod test_vec_append_transfer;
+mod test_vec_buffer_coherence;
+mod test_vec_buffer_shared_handles;
+mod test_vec_empty_pointer;
+mod test_vec_primitive_store;
+mod test_vec_primitive_store_routes;
+mod test_vec_shadow_memory_authority;
+mod test_vec_type_identity;
+mod test_wrapper_identity;
 // `Rvalue::Reborrow` exists only in Trust MIR.
 mod test_boxed_callable_constants;
 #[cfg(trust_toolchain)]
