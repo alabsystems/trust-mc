@@ -30,6 +30,7 @@ REQUIRED_AUTHORITY_FIELDS = frozenset(
         "ay_authority",
     }
 )
+OPTIONAL_AUTHORITY_FIELDS = frozenset({"ay_runtime_default"})
 
 
 class DriverAttestationError(ValueError):
@@ -70,7 +71,7 @@ def parse_authority_output(output: str) -> dict[str, str]:
         fields[key] = value
 
     missing = REQUIRED_AUTHORITY_FIELDS - fields.keys()
-    unknown = fields.keys() - REQUIRED_AUTHORITY_FIELDS
+    unknown = fields.keys() - REQUIRED_AUTHORITY_FIELDS - OPTIONAL_AUTHORITY_FIELDS
     if missing or unknown:
         details = []
         if missing:
@@ -80,6 +81,8 @@ def parse_authority_output(output: str) -> dict[str, str]:
         raise DriverAttestationError(
             "invalid driver authority fields: " + " ".join(details)
         )
+    if fields.get("ay_runtime_default", "path") not in {"bundled", "path"}:
+        raise DriverAttestationError("invalid driver AY runtime default")
     return fields
 
 

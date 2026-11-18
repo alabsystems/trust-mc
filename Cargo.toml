@@ -5,7 +5,7 @@
 
 [package]
 name = "trust-mc"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "A bit-precise model checker for Rust."
 readme = "README.md"
@@ -405,22 +405,22 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # 40-character ay revision for reproducible measurements; a floating
 # `branch = "main"` does not satisfy it. Cargo.lock intentionally records the
 # path-patched packages; this manifest rev records the exact upstream commit.
-ay-dpll = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
-ay-core = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
-ay-frontend = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
-ay-chc = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
-ay_bindings = { version = "0.28.2", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
+ay-dpll = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
+ay-core = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
+ay-frontend = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
+ay-chc = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
+ay_bindings = { version = "0.28.4", package = "ay-bindings", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
 # Trust: default-features = false drops ay's GMP-backed LRA path (`rug` +
 # `gmp-mpfr-sys`). trust-mc-driver links ay in-process; the pure-Rust
 # num_rational fallback is functionally identical and adds no native `-lgmp`
 # link, so the Trust rustc_driver link has no undefined `___gmpq_*` symbols.
-ay = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724", default-features = false }
-ay-sys = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
+ay = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9", default-features = false }
+ay-sys = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
 # Shared AY encoding/invocation surface — consumed from its canonical home in
 # the ay repo (NOT vendored). Because all ay-family deps above use the same
 # pinned rev, ay-encode's own ay-chc/ay-bindings/ay-core resolve to the same
 # rev — one shared copy of ChcProblem/VerifiedChcResult/etc.
-ay-encode = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
+ay-encode = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
 num-bigint = "0.4"
 
 # Common dependencies centralized for version consistency across workspace members.

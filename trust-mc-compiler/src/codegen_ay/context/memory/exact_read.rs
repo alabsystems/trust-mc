@@ -36,8 +36,10 @@ const MAX_VISITS: usize = 50_000;
 const MAX_DEPTH: usize = 64;
 /// Nesting depth one address resolution descends into a term.
 const ADDR_DEPTH: usize = 32;
-/// Conjuncts of an assumption a fold keeps.
+/// Implied terms an assumption contributes to a fold.
 const MAX_ASSUMED: usize = 256;
+/// Nodes visited when recovering common facts at control-flow joins.
+const MAX_ASSUMPTION_VISITS: usize = 1024;
 
 /// What codegen has asserted about addresses and the values stored at them.
 pub(in crate::codegen_ay) struct ByteMemoryFacts<'a> {
@@ -71,34 +73,88 @@ impl ByteMemoryFacts<'_> {
     }
 
     /// `fold` for a term used only where `assumption` holds. A conditional
-    /// whose condition is the assumption or one of its conjuncts takes its
-    /// first branch, and one whose condition is the negation of either takes
-    /// its second. SSA definitions made on a path are `ite(path, value, init)`,
-    /// so this is what resolves a value defined on the path a check is posed on.
+    /// whose condition is implied by the assumption takes its first branch,
+    /// and one whose negation is implied takes its second. Keep conjunction
+    /// facts and facts common to all arms of a disjunction. An asserted
+    /// `ite(path, value, init)` can then resolve beyond another join.
     /// The result equals `e` in every model of the facts where the assumption
     /// holds.
     #[must_use]
     pub(in crate::codegen_ay) fn fold_assuming(&self, e: &Expr, assumption: Option<&Expr>) -> Expr {
-        let mut assumed = Vec::new();
+        let mut implied = Vec::new();
         if let Some(assumption) = assumption {
-            conjuncts(assumption, &mut assumed);
+            let mut remaining = MAX_ASSUMPTION_VISITS;
+            implied_terms(assumption, &mut implied, MAX_DEPTH, &mut remaining);
         }
+        let assumed = implied
+            .iter()
+            .map(|fact| {
+                let (condition, positive) = boolean_polarity(fact);
+                (condition.clone(), positive)
+            })
+            .collect();
         let mut folder = Folder { facts: self, visits: 0, assumed };
+        if e.sort().is_bool()
+            && let Some(value) = folder.decided(e)
+        {
+            return Expr::bool_const(value);
+        }
         folder.term(e, MAX_DEPTH)
     }
 }
 
-/// `e` and, through nested conjunctions, every conjunct of it.
-fn conjuncts(e: &Expr, out: &mut Vec<Expr>) {
-    if out.len() >= MAX_ASSUMED {
+/// Collect terms forced true by `e`. At a disjunction, an implied term
+/// must appear in every arm's facts. Exhausting a bound drops facts only.
+fn implied_terms(e: &Expr, out: &mut Vec<Expr>, depth: usize, remaining: &mut usize) {
+    if out.len() >= MAX_ASSUMED || depth == 0 || *remaining == 0 {
         return;
     }
+    *remaining -= 1;
+    let depth = depth - 1;
     out.push(e.clone());
-    if let ExprValue::And(children) = e.value() {
-        for child in children {
-            conjuncts(child, out);
+    match e.value() {
+        ExprValue::And(children) => {
+            for child in children {
+                implied_terms(child, out, depth, remaining);
+                if out.len() >= MAX_ASSUMED || *remaining == 0 {
+                    break;
+                }
+            }
         }
+        ExprValue::Or(children) => {
+            let mut children = children.iter();
+            let Some(first) = children.next() else {
+                return;
+            };
+            let mut common = Vec::new();
+            implied_terms(first, &mut common, depth, remaining);
+            let mut arm = Vec::new();
+            for child in children {
+                if common.is_empty() {
+                    return;
+                }
+                arm.clear();
+                implied_terms(child, &mut arm, depth, remaining);
+                common.retain(|term| arm.contains(term));
+            }
+            out.extend(common.into_iter().take(MAX_ASSUMED - out.len()));
+        }
+        _ => {}
     }
+}
+
+/// Separate a condition from its leading negations. A bounded partial peel
+/// still preserves the exact parity of every operator it removes.
+fn boolean_polarity(mut condition: &Expr) -> (&Expr, bool) {
+    let mut positive = true;
+    for _ in 0..MAX_DEPTH {
+        let ExprValue::Not(inner) = condition.value() else {
+            break;
+        };
+        condition = inner;
+        positive = !positive;
+    }
+    (condition, positive)
 }
 
 /// An address as `base + offset`, wrapping at the pointer width; no base for a
@@ -126,8 +182,8 @@ enum ChainRead {
 struct Folder<'f, 'a> {
     facts: &'f ByteMemoryFacts<'a>,
     visits: usize,
-    /// Terms known to be true wherever the folded term is used.
-    assumed: Vec<Expr>,
+    /// Conditions and their truth values wherever the folded term is used.
+    assumed: Vec<(Expr, bool)>,
 }
 
 impl Folder<'_, '_> {
@@ -142,21 +198,13 @@ impl Folder<'_, '_> {
     /// The truth value of `cond`, when it is a constant or the assumption
     /// decides it.
     fn decided(&self, cond: &Expr) -> Option<bool> {
-        if let Some(value) = bool_value(cond) {
-            return Some(value);
+        let (condition, positive) = boolean_polarity(cond);
+        if let Some(value) = bool_value(condition) {
+            return Some(value == positive);
         }
-        if self.assumed.iter().any(|known| known == cond) {
-            return Some(true);
-        }
-        let negated_known = match cond.value() {
-            ExprValue::Not(inner) => self.assumed.iter().any(|known| known == inner),
-            _ => false,
-        };
-        let known_negated = self
-            .assumed
+        self.assumed
             .iter()
-            .any(|known| matches!(known.value(), ExprValue::Not(inner) if inner == cond));
-        (negated_known || known_negated).then_some(false)
+            .find_map(|(known, value)| (known == condition).then_some(*value == positive))
     }
 
     fn term(&mut self, e: &Expr, depth: usize) -> Expr {
@@ -201,6 +249,7 @@ impl Folder<'_, '_> {
             ExprValue::Or(children) => return self.junction(e, children, depth, false),
             ExprValue::BvAdd(left, right)
             | ExprValue::BvSub(left, right)
+            | ExprValue::BvMul(left, right)
             | ExprValue::BvAnd(left, right) => {
                 let left = self.term(left, depth);
                 let right = self.term(right, depth);
@@ -426,7 +475,7 @@ fn bits(e: &Expr) -> Option<(u128, u32)> {
     }
 }
 
-/// `e`, an addition, subtraction or bitwise and, over folded operands.
+/// A bitvector arithmetic operation over folded operands.
 fn arithmetic(e: &Expr, left: Expr, right: Expr) -> Expr {
     let width = e.sort().bitvec_width().unwrap_or(0);
     if let (Some((l, _)), Some((r, _))) = (bits(&left), bits(&right))
@@ -435,6 +484,7 @@ fn arithmetic(e: &Expr, left: Expr, right: Expr) -> Expr {
         let value = match e.value() {
             ExprValue::BvAdd(..) => l.wrapping_add(r),
             ExprValue::BvSub(..) => l.wrapping_sub(r),
+            ExprValue::BvMul(..) => l.wrapping_mul(r),
             _ => l & r,
         };
         return Expr::bitvec_const(low_bits(value, width), width);
@@ -444,6 +494,7 @@ fn arithmetic(e: &Expr, left: Expr, right: Expr) -> Expr {
         ExprValue::BvAnd(..) if zero(&left) || zero(&right) => Expr::bitvec_const(0u128, width),
         ExprValue::BvAdd(..) => left.bvadd(right),
         ExprValue::BvSub(..) => left.bvsub(right),
+        ExprValue::BvMul(..) => left.bvmul(right),
         _ => left.bvand(right),
     }
 }
@@ -791,6 +842,40 @@ mod tests {
         assert_eq!(facts.fold_assuming(&on_b, Some(&both)), byte(1));
         assert_eq!(facts.fold_assuming(&off_a, Some(&both)), byte(2));
         assert_eq!(facts.fold(&on_b), on_b);
+    }
+
+    #[test]
+    fn a_join_keeps_only_facts_implied_by_every_arm() {
+        let defs = HashMap::new();
+        let selected = Expr::var("selected", Sort::bool());
+        let previous_join = Expr::var("previous_join", Sort::bool());
+        let aligned = Expr::var("aligned", Sort::bool());
+        let condition = previous_join
+            .clone()
+            .and(selected.clone())
+            .or(previous_join.clone().and(selected.clone().not()))
+            .and(aligned);
+        let facts = facts(&defs, &[], 1);
+
+        let initialized = Expr::ite(previous_join, byte(1), byte(2));
+        let branch_value = Expr::ite(selected, byte(3), byte(4));
+        assert_eq!(facts.fold_assuming(&initialized, Some(&condition)), byte(1));
+        assert_eq!(facts.fold_assuming(&branch_value, Some(&condition)), branch_value);
+    }
+
+    #[test]
+    fn nested_negations_select_the_feasible_pointer_arm() {
+        let defs = HashMap::new();
+        let selected = Expr::var("selected", Sort::bool());
+        let condition = selected.clone().not().not();
+        let opposite = selected.clone().not().not().not();
+        let on_path = Expr::bool_const(true).and(opposite);
+        let facts = facts(&defs, &[], 1);
+        assert_eq!(facts.fold_assuming(&condition, Some(&on_path)), Expr::bool_const(false));
+        assert_eq!(facts.fold_assuming(&selected, Some(&on_path)), Expr::bool_const(false));
+        let joined = Expr::ite(condition, ptr(1), ptr(2));
+        let displacement = joined.bvmul(ptr(8));
+        assert_eq!(facts.fold_assuming(&displacement, Some(&on_path)), ptr(16));
     }
 
     #[test]

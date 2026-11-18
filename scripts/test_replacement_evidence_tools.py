@@ -554,6 +554,19 @@ class DriverBinaryAttestationTests(unittest.TestCase):
                     )
             self.assertEqual(driver_attestation.parse_authority_output(line), fields)
 
+    def test_driver_runtime_hint_is_optional_and_does_not_relax_authority_fields(self) -> None:
+        old = self.authority_line()
+        self.assertNotIn("ay_runtime_default", driver_attestation.parse_authority_output(old))
+        for mode in ("bundled", "path"):
+            fields = driver_attestation.parse_authority_output(
+                old.rstrip() + f" ay_runtime_default={mode}\n"
+            )
+            self.assertEqual(fields.pop("ay_runtime_default"), mode)
+            self.assertEqual(fields, driver_attestation.parse_authority_output(old))
+        for suffix in ("ay_runtime_default=unknown", "unknown_runtime=bundled"):
+            with self.assertRaises(driver_attestation.DriverAttestationError):
+                driver_attestation.parse_authority_output(old.rstrip() + f" {suffix}\n")
+
     def test_driver_authority_rejects_noise_dirty_and_wrong_commit(self) -> None:
         with self.assertRaises(driver_attestation.DriverAttestationError):
             driver_attestation.parse_authority_output(

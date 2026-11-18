@@ -75,48 +75,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
-    /// Codegen String operations (Part of #1312).
-    ///
-    /// String is modeled as a struct with (ptr, len, cap) fields.
-    /// Build a symbolic `String` of at most `bound` bytes.
-    ///
-    /// For `<String as BoundedArbitrary>::bounded_any::<N>()`. Modelling the
-    /// library's body faithfully would mean teaching codegen UTF-8 chunking;
-    /// modelling what the API PROMISES does not. A String built from N bytes
-    /// holds at most N bytes whatever the chunking does, because a valid UTF-8
-    /// prefix of an N-byte array cannot exceed N bytes.
-    ///
-    /// The contents stay unconstrained -- an over-approximation, and why this
-    /// is sound -- while the length gets the bound harnesses actually assert.
-    pub(in crate::codegen_ay::statement) fn codegen_bounded_string_value(
-        &mut self,
-        bound: u64,
-        destination: &Place,
-    ) {
-        let byte_array = Sort::array(ptr_sort(), bv8_sort());
-        let string_sort = struct_sort(RUST_STRING_SORT, names::vec_fields(byte_array.clone()));
-
-        let len_name = self.ctx.fresh_name("bounded_string_len");
-        let len = self.ctx.declare_var(&len_name, ptr_sort());
-        self.ctx.assert(len.clone().bvule(Expr::bitvec_const(u128::from(bound), POINTER_WIDTH)));
-
-        let data_name = self.ctx.fresh_name("bounded_string_data");
-        let data = self.ctx.declare_var(&data_name, byte_array);
-        let zero = Expr::bitvec_const(0u64, POINTER_WIDTH);
-
-        let string = Expr::datatype_constructor(
-            RUST_STRING_SORT,
-            RUST_STRING_CONS,
-            vec![zero.clone(), len, zero, data],
-            string_sort,
-        );
-        let base = self.ssa_base_name(destination);
-        let name = self.ssa_name_from_base(&base, true);
-        let var = self.ctx.declare_var(&name, string.sort().clone());
-        self.assert_ssa_def(var.clone(), string, &base);
-        self.env_update(std::sync::Arc::from(base), var);
-    }
-
+    /// Codegen authenticated native String operations (Part of #1312).
+    /// String uses a logical (ptr, len, cap, data) representation.
     pub(in crate::codegen_ay::statement) fn codegen_string_stub(
         &mut self,
         stub_kind: StubKind,
@@ -137,6 +97,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         match stub_kind {
             StringNew => {
+                let alignment = destination.ty(self.body.locals()).ok().and_then(|ty| {
+                    crate::codegen_ay::shared::string_identity::native_empty_string_alignment(
+                        self.ctx.tcx,
+                        ty,
+                    )
+                });
+                let Some(alignment) = alignment else {
+                    self.ctx.unsupported_with_fallback(
+                        "native_string_empty_pointer_layout",
+                        "native String Vec<u8> alignment unavailable",
+                    );
+                    return None;
+                };
+                let ptr = Expr::bitvec_const(alignment as u128, POINTER_WIDTH);
+                if self.ctx.config.extra_pointer_checks {
+                    self.ctx.heap_invalidate_no_provenance(ptr.clone());
+                }
                 // Part of #1632: Include fld_data array backing to match sort_inference.rs.
                 // Use a canonical empty String so repeated String::new() calls compare equal.
                 let byte_array = Sort::array(ptr_sort(), bv8_sort());
@@ -147,7 +124,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let string = Expr::datatype_constructor(
                     RUST_STRING_SORT,
                     RUST_STRING_CONS,
-                    vec![zero.clone(), zero.clone(), zero, data],
+                    vec![ptr, zero.clone(), zero, data],
                     string_sort,
                 );
                 self.assign_value_to_place(destination, string);
@@ -442,6 +419,17 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
 
             StringAsStr => {
+                if !crate::codegen_ay::shared::string_view::string_view_is_logical_only(
+                    self.ctx.tcx,
+                    self.body,
+                    destination,
+                ) && !self.native_empty_string_nullness_view(args, destination)
+                {
+                    self.ctx.unsupported_with_fallback(
+                        "native_string_view_physical_custody_unqualified",
+                        "String view escapes logical metadata use without physical custody",
+                    );
+                }
                 // String::as_str(&self) -> &str
                 // Returns a Slice view of the String's UTF-8 content (ptr, len, data).
                 // Follows the VecAsSlice pattern. Part of #3582.

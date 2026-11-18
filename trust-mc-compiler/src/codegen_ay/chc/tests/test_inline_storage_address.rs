@@ -13,6 +13,8 @@ use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{Body, ProjectionElem, StatementKind, TerminatorKind};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod shared_slice;
+
 const SOURCE: &str = r#"
 #![allow(dead_code, unused_assignments)]
 #[repr(C)] pub struct Pair { first: u64, second: u64 }
@@ -640,4 +642,369 @@ fn native_inline_storage_address_keeps_dead_owner_store_obligation() {
         retain_storage_artifact(&format!("{label}_checked_query"), "smt2", &smt);
         assert_z3_result_with_timeout(&smt, "sat", 30);
     });
+}
+
+// Keep the original raw-address controls byte-for-byte. These separate controls
+// must observe compiler-produced projected Ref rvalues; source spelling alone
+// is not evidence that the new production branch was exercised.
+mod projected_reference {
+    use super::*;
+    use rustc_public::mir::Rvalue;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn source() -> String {
+        let mut source = SOURCE.to_owned();
+        for (before, after) in [
+            (
+                "pub fn mutable_first(&mut self) -> *mut u64 { &raw mut self.first }",
+                "pub fn mutable_first(&mut self) -> *mut u64 { &mut self.first }",
+            ),
+            (
+                "pub fn shared_first(&self) -> *const u64 { &raw const self.first }",
+                "pub fn shared_first(&self) -> *const u64 { &self.first }",
+            ),
+            ("self.first = 42; &raw mut self.second", "self.first = 42; &mut self.second"),
+            (
+                "if self.first == 0 { &raw const self.first } else { &raw const self.second }",
+                "if self.first == 0 { &self.first } else { &self.second }",
+            ),
+            (
+                "pub fn mutable_second(&mut self) -> *mut u64 { &raw mut self.second }",
+                "pub fn mutable_second(&mut self) -> *mut u64 { let field = &mut self.second; let again = &mut *field; again }",
+            ),
+            (
+                "pub fn shared_second(&self) -> *const u64 { &raw const self.second }",
+                "pub fn shared_second(&self) -> *const u64 { let field = &self.second; let again = &*field; again }",
+            ),
+        ] {
+            assert_eq!(source.matches(before).count(), 1, "replace the exact getter fixture");
+            source = source.replace(before, after);
+        }
+        source.push_str(
+            r#"
+impl Pair {
+    #[inline(never)] pub fn raw_to_reference(&self) -> *const u64 {
+        let pointer = &raw const self.second; unsafe { &*pointer }
+    }
+    #[inline(never)] pub fn projected_type_pun(&self) -> *const u32 {
+        (&self.second as *const u64) as *const u32
+    }
+    #[inline(never)] pub fn projected_upgrade(&self) -> *mut u64 {
+        (&self.second as *const u64) as *mut u64
+    }
+}
+pub fn raw_reference_getter() -> *const u64 {
+    let value = Pair { first: 7, second: 1 }; value.raw_to_reference()
+}
+pub fn projected_type_pun_getter() -> *const u32 {
+    let value = Pair { first: 7, second: 1 }; value.projected_type_pun()
+}
+pub fn projected_upgrade_getter() -> *mut u64 {
+    let value = Pair { first: 7, second: 1 }; value.projected_upgrade()
+}
+"#,
+        );
+        source
+    }
+
+    fn with_context<F>(callback: F)
+    where
+        F: for<'tcx> FnOnce(crate::codegen_ay::context::AYCtx<'tcx, 'static>) + Send,
+    {
+        let completed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&completed);
+        with_storage_address_ctx(&source(), move |ctx| {
+            callback(ctx);
+            observed.store(true, Ordering::SeqCst);
+        });
+        assert!(completed.load(Ordering::SeqCst), "compiler callback must complete");
+    }
+
+    fn require_projected_reference(body: &Body) {
+        let mut projected = 0;
+        let mut converted = 0;
+        for statement in body.blocks.iter().flat_map(|block| &block.statements) {
+            let StatementKind::Assign(_, rhs) = &statement.kind else { continue };
+            match rhs {
+                Rvalue::Ref(_, _, place)
+                    if matches!(
+                        place.projection.as_slice(),
+                        [ProjectionElem::Deref, ProjectionElem::Field(..), ..]
+                    ) =>
+                {
+                    projected += 1;
+                }
+                Rvalue::AddressOf(_, place)
+                    if place.projection.as_slice() == [ProjectionElem::Deref]
+                        && matches!(
+                            body.locals()[place.local].ty.kind(),
+                            TyKind::RigidTy(RigidTy::Ref(..))
+                        ) =>
+                {
+                    converted += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(projected > 0, "actual projected Ref producer is required: {body:#?}");
+        assert!(converted > 0, "actual reference-to-raw address producer is required: {body:#?}");
+    }
+
+    #[test]
+    fn native_inline_storage_projected_reference_actual_mir_and_layout() {
+        with_context(|ctx| {
+            let body = find_instance_by_suffix(ctx.tcx, "address_evidence").body().unwrap();
+            retain_storage_body("projected_ref_address_evidence_native", &body);
+            let mut context = ChcCtx::new(ctx.tcx, &body, "projected_ref_addresses", mem_config());
+            context.declare_block_relations();
+            let mut owners = BTreeMap::<usize, (u32, BTreeSet<u32>)>::new();
+            let mut inspected = 0;
+            for bb in 0..body.blocks.len() {
+                let Some((instance, args)) = resolve_call(&body, bb) else { continue };
+                let path = instance.def.name();
+                let field = if path.ends_with("_first") {
+                    0
+                } else if path.ends_with("_second") {
+                    1
+                } else {
+                    continue;
+                };
+                let callee = instance.callee_body().expect("actual projected getter MIR");
+                require_projected_reference(&callee);
+                retain_storage_body(&format!("projected_ref_getter_{inspected}_native"), &callee);
+                install_call_liveness(&mut context, bb);
+                let (address, target) =
+                    context.inline_storage_address_for_test(&callee, args).unwrap_or_else(|| {
+                        panic!("typed projected reference must retain storage: {path}")
+                    });
+                assert!(matches!(target.projections.as_slice(),
+                    [ProjectionElem::Field(index, _)] if *index == field));
+                let (object, offset) =
+                    ChcCtx::try_extract_constant_addr(&address.into_expr()).unwrap();
+                let expected =
+                    context.get_field_offset(body.locals()[target.local].ty, field).unwrap();
+                assert_eq!(u64::from(offset), expected, "actual caller layout");
+                assert_eq!(context.heap_state.local_idx_for_obj_id(object), Some(target.local));
+                let owner = owners.entry(target.local).or_insert_with(|| (object, BTreeSet::new()));
+                assert_eq!(owner.0, object);
+                owner.1.insert(offset);
+                inspected += 1;
+            }
+            assert_eq!(inspected, 8, "both fields and capabilities of two equal-valued owners");
+            assert_eq!(owners.len(), 2);
+            assert_eq!(owners.values().map(|owner| owner.0).collect::<BTreeSet<_>>().len(), 2);
+            assert!(owners.values().all(|owner| owner.1 == BTreeSet::from([0, 8])));
+        });
+    }
+
+    #[test]
+    fn native_inline_storage_projected_reference_safe_bug_and_live_return() {
+        with_context(|ctx| {
+            for method in ["mutable_first", "shared_first", "mutable_second", "shared_second"] {
+                let getter = find_instance_by_suffix(ctx.tcx, method).callee_body().unwrap();
+                require_projected_reference(&getter);
+            }
+            let abstraction = StdAbstraction::resolve(ctx.tcx);
+            for depth in [0, 32] {
+                for name in ["store_second_preserves_first", "store_second_bug"] {
+                    let label = format!("projected_ref_{name}_d{depth}");
+                    let instance = find_instance_by_suffix(ctx.tcx, name);
+                    let original = instance.callee_body().unwrap();
+                    retain_storage_body(&format!("{label}_native"), &original);
+                    let (_, body) = FunctionInlinePass::new(InlineConfig {
+                        max_depth: depth,
+                        chc_native_box_drop: true,
+                        ..InlineConfig::default()
+                    })
+                    .transform_with_body_provider(
+                        ctx.tcx,
+                        original,
+                        instance,
+                        |callee| {
+                            if native_assertion_panic_boundary(ctx.tcx, callee)
+                                || abstraction.abstracts_public_instance(ctx.tcx, callee)
+                                || [
+                                    "mutable_first",
+                                    "shared_first",
+                                    "mutable_second",
+                                    "shared_second",
+                                ]
+                                .iter()
+                                .any(|method| callee.def.name().ends_with(method))
+                            {
+                                None
+                            } else {
+                                callee.callee_body()
+                            }
+                        },
+                    );
+                    retain_storage_body(&label, &body);
+                    let (vc, _, diagnostics) =
+                        ChcCtx::new(ctx.tcx, &body, label.as_str(), mem_config())
+                            .translate_with_diagnostics();
+                    let reasons = crate::codegen_ay::take_translation_drop_site_reasons_by_fn()
+                        .remove(&label)
+                        .unwrap_or_default();
+                    assert!(reasons.is_empty(), "{label}: {reasons:?}");
+                    assert_eq!(diagnostics.place_translation_drop.get(), 0, "{label}");
+                    assert_eq!(diagnostics.sound_havoc_drop.get(), 0, "{label}");
+                    assert_eq!(diagnostics.heap_check_untranslatable.get(), 0, "{label}");
+                    assert!(vc.approximation_identity_complete, "{label}");
+                    let assertions =
+                        retain_exact_native_assertions(ctx.tcx, &body, &vc, name, &label);
+                    if depth == 0 {
+                        let mut checked = vc.clone();
+                        let expected = if name.ends_with("bug") {
+                            checked.query = trust_mc_core::chc::ChcQuery::new()
+                                .with_target(assertions[0].clone());
+                            "sat"
+                        } else {
+                            "unsat"
+                        };
+                        let smt = crate::codegen_ay::emit_chc(&checked).to_string();
+                        retain_storage_artifact(&format!("{label}_checked_query"), "smt2", &smt);
+                        assert_z3_result_with_timeout(&smt, expected, 30);
+                        if !name.ends_with("bug") {
+                            let returns: Vec<_> = body
+                                .blocks
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(bb, block)| {
+                                    matches!(block.terminator.kind, TerminatorKind::Return)
+                                        .then_some(bb)
+                                })
+                                .collect();
+                            assert_eq!(returns.len(), 1, "actual normal return must remain");
+                            let relation = format!("{label}__bb{}", returns[0]);
+                            assert!(vc.relations.iter().any(|decl| decl.name.as_str() == relation));
+                            let returned = vc
+                                .rules
+                                .iter()
+                                .find(|rule| {
+                                    rule.head.name.as_str() == relation
+                                        && rule.body.relation.is_some()
+                                })
+                                .expect("actual transition into the return block")
+                                .head
+                                .clone();
+                            let live = format!("{label}_live_return");
+                            checked
+                                .relations
+                                .push(trust_mc_core::chc::RelationDecl::nullary(&live));
+                            checked.rules.push(trust_mc_core::chc::Rule::new(
+                                trust_mc_core::chc::RuleBody::new(Some(returned), Vec::new()),
+                                trust_mc_core::chc::RelationApp::nullary(&live),
+                            ));
+                            checked.query = trust_mc_core::chc::ChcQuery::new().with_target(live);
+                            let smt = crate::codegen_ay::emit_chc(&checked).to_string();
+                            retain_storage_artifact(&format!("{label}_live_return"), "smt2", &smt);
+                            assert_z3_result_with_timeout(&smt, "sat", 30);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_inline_storage_projected_reference_keeps_custody_refusals() {
+        with_context(|ctx| {
+            for (host, method) in [
+                ("retargeted_carrier", "mutable_second"),
+                ("exposed_carrier", "mutable_second"),
+                ("effectful_getter", "effectful"),
+                ("branching_getter", "branching"),
+                ("numeric_pointer_value", "numeric"),
+                ("expired_local_getter", "expired_local"),
+                ("raw_reference_getter", "raw_to_reference"),
+                ("projected_type_pun_getter", "projected_type_pun"),
+                ("projected_upgrade_getter", "projected_upgrade"),
+            ] {
+                let body = find_instance_by_suffix(ctx.tcx, host).body().unwrap();
+                let mut context = ChcCtx::new(ctx.tcx, &body, host, mem_config());
+                context.declare_block_relations();
+                let mut inspected = 0;
+                for bb in 0..body.blocks.len() {
+                    let Some((instance, args)) = resolve_call(&body, bb) else { continue };
+                    if !instance.def.name().ends_with(method) {
+                        continue;
+                    }
+                    install_call_liveness(&mut context, bb);
+                    assert!(
+                        context
+                            .inline_storage_address_for_test(&instance.callee_body().unwrap(), args)
+                            .is_none(),
+                        "{host}"
+                    );
+                    inspected += 1;
+                }
+                assert_eq!(inspected, 1, "actual refusal site: {host}");
+            }
+            for (host, method, expected) in [
+                ("retargeted_result", "mutable_second", 2),
+                ("exposed_result", "mutable_second", 1),
+                ("copied_exposed_result", "mutable_second", 1),
+                ("shared_capability_upgrade", "shared_second", 1),
+            ] {
+                let body = find_instance_by_suffix(ctx.tcx, host).body().unwrap();
+                let mut context = ChcCtx::new(ctx.tcx, &body, host, mem_config());
+                context.declare_block_relations();
+                let mut inspected = 0;
+                for bb in 0..body.blocks.len() {
+                    let Some((instance, _)) = resolve_call(&body, bb) else { continue };
+                    if !instance.def.name().ends_with(method) {
+                        continue;
+                    }
+                    let TerminatorKind::Call { destination, .. } = &body.blocks[bb].terminator.kind
+                    else {
+                        unreachable!()
+                    };
+                    assert!(
+                        !context.inline_storage_result_custody_for_test(destination.local),
+                        "{host}: retarget, escape or capability upgrade must remain refused"
+                    );
+                    inspected += 1;
+                }
+                assert_eq!(inspected, expected, "actual result refusal sites: {host}");
+            }
+            let body = find_instance_by_suffix(ctx.tcx, "dangling_field_store").body().unwrap();
+            let mut context = ChcCtx::new(ctx.tcx, &body, "projected_ref_dead_owner", mem_config());
+            context.declare_block_relations();
+            let getters: Vec<_> = (0..body.blocks.len())
+                .filter_map(|bb| {
+                    let (instance, args) = resolve_call(&body, bb)?;
+                    instance.def.name().ends_with("mutable_second").then_some((bb, instance, args))
+                })
+                .collect();
+            assert_eq!(getters.len(), 1);
+            let (bb, getter, args) = &getters[0];
+            let callee = getter.callee_body().unwrap();
+            require_projected_reference(&callee);
+            install_call_liveness(&mut context, *bb);
+            let (_, target) = context.inline_storage_address_for_test(&callee, args).unwrap();
+            let stores: Vec<_> = body
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(bb, block)| {
+                    block.statements.iter().enumerate().filter_map(move |(index, statement)| {
+                        matches!(&statement.kind, StatementKind::Assign(lhs, _)
+                        if lhs.projection.as_slice() == [ProjectionElem::Deref])
+                        .then_some((bb, index))
+                    })
+                })
+                .collect();
+            assert_eq!(stores.len(), 1, "actual dangling store must remain");
+            assert_eq!(body.blocks.iter().flat_map(|block| &block.statements).filter(|statement|
+                matches!(statement.kind, StatementKind::StorageDead(local) if local == target.local))
+                .count(), 1, "actual owner expiration must remain");
+            install_statement_liveness(&mut context, stores[0].0, stores[0].1);
+            assert_eq!(context.stack_local_is_live(target.local), Some(false));
+            assert!(
+                context.inline_storage_address_for_test(&callee, args).is_none(),
+                "an expired owner cannot acquire a new storage certificate"
+            );
+        });
+    }
 }

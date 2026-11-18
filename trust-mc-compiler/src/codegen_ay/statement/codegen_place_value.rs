@@ -167,6 +167,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         operand: &Operand,
     ) -> Option<(Expr, RefValueSource)> {
         debug!("get_value_through_ref: called with operand={:?}", operand);
+        self.guard_shared_scalar_slice_operand(operand);
+        let (value, source) = self.get_value_through_ref_source_inner(operand)?;
+        if matches!(source, RefValueSource::Value) {
+            self.guard_shared_scalar_operand_data_read(operand, &value);
+        }
+        Some((value, source))
+    }
+
+    fn get_value_through_ref_source_inner(
+        &mut self,
+        operand: &Operand,
+    ) -> Option<(Expr, RefValueSource)> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => {
                 // Build the reference base name using projection-aware ssa_base_name (#431).

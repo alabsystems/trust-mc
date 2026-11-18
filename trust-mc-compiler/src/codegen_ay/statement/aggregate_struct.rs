@@ -75,8 +75,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // Clone args before sort inference so field operands can be coerced to
         // the constructor field sorts below.
         let args_for_fields = args.clone();
-        // Part of #1632: Clone args only for Vec/RawVec element type extraction
-        let args_for_vec = if base_name == "Vec" { Some(args.clone()) } else { None };
+        // A name cannot select the native Vec aggregate or invent buffer data.
+        let native_vec = Self::is_native_vec_adt(def);
+        let args_for_vec = if native_vec { Some(args.clone()) } else { None };
         let sort = Self::infer_adt_sort(def, args)?;
 
         // #918, #926: BigInt/BigUint/Ratio types return Int sort - handle specially
@@ -112,10 +113,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         // Part of #1275, #1632: Vec/String/RawVec special handling.
-        if base_name == "Vec" && operands.len() == 2 {
+        if native_vec && operands.len() == 2 {
             return self.codegen_vec_aggregate(operands, args_for_vec.as_ref()?, sort);
         }
-        if base_name == "String" && operands.len() == 1 {
+        if Self::is_native_string_adt(def) && operands.len() == 1 {
             return self.codegen_string_aggregate(operands, sort);
         }
         if base_name == "RawVec" && operands.len() == 2 {

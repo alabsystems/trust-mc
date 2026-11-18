@@ -30,6 +30,8 @@ use rustc_public::ty::{RigidTy, Ty, TyKind};
 
 use super::super::{ChcCtx, RefTarget};
 
+mod native;
+
 /// The unsigned integer a constant operand holds, read through the
 /// constant-pointer rule (`shared/const_pointer.rs`): relocated bytes are
 /// never data, so a pointer constant is `None` and the caller fails closed.
@@ -81,6 +83,12 @@ const MAX_CHAIN: usize = 64;
 enum PointerDef<'a> {
     Rvalue(&'a Rvalue),
     Call { func: &'a Operand, args: &'a [Operand] },
+}
+
+#[derive(Clone, Copy)]
+enum OffsetCallAuthority {
+    Existing,
+    NativeCore,
 }
 
 /// How a pointer-arithmetic callee moves its first argument.
@@ -301,7 +309,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if m.1 == 0 {
                 continue;
             }
-            let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind else {
+            let TerminatorKind::Call { func, args, destination, .. } = &block.terminator.kind
+            else {
                 return false;
             };
             let in_args = args.iter().any(|a| {
@@ -335,7 +344,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             }
             Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
                 let arg_count = self.body.arg_locals().len();
-                if place.local == 0 || place.local <= arg_count {
+                if place.local == 0
+                    || place.local <= arg_count
+                    || self.integer_local_storage_is_addressed(place.local)
+                {
                     return None;
                 }
                 let value = match self.sole_pointer_definition(place.local, reachable)? {
@@ -506,7 +518,11 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         ptr_local: usize,
         ref_target: &RefTarget,
     ) -> Option<i128> {
-        let found = self.store_pointer_referent_byte_offset_walk(ptr_local, ref_target);
+        let found = self.store_pointer_referent_byte_offset_walk(
+            ptr_local,
+            ref_target,
+            OffsetCallAuthority::Existing,
+        );
         tracing::debug!(
             ptr_local,
             ?ref_target,
@@ -520,6 +536,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         &self,
         ptr_local: usize,
         ref_target: &RefTarget,
+        authority: OffsetCallAuthority,
     ) -> Option<i128> {
         let target_place =
             Place { local: ref_target.local, projection: ref_target.projections.clone() };
@@ -535,7 +552,15 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             if self.pointer_local_written_indirectly(cur) {
                 return None;
             }
-            let next_local = |op: &Operand| self.chain_operand_local(op, &reachable);
+            let next_local = |op: &Operand| match authority {
+                OffsetCallAuthority::Existing => self.chain_operand_local(op, &reachable),
+                OffsetCallAuthority::NativeCore => match op {
+                    Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+                        Some(place.local)
+                    }
+                    _ => None,
+                },
+            };
             match self.sole_pointer_definition(cur, &reachable)? {
                 PointerDef::Rvalue(rvalue) => match rvalue {
                     Rvalue::Use(op, ..) => cur = next_local(op)?,
@@ -568,7 +593,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 if rest.iter().all(|p| matches!(p, ProjectionElem::Field(..))) =>
                             {
                                 let n = ref_target.projections.len();
-                                if rest.len() > n || ref_target.projections[n - rest.len()..] != *rest {
+                                if rest.len() > n
+                                    || ref_target.projections[n - rest.len()..] != *rest
+                                {
                                     return None;
                                 }
                                 let prefix = RefTarget {
@@ -578,6 +605,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                                 return (self.store_pointer_referent_byte_offset_walk(
                                     place.local,
                                     &prefix,
+                                    authority,
                                 ) == Some(0))
                                 .then_some(offset);
                             }
@@ -602,8 +630,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     _ => return None,
                 },
                 PointerDef::Call { func, args } => {
-                    let path = self.resolve_callee_path(func)?;
-                    let kind = classify_offset_callee(&path)?;
+                    let kind = match authority {
+                        OffsetCallAuthority::Existing => {
+                            classify_offset_callee(&self.resolve_callee_path(func)?)?
+                        }
+                        OffsetCallAuthority::NativeCore => self.native_offset_callee(func)?,
+                    };
                     let first = args.first()?;
                     let step = match kind {
                         OffsetCallee::Identity => 0,
@@ -755,8 +787,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     let first = args.first()?;
                     let moved = match classify_offset_callee(&path)? {
                         OffsetCallee::Identity => Some(0),
-                        OffsetCallee::ElemsForward => step(first, args.get(1)?, Some(false), false)?,
-                        OffsetCallee::ElemsBackward => step(first, args.get(1)?, Some(false), true)?,
+                        OffsetCallee::ElemsForward => {
+                            step(first, args.get(1)?, Some(false), false)?
+                        }
+                        OffsetCallee::ElemsBackward => {
+                            step(first, args.get(1)?, Some(false), true)?
+                        }
                         OffsetCallee::ElemsSigned => step(first, args.get(1)?, Some(true), false)?,
                         OffsetCallee::IntrinsicOffset => step(first, args.get(1)?, None, false)?,
                         OffsetCallee::BytesForward
@@ -869,9 +905,7 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                     if !path.ends_with("::addr") {
                         return false;
                     }
-                    return args
-                        .first()
-                        .and_then(|arg| self.copied_pointer_root(arg, &reachable))
+                    return args.first().and_then(|arg| self.copied_pointer_root(arg, &reachable))
                         == Some(root);
                 }
                 _ => return false,

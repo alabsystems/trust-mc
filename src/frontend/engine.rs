@@ -9,6 +9,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::OnceLock;
 use std::{env, fs};
 
 use super::{BUILD_CMD, COMPILER, DRIVER, EXIT_NOT_READY, Fail, Front, VERSION};
@@ -19,6 +20,7 @@ pub(crate) struct Engine {
     pub(crate) sysroot: PathBuf,
     pub(crate) driver: PathBuf,
     pub(crate) source: &'static str,
+    authority: OnceLock<Result<Authority, String>>,
 }
 
 impl Engine {
@@ -125,7 +127,12 @@ pub(crate) fn resolve_engine() -> Option<Engine> {
     for candidate in candidates() {
         if candidate.found() {
             let driver = candidate.driver()?;
-            return Some(Engine { sysroot: candidate.sysroot?, driver, source: candidate.source });
+            return Some(Engine {
+                sysroot: candidate.sysroot?,
+                driver,
+                source: candidate.source,
+                authority: OnceLock::new(),
+            });
         }
     }
     None
@@ -174,15 +181,48 @@ pub(crate) fn solver_override() -> Option<PathBuf> {
 }
 
 /// The `ay` solver binary the engine will pick: `$TRUST_MC_AY_BIN` when set
-/// (and nothing else, even when it is unusable), otherwise first in the
-/// sysroot's `bin`, then on `PATH` — the same order the engine sees after
-/// [`exec_engine`] prepends `<sysroot>/bin`.
+/// (and nothing else, even when unusable), otherwise the release engine's
+/// private helper, or development `bin`/PATH. The engine reports its default
+/// through its existing authority probe; the probe is cached per invocation.
 pub(crate) fn solver_path(engine: Option<&Engine>) -> Option<PathBuf> {
     if let Some(path) = solver_override() {
         return is_executable(&path).then_some(path);
     }
+    if let Some(engine) = engine
+        && bundled_solver_required(Some(engine))
+    {
+        return private_solver_path(&engine.driver);
+    }
     let extra = engine.map(|e| vec![e.sysroot.join("bin")]).unwrap_or_default();
     find_on_path("ay", &extra)
+}
+
+pub(crate) fn bundled_solver_required(engine: Option<&Engine>) -> bool {
+    engine
+        .and_then(|e| engine_authority(e).ok())
+        .is_some_and(|a| a.ay_runtime_default.as_deref() == Some("bundled"))
+}
+
+/// Mirror the release driver's private-file boundary before doctor executes a
+/// version probe. Resolve relative to the actual driver, including a PATH link.
+fn private_solver_path(driver: &Path) -> Option<PathBuf> {
+    let driver = driver.canonicalize().ok()?;
+    let bin = driver.parent().filter(|p| p.file_name().is_some_and(|n| n == "bin"))?;
+    let directory = bin.parent()?.join("libexec");
+    let metadata = fs::symlink_metadata(&directory).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let helper = directory.join("ay");
+    let metadata = fs::symlink_metadata(&helper).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || !is_executable(&helper)
+        || helper.canonicalize().ok()? != helper
+    {
+        return None;
+    }
+    Some(helper)
 }
 
 /// The root manifest of the workspace this front door was built in.
@@ -350,8 +390,9 @@ pub(crate) fn drive_as(
         )));
     }
 
+    let solver = needs_solver.then(|| solver_path(Some(&engine))).flatten();
     if needs_solver
-        && solver_path(Some(&engine)).is_none()
+        && solver.is_none()
         && let Some(path) = solver_override()
     {
         return Err(Fail::not_ready(format!(
@@ -363,7 +404,14 @@ pub(crate) fn drive_as(
         )));
     }
 
-    if needs_solver && solver_path(Some(&engine)).is_none() {
+    if needs_solver && solver.is_none() && bundled_solver_required(Some(&engine)) {
+        return Err(Fail::not_ready(
+            "error: this engine's private libexec/ay is unavailable\n       \
+             Reinstall the complete trust-mc bundle. No PATH fallback is allowed.\n"
+                .to_string(),
+        ));
+    }
+    if needs_solver && solver.is_none() {
         return Err(Fail::not_ready(format!(
             "error: the `ay` SMT solver is not on PATH\n\n\
              trust-mc discharges bounded (BMC) proof obligations by running `ay`, and the\n\
@@ -540,27 +588,40 @@ pub(crate) fn capture_either(program: &Path, args: &[&str]) -> Result<String, St
     if out.status.success() { Ok(text) } else { Err(text) }
 }
 
-/// `trust-mc-driver --version` → e.g. `trust-mc 0.2.0`.
-pub(crate) fn engine_version(engine: &Engine) -> Option<String> {
-    capture(&engine.driver, &["--version"]).map(|s| s.trim().to_string())
+/// The driver reports its own package version. Older drivers can answer
+/// `--version` even when they cannot provide authority metadata.
+pub(crate) fn engine_version(engine: &Engine, authority: Option<&Authority>) -> Option<String> {
+    if let Some(version) = authority.and_then(|a| a.version.as_deref()) {
+        return Some(format!("trust-mc {version}"));
+    }
+    let output = capture(&engine.driver, &["--version"])?;
+    output.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_owned)
 }
 
 /// What `--version-authority` tells us about the linked AY build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Authority {
+    pub(crate) version: Option<String>,
     pub(crate) trust_mc_sha: String,
     pub(crate) trust_mc_dirty: bool,
     pub(crate) ay_version: String,
     pub(crate) ay_pin: String,
     pub(crate) ay_linked_sha: String,
-    pub(crate) matched: bool,
+    pub(crate) linked_at_pin: bool,
+    pub(crate) ay_runtime_default: Option<String>,
 }
 
 /// `trust-mc-driver --version-authority`. The engine fails closed (non-zero)
 /// when the linked AY is dirty or off-pin; the error text is returned as-is.
 pub(crate) fn engine_authority(engine: &Engine) -> Result<Authority, String> {
-    let line = capture_either(&engine.driver, &["--version-authority"])?;
-    parse_authority(&line).ok_or_else(|| format!("unexpected --version-authority output: {line}"))
+    engine
+        .authority
+        .get_or_init(|| {
+            let line = capture_either(&engine.driver, &["--version-authority"])?;
+            parse_authority(&line)
+                .ok_or_else(|| format!("unexpected --version-authority output: {line}"))
+        })
+        .clone()
 }
 
 /// Parse the single `trust_mc-version-authority key=value ...` line.
@@ -571,13 +632,22 @@ pub(crate) fn parse_authority(line: &str) -> Option<Authority> {
             .find_map(|kv| kv.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
             .map(str::to_string)
     };
+    let ay_runtime_default = field("ay_runtime_default");
+    if ay_runtime_default.as_deref().is_some_and(|mode| !matches!(mode, "bundled" | "path")) {
+        return None;
+    }
+    let ay_pin = field("ay_pin")?;
+    let ay_linked_sha = field("ay_linked_sha")?;
+    let linked_at_pin = ay_linked_sha == ay_pin;
     Some(Authority {
+        version: field("version").filter(|version| !version.is_empty()),
         trust_mc_sha: field("trust_mc_sha")?,
         trust_mc_dirty: field("trust_mc_dirty").as_deref() == Some("1"),
         ay_version: field("ay_version")?,
-        ay_pin: field("ay_pin")?,
-        ay_linked_sha: field("ay_linked_sha")?,
-        matched: field("ay_authority").as_deref() == Some("matched"),
+        ay_pin,
+        ay_linked_sha,
+        linked_at_pin,
+        ay_runtime_default,
     })
 }
 
@@ -679,12 +749,65 @@ mod tests {
                     ay_linked_sha=5bd74669349190eae57027c91c0430b4980046ac ay_linked_dirty=0 \
                     ay_authority=matched";
         let a = parse_authority(line).unwrap();
+        assert_eq!(a.version.as_deref(), Some("0.2.0"));
         assert_eq!(a.ay_version, "0.13.0");
         assert_eq!(a.ay_pin, "5bd74669349190eae57027c91c0430b4980046ac");
         assert_eq!(a.ay_linked_sha, a.ay_pin);
-        assert!(a.matched);
+        assert!(a.linked_at_pin);
         assert!(a.trust_mc_dirty);
+        assert_eq!(a.ay_runtime_default, None, "older driver output remains supported");
+        assert_eq!(
+            parse_authority(&format!("{line} ay_runtime_default=bundled"))
+                .unwrap()
+                .ay_runtime_default
+                .as_deref(),
+            Some("bundled")
+        );
+        assert!(parse_authority(&format!("{line} ay_runtime_default=unknown")).is_none());
         assert!(parse_authority("error: linked AY build is dirty").is_none());
+        let bundled = line.replace("ay_authority=matched", "ay_authority=contains-pin");
+        assert!(parse_authority(&bundled).unwrap().linked_at_pin);
+        let descendant = bundled.replace(
+            "ay_linked_sha=5bd74669349190eae57027c91c0430b4980046ac",
+            "ay_linked_sha=fcdc0472e27fd131167fd7508d428af9a9c6c69f",
+        );
+        assert!(!parse_authority(&descendant).unwrap().linked_at_pin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_private_solver_follows_the_actual_driver_and_refuses_escaped_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let unique =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root =
+            env::temp_dir().join(format!("trust-mc-private-ay-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let bundle = root.join("bundle");
+        fs::create_dir_all(bundle.join("bin")).unwrap();
+        fs::create_dir(bundle.join("libexec")).unwrap();
+        let driver = bundle.join("bin/trust-mc-driver");
+        fs::write(&driver, []).unwrap();
+        let helper = bundle.join("libexec/ay");
+        fs::write(&helper, []).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let driver_link = root.join("driver-link");
+        symlink(&driver, &driver_link).unwrap();
+        // The global PATH is irrelevant to a valid private helper.
+        assert_eq!(private_solver_path(&driver_link), Some(helper.clone()));
+        fs::remove_file(&helper).unwrap();
+        assert_eq!(private_solver_path(&driver_link), None);
+        let outside = root.join("outside-ay");
+        fs::write(&outside, []).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, &helper).unwrap();
+        assert_eq!(private_solver_path(&driver_link), None);
+        fs::remove_file(&helper).unwrap();
+        fs::remove_dir(bundle.join("libexec")).unwrap();
+        symlink(&root, bundle.join("libexec")).unwrap();
+        assert_eq!(private_solver_path(&driver_link), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

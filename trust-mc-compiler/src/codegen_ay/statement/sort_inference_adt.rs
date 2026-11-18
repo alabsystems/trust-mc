@@ -23,6 +23,25 @@ use rustc_public::ty::{AdtDef, AdtKind, GenericArgKind, GenericArgs};
 use super::StatementCodegen;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    pub(super) fn is_native_string_adt(def: AdtDef) -> bool {
+        rustc_middle::ty::tls::with(|tcx| {
+            crate::codegen_ay::shared::string_identity::is_native_string_adt(tcx, def)
+        })
+    }
+
+    /// Only the compiler's actual alloc definition owns the Vec header/buffer
+    /// representation. Imports and aliases preserve that definition; a foreign
+    /// ADT with the same spelling keeps its own declared fields.
+    pub(super) fn is_native_vec_adt(def: AdtDef) -> bool {
+        rustc_middle::ty::tls::with(|tcx| {
+            crate::kani_middle::std_abstraction::is_sysroot_alloc_definition_at(
+                tcx,
+                rustc_public::rustc_internal::internal(tcx, def.def_id()),
+                &["vec", "Vec"],
+            )
+        })
+    }
+
     /// Handle well-known ADT types from `infer_sort_from_ty`'s ADT branch.
     ///
     /// Returns `Some(sort)` if the ADT is a recognized well-known type,
@@ -183,17 +202,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return Self::into_iter_sort(def, args);
         }
 
-        // Part of #1275, #1835: Vec<T>
-        if adt_name == "Vec"
-            || adt_name == "std::vec::Vec"
-            || adt_name == "alloc::vec::Vec"
-            || adt_name.ends_with("::Vec")
-        {
+        // Part of #1275, #1835: the actual Vec<T> definition.
+        if Self::is_native_vec_adt(def) {
             return Some(Self::vec_sort_from_args(args));
         }
 
         // Part of #1275: String
-        if adt_name == "String" || adt_name == "std::string::String" {
+        if Self::is_native_string_adt(def) {
             return Some(Self::string_sort());
         }
 

@@ -14,10 +14,10 @@ description = "trust_ir Module consumption for trust-mc BMC verification"
 trust-mc-core = { path = "../trust-mc-core" }
 ay_bindings.workspace = true
 thiserror.workspace = true
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe" }
 serde_json = { workspace = true, optional = true }
 # One canonical complete module validator for every direct BMC input.
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f" }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe" }
 
 [features]
 # The direct-call-summary census CLI (`call-summary-census`). Opt-in so the
@@ -42,7 +42,7 @@ ay_bindings = { workspace = true, features = ["direct"] }
 # Load a REAL `-Ztrust-dump=native-bundle` module (produced by trustc from Rust
 # source through the trust-ir-bridge) so the interior-pointer store tests run on
 # the production lowering path, not only on hand-built IR.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["serde", "binary"] }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["serde", "binary"] }
 serde_json.workspace = true
 
 [lints]

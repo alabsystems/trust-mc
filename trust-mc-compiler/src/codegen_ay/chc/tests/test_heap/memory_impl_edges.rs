@@ -55,16 +55,20 @@ fn test_sort_from_type_key_std_vec_defaults_to_bv32_elem() {
 }
 
 #[test]
-fn test_sort_from_type_key_string_layout() {
-    let expected = struct_sort(
-        RUST_STRING_SORT,
-        [
-            ("fld_ptr", Sort::bitvec(POINTER_WIDTH)),
-            ("fld_len", Sort::bitvec(POINTER_WIDTH)),
-            ("fld_cap", Sort::bitvec(POINTER_WIDTH)),
-        ],
-    );
-    assert_eq!(ChcCtx::sort_from_type_key("std_string_String"), expected);
+fn test_sort_from_type_key_string_spelling_has_no_layout_authority() {
+    let opaque = ChcCtx::unknown_type_key_fallback_sort();
+    for (key, expected) in [
+        ("String", opaque.clone()),
+        ("StringSpoof", opaque.clone()),
+        ("std_string_String", opaque),
+        // The pre-existing foreign_ namespace denotes an opaque extern
+        // address. It still grants no native String fields or layout.
+        ("foreign_std_string_String", Sort::bitvec(POINTER_WIDTH)),
+    ] {
+        let actual = ChcCtx::sort_from_type_key(key);
+        assert_eq!(actual, expected, "{key}");
+        assert_ne!(actual.datatype_name(), Some(crate::codegen_ay::names::RUST_STRING_SORT));
+    }
 }
 
 #[test]

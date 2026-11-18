@@ -6,7 +6,6 @@
 #![allow(clippy::unwrap_used)]
 
 use super::common::*;
-use crate::codegen_ay::names::RUST_STRING_SORT;
 
 mod address_and_naming;
 mod alloc_preconditions_and_regions;

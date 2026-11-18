@@ -34,6 +34,112 @@
 schema = "trust-mc.soundness-dual-manifest/v1"
 
 [[entry]]
+path = "shared_scalar_slice_address_dual.rs"
+kind = "dual"
+flags = []
+lanes = ["bmc"]
+oracle = "A shared one-element slice of the second field keeps that field's address and value."
+
+[[entry.harness]]
+name = "one_element_alias_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_wrong_address_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "one_element_dead_owner_after_widening_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "one_element_dead_owner_before_widening_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "one_element_conditional_raw_owner_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "one_element_conditional_raw_live_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_reference_alias_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_reference_dead_owner_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "one_element_current_bytes_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_pointer_only_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_stale_after_raw_write_refusal"
+expected = "NOT_SUCCESSFUL"
+
+[[entry.harness]]
+name = "one_element_conditional_raw_end_bug"
+expected = "FAILED"
+property = "memory-safety"
+
+[[entry.harness]]
+name = "one_element_conditional_raw_prefix_field_safe"
+expected = "SUCCESSFUL"
+
+[[entry]]
+path = "projected_reference_index_dual.rs"
+kind = "dual"
+flags = []
+lanes = ["bmc"]
+oracle = "Forward array indices select their own byte offsets through a typed reference."
+
+[[entry.harness]]
+name = "correct_indexed_address_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "wrong_indexed_address_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry.harness]]
+name = "different_indices_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "different_indices_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry]]
+path = "projected_reference_address_dual.rs"
+kind = "dual"
+flags = []
+lanes = ["bmc"]
+oracle = "The second field of two consecutive repr(C) u64 fields has its own nonzero offset."
+
+[[entry.harness]]
+name = "correct_address_safe"
+expected = "SUCCESSFUL"
+
+[[entry.harness]]
+name = "wrong_address_bug"
+expected = "FAILED"
+property = "assertion"
+
+[[entry]]
 path = "alloc_id_offset_dual.rs"
 kind = "dual"
 flags = []

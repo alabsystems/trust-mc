@@ -330,6 +330,15 @@ impl<'tcx, 'body> CallString for ChcCtx<'tcx, 'body> {
                 );
             }
             StubKind::StringAsStr => {
+                if !crate::codegen_ay::shared::string_view::string_view_is_logical_only(
+                    self.tcx,
+                    self.body,
+                    &rustc_public::mir::Place { local: dest_local, projection: Vec::new() },
+                ) {
+                    self.record_sound_fallback_reason(
+                        "native_string_view_physical_custody_unqualified",
+                    );
+                }
                 self.codegen_string_as_str(
                     dest_local,
                     collection_local,

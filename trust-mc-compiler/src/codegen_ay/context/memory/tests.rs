@@ -275,6 +275,32 @@ fn test_load_symbolic_memory_value_roundtrips_non_bitvec_store() {
 }
 
 #[test]
+fn test_load_materialized_memory_bytes_requires_typed_store_completion() {
+    with_test_ay_ctx(|mut ctx| {
+        ctx.init_memory();
+        let addr = Expr::bitvec_const(7u128, POINTER_WIDTH);
+        let value = Expr::bitvec_const(0x0102030405060708u64, 64);
+        ctx.track_symbolic_store(addr.clone(), Expr::int_const(123));
+        ctx.store_memory_bytes(addr.clone(), value.clone());
+        assert!(ctx.load_materialized_memory_bytes(addr.clone(), 8).is_none());
+
+        ctx.mark_symbolic_store_byte_image(addr.clone());
+        let current = ctx.load_materialized_memory_bytes(addr.clone(), 8).unwrap();
+        let defs = std::collections::HashMap::new();
+        assert_eq!(ctx.byte_memory_facts(&defs).fold(&current), value);
+
+        let on_path = ctx.declare_var("opaque_store_condition", Sort::bool());
+        ctx.store_memory_symbolic_on_path(addr.clone(), Expr::int_const(55), on_path);
+        assert!(ctx.load_materialized_memory_bytes(addr.clone(), 8).is_none());
+
+        ctx.store_memory_bytes(addr.clone(), Expr::bitvec_const(3u64, 64));
+        ctx.mark_symbolic_store_byte_image(addr.clone());
+        ctx.store_memory_bytes(addr.clone(), Expr::int_const(56));
+        assert!(ctx.load_materialized_memory_bytes(addr, 8).is_none());
+    });
+}
+
+#[test]
 fn test_load_memory_bytes_panics_after_symbolic_store_same_addr() {
     with_test_ay_ctx(|mut ctx| {
         ctx.init_memory();

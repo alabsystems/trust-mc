@@ -214,7 +214,9 @@ impl<'tcx, 'body> CodegenTypesAdt<'tcx, 'body> for ChcCtx<'tcx, 'body> {
         }
 
         // #1166: String type
-        if name == "String" || name == "std::string::String" {
+        if rustc_middle::ty::tls::with(|tcx| {
+            crate::codegen_ay::shared::string_identity::is_native_string_adt(tcx, def)
+        }) {
             debug!(adt_name = ?name, "String -> Datatype sort (ptr, len, cap)");
             return Some(struct_sort(names::RUST_STRING_SORT, names::string_fields()));
         }

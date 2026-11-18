@@ -209,6 +209,16 @@ impl BodyTransformation {
         }
     }
 
+    /// Populate the real transformer map for classification-only native tests.
+    /// This does not install the independent CHC thread-local walker scope or
+    /// run transformation passes; callers must not claim transformed bodies.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests_with_stubs(
+        stubs: crate::kani_middle::codegen_units::Stubs,
+    ) -> Self {
+        Self { stubs, ..Self::new_for_tests() }
+    }
+
     /// Re-key the loop-removing passes on the bound of the harness about to
     /// be translated (`harness_declared_unwind`), and drop every body
     /// transformed under the previous one.

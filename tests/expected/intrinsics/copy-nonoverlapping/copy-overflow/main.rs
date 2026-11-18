@@ -1,5 +1,6 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// compile-flags: -A unstable_imports
 //! Checks that `copy_nonoverlapping` triggers an overflow failure if the `count`
 //! argument can overflow a `usize`
 #![feature(core_intrinsics)]

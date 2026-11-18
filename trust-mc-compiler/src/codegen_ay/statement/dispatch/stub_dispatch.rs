@@ -29,6 +29,77 @@ use crate::codegen_ay::stubs::StubKind;
 use crate::codegen_ay::types::POINTER_WIDTH;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
+    /// Authenticate the registry candidate before a query handler can use it.
+    /// Later family-specific checks still run in the dispatcher below.
+    fn stdlib_registry_candidate(&self, func: &Operand, callee_path: &str) -> Option<StubKind> {
+        let stub_kind = self.stub_registry.lookup(callee_path)?;
+        if stub_kind == StubKind::RawVecPtr && !self.native_rawvec_ptr_call(func) {
+            return None;
+        }
+        if crate::codegen_ay::shared::string_identity::is_string_stub(stub_kind)
+            && (self.ctx.unit_has_stubs()
+                || !crate::codegen_ay::shared::string_identity::string_stub_is_authorized(
+                    self.ctx.tcx,
+                    func,
+                    self.body.locals(),
+                    stub_kind,
+                ))
+        {
+            return None;
+        }
+        if crate::codegen_ay::shared::callee_is_local_item(func, self.body.locals()) {
+            debug!(?stub_kind, %callee_path, "a local item named like a std stub: not a stub");
+            return None;
+        }
+        // BMC's replacements live on its attached transformer, independently
+        // of the CHC TLS read by the shared predicate. A replacement anywhere
+        // in this unit can change a query transitively. Scope this veto to the
+        // six query categories; other families keep their existing routing.
+        if matches!(
+            stub_kind,
+            StubKind::VecLen
+                | StubKind::VecCapacity
+                | StubKind::VecIsEmpty
+                | StubKind::VecAsPtr
+                | StubKind::VecAsMutPtr
+                | StubKind::VecAsSlice
+        ) && self.ctx.unit_has_stubs()
+        {
+            return None;
+        }
+        crate::codegen_ay::shared::vec_query_identity::vec_query_stub_is_authorized(
+            self.ctx.tcx,
+            func,
+            self.body.locals(),
+            stub_kind,
+        )
+        .then_some(stub_kind)
+    }
+
+    /// Classification-only access to the production BMC decision. This does
+    /// not encode a call, establish layout custody or run a solver.
+    #[cfg(all(test, feature = "compiler-corpus-tests"))]
+    pub(in crate::codegen_ay) fn test_stdlib_registry_candidate(
+        &self,
+        func: &Operand,
+    ) -> Option<StubKind> {
+        self.stdlib_registry_candidate(func, &self.resolve_callee_path(func)?)
+    }
+
+    #[cfg(all(test, feature = "compiler-corpus-tests"))]
+    pub(in crate::codegen_ay) fn test_string_dispatch_misses(
+        &mut self,
+        func: &Operand,
+        args: &[Operand],
+        destination: &Place,
+        target: Option<BasicBlockIdx>,
+    ) -> bool {
+        matches!(
+            self.try_codegen_stdlib_stub_call(func, args, destination, target),
+            CallDispatchOutcome::Miss
+        )
+    }
+
     /// Try to codegen a stdlib call via semantic stub registry.
     ///
     // INVARIANT for every arm below: a handler's `None` means "I could not encode
@@ -51,9 +122,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> CallDispatchOutcome {
+        if target.is_some() && self.native_empty_string_nullness_as_ptr(func, args, destination) {
+            return CallDispatchOutcome::from_nested_target_for_call(Some(target), target);
+        }
+        // Typed headers grant neither an unqualified pointer nor child writeback.
+        if crate::codegen_ay::native_string_unmodeled_operation(
+            self.ctx.tcx,
+            func,
+            self.body.locals(),
+            !self.ctx.unit_has_stubs(),
+        ) {
+            self.ctx.unsupported_with_fallback(
+                "native_string_unmodeled_operation",
+                "actual inherent String operation lacks native custody",
+            );
+            self.codegen_symbolic_result(destination);
+            return CallDispatchOutcome::from_nested_target_for_call(Some(target), target);
+        }
         let Some(callee_path) = self.resolve_callee_path(func) else {
             return CallDispatchOutcome::Miss;
         };
+
+        if target.is_some()
+            && callee_path.ends_with("::from_ref")
+            && self.try_codegen_shared_scalar_slice(func, args, destination).is_some()
+        {
+            return CallDispatchOutcome::from_nested_target_for_call(Some(target), target);
+        }
 
         if target.is_none() && bmc_is_no_return_panic_helper(&callee_path) {
             // These shims take the panic message as a leading `&str` (e.g.
@@ -69,14 +164,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.try_codegen_btree_internal_precheck(func, &callee_path, args, destination, target)
         {
             return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
-        }
-
-        // `<String as BoundedArbitrary>::bounded_any::<N>` — model the bound the
-        // API promises instead of the UTF-8 chunking the library goes through.
-        if let Some(result) =
-            self.try_codegen_bounded_string_precheck(func, &callee_path, destination, target)
-        {
-            return CallDispatchOutcome::from_fallthrough_result(result);
         }
 
         // Pre-check for Cow<str>::to_string() which has path that doesn't contain "Cow" (Part of #1738)
@@ -95,15 +182,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return CallDispatchOutcome::from_nested_target_for_call(Some(result), target);
         }
 
-        let Some(stub_kind) = self.stub_registry.lookup(&callee_path) else {
+        let Some(stub_kind) = self.stdlib_registry_candidate(func, &callee_path) else {
             return CallDispatchOutcome::Miss;
         };
-        // The registry matches path text; a callee of the local crate is the
-        // user's code, never std's item (`shared::callee_is_local_item`).
-        if crate::codegen_ay::shared::callee_is_local_item(func, self.body.locals()) {
-            debug!(?stub_kind, %callee_path, "a local item named like a std stub: not a stub");
-            return CallDispatchOutcome::Miss;
-        }
         // `Iterator::sum` is matched by NAME; only core's numeric `Sum` impls
         // are a fold the element-wise unroll encodes (a user `Sum`,
         // `Duration` or `Option<T>` is left to the ordinary call path). The

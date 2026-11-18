@@ -77,19 +77,21 @@ pub(crate) fn version_command(rest: &[OsString]) -> Front<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!("target:  {TARGET}");
-    match resolve_engine() {
+    let engine = resolve_engine();
+    match engine.as_ref() {
         None => println!("engine:  not installed (run `trust-mc doctor`)"),
         Some(engine) => {
             println!("engine:  {} ({})", engine.driver.display(), engine.source);
-            if let Some(version) = engine_version(&engine) {
+            let authority = engine_authority(engine);
+            if let Some(version) = engine_version(engine, authority.as_ref().ok()) {
                 println!("         {version}");
             }
-            match engine_authority(&engine) {
+            match authority {
                 Ok(a) => println!(
                     "         linked AY {} @ {}{} (pinned {}{})",
                     a.ay_version,
                     short(&a.ay_linked_sha),
-                    if a.matched { "" } else { " [NOT the pinned commit]" },
+                    if a.linked_at_pin { "" } else { " [NOT the pinned commit]" },
                     short(&a.ay_pin),
                     if a.trust_mc_dirty { "; engine built from a dirty tree" } else { "" }
                 ),
@@ -97,10 +99,13 @@ pub(crate) fn version_command(rest: &[OsString]) -> Front<ExitCode> {
             }
         }
     }
-    match solver_path(resolve_engine().as_ref()) {
+    match solver_path(engine.as_ref()) {
         None => match solver_override() {
             Some(path) => {
                 println!("solver:  ${AY_BIN_ENV}={} is not an executable file", path.display())
+            }
+            None if engine::bundled_solver_required(engine.as_ref()) => {
+                println!("solver:  private libexec/ay unavailable; reinstall the trust-mc bundle")
             }
             None => println!("solver:  `ay` not on PATH"),
         },
@@ -110,8 +115,9 @@ pub(crate) fn version_command(rest: &[OsString]) -> Front<ExitCode> {
             if let Some(line) = &version {
                 println!("         {line}");
             }
-            let pin = resolve_engine()
-                .and_then(|engine| engine_authority(&engine).ok())
+            let pin = engine
+                .as_ref()
+                .and_then(|engine| engine_authority(engine).ok())
                 .map(|authority| authority.ay_pin)
                 .or_else(declared_ay_pin);
             if let Some(pin) = pin {
@@ -134,6 +140,7 @@ struct Report {
     ready: bool,
     fixes: Vec<String>,
     warnings: Vec<String>,
+    engine: Option<Engine>,
 }
 
 /// Examine the installation. Every check names the path it inspects; `verbose`
@@ -174,7 +181,7 @@ fn examine(verbose: bool) -> Report {
              ...or install a release bundle:\n    trust-mc setup"
         ));
         finish_solver(&mut out, None, None, &mut ready, &mut fixes, &mut warnings, verbose);
-        return finish(out, ready, fixes, warnings);
+        return finish(out, ready, fixes, warnings, None);
     };
     line(&mut out, format!("  using: {} ({})", engine.driver.display(), engine.source));
 
@@ -189,25 +196,14 @@ fn examine(verbose: bool) -> Report {
     }
 
     if verbose {
+        line(&mut out, format!("      $ {} --version-authority", engine.driver.display()));
+    }
+    let authority = engine_authority(&engine);
+    if verbose && authority.as_ref().ok().and_then(|a| a.version.as_ref()).is_none() {
         line(&mut out, format!("      $ {} --version", engine.driver.display()));
     }
-    match engine_version(&engine) {
-        Some(v) => {
-            let expected = format!("trust-mc {VERSION}");
-            if v.ends_with(&format!(" {VERSION}")) {
-                line(&mut out, format!("  [x] engine reports: {v}"));
-            } else {
-                line(
-                    &mut out,
-                    format!("  [!] engine reports: {v} (this front door is {expected})"),
-                );
-                warnings.push(format!(
-                    "engine and front door versions differ ({v} vs {expected}); one of them is a\n  \
-                     stale build. Rebuild the engine ({BUILD_CMD})\n  \
-                     or reinstall the front door (targo --unverified install --path .)."
-                ));
-            }
-        }
+    match engine_version(&engine, authority.as_ref().ok()) {
+        Some(v) => line(&mut out, format!("  [x] engine reports: {v}")),
         None => {
             ready = false;
             line(&mut out, "  [ ] engine does not answer --version".to_string());
@@ -215,10 +211,7 @@ fn examine(verbose: bool) -> Report {
         }
     }
 
-    if verbose {
-        line(&mut out, format!("      $ {} --version-authority", engine.driver.display()));
-    }
-    let authority = match engine_authority(&engine) {
+    let authority = match authority {
         Ok(a) => {
             line(
                 &mut out,
@@ -226,7 +219,7 @@ fn examine(verbose: bool) -> Report {
                     "  [x] linked AY {} @ {} ({}{})",
                     a.ay_version,
                     short(&a.ay_linked_sha),
-                    if a.matched { "the pinned commit" } else { "NOT the pinned commit" },
+                    if a.linked_at_pin { "the pinned commit" } else { "NOT the pinned commit" },
                     if a.trust_mc_dirty { ", engine built from a dirty tree" } else { "" }
                 ),
             );
@@ -305,7 +298,7 @@ fn examine(verbose: bool) -> Report {
         &mut warnings,
         verbose,
     );
-    finish(out, ready, fixes, warnings)
+    finish(out, ready, fixes, warnings, Some(engine))
 }
 
 fn finish_solver(
@@ -354,6 +347,12 @@ fn finish_solver(
                          `ay` from PATH:\n    unset {AY_BIN_ENV}"
                     ));
                 }
+                None if engine::bundled_solver_required(engine) => {
+                    out.push_str("  [ ] private libexec/ay unavailable; no PATH fallback\n");
+                    fixes.push(
+                        "reinstall the complete trust-mc bundle with its private AY helper".into(),
+                    );
+                }
                 None => {
                     out.push_str("  [ ] ay  not on PATH\n");
                     fixes.push(format!("put the solver on PATH:\n    {}", solver_hint()));
@@ -363,6 +362,8 @@ fn finish_solver(
         Some(ay) => {
             let origin = if override_path.is_some() {
                 format!("from ${AY_BIN_ENV}")
+            } else if engine::bundled_solver_required(engine) {
+                "from this engine's private libexec/ay".into()
             } else {
                 "on PATH".into()
             };
@@ -405,7 +406,13 @@ fn finish_solver(
     out.push('\n');
 }
 
-fn finish(mut out: String, ready: bool, fixes: Vec<String>, warnings: Vec<String>) -> Report {
+fn finish(
+    mut out: String,
+    ready: bool,
+    fixes: Vec<String>,
+    warnings: Vec<String>,
+    engine: Option<Engine>,
+) -> Report {
     for w in &warnings {
         out.push_str(&format!("warning: {w}\n\n"));
     }
@@ -417,7 +424,7 @@ fn finish(mut out: String, ready: bool, fixes: Vec<String>, warnings: Vec<String
             out.push_str(&format!("  {fix}\n\n"));
         }
     }
-    Report { text: out, ready, fixes, warnings }
+    Report { text: out, ready, fixes, warnings, engine }
 }
 
 impl Report {
@@ -430,8 +437,8 @@ impl Report {
     /// formatting change away from lying, and the exit code is what a script
     /// actually gates on.
     fn to_json(&self) -> String {
-        let engine = resolve_engine();
-        let solver = solver_path(engine.as_ref());
+        let engine = self.engine.as_ref();
+        let solver = solver_path(engine);
         let mut s = String::from("{\n");
         let _ = writeln!(s, "  \"ready\": {},", self.ready);
         let _ = writeln!(s, "  \"exit_code\": {},", if self.ready { 0 } else { EXIT_NOT_READY });
@@ -439,7 +446,8 @@ impl Report {
         let _ = writeln!(s, "  \"target\": {},", json_string(TARGET));
         match &engine {
             Some(e) => {
-                let _ = writeln!(s, "  \"engine\": {},", json_string(&e.driver.display().to_string()));
+                let _ =
+                    writeln!(s, "  \"engine\": {},", json_string(&e.driver.display().to_string()));
                 let _ = writeln!(s, "  \"engine_source\": {},", json_string(e.source));
             }
             None => {

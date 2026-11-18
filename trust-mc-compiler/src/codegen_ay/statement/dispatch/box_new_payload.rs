@@ -246,8 +246,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             return false;
         };
         let word_bytes = (POINTER_WIDTH / 8) as usize;
-        let words: Vec<(&str, usize)> = match def.trimmed_name().as_str() {
-            "RawVec" => {
+        // Reexports can change the displayed name. Only the actual native
+        // definition authorizes its flattened physical header layout.
+        let words: Vec<(&str, usize)> = match () {
+            _ if Self::is_native_rawvec_adt(*def) => {
                 if LayoutOf::new(ty).size_of() != Some(2 * word_bytes) {
                     return false;
                 }
@@ -257,7 +259,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 };
                 vec![("fld_ptr", ptr_off), ("fld_cap", cap_off)]
             }
-            "Vec" => {
+            _ if Self::is_native_vec_adt(*def) => {
                 let Some((ptr_off, cap_off, len_off)) =
                     Self::vec_ptr_cap_len_offsets(ty, def, adt_args)
                 else {
@@ -265,7 +267,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 };
                 vec![("fld_ptr", ptr_off), ("fld_cap", cap_off), ("fld_len", len_off)]
             }
-            "String" => {
+            _ if Self::is_native_string_adt(*def) => {
                 if LayoutOf::new(ty).size_of() != Some(3 * word_bytes) {
                     return false;
                 }
@@ -361,6 +363,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         def: &AdtDef,
         adt_args: &GenericArgs,
     ) -> Option<(usize, usize, usize)> {
+        if !Self::is_native_vec_adt(*def) {
+            return None;
+        }
         let word_bytes = (POINTER_WIDTH / 8) as usize;
         if LayoutOf::new(ty).size_of() != Some(3 * word_bytes) {
             return None;

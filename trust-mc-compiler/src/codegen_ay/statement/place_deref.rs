@@ -17,6 +17,7 @@ use crate::rustc_compat::prelude::*;
 use crate::codegen_ay::ptr_repr::PtrRepr;
 use crate::codegen_ay::types::{CtorFieldExt, POINTER_WIDTH};
 use ay_bindings::SortInner;
+use rustc_public::ty::Ty;
 use tracing::debug;
 
 impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
@@ -248,6 +249,24 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// The byte displacement and final type of a field-only raw projection.
+    /// Use the same layout for the physical load and its allocation check.
+    pub(super) fn raw_field_projection_layout(
+        pointee: Ty,
+        projections: &[ProjectionElem],
+    ) -> Option<(usize, Ty)> {
+        let mut offset = 0usize;
+        let mut ty = pointee;
+        for projection in projections {
+            let ProjectionElem::Field(index, field_ty) = projection else {
+                return None;
+            };
+            offset = offset.checked_add(LayoutOf::new(ty).field_offset(*index)?)?;
+            ty = *field_ty;
+        }
+        Some((offset, ty))
+    }
+
     /// Emit null pointer and alignment checks for raw pointer dereferences.
     ///
     /// When a place contains a Deref projection on a raw pointer (*const T or *mut T),
@@ -256,7 +275,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// 2. An alignment check (violation if ptr % align != 0, when alignment > 1)
     /// 3. A heap-allocation validity check (violation if `heap_is_allocated(ptr, size)` is false)
     ///
-    /// Regular references (&T, &mut T) are not checked as Rust guarantees their validity.
+    /// Modeled singleton slice reads also check their original stack owner.
     ///
     /// REQUIRES: place.projection contains at least one Deref to be effective
     /// ENSURES: For each RawPtr Deref in place.projection, adds null_pointer_check violation
@@ -276,6 +295,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let Some(ptr_ty) = ptr_place.ty(self.body.locals()).into_option() else {
                 continue;
             };
+            self.guard_shared_scalar_slice_place(&ptr_place, ptr_ty);
             let TyKind::RigidTy(RigidTy::RawPtr(pointee_ty, _)) = ptr_ty.kind() else {
                 continue;
             };
@@ -311,6 +331,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 Some(loc) => (loc.as_expr().clone(), POINTER_WIDTH),
                 None => (ptr_expr.clone(), ptr_width),
             };
+            let after_deref = &place.projection[deref_idx + 1..];
+            let next_deref = after_deref
+                .iter()
+                .position(|projection| matches!(projection, ProjectionElem::Deref))
+                .unwrap_or(after_deref.len());
+            let access = Self::raw_field_projection_layout(pointee_ty, &after_deref[..next_deref])
+                .and_then(|(offset, leaf)| Some((offset, LayoutOf::new(leaf).size_of()?)));
+            if !Self::is_wide_pointer_ty(ptr_ty) {
+                self.guard_shared_scalar_raw_address(&checked, access);
+            }
             let zero = Expr::bitvec_const(0, checked_width);
 
             // Record null pointer dereference violation if pointer is zero.
@@ -331,10 +361,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             // only remaining `None` means there is no address to ask the heap
             // model about — a representable reason, unlike a width coincidence.
             if let Some(addr) = deref_addr {
-                let size_bytes = LayoutOf::new(pointee_ty).size_of();
+                let mut addr_expr = addr.into_expr();
+                let size_bytes = if let Some((offset, bytes)) = access {
+                    if offset != 0 {
+                        addr_expr =
+                            addr_expr.bvadd(Expr::bitvec_const(offset as u128, POINTER_WIDTH));
+                    }
+                    Some(bytes)
+                } else {
+                    LayoutOf::new(pointee_ty).size_of()
+                };
                 let access_size =
                     size_bytes.map(|size| Expr::bitvec_const(size as u128, POINTER_WIDTH));
-                let addr_expr = addr.into_expr();
 
                 // The accessed range must lie inside the object, which
                 // `heap_is_allocated` below cannot decide: it compares 1 MiB

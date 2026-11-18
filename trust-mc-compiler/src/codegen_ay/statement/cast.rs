@@ -55,6 +55,22 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         operand: &Operand,
         target_ty: rustc_public::ty::Ty,
     ) -> Option<Expr> {
+        if let Ok(source_ty) = operand.ty(self.body.locals())
+            && source_ty != target_ty
+            && !matches!(kind, super::CastKind::Subtype)
+            && (crate::codegen_ay::shared::string_identity::type_contains_native_string(
+                self.ctx.tcx,
+                source_ty,
+            ) || crate::codegen_ay::shared::string_identity::type_contains_native_string(
+                self.ctx.tcx,
+                target_ty,
+            ))
+        {
+            self.ctx.unsupported_with_fallback(
+                "native_string_header_physical_custody_unqualified",
+                "native String physical cast/transport",
+            );
+        }
         let value = self.codegen_cast_with_kind_inner(kind, operand, target_ty)?;
         self.box_cast_transport(operand, target_ty, value)
     }

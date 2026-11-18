@@ -109,6 +109,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Returns Some(expr) with expr.sort() matching place type
     /// ENSURES: Returns None if place cannot be translated (unsupported projection)
     pub(super) fn codegen_place(&mut self, place: &Place) -> Option<Expr> {
+        let value = self.codegen_place_inner(place)?;
+        self.guard_shared_scalar_place_data_read(place, &value);
+        Some(value)
+    }
+
+    fn codegen_place_inner(&mut self, place: &Place) -> Option<Expr> {
         // #408: For ZST types, return a canonical value immediately.
         // Fieldless structs are encoded as Bool in BMC sort inference, so they
         // must use a Bool sentinel here rather than the generic Unit datatype.
@@ -137,6 +143,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         self.emit_raw_ptr_deref_checks(place);
+
+        if let Some(value) = self.native_vec_field_place(place) {
+            return value;
+        }
 
         // #1210: Handle Box<T> field access where Deref is not first projection.
         // For Box<T>, MIR generates: (*((b.0).0)).field

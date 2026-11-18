@@ -131,7 +131,21 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
     arg_operands: &[Operand],
     caller_locals: &[LocalDecl],
 ) -> Option<Expr> {
+    if crate::codegen_ay::native_string_unmodeled_operation(ctx.tcx, func, caller_locals, true) {
+        ctx.record_sound_fallback_reason("native_string_unmodeled_operation");
+        return None;
+    }
     let first_arg = arg_operands.first();
+    if let Some(stub) = ctx.stub_registry.lookup(callee_path)
+        && !crate::codegen_ay::shared::string_identity::string_stub_is_authorized(
+            ctx.tcx,
+            func,
+            caller_locals,
+            stub,
+        )
+    {
+        return None;
+    }
     // The comparison fast paths below compare encodings. A comparison whose
     // `==` or order is not its encodings' (a float, a reference or a
     // hand-written `PartialEq` in it; `codegen_call_cmp_semantic.rs`) is
@@ -277,9 +291,19 @@ pub(in crate::codegen_ay) fn inline_known_call_expr_for_callee_path<'tcx, 'body>
         return Some(expr);
     }
 
-    // Use path-based stub lookup so this works for nested bodies (closures,
-    // inlined functions) where `func` cannot be resolved against ctx.body.
-    match ctx.stub_registry.lookup(callee_path)? {
+    // The supplied path chooses a candidate for nested bodies. Authenticate
+    // the actual operand against that body's locals before granting a Vec
+    // query model, including foreign trait methods on a real Vec receiver.
+    let stub = ctx.stub_registry.lookup(callee_path)?;
+    if !crate::codegen_ay::shared::vec_query_identity::vec_query_stub_is_authorized(
+        ctx.tcx,
+        func,
+        caller_locals,
+        stub,
+    ) {
+        return None;
+    }
+    match stub {
         StubKind::VecLen => inline_vec_len_expr(translated_args),
         // Part of #4057: VecIsEmpty inline fast-path for closure-body Vec accessors.
         StubKind::VecIsEmpty => inline_vec_is_empty_expr(translated_args),

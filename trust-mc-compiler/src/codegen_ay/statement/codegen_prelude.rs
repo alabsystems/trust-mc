@@ -201,10 +201,13 @@ pub(in crate::codegen_ay) struct StatementCodegen<'a, 'tcx, 't> {
     /// Index of the basic block currently being translated. Set by
     /// `initialize_block_entry_env`, which every block traversal (the function
     /// walk in `codegen_function` and the mini-inliner's DAG walk) calls before
-    /// the block's statements and terminator. Only the unwinding-assertion
-    /// sentinel lookup reads it; a stale value can therefore never do worse than
-    /// leave the pre-existing `unreachable` label in place.
+    /// the block's statements and terminator. The unwinding sentinel and the
+    /// closed empty-String nullness consumer read it. That consumer also binds
+    /// the exact actual call destination and source path before granting a model.
     pub(super) current_bb: usize,
+    /// Immutable body eligibility only; both nullness consumers share this one
+    /// bounded walk. Current owner/reference and replacement checks stay live.
+    pub(super) empty_string_nullness_plans: std::sync::OnceLock<Vec<super::string_nullness::Plan>>,
     /// While a write through a derived name is carried up into its root
     /// (`try_propagate_deref_write_to_parent_datatype`), that derived name:
     /// the root's new value is built from it, so it and the entries above it
@@ -306,6 +309,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             bridge_enum_read: None,
             unwind_assert_blocks: super::unwind_sentinel::unwind_assert_sentinel_blocks(body),
             current_bb: 0,
+            empty_string_nullness_plans: std::sync::OnceLock::new(),
             derived_write_source: None,
             may_continue_blocks: None,
             const_pointee_objects: std::collections::HashMap::new(),

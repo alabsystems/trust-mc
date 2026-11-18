@@ -75,6 +75,8 @@ mod datatype;
 mod datatype_deref_write;
 mod dispatch;
 mod foreign_frame;
+mod native_vec_field;
+mod shared_scalar_slice;
 // NOTE: INTERNAL_WORKAROUND_COUNT is available via dispatch module for telemetry
 // within this crate. Not re-exported to avoid unused import warnings.
 mod collections;
@@ -114,12 +116,14 @@ mod sort_inference;
 mod sort_inference_adt;
 mod ssa;
 mod stack_lifetime;
+mod string_nullness;
 mod terminator;
 #[cfg(all(test, feature = "compiler-corpus-tests"))]
 mod tests;
 mod unwind_sentinel;
 
 // Re-export StatementCodegen from codegen_prelude for crate-level access.
+pub(in crate::codegen_ay) use codegen_assign_slice_cast::ExactSharedScalarSliceModel;
 pub(in crate::codegen_ay) use codegen_prelude::StatementCodegen;
 pub(in crate::codegen_ay) use codegen_prelude::{AdapterStage, AdapterStageKind, BmcModifiesFrame};
 pub(in crate::codegen_ay) use ref_pointee_table::{MergedAlternative, PointeeLookup, RefPointees};

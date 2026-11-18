@@ -1,0 +1,107 @@
+{
+  "status": "UNCOMPILED/UNRUN fixture plan; not registered and no acceptance credit",
+  "controls": [
+    {
+      "harness": "external_len_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_len_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_capacity_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_capacity_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_empty_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_empty_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_pointer_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_pointer_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_mut_pointer_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_mut_pointer_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_slice_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_slice_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "real_reexport_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "real_reexport_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_trait_on_real_vec_safe",
+      "expected": "PROOF",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    },
+    {
+      "harness": "external_trait_on_real_vec_bug",
+      "expected": "CTREX",
+      "status": "UNCOMPILED/UNRUN",
+      "scope": "actual project dependency, both CHC and BMC lanes required; source expected result only"
+    }
+  ],
+  "files": {
+    "fixture/Cargo.toml": "dd68b8927330d04456f88cf6c1b38a99dc4f57bd3656f4d62a47e34468588149",
+    "fixture/lookalike/Cargo.toml": "e1ca6542e021e9a85604a545fdde9fa9e8ba0cdfd0cfbe0f1953bb9b91c47a00",
+    "fixture/lookalike/src/lib.rs": "5a11a19c28e6b9fe489f8eaa695b8679640c6ac670fdcfa9befd97bcab490b5a",
+    "fixture/src/lib.rs": "006b385fdaaa506b62464385e26cb653be5f1d88f9fc311b98d3b8bf34a22056"
+  }
+}

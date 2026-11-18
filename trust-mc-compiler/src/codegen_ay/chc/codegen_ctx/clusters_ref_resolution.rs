@@ -274,6 +274,10 @@ pub(in crate::codegen_ay::chc) struct RefResolution {
     /// derivation.
     pub(in crate::codegen_ay::chc) untranslated_transition_blocks: HashSet<usize>,
 
+    /// Host call blocks whose emitted result has a uniquely held, typed stack
+    /// field address. The Vec buffer prescan can exclude these exact producers.
+    pub(in crate::codegen_ay::chc) inline_stack_address_calls: HashSet<usize>,
+
     /// Memory array initializations needed for promoted constant references.
     /// Each entry: (type_key, elem_sort, value_expr, promoted_obj_id, byte_offset).
     /// Different promoted constants must use distinct object IDs so their typed
@@ -508,6 +512,7 @@ impl RefResolution {
             kept_payload_value_facts: HashMap::new(),
             index_value_ref_dests: HashSet::new(),
             untranslated_transition_blocks: HashSet::new(),
+            inline_stack_address_calls: HashSet::new(),
             const_ref_memory_inits: Vec::new(),
             const_ref_objects: HashMap::new(),
             const_memory_provenance: HashMap::new(),

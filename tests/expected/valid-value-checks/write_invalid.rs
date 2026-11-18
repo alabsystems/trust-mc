@@ -1,5 +1,6 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// compile-flags: -A unstable_imports
 // kani-flags: -Z valid-value-checks
 
 //! Check that Kani can identify UB after writing an invalid value.

@@ -551,6 +551,12 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         for (pointer, at, write, dead_checked) in self.raw_pointer_accesses() {
             let root = roots.entry(pointer).or_insert_with(|| self.buffer_root(&defs, pointer));
             let Some(root) = root.as_ref() else { continue };
+            // A spelling match can also find a foreign accessor. When its
+            // exact host call returned a typed stack field address, ordinary
+            // stack storage checks own the access and no Vec buffer is involved.
+            if self.ref_resolution.inline_stack_address_calls.contains(&root.call_block) {
+                continue;
+            }
             // An access the dead-target test fails on every path (the `Vec`'s
             // scope ended: it was dropped, then its storage died) is a certified
             // dangling access whatever value it reads; it needs no fail-close.

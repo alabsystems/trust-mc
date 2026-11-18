@@ -71,7 +71,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         self.ctx.track_symbolic_store(addr.clone(), value.clone());
         self.ctx.havoc_memory_range(addr.clone(), size as u64);
-        if !self.store_payload_bytes(ty, &value, &addr, 0) {
+        if self.store_payload_bytes(ty, &value, &addr, 0) {
+            self.ctx.mark_symbolic_store_byte_image(addr);
+        } else {
             self.ctx.bmc_sound_havoc("typed_store_bytes_undetermined");
         }
     }

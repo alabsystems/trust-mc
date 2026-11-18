@@ -111,11 +111,13 @@ mod sort_inference_adt;
 mod sort_stubs;
 mod ssa;
 mod stack_lifetime;
+mod string_type_identity;
 mod stub_dispatch_memory;
 mod stub_dispatch_option_result;
 mod stub_dispatch_simple;
 mod terminator;
 mod test_ssa_algorithm;
+mod vec_type_identity;
 
 /// Serializes access to BMC_ITERATOR_UNSOUND_SKIP_COUNT across tests.
 ///

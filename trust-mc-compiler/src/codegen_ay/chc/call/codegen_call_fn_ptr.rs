@@ -100,6 +100,13 @@ impl<'tcx, 'body> CallDispatchFnPtr for ChcCtx<'tcx, 'body> {
             );
             return false;
         }
+        if candidates.targets.iter().any(|(_, target)| {
+            matches!(&target.kind, crate::codegen_ay::fn_ptr_identity::FnPtrTargetKind::Item { instance, .. }
+                if crate::codegen_ay::native_string_unmodeled_operation_instance(self.tcx, *instance, true))
+        }) {
+            self.record_sound_fallback_reason("native_string_unmodeled_operation");
+            return false;
+        }
         let mut bodies = Vec::with_capacity(candidates.targets.len());
         for (id, fn_target) in &candidates.targets {
             let Some(body) = fn_target.target_body() else {
@@ -151,8 +158,8 @@ impl<'tcx, 'body> CallDispatchFnPtr for ChcCtx<'tcx, 'body> {
             return true;
         }
 
-        let Some(pointer) =
-            pointer.filter(|p| p.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH))
+        let Some(pointer) = pointer
+            .filter(|p| p.sort().bitvec_width() == Some(crate::codegen_ay::types::POINTER_WIDTH))
         else {
             return false;
         };
@@ -203,7 +210,10 @@ impl<'tcx, 'body> CallDispatchFnPtr for ChcCtx<'tcx, 'body> {
             // A candidate that cannot be walked could be the one called.
             self.heap_state.restore_transient_rule_state(&heap_snapshot);
             self.encode.modified_state_indices = modified_snapshot;
-            debug!(bb_idx = dcx.bb_idx, "fn_ptr: a candidate was not walked; unhandled-call fallback");
+            debug!(
+                bb_idx = dcx.bb_idx,
+                "fn_ptr: a candidate was not walked; unhandled-call fallback"
+            );
             return false;
         }
         let default = self.fn_ptr_obligation_default(&candidates);

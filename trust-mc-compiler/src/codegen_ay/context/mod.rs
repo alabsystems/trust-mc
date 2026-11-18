@@ -109,12 +109,9 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     var_map: HashMap<Arc<str>, Expr>,
     /// Array-based memory model expression.
     memory: Option<Expr>,
-    /// Addresses that received non-bitvec symbolic stores (Int, Array, Datatype).
-    ///
-    /// Maps coerced address → symbolic value expression for recovery on matching
-    /// non-bitvec raw-pointer loads and for fail-closed byte-load guards.
-    /// Part of #2599.
-    symbolic_memory_stores: HashMap<Expr, Expr>,
+    /// Whole values at coerced addresses and whether the typed store also
+    /// wrote a usable byte image for that object.
+    symbolic_memory_stores: HashMap<Expr, SymbolicMemoryStore>,
     /// Counter for generating unique names.
     name_counter: u64,
     /// Counter for generating unique assertion labels.
@@ -274,11 +271,27 @@ pub(in crate::codegen_ay) struct AYCtx<'tcx, 't> {
     pub(in crate::codegen_ay) alloc_roots: FxIndexMap<Arc<str>, (Expr, u128)>,
     /// Address symbols whose view changed on reuse: never a named allocation.
     pub(in crate::codegen_ay) alloc_views_poisoned: HashSet<String>,
-    /// Merge (phi) definitions `phi_var = ite(pred, v1, ite(..))`, keyed by the
-    /// phi variable. Read ONLY by the allocation resolver (alloc_view.rs): the
-    /// phi RHS is not cached in `ssa_concrete_values`, whose other readers
-    /// would change meaning on an `ite` root.
+    /// Asserted phi definitions for allocation tracking. Includes the guard
+    /// and pre-state arm when part of the equality. General value folding
+    /// continues to use its own `ssa_concrete_values` cache.
     pub(in crate::codegen_ay) alloc_phi_defs: HashMap<String, Expr>,
+    /// Original stack storage of each modeled `slice::from_ref` backing array.
+    /// The fresh array symbol follows the value through SSA copies and returns.
+    pub(in crate::codegen_ay) shared_scalar_slices: HashMap<String, SharedScalarSlice>,
+}
+
+struct SymbolicMemoryStore {
+    value: Expr,
+    has_byte_image: bool,
+}
+
+#[derive(Clone)]
+pub(in crate::codegen_ay) struct SharedScalarSlice {
+    pub(in crate::codegen_ay) owner: Arc<str>,
+    pub(in crate::codegen_ay) pointee: Arc<str>,
+    pub(in crate::codegen_ay) address: Expr,
+    pub(in crate::codegen_ay) backing: Expr,
+    pub(in crate::codegen_ay) scalar: Expr,
 }
 
 /// Where an address symbol sits inside the allocation it points into
@@ -386,6 +399,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
             alloc_roots: FxIndexMap::default(),
             alloc_views_poisoned: HashSet::new(),
             alloc_phi_defs: HashMap::new(),
+            shared_scalar_slices: HashMap::new(),
         }
     }
 
@@ -451,6 +465,13 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// body the unit runs; empty without a transformer (lightweight tests).
     pub(in crate::codegen_ay) fn unit_stub_map(&self) -> crate::kani_middle::codegen_units::Stubs {
         self.transformer.as_deref().map(|t| t.stub_map_for_walk()).unwrap_or_default()
+    }
+
+    /// Whether this context's actual transformer replaces any unit call.
+    /// BMC does not install the CHC walker's thread-local transformer scope.
+    /// Inspect the attached map in constant time, without cloning its entries.
+    pub(in crate::codegen_ay) fn unit_has_stubs(&self) -> bool {
+        self.transformer.as_deref().is_some_and(BodyTransformation::has_stubs)
     }
 
     pub(in crate::codegen_ay) fn record_chc_local_to_state_idx(
@@ -1024,8 +1045,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
 // Re-export test helpers for use by other test modules in the crate.
 #[cfg(test)]
 pub(in crate::codegen_ay) use testing::{
-    with_test_ay_ctx, with_test_ay_ctx_for_source, with_test_ay_ctx_for_source_with_edition,
-    with_test_ay_ctx_for_source_with_rustc_flags,
+    with_test_ay_ctx, with_test_ay_ctx_for_external_source, with_test_ay_ctx_for_source,
+    with_test_ay_ctx_for_source_with_edition, with_test_ay_ctx_for_source_with_rustc_flags,
 };
 
 #[cfg(test)]

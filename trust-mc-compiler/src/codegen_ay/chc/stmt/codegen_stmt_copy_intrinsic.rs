@@ -41,6 +41,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         acc: &mut StmtAccumulator<'_>,
         allow_overlap: bool,
     ) -> bool {
+        if self.try_encode_invalid_array_copy_span(copy) {
+            return true;
+        }
         // UB obligations (span bounds / alignment / overlap) are independent
         // of whether the value copy below can be modeled precisely — emit
         // them first so every early return still carries the checks.
@@ -565,6 +568,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
         if !count_is_one {
             return false;
+        }
+        if self.try_encode_invalid_array_copy_span(copy) {
+            return true;
         }
         let lane_falls_back = self.resolve_copy_destination(&copy.dst, acc.modified).is_none()
             || (self.resolve_copy_intrinsic_target(&copy.src).is_none()

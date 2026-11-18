@@ -93,7 +93,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         match inner_ty.kind() {
             TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Array(..)) => true,
-            TyKind::RigidTy(RigidTy::Adt(def, _)) => def.trimmed_name() == "Vec",
+            TyKind::RigidTy(RigidTy::Adt(def, _)) => Self::is_native_vec_adt(def),
             _ => false, // external enum: TyKind
         }
     }
@@ -338,6 +338,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             self.record_violation_guarded(oob, "bounds_check");
         }
 
+        if self.try_codegen_shared_scalar_slice_index_ref(slice_arg, &idx_coerced, destination) {
+            return target;
+        }
+
         // Part of #3392: save index expr before it's moved into select().
         let idx_for_propagation = idx_coerced.clone();
 
@@ -386,8 +390,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         self.get_datatype_field_sort(&slice_expr, "fld_buf").map(|s| ("fld_buf", s))
                     });
                 if let Some((fld_name, data_sort)) = backing {
-                    let data = slice_expr.field_select(dt_name, fld_name, data_sort);
-                    data.select(idx_coerced)
+                    let data = slice_expr.clone().field_select(dt_name, fld_name, data_sort);
+                    let value = data.select(idx_coerced);
+                    self.guard_shared_scalar_slice_data_read(&slice_expr, &value);
+                    value
                 } else {
                     // Fallback: Vec/String/Slice datatypes use "fld_ptr" field naming convention
                     let ptr_expr = slice_expr.field_select(dt_name, "fld_ptr", ptr_sort());
@@ -465,6 +471,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
 
         let elem_ty = self.slice_elem_ty_from_operand(slice_arg)?;
+
+        self.guard_shared_scalar_slice_get(slice_arg);
 
         // Index and length, both coerced to POINTER_WIDTH.
         let idx_expr = self.codegen_operand(index_arg)?;
@@ -962,8 +970,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 let dt = range_val.sort().datatype_sort()?;
                 let dt_name = dt.name.to_string();
                 let cons = dt.constructors.first()?;
-                let start_sort =
-                    cons.fields.iter().find(|f| &*f.name == "fld_start")?.sort.clone();
+                let start_sort = cons.fields.iter().find(|f| &*f.name == "fld_start")?.sort.clone();
                 Self::coerce_bv_to_pointer_width(range_val.field_select(
                     dt_name.as_str(),
                     "fld_start",
@@ -990,7 +997,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<u64> {
         let bound = self
             .const_bv_value_followed(len_expr)
-            .or_else(|| self.slice_len_expr(slice_arg).and_then(|l| self.const_bv_value_followed(&l)))
+            .or_else(|| {
+                self.slice_len_expr(slice_arg).and_then(|l| self.const_bv_value_followed(&l))
+            })
             .or_else(|| self.datatype_len_field_const(backing))?;
         (bound <= Self::MAX_SHIFTED_SUBSLICE_ELEMS).then_some(bound)
     }
@@ -1006,8 +1015,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     fn shifted_subslice_backing(&mut self, data: &Expr, start: &Expr, bound: u64) -> Expr {
         let name = self.ctx.fresh_name("ay_subslice_shifted");
         let shifted = self.ctx.declare_var(&name, data.sort().clone());
-        let index_width =
-            data.sort().array_sort().and_then(|a| a.index_sort.bitvec_width()).unwrap_or(POINTER_WIDTH);
+        let index_width = data
+            .sort()
+            .array_sort()
+            .and_then(|a| a.index_sort.bitvec_width())
+            .unwrap_or(POINTER_WIDTH);
         let start = match start.sort().bitvec_width() {
             Some(w) if w == index_width => start.clone(),
             Some(w) if w < index_width => start.clone().zero_extend(index_width - w),
@@ -1058,9 +1070,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     .wrapping_sub(self.const_bv_value_at(b, depth - 1)?),
             ),
             ExprValue::BvZeroExtend { expr, .. } => self.const_bv_value_at(expr, depth - 1),
-            ExprValue::BvExtract { expr, high, low } if *low == 0 && *high < 64 => self
-                .const_bv_value_at(expr, depth - 1)
-                .map(|v| v & ((1u64 << (high + 1)) - 1)),
+            ExprValue::BvExtract { expr, high, low } if *low == 0 && *high < 64 => {
+                self.const_bv_value_at(expr, depth - 1).map(|v| v & ((1u64 << (high + 1)) - 1))
+            }
             // ANY field selected off a constructor value: read that constructor
             // argument. Restricting this to `fld_len` was not enough — a
             // sub-slice's length is `fld_end - fld_start` of the Range value, so
@@ -1104,7 +1116,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
         let followed = self.follow_ssa(value, 64);
         match followed.value() {
-            ExprValue::DatatypeSelector { expr, selector_name, .. } if selector_name == "fld_len" => {
+            ExprValue::DatatypeSelector { expr, selector_name, .. }
+                if selector_name == "fld_len" =>
+            {
                 self.datatype_field_const_at(expr, "fld_len", depth - 1)
             }
             ExprValue::DatatypeSelector { .. } => None,
@@ -1191,9 +1205,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let dt_name = dt.name.to_string();
         let cons = dt.constructors.first()?;
         let start_sort = cons.fields.iter().find(|f| &*f.name == "fld_start")?.sort.clone();
-        let start = Self::coerce_bv_to_pointer_width(
-            range_val.field_select(dt_name.as_str(), "fld_start", start_sort),
-        )?;
+        let start = Self::coerce_bv_to_pointer_width(range_val.field_select(
+            dt_name.as_str(),
+            "fld_start",
+            start_sort,
+        ))?;
         let source_len = Self::coerce_bv_to_pointer_width(self.slice_len_expr(slice_arg)?)?;
         // `slice[start..]` with `start > len` is a Rust panic
         // (`slice_start_index_len_fail`), and `source_len - start` would wrap
@@ -1280,7 +1296,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         match inner_ty.kind() {
             TyKind::RigidTy(RigidTy::Slice(elem)) => Some(elem),
             TyKind::RigidTy(RigidTy::Array(elem, _)) => Some(elem),
-            TyKind::RigidTy(RigidTy::Adt(def, args)) if def.trimmed_name() == "Vec" => {
+            TyKind::RigidTy(RigidTy::Adt(def, args)) if Self::is_native_vec_adt(def) => {
                 args.0.first().and_then(|arg| {
                     if let rustc_public::ty::GenericArgKind::Type(elem_ty) = arg {
                         Some(*elem_ty)
@@ -1328,7 +1344,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 // Vec/String/Slice datatypes use "fld_len" field naming convention
                 Some(slice_expr.field_select(dt_name, "fld_len", ptr_sort()))
             }
-            TyKind::RigidTy(RigidTy::Adt(def, _)) if def.trimmed_name() == "Vec" => {
+            TyKind::RigidTy(RigidTy::Adt(def, _)) if Self::is_native_vec_adt(def) => {
                 let vec_expr = self.get_value_through_ref(operand)?;
                 let vec_expr_for_sort = vec_expr.clone();
                 let vec_sort = vec_expr_for_sort.sort();

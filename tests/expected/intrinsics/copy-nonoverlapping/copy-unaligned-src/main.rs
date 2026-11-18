@@ -1,5 +1,6 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// compile-flags: -A unstable_imports
 
 //! Checks that `copy_nonoverlapping` fails when `src` is not aligned.
 #![feature(core_intrinsics)]

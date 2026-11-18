@@ -95,6 +95,14 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // own (`derived_place_address`).
         let addr = match self.derived_place_address(place, pointee_ty) {
             Some(addr) => addr,
+            None if self.is_projected_thin_reference(place) => {
+                self.ctx.unsupported_with_fallback(
+                    "projected_reference_address_unresolved",
+                    format!("the current reference address does not place {place:?}"),
+                );
+                let field_base = self.ssa_base_name(place);
+                self.get_or_create_address_symbol(&field_base, place, pointee_ty)?
+            }
             None => self.get_or_create_address_symbol(base_name.as_ref(), place, pointee_ty)?,
         };
 
@@ -124,6 +132,74 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         Some(addr)
     }
 
+    pub(super) fn is_projected_thin_reference(&self, place: &Place) -> bool {
+        matches!(place.projection.as_slice(), [ProjectionElem::Deref, _, ..])
+            && matches!(
+                self.body.locals()[place.local].ty.kind(),
+                TyKind::RigidTy(RigidTy::Ref(_, pointee, _)) if LayoutOf::new(pointee).is_sized()
+            )
+    }
+
+    /// Give a statically decided index the same storage key as its literal
+    /// counterpart. Use the current path and asserted SSA definitions, so a
+    /// local reassigned between borrows gives each borrow its own element.
+    /// Original MIR bounds checks are translated by their own terminators.
+    pub(super) fn normalize_indexed_reference_borrow(&mut self, rvalue: &Rvalue) -> Option<Rvalue> {
+        let (Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place)) = rvalue else {
+            return None;
+        };
+        if !self.is_projected_thin_reference(place)
+            || !place.projection.iter().any(|p| matches!(p, ProjectionElem::Index(_)))
+        {
+            return None;
+        }
+        let TyKind::RigidTy(RigidTy::Ref(_, mut ty, _)) = self.body.locals()[place.local].ty.kind()
+        else {
+            return None;
+        };
+        let mut place = place.clone();
+        for projection in &mut place.projection[1..] {
+            match projection {
+                ProjectionElem::Field(_, field_ty) => ty = *field_ty,
+                ProjectionElem::Index(_)
+                | ProjectionElem::ConstantIndex { from_end: false, .. } => {
+                    let TyKind::RigidTy(RigidTy::Array(elem, len)) = ty.kind() else {
+                        return None;
+                    };
+                    let len = len.eval_target_usize().into_option()?;
+                    let offset = self.current_array_index(projection)?;
+                    if offset >= len {
+                        return None;
+                    }
+                    *projection =
+                        ProjectionElem::ConstantIndex { offset, min_length: len, from_end: false };
+                    ty = elem;
+                }
+                _ => return None,
+            }
+        }
+        match rvalue {
+            Rvalue::Ref(region, kind, _) => Some(Rvalue::Ref(region.clone(), *kind, place)),
+            Rvalue::AddressOf(kind, _) => Some(Rvalue::AddressOf(*kind, place)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn current_array_index(&self, projection: &ProjectionElem) -> Option<u64> {
+        match projection {
+            ProjectionElem::Index(local) => {
+                let name = crate::codegen_ay::names::local_name(self.ctx.current_fn_name(), *local);
+                let index = self.fold_memory_reads_on_path(self.env_lookup(&name)?);
+                let ExprValue::BitVecConst { value, width: POINTER_WIDTH } = index.value() else {
+                    return None;
+                };
+                value.to_string().parse().ok()
+            }
+            ProjectionElem::ConstantIndex { offset, from_end: false, .. } => Some(*offset),
+            _ => None,
+        }
+    }
+
     /// The address of a place INSIDE another object, derived from that object's
     /// address instead of minted as an unrelated symbol:
     ///
@@ -132,17 +208,18 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ///   other) plus rustc's field offsets and `index * size_of::<T>()`;
     /// - `&*b`, `&(*b).f` for a `Box` local: the heap allocation the box holds
     ///   (its value after `Box::new`) plus the field offsets.
+    /// - `&(*r).f` for a thin reference with its current referent address
+    ///   established: that address plus the declared field offsets.
     ///
     /// Two fields of one struct, two elements of one array, two boxes and a local
     /// beside a box each got a fresh address with only non-null / alignment
     /// constraints, so `ptr::eq(&s.a, &s.b)`, `ptr::eq(&*b1, &*b2)` and
     /// `ptr::eq(&x, &*b)` were satisfiable and `&a[1] as usize == &a[0] as usize
     /// + 1` was not: the safe harnesses FAILED with a Genuine counterexample
-    /// (negative/alloc_id_fields_offsets.rs, main 31793ccc3). Cached under the
-    /// place's base name like every other address. `None` (the caller keeps the
-    /// unrelated symbol) for a place this cannot place: a symbolic index with no
-    /// value, an index from the end, a `Downcast`, an unsized or unlaid-out
-    /// field, a dereference of anything but a `Box` local.
+    /// (negative/alloc_id_fields_offsets.rs, main 31793ccc3). A field reached
+    /// through a thin reference is recomputed from the current pointer.
+    /// Other derived addresses are cached under the place's base name.
+    /// Declines an unresolved dereference or a projection without an offset.
     pub(super) fn derived_place_address(
         &mut self,
         place: &Place,
@@ -151,8 +228,12 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if place.projection.is_empty() {
             return None;
         }
+        let projected_reference = self.is_projected_thin_reference(place);
         let cache_key = self.ssa_base_name(place);
-        if let Some(cached) = self.addr_symbols.get(cache_key.as_str()) {
+        // A reference can be rebound, so the syntactic `(*r).f` key cannot
+        // answer for its current pointee. Assignment records the field address
+        // under the resolved referent's name for later reborrows.
+        if !projected_reference && let Some(cached) = self.addr_symbols.get(cache_key.as_str()) {
             return Some(cached.clone());
         }
         let root_ty = self.body.locals()[place.local].ty;
@@ -183,15 +264,33 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                         if self.ref_pointees.is_poisoned(ref_base.as_str()) {
                             return None;
                         }
-                        let pointee_base = self.ref_pointees.get(ref_base.as_str()).cloned()?;
-                        let ptr = self.const_pointee_objects.get(pointee_base.as_ref()).copied()?;
-                        let naming = self.global_alloc_naming();
-                        let target_base = super::global_alloc::global_alloc_address(
-                            self.ctx,
-                            &ptr.key()?,
-                            naming,
-                        )?;
-                        let base = ptr.address(&target_base, POINTER_WIDTH)?;
+                        let pointee_base = self.ref_pointees.get(ref_base.as_str())?;
+                        let base = if let Some(ptr) =
+                            self.const_pointee_objects.get(pointee_base.as_ref()).copied()
+                        {
+                            let naming = self.global_alloc_naming();
+                            let target_base = super::global_alloc::global_alloc_address(
+                                self.ctx,
+                                &ptr.key()?,
+                                naming,
+                            )?;
+                            ptr.address(&target_base, POINTER_WIDTH)?
+                        } else if projected_reference
+                            && place.projection[1..].iter().all(|projection| {
+                                matches!(
+                                    projection,
+                                    ProjectionElem::Field(..)
+                                        | ProjectionElem::ConstantIndex { from_end: false, .. }
+                                )
+                            })
+                        {
+                            let recorded = self.addr_symbols.get(pointee_base.as_ref())?;
+                            let current = self.env_lookup(&ref_base)?;
+                            self.retains_alloc_address(current, recorded)
+                                .then(|| recorded.clone())?
+                        } else {
+                            return None;
+                        };
                         (base, pointee, &place.projection[1..])
                     }
                 }
@@ -212,16 +311,21 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     current_ty = *field_ty;
                 }
                 ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
-                    let elem_ty = match current_ty.kind() {
-                        TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
+                    let (elem_ty, len) = match current_ty.kind() {
+                        TyKind::RigidTy(RigidTy::Array(elem, len)) => (elem, len),
                         _ => return None, // external enum: TyKind (a slice has no static layout here)
                     };
+                    if projected_reference
+                        && let ProjectionElem::ConstantIndex { offset, from_end: false, .. } = proj
+                        && *offset >= len.eval_target_usize().into_option()?
+                    {
+                        return None;
+                    }
                     let elem_size = LayoutOf::new(elem_ty).size_of()?;
                     let idx = self.projection_index_value(proj, POINTER_WIDTH)?;
                     if elem_size > 0 {
-                        addr = addr.bvadd(
-                            idx.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH)),
-                        );
+                        addr = addr
+                            .bvadd(idx.bvmul(Expr::bitvec_const(elem_size as u128, POINTER_WIDTH)));
                     }
                     current_ty = elem_ty;
                 }
@@ -229,7 +333,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
         }
         let _ = pointee_ty;
-        self.addr_symbols.insert(cache_key.into(), addr.clone());
+        if !projected_reference {
+            self.addr_symbols.insert(cache_key.into(), addr.clone());
+        }
         debug!(?place, "addr_of_place: derived the address from the enclosing object");
         Some(addr)
     }

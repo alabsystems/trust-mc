@@ -204,27 +204,59 @@ fn build_cover_probe_query(smt_content: &str, cover_names: &[String], with_model
 
 /// Identify only the main disjunction of named violation flags. Keep program
 /// constraints, including disjunctions that merely mention a violation flag.
+/// Both emitters left-fold OR, so a question with three flags is nested. Walk
+/// that grammar iteratively in linear time and constant space; there is no
+/// recursive parser stack or new depth/resource limit. An OR must contain a
+/// child, and every leaf must be an unquoted compiler violation symbol.
 fn is_violation_query_assertion(form: &str) -> bool {
     let Some(("assert", rest)) = form.strip_prefix('(').and_then(split_token) else {
         return false;
     };
     let Some(term) = rest.trim().strip_suffix(')').map(str::trim) else { return false };
-    let flags = if let Some(inner) = term.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        let Some(("or", flags)) = split_token(inner) else { return false };
-        flags
-    } else {
-        term
-    };
-    let mut remaining = flags;
+    let mut remaining = term;
+    let mut depth = 0usize;
+    let mut needs_child = true;
     let mut saw_flag = false;
-    while let Some((flag, rest)) = split_token(remaining) {
-        if !flag.starts_with("ay_violation_") {
+    let mut complete = false;
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            return complete && depth == 0 && saw_flag;
+        }
+        if complete {
             return false;
         }
-        saw_flag = true;
-        remaining = rest;
+        if let Some(inner) = remaining.strip_prefix('(') {
+            let Some(("or", rest)) = split_token(inner) else { return false };
+            let Some(next_depth) = depth.checked_add(1) else { return false };
+            depth = next_depth;
+            needs_child = true;
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix(')') {
+            if depth == 0 || needs_child {
+                return false;
+            }
+            depth -= 1;
+            needs_child = false;
+            complete = depth == 0;
+            remaining = rest;
+        } else {
+            let Some((flag, rest)) = split_token(remaining) else { return false };
+            let Some(label) = flag.strip_prefix("ay_violation_") else { return false };
+            // These are the compiler's generated simple symbols. Quotes,
+            // comments, strings and other operators cannot grant permission
+            // to delete a program constraint.
+            if label.is_empty()
+                || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return false;
+            }
+            saw_flag = true;
+            needs_child = false;
+            complete = depth == 0;
+            remaining = rest;
+        }
     }
-    saw_flag && remaining.trim().is_empty()
 }
 
 /// Build a secondary SMT query asking whether the harness is reachable at all —
@@ -579,6 +611,193 @@ fn paren_delta(line: &str) -> i32 {
         }
     }
     delta
+}
+
+#[cfg(test)]
+mod bmc_probe_query_tests {
+    use super::*;
+
+    // Three satisfied assertions make the primary query UNSAT. The first two
+    // guards are reachable and the third is dead; retaining the primary OR
+    // would incorrectly make all three secondary guards UNSAT. AY execution
+    // of these queries is separate from the exact construction controls here.
+    const PROGRAM: &str = "\
+(set-logic QF_AUFBV)
+(declare-const input (_ BitVec 8))
+(assert (= input #x03))
+(declare-const ay_reach_kani_assert_0 Bool)
+(declare-const ay_reach_kani_assert_1 Bool)
+(declare-const ay_reach_kani_assert_2 Bool)
+(assert (= ay_reach_kani_assert_0 (= input #x03)))
+(assert (= ay_reach_kani_assert_1 (bvult input #x08)))
+(assert (= ay_reach_kani_assert_2 false))
+(declare-const ay_violation_kani_assert_0 Bool)
+(declare-const ay_violation_kani_assert_1 Bool)
+(declare-const ay_violation_kani_assert_2 Bool)
+(assert (= ay_violation_kani_assert_0 (and ay_reach_kani_assert_0 (not (= input #x03)))))
+(assert (= ay_violation_kani_assert_1 (and ay_reach_kani_assert_1 (not (bvult input #x08)))))
+(assert (= ay_violation_kani_assert_2 ay_reach_kani_assert_2))
+";
+    const QUESTION: &str = "(assert (or (or ay_violation_kani_assert_0 ay_violation_kani_assert_1) ay_violation_kani_assert_2))";
+
+    #[cfg(feature = "ay-chc-native")]
+    #[test]
+    fn nested_probe_queries_preserve_actual_ay_reachability() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        fn verdicts(smt: &str) -> Vec<String> {
+            let commands = ay_frontend::parse(smt).expect("production builder emits valid SMT");
+            let mut executor = ay::executor::Executor::new();
+            let interrupt = Arc::new(AtomicBool::new(false));
+            executor.set_interrupt(Arc::clone(&interrupt));
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            let timer_interrupt = Arc::clone(&interrupt);
+            let timer = std::thread::spawn(move || {
+                if cancel_rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                    timer_interrupt.store(true, Ordering::Relaxed);
+                }
+            });
+            let outputs = executor.execute_all(&commands);
+            let _ = cancel_tx.send(());
+            timer.join().expect("timer thread");
+            assert!(!interrupt.load(Ordering::Relaxed), "AY timeout:\n{smt}");
+            outputs
+                .expect("AY execution")
+                .into_iter()
+                .filter(|value| matches!(value.as_str(), "sat" | "unsat" | "unknown"))
+                .collect()
+        }
+
+        let primary = format!("{PROGRAM}{QUESTION}\n(check-sat)\n(exit)\n");
+        assert_eq!(verdicts(&primary), ["unsat"]);
+        let names: Vec<_> = (0..3).map(|id| format!("ay_reach_kani_assert_{id}")).collect();
+        let secondary = build_cover_sat_query(&primary, &names);
+        assert_eq!(verdicts(&secondary), ["sat", "sat", "unsat"]);
+        let contradictory = format!(
+            "{PROGRAM}(declare-const ordinary_guard Bool)\n(assert (= ordinary_guard false))\n(assert ordinary_guard)\n{QUESTION}\n(check-sat)\n"
+        );
+        assert_eq!(
+            verdicts(&build_cover_sat_query(&contradictory, &names)),
+            ["unsat", "unsat", "unsat"]
+        );
+    }
+
+    #[test]
+    fn nested_three_check_probe_keeps_live_and_dead_guard_definitions() {
+        let primary = format!("{PROGRAM}{QUESTION}\n(check-sat)\n(exit)\n");
+        let names: Vec<_> = (0..3).map(|id| format!("ay_reach_kani_assert_{id}")).collect();
+        let query = build_cover_sat_query(&primary, &names);
+        let expected = format!(
+            "{PROGRAM}\
+(push 1)\n(assert ay_reach_kani_assert_0)\n(check-sat)\n(pop 1)\n\
+(push 1)\n(assert ay_reach_kani_assert_1)\n(check-sat)\n(pop 1)\n\
+(push 1)\n(assert ay_reach_kani_assert_2)\n(check-sat)\n(pop 1)\n(exit)\n"
+        );
+        assert_eq!(top_level_forms(&query), top_level_forms(&expected));
+        assert!(!query.contains(QUESTION));
+    }
+
+    #[test]
+    fn multiline_nested_witness_preserves_program_and_scopes_model_requests() {
+        let primary = format!(
+            "{PROGRAM}(assert\n  (or\n    (or ay_violation_kani_assert_0\n        ay_violation_kani_assert_1)\n    ay_violation_kani_assert_2))\n\
+(check-sat)\n(get-value (input))\n(get-value (ay_violation_kani_assert_0))\n(exit)\n"
+        );
+        let query = build_cover_witness_query(&primary, "ay_reach_kani_assert_0");
+        let expected = format!(
+            "{PROGRAM}(push 1)\n(assert ay_reach_kani_assert_0)\n(check-sat)\n\
+(get-value (input))\n(get-value (ay_violation_kani_assert_0))\n(pop 1)\n(exit)\n"
+        );
+        assert_eq!(top_level_forms(&query), top_level_forms(&expected));
+    }
+
+    #[test]
+    fn contradictory_program_remains_contradictory_for_cover_and_witness_probes() {
+        // Keep the legacy empty-primary-question `(assert false)` behavior
+        // separate: without additional emitter authority those same bytes
+        // cannot distinguish that question from a program contradiction.
+        let program = format!(
+            "{PROGRAM}(declare-const ordinary_guard Bool)\n\
+(assert (= ordinary_guard false))\n(assert ordinary_guard)\n"
+        );
+        let primary = format!("{program}{QUESTION}\n(check-sat)\n");
+        let names: Vec<_> = (0..3).map(|id| format!("ay_reach_kani_assert_{id}")).collect();
+        let query = build_cover_sat_query(&primary, &names);
+        let program_forms = top_level_forms(&program);
+        let forms = top_level_forms(&query);
+        assert_eq!(&forms[..program_forms.len()], program_forms.as_slice());
+        for name in &names {
+            let witness = build_cover_witness_query(&primary, name);
+            let forms = top_level_forms(&witness);
+            assert_eq!(&forms[..program_forms.len()], program_forms.as_slice());
+        }
+        // Every actual AY probe must answer UNSAT for this program, including
+        // the otherwise-live first and second guards. Never replace it by true.
+    }
+
+    #[test]
+    fn probe_keeps_negation_conjunction_unrelated_and_contradictory_constraints() {
+        for constraint in [
+            "(assert (and ay_violation_a_0 ay_violation_b_1))",
+            "(assert (not ay_violation_a_0))",
+            "(assert (or ay_violation_a_0 ordinary_guard))",
+            "(assert (or (or ay_violation_a_0 ordinary_guard) ay_violation_b_1))",
+            "(assert (= ay_violation_a_0 false))",
+            "(assert (or ay_violation_a_0 true))",
+            "(assert (or))",
+            "(assert (or ay_violation_a_0 (or)))",
+            "(assert (or |ay_violation_quoted_0| ay_violation_b_1))",
+            "(assert (or ay_violation_a_0 \"ay_violation_string_1\"))",
+            "(assert (or ay_violation_a_0 ; ay_violation_comment_1\n ordinary_guard))",
+        ] {
+            assert!(!is_violation_query_assertion(constraint), "{constraint}");
+            let primary = format!("{PROGRAM}{constraint}\n{QUESTION}\n(check-sat)\n");
+            for query in [
+                build_cover_sat_query(&primary, &["ay_reach_kani_assert_0".to_owned()]),
+                build_cover_witness_query(&primary, "ay_reach_kani_assert_0"),
+            ] {
+                let forms = top_level_forms(&query);
+                assert!(forms.contains(&constraint), "lost {constraint}: {query}");
+                assert!(!forms.contains(&QUESTION), "kept primary question: {query}");
+            }
+        }
+        for rejected in [
+            "(assert false)",
+            "(assert ay_violation_)",
+            "(assert ay_violation_a_0 ay_violation_b_1)",
+            "(assert (or ay_violation_a_0)) trailing",
+            "(assert (or ay_violation_a_0)",
+        ] {
+            assert!(!is_violation_query_assertion(rejected), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn probe_recognizes_the_captured_six_flag_left_fold() {
+        // Exact primary question retained from the actual 289a BMC
+        // external_pointer_safe capture; no verdict is inferred here.
+        let question = "(assert (or (or (or (or (or ay_violation_raw_ptr_deref_misaligned_0 ay_violation_raw_ptr_deref_null_1) ay_violation_null_pointer_check_2) ay_violation_use_after_free_check_3) ay_violation_alignment_check_4) ay_violation_kani_assert_5))";
+        let constraint = "(assert (= ay_violation_kani_assert_5 (and guard (not assertion))))";
+        let primary = format!("{constraint}\n{question}\n(check-sat)\n");
+        let query = build_cover_sat_query(&primary, &["ay_reach_kani_assert_5".to_owned()]);
+        assert!(query.contains(constraint), "{query}");
+        assert!(!query.contains(question), "{query}");
+    }
+
+    #[test]
+    fn deep_violation_left_fold_uses_no_recursive_parser_limit() {
+        let mut question = String::from("(assert ");
+        for _ in 0..4096 {
+            question.push_str("(or ");
+        }
+        question.push_str("ay_violation_kani_assert_0");
+        for _ in 0..4096 {
+            question.push_str(" ay_violation_kani_assert_1)");
+        }
+        question.push(')');
+        assert!(is_violation_query_assertion(&question));
+    }
 }
 
 #[cfg(test)]

@@ -21,8 +21,11 @@ pub(in crate::codegen_ay) mod native_box_raw;
 pub(in crate::codegen_ay) mod native_box_uninit;
 #[cfg(all(trust_toolchain, version("1.101")))]
 pub(in crate::codegen_ay) mod native_maybe_memory;
+pub(in crate::codegen_ay) mod string_identity;
+pub(in crate::codegen_ay) mod string_view;
 pub(in crate::codegen_ay) mod transmute_layout;
 pub(in crate::codegen_ay) mod vec_capacity;
+pub(in crate::codegen_ay) mod vec_query_identity;
 
 // Re-export all public items from the extracted crate.
 pub(in crate::codegen_ay) use self::inline_limits::*;

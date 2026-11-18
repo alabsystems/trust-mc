@@ -7,6 +7,117 @@ use crate::codegen_ay::test_fixtures::find_instance_by_suffix;
 use rustc_public::CrateDef;
 
 #[test]
+fn bmc_singleton_receipts_require_every_actual_root_call() {
+    const SOURCE: &str = r#"
+        pub fn exact(value: u64) {
+            let other = 7u64;
+            let first = core::slice::from_ref(&value);
+            let second = core::slice::from_ref(&other);
+            assert!(first[0] == value);
+            assert!(second[0] == other);
+        }
+        pub fn incomplete(value: u64) {
+            let other = 11u64;
+            let first = core::slice::from_ref(&value);
+            let second = core::slice::from_ref(&other);
+            assert!(first[0] == value);
+            assert!(second[0] == other);
+        }
+        pub fn mixed(value: u64, unknown: &u64) {
+            let first = core::slice::from_ref(&value);
+            let second = core::slice::from_ref(unknown);
+            assert!(first[0] == value);
+            assert!(second[0] == *unknown);
+        }
+        #[inline(never)]
+        fn through_helper(value: &u64) -> &[u64] {
+            core::slice::from_ref(value)
+        }
+        pub fn helper_root(value: u64) {
+            let slice = through_helper(&value);
+            assert!(slice[0] == value);
+        }
+    "#;
+
+    // Inventory real compiler-produced Call terminators. These are reachability
+    // events only; no test code constructs an exact-model receipt.
+    fn record_calls(caller: Instance, body: &Body) -> usize {
+        let mut count = 0;
+        for (block, basic_block) in body.blocks.iter().enumerate() {
+            let TerminatorKind::Call { func, .. } = &basic_block.terminator.kind else {
+                continue;
+            };
+            let TyKind::RigidTy(RigidTy::FnDef(def, args)) = func.ty(body.locals()).unwrap().kind()
+            else {
+                continue;
+            };
+            if def.name().ends_with("::from_ref") {
+                record_pending(
+                    "std::slice::from_ref",
+                    Instance::resolve(def, &args).unwrap(),
+                    Some(AbstractionCallsite { caller, body, block }),
+                    true,
+                );
+                count += 1;
+            }
+        }
+        count
+    }
+
+    let mut exercised = false;
+    with_test_ay_ctx_for_source(SOURCE, |mut ctx| {
+        ctx.config.use_chc = false;
+        ctx.queries.set_args(crate::args::Arguments::default());
+        for (suffix, complete, modeled, unresolved) in [
+            ("exact", true, 2, 0),
+            // Both calls really model, but partial reachability supplies no authority.
+            ("incomplete", false, 2, 2),
+            // A borrowed argument has no authenticated stack allocation. Its
+            // sibling's positive receipt cannot clear either encounter.
+            ("mixed", true, 1, 2),
+            // The helper does model after inlining, but its original callsite
+            // lacks root relocation custody and must keep its early event.
+            ("helper_root", true, 1, 1),
+        ] {
+            let root = find_instance_by_suffix(ctx.tcx, suffix);
+            let body = root.body().unwrap();
+            let scope = AccountingScope::begin(Some(root));
+            begin_inventory();
+            record_reachable_body(root, &body);
+            let mut encounters = record_calls(root, &body);
+            if suffix == "helper_root" {
+                let helper = find_instance_by_suffix(ctx.tcx, "through_helper");
+                let helper_body = helper.body().unwrap();
+                record_reachable_body(helper, &helper_body);
+                encounters += record_calls(helper, &helper_body);
+            }
+            assert_eq!(encounters, if suffix == "helper_root" { 1 } else { 2 });
+            if complete {
+                finish_inventory();
+            }
+
+            let before = ctx.shared_scalar_slices.len();
+            let checks_before = ctx.bmc_vc.violations.len();
+            ctx.set_current_fn(root);
+            // Exercise the actual inliner custody handoff, final BMC traversal,
+            // authenticated singleton handler and owning attempt completion.
+            crate::codegen_ay::codegen_function::codegen_function_with_body(
+                &mut ctx,
+                root,
+                body,
+                &root.name(),
+            );
+            assert_eq!(ctx.shared_scalar_slices.len() - before, modeled, "{suffix}/{complete}");
+            assert!(ctx.bmc_vc.violations.len() > checks_before, "actual source consumers survive");
+            assert_eq!(unresolved_for_test(), unresolved, "{suffix}/{complete}");
+            scope.finish();
+        }
+        exercised = true;
+    });
+    assert!(exercised, "compiler-produced BMC singleton controls must execute");
+}
+
+#[test]
 fn accounting_inventory_preserves_noncall_and_indirect_uses() {
     const SOURCE: &str = r#"
         use std::sync::atomic::AtomicI32;

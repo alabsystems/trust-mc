@@ -98,6 +98,7 @@ mod codegen_stmt_assign_simple_vtable;
 mod codegen_stmt_const_ref_assign;
 mod codegen_stmt_copy;
 mod codegen_stmt_copy_intrinsic;
+mod codegen_stmt_copy_span;
 mod codegen_stmt_flatten_constrain;
 pub(super) mod codegen_stmt_flatten_copy;
 mod codegen_stmt_flatten_dt_ite;

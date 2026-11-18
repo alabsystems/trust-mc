@@ -115,7 +115,7 @@ ROWS = [
     ("codegen_ay/statement/codegen_assign_helpers.rs", "track_aggregate_ref_pointees", "operand", 1, "RC(_)", "{}", "no-place"),
     ("codegen_ay/statement/codegen_assign_slice_cast.rs", "try_construct_slice_datatype_from_cast", "operand", 1, "RC(_)", "return None", "no-place"),
     ("codegen_ay/statement/codegen_copy.rs", "try_eval_const_operand", "operand", 1, "RC(_)", "None", "no-place"),
-    ("codegen_ay/statement/codegen_place_value.rs", "get_value_through_ref_source", "operand", 1, "RC(_)", "self.codegen_operand(operand).map(|expr| (expr, RefValueSource::Unreported))", "delegate"),
+    ("codegen_ay/statement/codegen_place_value.rs", "get_value_through_ref_source_inner", "operand", 1, "RC(_)", "self.codegen_operand(operand).map(|expr| (expr, RefValueSource::Unreported))", "delegate"),
     ("codegen_ay/statement/codegen_place_value.rs", "get_option_payload_value", "operand", 1, "RC(_)", "false", "no-place"),
     ("codegen_ay/statement/codegen_sort.rs", "infer_sort_from_operand", "operand", 1, "RC(_)", "Self::infer_sort_from_ty(rustc_public::ty::Ty::bool_ty())", "type"),
     ("codegen_ay/statement/codegen_sort.rs", "assert_label_for_message", "msg", 1, "AssertMessage::NullReferenceConstructed", '"raw_ptr_deref_null"', "label"),

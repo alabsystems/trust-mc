@@ -584,19 +584,19 @@ fn test_has_special_codegen_handler_cell_quarantine_is_exact() {
 
 #[test]
 fn test_has_special_codegen_handler_string() {
-    // String operations should have special handlers (#1691)
-    assert!(FunctionInlinePass::has_special_codegen_handler(
+    // Spelling alone does not freeze String calls; actual FnDefs do.
+    assert!(!FunctionInlinePass::has_special_codegen_handler(
         "alloc::string::String::from_utf8_lossy"
     ));
-    assert!(FunctionInlinePass::has_special_codegen_handler("std::string::String::new"));
-    assert!(FunctionInlinePass::has_special_codegen_handler("alloc::string::String::len"));
+    assert!(!FunctionInlinePass::has_special_codegen_handler("std::string::String::new"));
+    assert!(!FunctionInlinePass::has_special_codegen_handler("alloc::string::String::len"));
 }
 
 #[test]
 fn test_has_special_codegen_handler_core_stub_boundaries() {
     assert!(FunctionInlinePass::has_special_codegen_handler("core::str::converts::from_utf8"));
-    // from_utf8_lossy remains blocked via the broader String stub path; this
-    // boundary test only checks the new core::str-specific matcher.
+    // String conversion boundaries use actual definition/signature checks;
+    // this test checks only the core::str-specific candidate matcher.
     assert!(!FunctionInlinePass::has_special_codegen_handler(
         "core::str::converts::from_utf8_unchecked"
     ));

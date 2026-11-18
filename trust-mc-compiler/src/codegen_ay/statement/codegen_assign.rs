@@ -24,7 +24,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Updates environment mapping for lhs
     /// ENSURES: Handles pointer derefs, checked ops, and aggregates
     pub(super) fn codegen_assign(&mut self, lhs: &Place, rhs: &Rvalue) {
+        let indexed_borrow = self.normalize_indexed_reference_borrow(rhs);
+        let rhs = indexed_borrow.as_ref().unwrap_or(rhs);
         self.guard_box_pointer_store(lhs);
+        // ABI AddressOf can also produce a typed reference in ordinary drop
+        // glue. Refuse only an actual raw-pointer destination here.
+        if let Rvalue::AddressOf(_, source) = rhs
+            && lhs
+                .ty(self.body.locals())
+                .ok()
+                .is_some_and(|ty| matches!(ty.kind(), TyKind::RigidTy(RigidTy::RawPtr(..))))
+            && source.ty(self.body.locals()).ok().is_some_and(|ty| {
+                crate::codegen_ay::shared::string_identity::type_contains_native_string(
+                    self.ctx.tcx,
+                    ty,
+                )
+            })
+        {
+            self.ctx.unsupported_with_fallback(
+                "native_string_header_physical_custody_unqualified",
+                "raw native String header address",
+            );
+        }
+
         // A store to the storage itself (no deref) replaces its value: a pointee
         // entry the handler does not re-insert describes the previous value, so
         // it is poisoned rather than silently reused (`ref_pointee_table`).
@@ -212,6 +234,10 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
         // Handle array index assignment: arr[i] = value uses SMT store.
         if self.try_codegen_assign_array_index(lhs, rhs) {
+            return;
+        }
+
+        if self.try_codegen_shared_scalar_slice_element_borrow(lhs, rhs) {
             return;
         }
 

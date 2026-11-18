@@ -166,6 +166,16 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
         let target = target?;
+        if crate::codegen_ay::native_string_unmodeled_operation_instance(
+            self.ctx.tcx,
+            instance,
+            !self.ctx.unit_has_stubs(),
+        ) {
+            self.ctx
+                .unsupported_with_fallback("native_string_unmodeled_operation", instance.name());
+            self.codegen_symbolic_result(destination);
+            return Some(target);
+        }
         let body = self.ctx.body_or_instance_body(instance)?;
         let effective_blocks = count_effective_blocks(&body);
         let limit = MAX_BMC_DAG_INLINE_EFFECTIVE_BLOCKS;

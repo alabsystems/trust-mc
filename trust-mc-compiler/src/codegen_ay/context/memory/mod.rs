@@ -86,7 +86,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         if let Some(symbolic_value) = self.symbolic_memory_stores.get(&addr) {
             panic!(
                 "load_memory at address previously written symbolically as {:?}; byte load would be unsound",
-                symbolic_value.sort()
+                symbolic_value.value.sort()
             );
         }
         self.memory().clone().select(addr)
@@ -101,28 +101,62 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     /// Panics if memory has not been initialized via `init_memory`.
     #[must_use]
     pub(in crate::codegen_ay) fn load_memory_bytes(&self, addr: Expr, num_bytes: u32) -> Expr {
+        Self::read_bytes(addr, num_bytes, |at| self.load_memory(at))
+    }
+
+    fn read_bytes(addr: Expr, num_bytes: u32, load_byte: impl Fn(Expr) -> Expr) -> Expr {
         // Zero-byte loads are invalid - return 1-bit zero as distinguishable error marker.
         // Caller should validate size > 0 before calling.
         if num_bytes == 0 {
             return Expr::bitvec_const(0, 1);
         }
-        // Note: symbolic_memory_stores guard is enforced inside load_memory (Part of #2599).
-        // Each byte-level read (including base addr and offsets) is checked individually.
-        if num_bytes == 1 {
-            return self.load_memory(addr);
-        }
         // Little-endian: byte 0 is LSB, byte n-1 is MSB
         // Result is concat(byte[n-1], ..., concat(byte[1], byte[0]))
         let ptr_width = POINTER_WIDTH;
-        let mut result = self.load_memory(addr.clone());
+        let mut result = load_byte(addr.clone());
         for i in 1..num_bytes {
             let offset = Expr::bitvec_const(i as u128, ptr_width);
             let byte_addr = addr.clone().bvadd(offset);
-            let byte = self.load_memory(byte_addr);
+            let byte = load_byte(byte_addr);
             // concat(high_bits, low_bits) - byte becomes new high bits
             result = byte.concat(result);
         }
         result
+    }
+
+    /// Compare a typed logical read with current byte memory even if a
+    /// completed typed store also kept its whole value at the same address.
+    /// The caller must establish that this range is a typed value, since
+    /// layout padding can stay unconstrained. An opaque symbolic entry
+    /// anywhere in the range still disallows the read.
+    pub(in crate::codegen_ay) fn load_materialized_memory_bytes(
+        &self,
+        addr: Expr,
+        num_bytes: u32,
+    ) -> Option<Expr> {
+        let addr = Self::coerce_memory_addr(addr);
+        let opaque_store = |at: &Expr| {
+            self.symbolic_memory_stores.get(at).is_some_and(|store| !store.has_byte_image)
+        };
+        if num_bytes == 0
+            || opaque_store(&addr)
+            || (0..num_bytes).any(|offset| {
+                opaque_store(&addr.clone().bvadd(Expr::bitvec_const(offset, POINTER_WIDTH)))
+            })
+        {
+            return None;
+        }
+        let memory = self.memory();
+        Some(Self::read_bytes(addr, num_bytes, |at| memory.clone().select(at)))
+    }
+
+    /// Record the completion of a typed byte store at this exact address.
+    /// An opaque replacement of the whole value creates a new entry.
+    pub(in crate::codegen_ay) fn mark_symbolic_store_byte_image(&mut self, addr: Expr) {
+        let addr = Self::coerce_memory_addr(addr);
+        if let Some(store) = self.symbolic_memory_stores.get_mut(&addr) {
+            store.has_byte_image = true;
+        }
     }
 
     /// Recover symbolic non-bitvec value that was previously stored at this address.
@@ -131,7 +165,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
     #[must_use]
     pub(in crate::codegen_ay) fn load_symbolic_memory_value(&self, addr: Expr) -> Option<Expr> {
         let addr = Self::coerce_memory_addr(addr);
-        self.symbolic_memory_stores.get(&addr).cloned()
+        self.symbolic_memory_stores.get(&addr).map(|store| store.value.clone())
     }
 
     /// Record a non-bitvector value stored at `addr` for whole-value readers
@@ -141,7 +175,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         let name = self.fresh_name("mem_symbolic");
         let var = self.declare_var(&name, value.sort().clone());
         self.assert(var.clone().eq(value));
-        self.symbolic_memory_stores.insert(addr, var);
+        self.symbolic_memory_stores
+            .insert(addr, super::SymbolicMemoryStore { value: var, has_byte_image: false });
     }
 
     /// Replace the `len` bytes at `addr` with fresh values; every other byte of
@@ -190,7 +225,7 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         let addr = Self::coerce_memory_addr(addr);
         let sort = value.sort().clone();
         let previous = match self.symbolic_memory_stores.get(&addr) {
-            Some(previous) if *previous.sort() == sort => previous.clone(),
+            Some(previous) if *previous.value.sort() == sort => previous.value.clone(),
             _ => {
                 self.bmc_sound_havoc("conditional_symbolic_store_prior");
                 let name = self.fresh_name("mem_symbolic_prior");
@@ -200,7 +235,8 @@ impl<'tcx, 't> AYCtx<'tcx, 't> {
         let name = self.fresh_name("mem_symbolic");
         let var = self.declare_var(&name, sort);
         self.assert(var.clone().eq(Expr::ite(on_path.clone(), value, previous)));
-        self.symbolic_memory_stores.insert(addr, var);
+        self.symbolic_memory_stores
+            .insert(addr, super::SymbolicMemoryStore { value: var, has_byte_image: false });
         // As in `store_memory_bytes`: the value's bytes were not written, so a
         // byte read of this object on the store's path would see a stale image
         // (a static's pinned initializer, a stack local's materialized bytes).

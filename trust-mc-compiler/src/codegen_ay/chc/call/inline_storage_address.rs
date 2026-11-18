@@ -6,6 +6,8 @@
 //! typed reference copies/reborrows and raw field-address producers, then binds
 //! that path to the caller's unique live, already-addressed stack owner.
 
+mod shared_slice;
+
 use super::ChcCtx;
 use super::chc_call_context::DispatchCallContext;
 use super::codegen_ctx::RefTarget;
@@ -17,8 +19,8 @@ use crate::codegen_ay::provenance::Loc;
 use ay_bindings::Expr;
 use rustc_public::mir::mono::Instance;
 use rustc_public::mir::{
-    Body, CastKind, Mutability, Operand, Place, ProjectionElem, RawPtrKind, Rvalue, StatementKind,
-    TerminatorKind,
+    Body, BorrowKind, CastKind, Mutability, Operand, Place, ProjectionElem, RawPtrKind, Rvalue,
+    StatementKind, TerminatorKind,
 };
 use rustc_public::ty::{AdtKind, RigidTy, Ty, TyKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -41,6 +43,7 @@ struct StoragePath {
     pointee: Ty,
     reference: bool,
     mutable: bool,
+    shared_slice: bool,
 }
 
 struct StorageAddress {
@@ -296,6 +299,9 @@ impl ChcCtx<'_, '_> {
     ) -> Option<StoragePath> {
         let [ProjectionElem::Deref, tail @ ..] = place.projection.as_slice() else { return None };
         let mut value = values.get(&place.local)?.clone();
+        if value.shared_slice {
+            return None;
+        }
         for projection in tail {
             work.tick(self)?;
             let ProjectionElem::Field(index, declared) = projection else { return None };
@@ -327,7 +333,13 @@ impl ChcCtx<'_, '_> {
     ) -> Option<StoragePath> {
         let mut values = HashMap::from([(
             1,
-            StoragePath { projections: Vec::new(), pointee: root, reference: true, mutable },
+            StoragePath {
+                projections: Vec::new(),
+                pointee: root,
+                reference: true,
+                mutable,
+                shared_slice: false,
+            },
         )]);
         let mut visited = HashSet::new();
         let mut bb = 0;
@@ -348,14 +360,20 @@ impl ChcCtx<'_, '_> {
                             Rvalue::CopyForDeref(place) if place.projection.is_empty() => {
                                 values.get(&place.local)?.clone()
                             }
-                            Rvalue::Ref(_, _, place)
-                                if place.projection.as_slice() == [ProjectionElem::Deref] =>
-                            {
-                                let source = values.get(&place.local)?;
-                                if !source.reference {
+                            Rvalue::Ref(_, kind, place) => {
+                                // A field reborrow retains the caller's typed
+                                // storage path, just as a raw field-address
+                                // producer does. Only an existing reference
+                                // can lend this path; neither referent values
+                                // nor raw pointer bits create reference custody.
+                                if !matches!(kind, BorrowKind::Shared | BorrowKind::Mut { .. }) {
                                     return None;
                                 }
-                                source.clone()
+                                let value = self.storage_address_project(place, &values, work)?;
+                                if !value.reference {
+                                    return None;
+                                }
+                                value
                             }
                             Rvalue::AddressOf(kind, place) => {
                                 let mut value =
@@ -386,9 +404,19 @@ impl ChcCtx<'_, '_> {
                                 }
                                 _ => return None,
                             };
+                        let actual_pointee = if value.shared_slice {
+                            let TyKind::RigidTy(RigidTy::Slice(element)) =
+                                self.resolve_body_ty(pointee).kind()
+                            else {
+                                return None;
+                            };
+                            element
+                        } else {
+                            pointee
+                        };
                         if value.reference != reference
                             || !same_ty_modulo_regions(
-                                self.resolve_body_ty(pointee),
+                                self.resolve_body_ty(actual_pointee),
                                 self.resolve_body_ty(value.pointee),
                             )
                             || (capability == Mutability::Mut && !value.mutable)
@@ -417,7 +445,29 @@ impl ChcCtx<'_, '_> {
                 TerminatorKind::Goto { target } => bb = *target,
                 TerminatorKind::Return => {
                     let value = values.remove(&0)?;
-                    return (!value.reference && !value.projections.is_empty()).then_some(value);
+                    return ((!value.reference || value.shared_slice)
+                        && !value.projections.is_empty())
+                    .then_some(value);
+                }
+                TerminatorKind::Call { func, args, destination, target: Some(target), .. } => {
+                    let element = self.native_shared_slice_from_ref(body, func)?;
+                    let [source] = args.as_slice() else { return None };
+                    let mut value = values.get(&plain_local(source)?)?.clone();
+                    if value.shared_slice
+                        || !value.reference
+                        || value.mutable
+                        || !destination.projection.is_empty()
+                        || destination.local == 1
+                        || !same_ty_modulo_regions(self.resolve_body_ty(value.pointee), element)
+                        || self
+                            .shared_storage_slice_element(body.locals().get(destination.local)?.ty)
+                            != Some(element)
+                    {
+                        return None;
+                    }
+                    value.shared_slice = true;
+                    values.insert(destination.local, value);
+                    bb = *target;
                 }
                 _ => return None,
             }
@@ -466,6 +516,16 @@ impl ChcCtx<'_, '_> {
         }
         let owner =
             self.storage_address_host_owner(arg, root, capability == Mutability::Mut, &mut work)?;
+        self.bind_inline_storage_path(root, owner, value, &mut work)
+    }
+
+    fn bind_inline_storage_path(
+        &mut self,
+        root: Ty,
+        owner: usize,
+        value: StoragePath,
+        work: &mut Work,
+    ) -> Option<StorageAddress> {
         let root_layout = root.layout().ok()?.shape();
         if !root_layout.is_sized() {
             return None;
@@ -515,6 +575,9 @@ impl ChcCtx<'_, '_> {
         {
             return false;
         }
+        if self.shared_storage_slice_element(body.locals()[0].ty).is_some() {
+            return self.try_inline_shared_storage_slice(dcx, body, instance);
+        }
         // Most callees cannot be this summary. Reject them before inspecting
         // caller custody or charging a scan of the host body.
         if dcx.args.len() != 1
@@ -532,11 +595,29 @@ impl ChcCtx<'_, '_> {
         }
         let Some(target) = *dcx.target else { return false };
         let dest = dcx.destination.local;
+        // The caller supplied this exact walker-selected transformed body.
+        // Observe it only on explicit debug logging, before any plan decision;
+        // a raw/source-derived body is not evidence of the production route.
+        if tracing::enabled!(target: "trust_mc_chc_storage_address", tracing::Level::DEBUG) {
+            let mut out = Vec::new();
+            let _ = body.dump(&mut out, &format!("{instance:?}"));
+            tracing::debug!(
+                target: "trust_mc_chc_storage_address",
+                ?instance, caller = %self.fn_name, arguments = ?dcx.args, destination = ?dcx.destination,
+                mir = %String::from_utf8_lossy(&out),
+                "Actual transformed storage-address candidate"
+            );
+        }
         let mut work = Work(MAX_WORK);
         if self.storage_address_result_custody(dest, &mut work).is_none() {
+            tracing::debug!(target: "trust_mc_chc_storage_address", ?instance, caller = %self.fn_name, "Storage-address result custody refused");
             return false;
         }
-        let Some(plan) = self.plan_inline_storage_address(body, dcx.args) else { return false };
+        let Some(plan) = self.plan_inline_storage_address(body, dcx.args) else {
+            tracing::debug!(target: "trust_mc_chc_storage_address", ?instance, caller = %self.fn_name, "Storage-address typed live-owner plan refused");
+            return false;
+        };
+        tracing::debug!(target: "trust_mc_chc_storage_address", ?instance, caller = %self.fn_name, owner = ?plan.target, object = plan.object, offset = plan.offset, "Storage-address typed live-owner plan accepted");
         if !same_ty_modulo_regions(
             self.resolve_body_ty(self.body.locals()[dest].ty),
             self.resolve_body_ty(body.locals()[0].ty),
@@ -567,7 +648,9 @@ impl ChcCtx<'_, '_> {
             if plan.offset == 0 {
                 self.known_alloc_ids.insert(dest, plan.object);
             }
-            self.record_known_stack_addr_expr(dest, address, "inline_storage_address");
+            if self.record_known_stack_addr_expr(dest, address, "inline_storage_address") {
+                self.ref_resolution.inline_stack_address_calls.insert(dcx.bb_idx);
+            }
         }
         handled
     }

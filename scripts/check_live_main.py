@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Callable, Sequence
@@ -75,19 +77,20 @@ def _run_agh(checkout: Path, arguments: Sequence[str]) -> subprocess.CompletedPr
         raise LiveMainError(f"cannot run agh: {error}") from error
 
 
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate observation field")
+        result[key] = value
+    return result
+
+
 def _agh_main(checkout: Path, repository: str) -> str:
     output = _require_success(
         _run_agh(checkout, ("repo", "refs", repository, "--ref", "refs/heads/main")),
         f"could not query live {repository}/main through agh",
     )
-
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate reference field")
-            result[key] = value
-        return result
 
     try:
         response = json.loads(output, object_pairs_hook=unique_object)
@@ -109,9 +112,30 @@ def _agh_main(checkout: Path, repository: str) -> str:
 def _fetch_agh_main(checkout: Path, remote: str, repository: str, run_git: GitRunner) -> str:
     """Authenticate observed main snapshots and allow only proven forward motion."""
     observed = _agh_main(checkout, repository)
+    tracking_ref = f"refs/remotes/{remote}/main"
     temporary_refs: dict[str, str] = {}
     try:
-        def fetch_observation(oid: str) -> str:
+        def materialize_observation(oid: str) -> str:
+            # The authenticated observation supplies the identity. An exact,
+            # available tracking object can supply its bytes without another
+            # network fetch. The second live observation and CAS still follow.
+            tracked = run_git(checkout, ("rev-parse", "--verify", "--quiet", tracking_ref))
+            if tracked.returncode not in (0, 1):
+                _require_success(tracked, f"could not inspect {remote}/main tracking ref")
+            if tracked.returncode == 0 and tracked.stdout.strip() == oid:
+                kind = run_git(checkout, ("cat-file", "-t", oid))
+                if kind.returncode == 0:
+                    if kind.stdout.strip() != "commit":
+                        raise LiveMainError("observed main is not a commit object")
+                    # Verify the same historical closure required by an exact
+                    # fetch, including parents behind any shallow boundary.
+                    closure = run_git(checkout, (
+                        "--shallow-file", os.devnull, "-c", "core.commitGraph=false",
+                        "rev-list", "--objects", "--quiet", "--missing=print", oid,
+                    ))
+                    if closure.returncode == 0 and not closure.stdout:
+                        return oid
+
             private_ref = f"refs/agh/trust-mc-live-main/{uuid.uuid4().hex}"
             temporary_refs[private_ref] = oid
             _require_success(
@@ -133,20 +157,18 @@ def _fetch_agh_main(checkout: Path, remote: str, repository: str, run_git: GitRu
                 raise LiveMainError("observed main is not a commit object")
             return fetched
 
-        fetched = fetch_observation(observed)
+        fetched = materialize_observation(observed)
         live = _agh_main(checkout, repository)
         if live != fetched:
-            # Both objects came from independent canonical Agh observations.
-            # An advancing branch does not change the selected immutable cut.
-            # Fetch the second observed object and prove the direction; do not
-            # insist on a quiescent branch or assert equivalence to future main.
-            latest = fetch_observation(live)
+            # Both object IDs came from independent canonical Agh observations.
+            # Materialize the second object and verify forward ancestry. The
+            # selected immutable cut survives an advancing branch.
+            latest = materialize_observation(live)
             ancestor = run_git(checkout, ("merge-base", "--is-ancestor", fetched, latest))
             if ancestor.returncode == 1:
                 raise LiveMainError("observed main rewound or forked between Agh observations")
             _require_success(ancestor, "could not compare observed main snapshots")
             fetched = latest
-        tracking_ref = f"refs/remotes/{remote}/main"
         previous = run_git(checkout, ("rev-parse", "--verify", "--quiet", tracking_ref))
         if previous.returncode not in (0, 1):
             _require_success(previous, f"could not read {remote}/main tracking ref")
@@ -157,7 +179,7 @@ def _fetch_agh_main(checkout: Path, remote: str, repository: str, run_git: GitRu
                 # A concurrent checker may already have authenticated a newer
                 # tracking snapshot. One bounded fresh canonical observation
                 # can establish that forward motion; never trust tracking alone.
-                refreshed = fetch_observation(_agh_main(checkout, repository))
+                refreshed = materialize_observation(_agh_main(checkout, repository))
                 for before in (fetched, old):
                     direction = run_git(checkout, ("merge-base", "--is-ancestor", before, refreshed))
                     if direction.returncode == 1:
@@ -183,6 +205,77 @@ def _fetch_agh_main(checkout: Path, remote: str, repository: str, run_git: GitRu
             )
 
 
+def _github_repository(checkout: Path, remote: str, run_git: GitRunner) -> str | None:
+    remote_url = _require_success(
+        run_git(checkout, ("remote", "get-url", remote)),
+        f"could not resolve {remote} authority",
+    )
+    github = GITHUB_REMOTE_RE.fullmatch(remote_url)
+    if github is not None:
+        return github[1]
+    if "github.com" in remote_url.lower():
+        raise LiveMainError("GitHub authority requires a canonical GitHub remote URL")
+    return None
+
+
+def _agh_ancestry_only(
+    checkout: Path, remote: str, repository: str, expected: str, run_git: GitRunner,
+) -> str:
+    """Check frozen-pin ancestry without installing or moving a checkout ref."""
+    tracking_ref = f"refs/remotes/{remote}/main"
+
+    def read_tracking() -> str | None:
+        result = run_git(checkout, ("rev-parse", "--verify", "--quiet", tracking_ref))
+        if result.returncode == 1:
+            return None
+        return _require_commit(
+            _require_success(result, f"could not read {remote}/main tracking ref"),
+            "old tracking main",
+        )
+
+    tracked = read_tracking()
+    first = _agh_main(checkout, repository)
+    confirmed = _agh_main(checkout, repository)
+    ancestors = dict.fromkeys(oid for oid in (expected, first, tracked) if oid is not None)
+    queries = [dict(ancestor=oid, descendant=confirmed) for oid in ancestors]
+    request = dict(commits=[confirmed], queries=queries)
+    with tempfile.TemporaryDirectory(prefix="trust-mc-main-ancestry-") as directory:
+        path = Path(directory) / "commits.json"
+        path.write_text(json.dumps(request), encoding="utf-8")
+        reply_text = _require_success(
+            _run_agh(checkout, (
+                "repo", "commit-ancestry", repository, str(checkout.resolve()), "--input", str(path),
+            )),
+            f"could not verify original {repository}/main ancestry through agh",
+        )
+    try:
+        result = json.loads(reply_text, object_pairs_hook=unique_object)
+        if (not isinstance(result, dict) or type(result.get("schema")) is not int
+                or result["schema"] != 1 or result.get("scope") != "commit-parent-ancestry-only-v1"
+                or result.get("commits") != request["commits"]
+                or result.get("refs_written") is not False
+                or result.get("checkout_complete") is not False):
+            raise ValueError("wrong scope or commit identity")
+        answers = result.get("queries")
+        if not isinstance(answers, list) or len(answers) != len(queries):
+            raise ValueError("wrong ancestry query inventory")
+        for query, answer in zip(queries, answers):
+            if (not isinstance(answer, dict) or set(answer) != {*query, "contained"}
+                    or any(answer[key] != value for key, value in query.items())
+                    or type(answer["contained"]) is not bool):
+                raise ValueError("wrong ancestry query binding")
+    except ValueError as error:
+        raise LiveMainError(f"malformed agh ancestry response for {repository}/main: {error}") from error
+    for answer in answers:
+        if not answer["contained"]:
+            raise LiveMainError(
+                f"{answer['ancestor']} is not an ancestor of observed {remote}/main {confirmed}"
+            )
+    if read_tracking() != tracked:
+        raise LiveMainError(f"{remote}/main tracking ref changed during ancestry verification")
+    return confirmed
+
+
 def fetch_live_main(
     checkout: Path, remote: str, *, run_git: GitRunner | None = None
 ) -> str:
@@ -191,15 +284,9 @@ def fetch_live_main(
     environment_transport = run_git is None
     run_git = _run_git if run_git is None else run_git
     if environment_transport:
-        remote_url = _require_success(
-            run_git(checkout, ("remote", "get-url", remote)),
-            f"could not resolve {remote} authority",
-        )
-        github = GITHUB_REMOTE_RE.fullmatch(remote_url)
-        if github is not None:
-            return _fetch_agh_main(checkout, remote, github[1], run_git)
-        if "github.com" in remote_url.lower():
-            raise LiveMainError("GitHub authority requires a canonical GitHub remote URL")
+        repository = _github_repository(checkout, remote, run_git)
+        if repository is not None:
+            return _fetch_agh_main(checkout, remote, repository, run_git)
 
     _require_success(
         run_git(checkout, ("fetch", "--quiet", remote, "main")),
@@ -251,6 +338,7 @@ def require_frozen_main_ancestor(
     expected: str,
     *,
     run_git: GitRunner | None = None,
+    commit_ancestry_only: bool = False,
 ) -> str:
     expected = _require_commit(expected, "frozen authority")
     local_git = _run_git if run_git is None else run_git
@@ -258,6 +346,10 @@ def require_frozen_main_ancestor(
         local_git(checkout, ("cat-file", "-e", f"{expected}^{{commit}}")),
         f"frozen content commit does not exist locally: {expected}",
     )
+    if commit_ancestry_only and run_git is None:
+        repository = _github_repository(checkout, remote, local_git)
+        if repository is not None:
+            return _agh_ancestry_only(checkout, remote, repository, expected, local_git)
     fetched = fetch_live_main(checkout, remote, run_git=run_git)
     ancestor = local_git(checkout, ("merge-base", "--is-ancestor", expected, fetched))
     if ancestor.returncode == 1:
@@ -270,7 +362,7 @@ def require_frozen_main_ancestor(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("exact", "frozen"))
+    parser.add_argument("mode", choices=("exact", "frozen", "frozen-ancestry"))
     parser.add_argument("checkout", type=Path)
     parser.add_argument("remote")
     parser.add_argument("expected")
@@ -280,7 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             resolved = require_exact_main(args.checkout, args.remote, args.expected)
         else:
             resolved = require_frozen_main_ancestor(
-                args.checkout, args.remote, args.expected
+                args.checkout, args.remote, args.expected,
+                commit_ancestry_only=args.mode == "frozen-ancestry",
             )
     except LiveMainError as error:
         print(f"check-live-main: error: {error}", file=sys.stderr)

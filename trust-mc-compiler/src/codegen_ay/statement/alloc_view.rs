@@ -211,6 +211,13 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         }
     }
 
+    /// Check that a reference still carries the recorded address of its
+    /// referent. Sharing an allocation alone would also admit a changed offset.
+    pub(super) fn retains_alloc_address(&self, current: &Expr, recorded: &Expr) -> bool {
+        self.resolve_alloc(recorded).is_some()
+            && self.is_symbol_on_defined_path(current, recorded, MAX_ALLOC_WALK)
+    }
+
     /// The constant an index local holds on every path where it is DEFINED.
     ///
     /// An index assigned under a path condition is `ite(pc, 3, <__ssa_init_>)`:

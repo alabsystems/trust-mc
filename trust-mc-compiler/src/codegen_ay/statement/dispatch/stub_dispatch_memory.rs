@@ -143,7 +143,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         target: Option<BasicBlockIdx>,
     ) -> Option<BasicBlockIdx> {
         debug!("codegen_stubbed_call: slice::as_ptr/as_mut_ptr - extracting data pointer");
-        let arg_expr = args.first().and_then(|a| self.codegen_operand(a))?;
+        let arg = args.first()?;
+        self.guard_shared_scalar_slice_operand(arg);
+        let arg_expr = self.codegen_operand(arg)?;
 
         // If the argument is already a bitvec (pointer), return it directly.
         // If it's a Slice datatype, extract fld_ptr.
@@ -179,9 +181,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         // see docs/findings/2026-08-22-raw-pointer-stores-are-dropped.md. The
         // pointer starts at element 0; `codegen_model_offset` refines it when
         // the pointer is advanced.
-        if let Some(arg) = args.first() {
-            self.record_slice_ptr_provenance(arg, destination);
-        }
+        self.record_slice_ptr_provenance(arg, destination);
         target
     }
 
@@ -395,9 +395,30 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     ) -> Option<BasicBlockIdx> {
         debug!("codegen_stubbed_call: RawVec::ptr - extracting ptr field");
         if let Some(rawvec_expr) = args.first().and_then(|a| self.codegen_operand(a)) {
-            let is_rawvec_datatype = rawvec_expr.sort().datatype_name() == Some("RawVec");
-            if is_rawvec_datatype {
-                let ptr = rawvec_expr.field_select("RawVec", "fld_ptr", ptr_sort());
+            // Observe the existing receiver custody without deriving a pointee,
+            // loading memory, or changing the fallback/debt accounting.
+            if tracing::enabled!(target: "trust_mc_bmc_rawvec", tracing::Level::DEBUG) {
+                let arg = &args[0];
+                let ref_base = match arg {
+                    Operand::Copy(place) | Operand::Move(place) => Some(self.ssa_base_name(place)),
+                    _ => None,
+                };
+                let pointee_base = ref_base.as_deref().and_then(|base| self.ref_pointees.get(base));
+                tracing::debug!(
+                    target: "trust_mc_bmc_rawvec",
+                    operand = ?arg,
+                    operand_ty = ?arg.ty(self.body.locals()),
+                    operand_value = ?rawvec_expr,
+                    reference_base = ?ref_base,
+                    tracked_pointee = ?pointee_base,
+                    tracked_value = ?pointee_base.and_then(|base| self.env_lookup(base)),
+                    destination = ?destination,
+                    "RawVec::ptr existing receiver state"
+                );
+            }
+            if let Some(ptr) =
+                args.first().and_then(|arg| self.native_rawvec_ptr_from_reference(arg))
+            {
                 self.assign_value_to_place(destination, ptr);
             } else {
                 warn!(

@@ -87,6 +87,69 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition<F>(
     with_test_ay_ctx_for_source_with_edition_and_rustc_flags(source, edition, &[], callback);
 }
 
+/// Compile a real separate dependency and observe the caller with the linked compiler.
+/// The fixed extern alias supplies source syntax only, never definition authority.
+pub(in crate::codegen_ay) fn with_test_ay_ctx_for_external_source<F>(
+    dependency_source: &str,
+    caller_source: &str,
+    rustc_flags: &[&str],
+    callback: F,
+) where
+    F: for<'tcx> FnOnce(AYCtx<'tcx, 'static>) + Send,
+{
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    static CRATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let directory = TempDir::new().expect("external query dependency directory");
+    let name = format!("external_vec_lookalike_{}", CRATE_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let source = directory.path().join("dependency.rs");
+    let output = directory.path().join("out");
+    fs::write(&source, dependency_source).expect("write real external dependency");
+    fs::create_dir(&output).expect("dependency output directory");
+    struct EmitDependency;
+    impl rustc_driver::Callbacks for EmitDependency {}
+    let mut arguments = vec![
+        "rustc".to_owned(),
+        source.to_string_lossy().into_owned(),
+        "--crate-type=rlib".to_owned(),
+        format!("--crate-name={name}"),
+        "--out-dir".to_owned(),
+        output.to_string_lossy().into_owned(),
+        "--edition=2024".to_owned(),
+        "-Cpanic=abort".to_owned(),
+        "-Zalways-encode-mir".to_owned(),
+        "-Zinline-mir=no".to_owned(),
+    ];
+    // Both crates must use the same sysroot and configuration when a control
+    // observes the bundled standard library's actual private MIR.
+    arguments.extend(rustc_flags.iter().map(|flag| (*flag).to_owned()));
+    let result = rustc_driver::catch_fatal_errors(|| {
+        rustc_driver::run_compiler(&arguments, &mut EmitDependency)
+    });
+    assert!(result.is_ok(), "external dependency compilation failed");
+    let rlib = output.join(format!("lib{name}.rlib"));
+    assert!(rlib.is_file(), "external dependency must emit its real rlib");
+    // Trust may split metadata from its rlib. Use the real emitted sibling,
+    // as context/testing.rs already does for sysroot dependencies.
+    let rmeta = rlib.with_extension("rmeta");
+    let metadata = if rmeta.is_file() { &rmeta } else { &rlib };
+    let dependency = format!("external_vec_lookalike={}", metadata.display());
+    let completed = Arc::new(AtomicBool::new(false));
+    let callback_completed = Arc::clone(&completed);
+    let mut flags = vec!["--extern", dependency.as_str(), "-Cpanic=abort", "-Zinline-mir=no"];
+    flags.extend_from_slice(rustc_flags);
+    with_test_ay_ctx_for_source_with_rustc_flags(caller_source, &flags, move |ctx| {
+        callback(ctx);
+        callback_completed.store(true, Ordering::SeqCst);
+    });
+    assert!(
+        completed.load(Ordering::SeqCst),
+        "actual external-definition classification callback must complete"
+    );
+}
+
 /// [`with_test_ay_ctx_for_source`] with extra `rustc` flags appended.
 ///
 /// The default context compiles at `-C opt-level=0`, which turns debug
@@ -223,6 +286,7 @@ pub(in crate::codegen_ay) fn with_test_ay_ctx_for_source_with_edition_and_rustc_
             alloc_roots: rustc_data_structures::fx::FxIndexMap::default(),
             alloc_views_poisoned: std::collections::HashSet::new(),
             alloc_phi_defs: HashMap::new(),
+            shared_scalar_slices: HashMap::new(),
         };
         callback(ctx);
     });

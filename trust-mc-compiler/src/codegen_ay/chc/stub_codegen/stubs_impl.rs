@@ -151,13 +151,27 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         if let Some(stub) =
             self.detect_string_eq_shared_impl_with_locals(func, &callee_path, locals)
         {
-            return Some(stub);
+            return crate::codegen_ay::shared::string_identity::string_stub_is_authorized(
+                self.tcx, func, locals, stub,
+            )
+            .then_some(stub);
         }
         let stub = self.stub_registry.lookup(chc_stub_lookup_path(&callee_path))?;
+        if !crate::codegen_ay::shared::string_identity::string_stub_is_authorized(
+            self.tcx, func, locals, stub,
+        ) {
+            return None;
+        }
         // The registry matches path text; a callee of the local crate is the
         // user's code, never std's item (`shared::callee_is_local_item`).
         if crate::codegen_ay::shared::callee_is_local_item(func, locals) {
             debug!(%callee_path, ?stub, "a local item named like a std stub: not a stub");
+            return None;
+        }
+        if !crate::codegen_ay::shared::vec_query_identity::vec_query_stub_is_authorized(
+            self.tcx, func, locals, stub,
+        ) {
+            debug!(%callee_path, ?stub, "Vec query candidate lacks canonical definition authority");
             return None;
         }
         // `Iterator::sum` is matched by NAME; only core's numeric `Sum` impls
@@ -412,7 +426,9 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 }
 
                 // String: track logical length like Vec/String stubs expect.
-                if name == "String" {
+                if rustc_middle::ty::tls::with(|tcx| {
+                    crate::codegen_ay::shared::string_identity::is_native_string_adt(tcx, def)
+                }) {
                     return Some(("string", full_name));
                 }
 

@@ -21,8 +21,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// ENSURES: Sets current_path_condition from block_path_conditions
     pub(in crate::codegen_ay) fn initialize_block_entry_env(&mut self, bb_idx: usize) {
         // Which block we are on. Recorded FIRST so the bb0 early-return below
-        // does not skip it. Read only by the unwinding-assertion sentinel lookup
-        // in the `Unreachable` terminator arm.
+        // does not skip it. The unwinding sentinel and closed empty-String
+        // nullness consumer require the actual block's identity.
         self.current_bb = bb_idx;
         self.initialize_storage_block(bb_idx);
 
@@ -210,15 +210,6 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             let pred = cond.unwrap_or_else(|| Expr::bool_const(true));
             ite_expr = Expr::ite(pred, val, ite_expr);
         }
-        // For the allocation resolver only (alloc_view.rs, `alloc_phi_defs`):
-        // `if c { base.add(2) } else { base.add(4) }` merges here, and without
-        // the definition the merged pointer named no allocation, so a proof over
-        // it was demoted (offset_from_distance_dual_safe.rs
-        // `safe_offset_from_branch_aligned_distance`, after2 bundle).
-        if let ay_bindings::ExprValue::Var { name } = phi_var.value() {
-            self.ctx.alloc_phi_defs.insert(name.clone(), ite_expr.clone());
-        }
-
         // SMT-LIB requires same-width operands for equality, so coerce widths.
         // Use signedness-aware coercion to preserve Rust cast semantics (#265).
         let (phi_coerced, ite_coerced) = match signed {
@@ -236,15 +227,23 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                 }
             }
         };
-        match value_guard {
-            None => self.ctx.assert(phi_coerced.eq(ite_coerced)),
+        let asserted_rhs = match value_guard {
+            None => ite_coerced,
             Some(guard) => {
                 // Keep phi definitions total under guarded reachability:
                 // when the block guard is false, preserve a stable symbolic pre-state value.
                 let else_expr = self.get_or_declare_ssa_init_symbol(var_name, ite_coerced.sort());
-                self.ctx.assert(phi_coerced.eq(Expr::ite(guard, ite_coerced, else_expr)));
+                Expr::ite(guard, ite_coerced, else_expr)
             }
+        };
+        // Allocation tracking may follow precisely the asserted equation.
+        // Coercing the left hand side does not define the whole phi variable.
+        if phi_coerced == phi_var
+            && let ay_bindings::ExprValue::Var { name } = phi_var.value()
+        {
+            self.ctx.alloc_phi_defs.insert(name.clone(), asserted_rhs.clone());
         }
+        self.ctx.assert(phi_coerced.eq(asserted_rhs));
 
         Some(phi_var)
     }

@@ -914,14 +914,11 @@ impl AYCodegenBackend {
         ay_bindings::AYProgram,
         trust_mc_core::artifact::VcArtifact,
     ) {
-        let accounting = super::unstubbed_accounting::AccountingScope::begin(if config.use_chc {
-            match starting_items {
+        let accounting =
+            super::unstubbed_accounting::AccountingScope::begin(match starting_items {
                 [MonoItem::Fn(root)] => Some(*root),
                 _ => None,
-            }
-        } else {
-            None
-        });
+            });
         let abstraction_boundary = AYAbstractionBoundary::new();
         let (mut items, call_graph) =
             super::translation_deadline::timed_phase("reachability", || {

@@ -344,6 +344,15 @@ pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
     destination: &rustc_public::mir::Place,
     inline_depth: usize,
 ) -> Option<InlineReturn> {
+    if crate::codegen_ay::native_string_unmodeled_operation(
+        ctx.tcx,
+        func,
+        outer_body.locals(),
+        true,
+    ) {
+        ctx.record_sound_fallback_reason("native_string_unmodeled_operation");
+        return None;
+    }
     let caller_vtable_ids = nested_caller_vtable_ids(ctx, args, inline_vtable_ids);
     let (caller_subslice_lens, caller_subslice_offsets) =
         build_inline_subslice_maps_from_args(ctx, args);
@@ -776,6 +785,13 @@ pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
                 })
             {
                 ctx.record_sound_fallback_reason("heterogeneous_sequence_comparison");
+                return None;
+            }
+            if candidates.targets.iter().any(|(_, target)| {
+                matches!(&target.kind, crate::codegen_ay::fn_ptr_identity::FnPtrTargetKind::Item { instance, .. }
+                    if crate::codegen_ay::native_string_unmodeled_operation_instance(ctx.tcx, *instance, true))
+            }) {
+                ctx.record_sound_fallback_reason("native_string_unmodeled_operation");
                 return None;
             }
             if candidates.exact {
@@ -1249,8 +1265,14 @@ pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
     // memory and retry.  This handles Vec::len/is_empty inside closure bodies
     // where the capture is a reference, not the DT value.
     if let Some(callee_path) = callee_path
-        && let Some(expr) =
-            try_inline_vec_accessor_via_memory(ctx, callee_path, &translated_args, args, outer_body)
+        && let Some(expr) = try_inline_vec_accessor_via_memory(
+            ctx,
+            func,
+            callee_path,
+            &translated_args,
+            args,
+            outer_body,
+        )
     {
         return Some(InlineReturn::value_only(expr));
     }
@@ -1525,6 +1547,7 @@ pub(in crate::codegen_ay::chc) fn try_inline_nested_call<'tcx, 'body>(
 /// this fallback resolves the pointer→DT indirection.
 fn try_inline_vec_accessor_via_memory(
     ctx: &mut ChcCtx<'_, '_>,
+    func: &Operand,
     callee_path: &str,
     translated_args: &[Expr],
     args: &[Operand],
@@ -1536,6 +1559,14 @@ fn try_inline_vec_accessor_via_memory(
     let stub = ctx.stub_registry.lookup(callee_path);
     let stub = stub?;
     if !matches!(stub, StubKind::VecLen | StubKind::VecIsEmpty) {
+        return None;
+    }
+    if !crate::codegen_ay::shared::vec_query_identity::vec_query_stub_is_authorized(
+        ctx.tcx,
+        func,
+        outer_body.locals(),
+        stub,
+    ) {
         return None;
     }
     if translated_args.len() != 1 {

@@ -181,41 +181,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         None
     }
 
-    /// Pre-check for Cow<str>::to_string() calls (Part of #1738).
-    /// Examines generic args because the def_path_str doesn't contain "Cow".
-    /// `<String as BoundedArbitrary>::bounded_any::<N>()` — a symbolic String
-    /// of at most N bytes. Reaches codegen because the inline pass declines it
-    /// (see `should_inline_mutable`); without that this call is expanded into
-    /// `utf8_chunks()` internals that abstract to unconstrained symbolics, and
-    /// the bound is lost.
-    pub(in crate::codegen_ay::statement) fn try_codegen_bounded_string_precheck(
-        &mut self,
-        func: &Operand,
-        callee_path: &str,
-        destination: &Place,
-        target: Option<BasicBlockIdx>,
-    ) -> Option<Option<BasicBlockIdx>> {
-        if !callee_path.ends_with("::bounded_any") || !callee_path.contains("String") {
-            return None;
-        }
-
-        let func_ty = func.ty(self.body.locals()).into_option()?;
-        let fn_args = match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(_, args)) => args,
-            _ => return None, // external enum: TyKind
-        };
-        // No resolvable const bound means there is no bound to state; decline
-        // and let the existing fallback handle it.
-        let bound = fn_args.0.iter().find_map(|arg| match arg {
-            GenericArgKind::Const(c) => c.eval_target_usize().into_option(),
-            _ => None,
-        })?;
-
-        debug!(bound, "bounded_any::<String, N>: modelling a String of at most N bytes");
-        self.codegen_bounded_string_value(bound, destination);
-        Some(target)
-    }
-
+    /// Authenticate Cow<str> conversions before the main registry route.
     pub(in crate::codegen_ay::statement) fn try_codegen_cow_tostring_precheck(
         &mut self,
         func: &Operand,
@@ -224,47 +190,29 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         destination: &Place,
         target: Option<BasicBlockIdx>,
     ) -> Option<Option<BasicBlockIdx>> {
+        // A cheap candidate filter avoids resolving unrelated calls. Only
+        // the actual-definition guard below grants permission to model one.
         if !callee_path.ends_with("::to_string") && !callee_path.contains("ToString::to_string") {
             return None;
         }
-
-        let func_ty = func.ty(self.body.locals()).into_option()?;
-        let fn_args = match func_ty.kind() {
-            TyKind::RigidTy(RigidTy::FnDef(_, args)) => args,
-            _ => return None, // external enum: TyKind
-        };
-
-        // Part of #2267: Structural matching instead of format!("{:?}") + contains().
-        let is_cow_str = fn_args.0.first().is_some_and(|arg| {
-            let GenericArgKind::Type(ty) = arg else { return false };
-            // Unwrap one level of reference if present (e.g., &Cow<'_, str>)
-            let inner_ty = match ty.kind() {
-                TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
-                _ => *ty, // external enum: TyKind
-            };
-            if let TyKind::RigidTy(RigidTy::Adt(def, inner_args)) = inner_ty.kind() {
-                def.trimmed_name().contains("Cow")
-                    && inner_args.0.iter().any(|a| matches!(a,
-                        GenericArgKind::Type(t) if matches!(t.kind(), TyKind::RigidTy(RigidTy::Str))))
-            } else {
-                false
-            }
-        });
-
-        if is_cow_str {
-            debug!(
-                "Cow<str>::to_string detected via generic arg precheck, routing to CowToString stub"
-            );
-            return Some(self.codegen_string_stub(
+        if self.ctx.unit_has_stubs()
+            || !crate::codegen_ay::shared::string_identity::string_stub_is_authorized(
+                self.ctx.tcx,
+                func,
+                self.body.locals(),
                 StubKind::CowToString,
-                args,
-                destination,
-                target,
-                callee_path,
-            ));
+            )
+        {
+            return None;
         }
-
-        None
+        debug!("authenticated native Cow<str>::to_string precheck");
+        Some(self.codegen_string_stub(
+            StubKind::CowToString,
+            args,
+            destination,
+            target,
+            callee_path,
+        ))
     }
 
     /// `MaybeUninit::uninit()` / `MaybeUninit::assume_init()` precheck.

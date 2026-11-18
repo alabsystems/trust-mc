@@ -505,35 +505,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
 
             // Handle projections after Deref (e.g., (*ptr).field) by computing byte offset
             if place.projection.len() > 1 {
-                let mut total_offset: usize = 0;
-                let mut current_ty = pointee_ty;
-                let mut final_field_ty = pointee_ty;
-                let mut all_fields = true;
-
-                for proj in place.projection.iter().skip(1) {
-                    if let ProjectionElem::Field(field_idx, field_ty) = proj {
-                        let layout = LayoutOf::new(current_ty);
-                        if let Some(offset) = layout.field_offset(*field_idx) {
-                            total_offset += offset;
-                            current_ty = *field_ty;
-                            final_field_ty = *field_ty;
-                        } else {
-                            debug!(
-                                "codegen_place: cannot compute field offset for field {}",
-                                *field_idx
-                            );
-                            all_fields = false;
-                            break;
-                        }
-                    } else {
-                        // external enum: ProjectionElem
-                        debug!("codegen_place: unsupported projection after Deref: {:?}", proj);
-                        all_fields = false;
-                        break;
-                    }
-                }
-
-                if all_fields
+                if let Some((total_offset, final_field_ty)) =
+                    Self::raw_field_projection_layout(pointee_ty, &place.projection[1..])
                     && let Some(ptr_expr) = self.codegen_place(&ptr_place)
                     && let Some(field_size) = LayoutOf::new(final_field_ty).size_of()
                 {
@@ -602,15 +575,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         let TyKind::RigidTy(RigidTy::RawPtr(pointee_ty, _)) = ptr_ty.kind() else {
             return None;
         };
-        let mut offset: usize = 0;
-        let mut current_ty = pointee_ty;
-        for proj in place.projection.iter().skip(1) {
-            let ProjectionElem::Field(field_idx, field_ty) = proj else {
-                return None;
-            };
-            offset += LayoutOf::new(current_ty).field_offset(*field_idx)?;
-            current_ty = *field_ty;
-        }
+        let (offset, current_ty) =
+            Self::raw_field_projection_layout(pointee_ty, place.projection.get(1..)?)?;
         let size = LayoutOf::new(current_ty).size_of()?;
         if size == 0 {
             return None;
@@ -665,13 +631,38 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             );
             return;
         };
+        if current.sort() != cached.sort() {
+            self.ctx.unsupported_with_fallback(
+                "raw pointer read from a cached value",
+                format!("the cached value of {place:?} and byte memory differ in sort"),
+            );
+            return;
+        }
+        self.guard_cached_memory_value(
+            cached,
+            current,
+            "unsound_raw_ptr_cached_read",
+            "raw_ptr_cached_read_guard",
+        );
+        debug!(?place, "raw pointer read from a cached value checked against byte memory");
+    }
+
+    /// A logical scalar read must agree with the current bytes without
+    /// assuming away a possible disagreement. Both callers qualify the address.
+    pub(super) fn guard_cached_memory_value(
+        &mut self,
+        cached: &Expr,
+        current: Expr,
+        label: &'static str,
+        approximation: &'static str,
+    ) {
         if current == *cached {
             return;
         }
         if current.sort() != cached.sort() {
             self.ctx.unsupported_with_fallback(
-                "raw pointer read from a cached value",
-                format!("the cached value of {place:?} and byte memory differ in sort"),
+                "cached scalar read differs in sort from byte memory",
+                label,
             );
             return;
         }
@@ -686,9 +677,8 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         if current == cached {
             return;
         }
-        self.record_violation_guarded(cached.ne(current), "unsound_raw_ptr_cached_read");
-        self.ctx.bmc_sound_havoc("raw_ptr_cached_read_guard");
-        debug!(?place, "raw pointer read from a cached value checked against byte memory");
+        self.record_violation_guarded(cached.ne(current), label);
+        self.ctx.bmc_sound_havoc(approximation);
     }
 
     /// Try to resolve remaining projections via piecewise env lookup (#3133).

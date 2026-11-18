@@ -114,6 +114,8 @@ pub(crate) fn print_machine_readable_sha() {
 ///
 /// `ay_authority` names the lane the guarantee was established in — see
 /// [`AyResolution`]. It is never printed unless the corresponding check passed.
+/// `ay_runtime_default=bundled|path` describes this engine's default helper
+/// selection, without probing a solver or changing explicit override policy.
 pub(crate) fn print_version_authority(invocation_type: InvocationType) -> Result<()> {
     use std::io::Write as _;
 
@@ -131,8 +133,9 @@ pub(crate) fn print_version_authority(invocation_type: InvocationType) -> Result
         "trust_mc-version-authority version={KANI_VERSION} invocation={invocation} \
          trust_mc_sha={TRUST_MC_GIT_SHA} trust_mc_dirty={TRUST_MC_GIT_DIRTY} \
          ay_version={ay_version} ay_pin={ay_pin} ay_linked_sha={} \
-         ay_linked_dirty=0 ay_authority={ay_authority}",
-        authority.linked.sha
+         ay_linked_dirty=0 ay_authority={ay_authority} ay_runtime_default={}",
+        authority.linked.sha,
+        if option_env!("MC_DRIVER_RELEASE_BUNDLE") == Some("1") { "bundled" } else { "path" }
     )
     .context("write version authority to stdout")?;
     Ok(())

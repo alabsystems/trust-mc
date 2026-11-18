@@ -547,6 +547,15 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
         pointee_base: &str,
         place: &Place,
     ) -> Option<Expr> {
+        tracing::debug!(
+            target: "trust_mc_bmc_rawvec",
+            pointee_base,
+            deref_place = ?place,
+            deref_ty = ?place.ty(self.body.locals()),
+            tracked_value = ?self.env_lookup(pointee_base),
+            durable_value = ?self.heap_pointees.get(pointee_base),
+            "Pointee state immediately before the existing synthesis fallback"
+        );
         POINTEE_SYNTHESIS_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         warn!(
             pointee_base,

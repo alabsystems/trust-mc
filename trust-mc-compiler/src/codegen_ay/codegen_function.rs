@@ -132,7 +132,8 @@ pub(crate) fn codegen_function_with_body(
         preserve_array_comparisons: ay_ctx.config.use_chc,
         bmc_native_box_validity: !ay_ctx.config.use_chc,
         chc_native_box_drop: ay_ctx.config.use_chc,
-    });
+    })
+    .with_unit_stubs(ay_ctx.unit_has_stubs());
     let inline_custody = super::unstubbed_accounting::before_root_inline(instance, &body);
     let (inlined, mut body) =
         inline_pass.transform_with_body_provider(ay_ctx.tcx, body, instance, |callee_instance| {
@@ -455,12 +456,23 @@ pub(crate) fn codegen_function_with_body(
         topo_order.len()
     );
 
+    // Diagnose the body actually consumed by BMC, after inlining and loop
+    // transforms. Like the CHC body trace below, this only records MIR.
+    if tracing::enabled!(target: "trust_mc_bmc_body", tracing::Level::DEBUG) {
+        let mut out = Vec::new();
+        let _ = body.dump(&mut out, &name);
+        tracing::debug!(target: "trust_mc_bmc_body", "{}", String::from_utf8_lossy(&out));
+    }
+
     // Error recovery boundary (#3739): catch panics from unsupported MIR
     // patterns in the BMC path (e.g., multi-level Box pointer chain gaps)
     // and convert them to a CTREX verdict instead of crashing the compiler.
     // Mirrors the CHC protection at line 254.
     let tuple_usage = TupleUsageAnalysis::run(&body);
     let result = catch_unwind(AssertUnwindSafe(|| {
+        // Only the complete final body can reconcile a retained root call. A
+        // changed/unrolled body or an abandoned traversal retains its events.
+        let accounting = super::unstubbed_accounting::EncodingAttempt::begin(Some(instance), &body);
         let mut codegen = StatementCodegen::new(ay_ctx, &body, tuple_usage);
 
         for bb_idx in topo_order {
@@ -489,6 +501,7 @@ pub(crate) fn codegen_function_with_body(
                 codegen.record_outgoing_edge(target_bb, branch_cond);
             }
         }
+        accounting.finish();
     }));
 
     match result {
@@ -966,6 +979,13 @@ fn body_calls_block_on(body: &rustc_public::mir::Body) -> bool {
 ///
 /// Returns `(topo_order, reachable_count)`. If `topo_order.len() < reachable_count`,
 /// the CFG contains cycles (loops) that need unrolling before BMC encoding.
+#[cfg(test)]
+pub(in crate::codegen_ay) fn native_test_compute_topo(
+    body: &rustc_public::mir::Body,
+) -> (Vec<usize>, usize) {
+    compute_topo(body)
+}
+
 fn compute_topo(body: &rustc_public::mir::Body) -> (Vec<usize>, usize) {
     let block_count = body.blocks.len();
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); block_count];

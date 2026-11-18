@@ -291,12 +291,19 @@ pub(crate) struct FunctionInlinePass {
     /// no non-failing execution can run a fetching loop body more than that many
     /// times. `codegen_function` reads it as a construct-derived unwind bound.
     variadic_actual_bound: Option<usize>,
+    /// Attached unit replacements can change native calls transitively.
+    unit_has_stubs: bool,
 }
 
 impl FunctionInlinePass {
     /// Create a new inline pass with the given configuration.
     pub(crate) fn new(config: InlineConfig) -> Self {
-        FunctionInlinePass { config, variadic_actual_bound: None }
+        FunctionInlinePass { config, variadic_actual_bound: None, unit_has_stubs: false }
+    }
+
+    pub(crate) fn with_unit_stubs(mut self, active: bool) -> Self {
+        self.unit_has_stubs = active;
+        self
     }
 
     /// Find all Call terminators in a MutableBody that should be inlined.
@@ -437,32 +444,6 @@ impl FunctionInlinePass {
             _ => return false, // external enum: TyKind
         };
 
-        // `<String as BoundedArbitrary>::bounded_any::<N>` must reach codegen
-        // rather than be inlined. Its body runs through `utf8_chunks()` /
-        // `Utf8Chunk::valid()`, which codegen abstracts to unconstrained
-        // symbolics, so inlining discards the one guarantee the API makes --
-        // that the String holds at most N bytes -- and
-        // `bounded_any::<String, 4>().len() <= 4` reported FAILED.
-        //
-        // Match on the GENERIC ARGS, not the name: `fn_def.0.name()` here is the
-        // unmonomorphised trait path `kani::BoundedArbitrary::bounded_any`, with
-        // no mention of String at all. (The fully-qualified
-        // `...<impl BoundedArbitrary for std::string::String>::bounded_any` that
-        // shows up in codegen logs is the resolved instance, a different string.)
-        if fn_name.ends_with("::bounded_any")
-            && fn_args_for_resolve.as_ref().is_some_and(|args| {
-                args.0.iter().any(|arg| {
-                    matches!(arg, rustc_public::ty::GenericArgKind::Type(t)
-                        if matches!(t.kind(),
-                            rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(def, _))
-                            if def.0.name().ends_with("String")))
-                })
-            })
-        {
-            debug!("Not inlining bounded_any for String (codegen models the bound)");
-            return false;
-        }
-
         // Preserve destructor Calls (`drop_in_place::<T>`) for inline owning
         // containers (ArrayVec/SmallVec) whose ELEMENT type is trivially droppable
         // (empty drop shim). Leaving them as Calls lets the BMC drop-glue intercept
@@ -584,6 +565,17 @@ impl FunctionInlinePass {
             && let Ok(instance) = Instance::resolve(def, args)
             && crate::codegen_ay::native_box_into_raw_identity(tcx, &instance).is_some()
         {
+            return false;
+        }
+        if crate::codegen_ay::native_string_unmodeled_operation(
+            tcx,
+            func,
+            body.locals(),
+            !self.unit_has_stubs,
+        ) || (!self.unit_has_stubs
+            && crate::codegen_ay::native_string_call_boundary(tcx, func, body.locals()))
+        {
+            debug!("Preserving authenticated String call boundary: {}", fn_name);
             return false;
         }
         if !callee_is_local && Self::has_special_codegen_handler(&fn_name) {
@@ -907,17 +899,6 @@ impl FunctionInlinePass {
             && (fn_name.contains("alloc::vec") || fn_name.contains("std::vec"))
         {
             debug!("Not inlining Vec IntoIter operation: {}", fn_name);
-            return true;
-        }
-
-        // String operations - preserve for stub codegen (#1691)
-        // String has semantic stubs (StringNew, StringLen, StringFromUtf8Lossy, etc.)
-        // If inlined, we'd hit internal String/RawVec operations that blow up the MIR.
-        // Note: alloc::string::String and std::string::String are both common paths
-        let contains_string =
-            fn_name.contains("alloc::string::String") || fn_name.contains("std::string::String");
-        if contains_string {
-            debug!("Not inlining String operation: {}", fn_name);
             return true;
         }
 
@@ -1294,11 +1275,6 @@ impl FunctionInlinePass {
         // Vec::from(&[T]) → VecFromSlice stub (#3673)
         if resolved_name.contains("Vec") && resolved_name.contains("From") {
             debug!("Resolved trait impl has Vec stub: {}", resolved_name);
-            return true;
-        }
-        // String::from(&str) → StringFrom stub
-        if resolved_name.contains("String") && resolved_name.contains("From") {
-            debug!("Resolved trait impl has String stub: {}", resolved_name);
             return true;
         }
         false

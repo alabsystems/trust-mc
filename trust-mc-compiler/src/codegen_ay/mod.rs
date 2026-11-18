@@ -59,6 +59,10 @@ pub(crate) use shared::native_box_raw::{
     native_bmc_box_drop_is_modeled, native_bmc_box_drop_value, native_bmc_box_from_raw,
     native_bmc_box_into_raw, native_bmc_has_custom_global_allocator, native_box_into_raw_identity,
 };
+pub(crate) use shared::string_identity::{
+    native_string_call_boundary, native_string_unmodeled_operation,
+    native_string_unmodeled_operation_instance,
+};
 mod statement;
 #[cfg(all(trust_toolchain, version("1.101")))]
 pub(crate) use shared::native_box_init::native_init_boundary;

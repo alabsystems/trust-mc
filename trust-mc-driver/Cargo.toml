@@ -71,8 +71,8 @@ ay-sys = { workspace = true, optional = true }
 # Required for source location mapping from .vc.json sidecar files
 trust-mc-core = { path = "../trust-mc-core" }
 # Optional native trust_ir bundle embedding path for compiler integrations.
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", optional = true }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", optional = true }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", optional = true }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", optional = true }
 trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 
 # Unix SIGPIPE handling (#663)
@@ -83,8 +83,8 @@ trust-mc-trust-bmc = { path = "../trust-mc-trust-bmc", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["serde"] }
-trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f" }
+trust_ir = { package = "trust-ir", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["serde"] }
+trust_ir-build = { package = "trust-ir-build", git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe" }
 ay_bindings = { workspace = true }
 # `legacy-liveness-oracle` is test-only: it exposes the pre-fix CHC relation
 # liveness so `tests/chc_liveness_verdict_parity.rs` can compare verdicts.

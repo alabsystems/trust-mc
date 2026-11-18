@@ -153,6 +153,26 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
     /// The dispatch spine after the Kani-function dispatcher
     /// ([`CallTerminator::codegen_call_terminator`]).
     fn codegen_call_terminator_after_kani(&mut self, dcx: &DispatchCallContext<'_>) -> bool {
+        if crate::codegen_ay::native_string_unmodeled_operation(
+            self.tcx,
+            dcx.func,
+            self.body.locals(),
+            true,
+        ) {
+            self.record_sound_fallback_reason("native_string_unmodeled_operation");
+            let Some(target) = *dcx.target else {
+                return false;
+            };
+            super::codegen_call_coerce::emit_sound_fallback_goto(
+                self,
+                dcx.from_app,
+                target,
+                dcx.modified_locals,
+                &[dcx.destination.local],
+                dcx.stmt_constraints,
+            );
+            return true;
+        }
         #[cfg(all(trust_toolchain, version("1.101")))]
         if self.try_native_box_into_raw(dcx) {
             return true;

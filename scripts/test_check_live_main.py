@@ -210,6 +210,110 @@ class LiveMainTests(unittest.TestCase):
             self.assertEqual(self._git(checkout, "rev-parse", "origin/main"), second)
             self.assertEqual(self._git(checkout, "for-each-ref", "refs/agh/"), "")
 
+    def test_aterm_reuses_current_tracking_object_after_two_live_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _first, second = self._history(root)
+            self._git(checkout, "fetch", "--quiet", "origin", "main")
+            self.assertEqual(self._git(checkout, "rev-parse", "origin/main"), second)
+            self._git(checkout, "remote", "set-url", "origin", "https://github.com/alabsystems/ay.git")
+            agh, calls = self._agh_fixture(root, checkout, [second, second])
+            with patch.object(check_live_main, "_run_git", side_effect=self._local_only_git), \
+                    patch.object(check_live_main, "_run_agh", side_effect=agh):
+                self.assertEqual(require_exact_main(checkout, "origin", second), second)
+            self.assertEqual(calls, [AGH_MAIN, AGH_MAIN])
+            self.assertEqual(self._git(checkout, "rev-parse", "origin/main"), second)
+            self.assertEqual(self._git(checkout, "for-each-ref", "refs/agh/"), "")
+
+    def test_aterm_requires_exact_fetch_when_tracking_object_has_shallow_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _full, _first, second = self._history(root)
+            shallow = root / "shallow"
+            subprocess.run(
+                ["git", "clone", "--depth", "1", (root / "remote.git").as_uri(), str(shallow)],
+                check=True, capture_output=True, text=True,
+            )
+            self.assertEqual(self._git(shallow, "rev-parse", "origin/main"), second)
+            self.assertEqual(self._git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+            self._git(shallow, "remote", "set-url", "origin", "https://github.com/alabsystems/ay.git")
+            calls: list[tuple[str, ...]] = []
+
+            def agh(_checkout: Path, arguments: Sequence[str]):
+                calls.append(tuple(arguments))
+                if tuple(arguments) == AGH_MAIN:
+                    return completed(arguments, stdout=json.dumps([
+                        {"oid": second, "ref": "refs/heads/main"},
+                    ]))
+                return completed(arguments, 3, stderr="exact fetch unavailable")
+
+            with patch.object(check_live_main, "_run_git", side_effect=self._local_only_git), \
+                    patch.object(check_live_main, "_run_agh", side_effect=agh):
+                with self.assertRaisesRegex(LiveMainError, "exact fetch unavailable"):
+                    fetch_live_main(shallow, "origin")
+            self.assertEqual(calls[0], AGH_MAIN)
+            self.assertEqual(calls[1][:2], ("repo", "fetch"))
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(self._git(shallow, "for-each-ref", "refs/agh/"), "")
+
+    def test_frozen_ancestry_checks_both_live_tips_and_leaves_tracking_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout, pinned, tracked = self._history(Path(directory))
+            self._git(checkout, "fetch", "--quiet", "origin", "main")
+            self._git(checkout, "remote", "set-url", "origin", "https://github.com/alabsystems/ay.git")
+            self.assertEqual(self._git(checkout, "rev-parse", "origin/main"), tracked)
+            confirmed = "e" * 40
+            queries = [{"ancestor": oid, "descendant": confirmed} for oid in (pinned, tracked)]
+
+            for failure in (None, "rewind", "numeric-judgment", "substituted-query"):
+                with self.subTest(failure=failure):
+                    calls: list[tuple[str, ...]] = []
+                    tips = iter((tracked, confirmed))
+
+                    def agh(actual_checkout: Path, arguments: Sequence[str]):
+                        self.assertEqual(actual_checkout, checkout)
+                        args = tuple(arguments)
+                        calls.append(args)
+                        if args == AGH_MAIN:
+                            return completed(args, stdout=json.dumps([
+                                {"oid": next(tips), "ref": "refs/heads/main"},
+                            ]))
+                        self.assertEqual(args[:-1], (
+                            "repo", "commit-ancestry", "alabsystems/ay", str(checkout.resolve()), "--input",
+                        ))
+                        self.assertEqual(json.loads(Path(args[-1]).read_text()), {
+                            "commits": [confirmed], "queries": queries,
+                        })
+                        answers = [{**query, "contained": True} for query in queries]
+                        if failure == "rewind":
+                            answers[-1]["contained"] = False
+                        elif failure == "numeric-judgment":
+                            answers[0]["contained"] = 1
+                        elif failure == "substituted-query":
+                            answers[0]["ancestor"] = confirmed
+                        return completed(args, stdout=json.dumps({
+                            "schema": 1, "scope": "commit-parent-ancestry-only-v1",
+                            "commits": [confirmed], "queries": answers,
+                            "refs_written": False, "checkout_complete": False,
+                        }))
+
+                    with patch.object(check_live_main, "_run_git", side_effect=self._local_only_git), \
+                            patch.object(check_live_main, "_run_agh", side_effect=agh):
+                        if failure is None:
+                            self.assertEqual(require_frozen_main_ancestor(
+                                checkout, "origin", pinned, commit_ancestry_only=True,
+                            ), confirmed)
+                        else:
+                            message = "is not an ancestor" if failure == "rewind" else "malformed agh ancestry"
+                            with self.assertRaisesRegex(LiveMainError, message):
+                                require_frozen_main_ancestor(
+                                    checkout, "origin", pinned, commit_ancestry_only=True,
+                                )
+                    self.assertEqual(calls[:2], [AGH_MAIN, AGH_MAIN])
+                    self.assertEqual(len(calls), 3)
+                    self.assertEqual(self._git(checkout, "rev-parse", "origin/main"), tracked)
+                    self.assertEqual(self._git(checkout, "for-each-ref", "refs/agh/"), "")
+
     def test_aterm_accepts_checked_advancing_main_and_refreshes_tracking_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

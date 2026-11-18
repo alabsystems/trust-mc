@@ -284,9 +284,7 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
                     .map(|(len, per)| scaled_len(len, per, pointer))
             }
             TyKind::RigidTy(RigidTy::Str) => self.slice_len_expr(first),
-            TyKind::RigidTy(RigidTy::Adt(def, adt_args))
-                if rustc_public::CrateDef::trimmed_name(&def) == "Vec" =>
-            {
+            TyKind::RigidTy(RigidTy::Adt(def, adt_args)) if Self::is_native_vec_adt(def) => {
                 let Some(elem) = adt_args.0.iter().find_map(|arg| match arg {
                     rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
                     _ => None,
@@ -444,11 +442,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             }
             self.slice_len_expr(text)?
         } else if path.contains("BoundedArbitrary") && path.ends_with("bounded_any") {
-            // The kani library's `bounded_any::<N>` for `String`, `Vec<P>` and
+            // The kani library's `bounded_any::<N>` for `Vec<P>` and
             // `Box<[P]>` of a primitive `P` (`library/trust-mc/src/
             // bounded_arbitrary.rs`): each loop it runs takes at most `N`
-            // passes (the `0..len` fill with `len <= N`, `Utf8Chunks::next` over
-            // `N` bytes), and `P::any()` runs none. A map or set's `insert`
+            // passes (the `0..len` fill with `len <= N`), and `P::any()` runs
+            // none. A map or set's `insert`
             // loop has no such bound and keeps the fail-closed fallback.
             let TyKind::RigidTy(RigidTy::FnDef(_, generics)) =
                 func.ty(self.body.locals()).into_option()?.kind()
@@ -1845,9 +1843,9 @@ fn bounded_any_container_is_loop_bounded(ty: rustc_public::ty::Ty) -> bool {
     match ty.kind() {
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             let name = rustc_public::CrateDef::name(&def);
-            if name == "std::string::String" || name == "alloc::string::String" {
-                return true;
-            }
+            // A String type/name cannot authenticate which bounded-any body
+            // runs. No String loop bound is supplied until that operation has
+            // canonical library/trait authority.
             if name == "std::vec::Vec" || name == "alloc::vec::Vec" {
                 return first_type_arg(&args).is_some_and(primitive);
             }

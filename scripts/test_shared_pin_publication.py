@@ -88,9 +88,11 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn('pinned_package_paths.py', source)
         self.assertNotIn('PIN_EXCLUSIONS=', source)
         self.assertIn('check_shared_pin_graph.py', source)
+        self.assertIn('frozen-ancestry', source)
         diagnostic = (SCRIPTS / 'check-shared-pin-drift.sh').read_text()
         self.assertIn('pinned_package_paths.py" drift', diagnostic)
         self.assertIn('pin-exclusions.toml', diagnostic)
+        self.assertNotIn('frozen-ancestry', diagnostic)
 
 
 class GraphTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+// compile-flags: -A unstable_imports
 
 // Check that `copy_nonoverlapping` fails if the `src`/`dst` regions overlap.
 #![feature(core_intrinsics)]

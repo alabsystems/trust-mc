@@ -79,7 +79,7 @@ require_frozen_content_checkout() {
     local expected="$3"
     local repository="$4"
     local remote
-    local fetched_main
+    local observed_main
 
     require_clean_checkout "${label}" "${checkout}" "${expected}"
     remote="$(canonical_remote "${checkout}" "${repository}")" \
@@ -87,15 +87,15 @@ require_frozen_content_checkout() {
     # A frozen content pin need not equal today's branch tip. It must remain in
     # canonical main history. Independently observed main snapshots may advance
     # only along checked ancestry. Forks and rewinds are refused.
-    fetched_main="$("${PYTHON}" "${ROOT_DIR}/scripts/check_live_main.py" \
-        frozen "${checkout}" "${remote}" "${expected}")" \
+    observed_main="$("${PYTHON}" "${ROOT_DIR}/scripts/check_live_main.py" \
+        frozen-ancestry "${checkout}" "${remote}" "${expected}")" \
         || die "${label} frozen live ${remote}/main verification failed"
 
-    if [[ "${expected}" != "${fetched_main}" ]]; then
+    if [[ "${expected}" != "${observed_main}" ]]; then
         printf 'check-shared-pins: note: %s frozen content %s intentionally lags descendant live main %s\n' \
-            "${label}" "${expected}" "${fetched_main}" >&2
+            "${label}" "${expected}" "${observed_main}" >&2
     fi
-    printf '%s\n' "${fetched_main}"
+    printf '%s\n' "${observed_main}"
 }
 
 trust_ir_audit="$("${PYTHON}" "${ROOT_DIR}/scripts/check_first_party_git_pins.py" \

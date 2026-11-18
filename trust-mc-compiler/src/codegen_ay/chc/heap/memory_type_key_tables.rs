@@ -146,11 +146,8 @@ pub(in crate::codegen_ay::chc) const PREFIX_TYPE_KEY_RULES: &[PrefixTypeKeyRule]
             struct_sort(names::vec_sort_name(&elem_suffix), names::vec_fields(array_sort))
         },
     },
-    // String: Datatype with (ptr, len, cap).
-    PrefixTypeKeyRule {
-        matches: |s| s.starts_with("String") || s.contains("std_string_String"),
-        sort: |_| struct_sort(names::RUST_STRING_SORT, names::string_fields()),
-    },
+    // A text-only key cannot authenticate String. Typed callers use the real
+    // ADT translation/registered array; unknown keys keep the opaque fallback.
     // Box<T>: pointer-width bitvec.
     PrefixTypeKeyRule {
         matches: |s| s.starts_with("Box") || s.contains("std_boxed_Box"),

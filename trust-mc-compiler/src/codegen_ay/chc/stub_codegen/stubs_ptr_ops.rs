@@ -254,6 +254,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         let Some(result_expr) = result_opt else {
+            self.clear_ptr_offset_metadata(dest_local);
+            self.ref_resolution.const_memory_provenance.remove(&dest_local);
             warn!(
                 fn_name = %self.fn_name,
                 "CHC: wrapping element pointer translation failed; emitting unconstrained transition with fallback metadata"
@@ -265,6 +267,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
         };
 
         let Some((_, dest_var)) = self.resolve_destination(dest_local) else {
+            self.clear_ptr_offset_metadata(dest_local);
+            self.ref_resolution.const_memory_provenance.remove(&dest_local);
             warn!(
                 fn_name = %self.fn_name,
                 "CHC: wrapping element pointer missing destination output state; emitting unconstrained transition with fallback metadata"
@@ -290,7 +294,10 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
                 cx.stmt_constraints,
                 [eq],
             );
+            self.propagate_wrapping_array_pointer_metadata(dest_local, cx.args);
         } else {
+            self.clear_ptr_offset_metadata(dest_local);
+            self.ref_resolution.const_memory_provenance.remove(&dest_local);
             warn!(
                 fn_name = %self.fn_name,
                 "CHC: wrapping element pointer coercion failed; emitting unconstrained transition with fallback metadata"
@@ -382,8 +389,8 @@ impl<'tcx, 'body> ChcCtx<'tcx, 'body> {
             pointee.kind(),
             TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..))
         ) || pointee.layout().ok().is_some_and(|l| l.shape().is_unsized());
-        if !is_wide || Self::translate_ty(arg_ty).and_then(|s| s.bitvec_width())
-            != Some(2 * POINTER_WIDTH)
+        if !is_wide
+            || Self::translate_ty(arg_ty).and_then(|s| s.bitvec_width()) != Some(2 * POINTER_WIDTH)
         {
             return stepped;
         }

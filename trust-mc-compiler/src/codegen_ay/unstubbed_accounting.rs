@@ -5,7 +5,7 @@
 //!
 //! A path is never authority. Every encounter of a callee must be a direct
 //! call in the one root body, carried through the compiler's inliner with its
-//! complete block unchanged, and modeled in every CHC encoding attempt. Unknown
+//! complete block unchanged, and modeled in every encoding attempt. Unknown
 //! uses, partial inventories, changed bodies and aborted scopes retain all events.
 
 use super::diagnostics::{add_unstubbed_semantic_events, record_unstubbed_coverage};
@@ -434,7 +434,19 @@ impl Drop for EncodingAttempt<'_> {
 pub(super) fn record_exact_address(
     evidence: super::chc::call::codegen_call_static_atomic_address::ExactAtomicAddressModel<'_>,
 ) {
-    let (root, body, block, callee) = evidence.into_parts();
+    record_exact_call(evidence.into_parts());
+}
+
+/// The BMC singleton producer issues this only after its canonical, live-storage
+/// model binds the result of the actual call. Helper calls keep their encounters:
+/// the existing root/inliner custody rule cannot authenticate their relocation.
+pub(super) fn record_exact_shared_scalar_slice(
+    evidence: super::statement::ExactSharedScalarSliceModel<'_>,
+) {
+    record_exact_call(evidence.into_parts());
+}
+
+fn record_exact_call((root, body, block, callee): (Option<Instance>, &Body, usize, Instance)) {
     with_current(|ledger| {
         if ledger.root != root || root.is_none() || ledger.preserved.get(&block) != Some(&callee) {
             return;

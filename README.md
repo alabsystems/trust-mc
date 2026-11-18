@@ -105,6 +105,15 @@ directory. `trust-mc` finds this bundle through its executable path, including
 when launched through a package-manager symlink from outside a checkout. An
 explicit `TRUST_MC_SYSROOT` still takes priority.
 
+The front door reads the engine's AY runtime choice once from
+`--version-authority`: new release engines select their private `libexec/ay`
+relative to the actual driver, including through a package-manager symlink.
+They require no global AY on PATH. `TRUST_MC_AY_BIN` remains an explicit override;
+the driver still validates the selected solver. Older engines without the
+`ay_runtime_default` field retain legacy PATH discovery. For an older private-AY
+bundle, select its matching helper explicitly with `TRUST_MC_AY_BIN`, or rebuild
+the bundle to obtain automatic discovery.
+
 To verify your Rust programs, build the engine backend and its keyed Kani
 library with the exact Trust seal recorded in [tools/tuple.toml](tools/tuple.toml). The compiler API
 port has landed; this route uses the seal's `rustc-dev` libraries and the

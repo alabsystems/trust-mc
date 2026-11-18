@@ -266,10 +266,9 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
     /// location instead of keeping them separate, which removes stale reads; it
     /// never merges distinct locations, because the suffix is exactly the
     /// projection chain and the prefix is the mapping the deref ladder itself
-    /// trusts. Restricted to `Field`/`Downcast` suffixes (a static offset into the
-    /// referent); `Index`/`Subslice`/`OpaqueCast` decline and keep the old
-    /// syntactic name. Declines to `None` whenever `ref_pointees` has no entry, so
-    /// the previous behaviour stands.
+    /// trusts. Fields, downcasts and known forward array indices on thin
+    /// references have static suffixes. Other projections keep their syntactic
+    /// names. Missing `ref_pointees` entries keep the original path.
     fn deref_pointee_alias(&mut self, place: &Place) -> Option<Arc<str>> {
         if !matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
             return None;
@@ -282,6 +281,11 @@ impl<'a, 'tcx, 't> StatementCodegen<'a, 'tcx, 't> {
             match proj {
                 ProjectionElem::Field(field, _) => {
                     let _ = write!(base, "_field_{field}");
+                }
+                ProjectionElem::ConstantIndex { offset, from_end: false, .. }
+                    if self.is_projected_thin_reference(place) =>
+                {
+                    let _ = write!(base, "_cidx_{offset}");
                 }
                 ProjectionElem::Downcast(variant_idx) => {
                     let _ = write!(base, "_variant_{}", variant_idx.to_index());
